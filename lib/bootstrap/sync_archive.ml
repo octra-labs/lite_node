@@ -83,6 +83,27 @@ let sync_path sync path =
   let fd = Unix.openfile path [Unix.O_RDONLY] 0 in
   Fun.protect ~finally:(fun () -> Unix.close fd) (fun () -> sync fd)
 
+let remove_stage ?(unlink = Unix.unlink) owner id =
+  if not (marked_stage owner id) then
+    invalid_arg "state sync stage ownership is unknown";
+  let stage = path owner id ^ ".next" in
+  let rec clear target =
+    match Unix.lstat target with
+    | stat when stat.Unix.st_kind = Unix.S_DIR ->
+      Unix.chmod target (stat.Unix.st_perm lor 0o700);
+      Sys.readdir target |> Array.iter (fun name -> clear (Filename.concat target name));
+      Unix.rmdir target
+    | _ -> unlink target in
+  let stat = Unix.lstat stage in
+  Unix.chmod stage (stat.Unix.st_perm lor 0o700);
+  Sys.readdir stage
+  |> Array.iter (fun name ->
+    if name <> ".writer" then clear (Filename.concat stage name));
+  sync_path Unix.fsync stage;
+  unlink (marker owner id);
+  Unix.rmdir stage;
+  sync_path Unix.fsync owner.root
+
 let rec sync_tree sync path =
   match (Unix.lstat path).Unix.st_kind with
   | Unix.S_DIR ->

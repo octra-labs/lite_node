@@ -10,6 +10,7 @@ type deps = {
   nonce : int;
   strict : bool;
   math : bool;
+  keyed : bool;
   stealth_count : int;
   max_stealth_per_epoch : int;
   max_stealth_defer : int;
@@ -20,7 +21,7 @@ type deps = {
   defer_count : string -> int;
   set_defer_count : string -> int -> unit;
   clear_defer_count : string -> unit;
-  preverify_state : string -> Preverify_cache.state;
+  preverify_state : keyed:bool -> math:bool -> string -> Preverify_cache.state;
   preverify_remove : string -> unit;
   preverify_ready :
     string ->
@@ -55,6 +56,7 @@ type deps = {
 type tx_deps = {
   strict : bool;
   math : bool;
+  keyed : bool;
   stealth_count : int;
   max_stealth_per_epoch : int;
   max_stealth_defer : int;
@@ -64,7 +66,7 @@ type tx_deps = {
   defer_count : string -> int;
   set_defer_count : string -> int -> unit;
   clear_defer_count : string -> unit;
-  preverify_state : string -> Preverify_cache.state;
+  preverify_state : keyed:bool -> math:bool -> string -> Preverify_cache.state;
   preverify_remove : string -> unit;
   preverify_ready :
     string ->
@@ -117,6 +119,7 @@ type gate_deps = {
 type live_tx_args = {
   strict : bool;
   math : bool;
+  keyed : bool;
   stealth_count : int;
   max_stealth_per_epoch : int;
   max_stealth_defer : int;
@@ -164,6 +167,7 @@ type live_ledger_tx_args = {
   field_policy : Private_ledger.field_policy;
   strict : bool;
   math : bool;
+  keyed : bool;
   current_epoch : unit -> int;
   private_result_policy :
     int ->

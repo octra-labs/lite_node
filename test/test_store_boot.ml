@@ -101,6 +101,34 @@ let root_error data =
     S.run_integrity deps;
     expect "invalid account was repaired or accepted" (!writes = 1 && !exits = 1))
 
+let waiting_origin data =
+  let directory = Filename.concat data "chaindata" in
+  Unix.mkdir directory 0o700;
+  let owner = Lock.acquire directory in
+  let input, output = Unix.pipe ~cloexec:true () in
+  flush_all ();
+  match Unix.fork () with
+  | 0 ->
+    Unix.close input;
+    Lock.release owner;
+    ignore (Unix.write_substring output "r" 0 1);
+    Unix.close output;
+    (try
+      let chain = Octra_core.Store_chaindata.open_chaindata ~lock_wait:120. directory in
+      let granted = Option.is_some chain.origin in
+      Octra_core.Store_chaindata.close chain;
+      Unix._exit (if granted then 1 else 0)
+    with _ -> Unix._exit 2)
+  | pid ->
+    Unix.close output;
+    let byte = Bytes.create 1 in
+    ignore (Unix.read input byte 0 1);
+    Unix.close input;
+    let file = open_out_bin (Filename.concat data "prior_state") in
+    close_out file;
+    Lock.release owner;
+    expect "waiting opener used prior freshness" (wait pid = Unix.WEXITED 0)
+
 let () =
   Test_workspace.with_dir "store_boot" (fun root ->
     List.iter (fun (name, run) ->
@@ -109,7 +137,8 @@ let () =
       run data;
       Printf.printf "event = passed case = %s\n%!" name)
       ["fresh", (fun data -> close (S.open_stores data));
-       "inherited", inherited; "open_failure", open_failure; "root_error", root_error];
+       "inherited", inherited; "open_failure", open_failure; "root_error", root_error;
+       "waiting_origin", waiting_origin];
     match W.recover ~data_dir:root (fun () ->
       raise (Unix.Unix_error (Unix.EACCES, "open", root))) with
     | _ -> failwith "unrelated startup error was hidden"

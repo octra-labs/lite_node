@@ -5,17 +5,17 @@ open Octra_vm
 
 let require condition reason = if not condition then failwith reason
 
-let check_admission () =
+let check_code () =
   let code = [|Contract_vm.LOAD_INT8_FP (0, 1, 2, 3, 4); Contract_vm.STOP|] in
   let raw = Bytecode.encode code in
   List.iter (fun point_ops ->
     List.iter (fun result ->
       match result with
-      | Error (Admission.Unsafe_error message) ->
+      | Error (Code_check.Unsafe_error message) ->
         require (message = "consensus unsafe opcode LOAD_INT8_FP at pc 0") "wrong policy refusal"
       | _ -> failwith "float decode reached consensus")
-      [Admission.of_code ~point_ops code; Admission.of_program ~point_ops code;
-       Admission.decode ~point_ops raw; Admission.decode_deploy ~point_ops raw];
+      [Code_check.of_code ~point_ops code; Code_check.of_program ~point_ops code;
+       Code_check.decode ~point_ops raw; Code_check.decode_deploy ~point_ops raw];
     require (Contract.decode_loaded ~point_ops raw = None) "loaded float decode")
     [false; true]
 
@@ -34,9 +34,9 @@ let check_fixed_input () =
     "fixed input allocated payload"
 
 let loaded ?(point_ops = true) raw =
-  match Admission.decode ~point_ops raw with
-  | Ok value -> Admission.code value
-  | Error error -> failwith (Admission.error_message error)
+  match Code_check.decode ~point_ops raw with
+  | Ok value -> Code_check.code value
+  | Error error -> failwith (Code_check.error_message error)
 
 let integer code =
   match code.(0) with
@@ -72,9 +72,9 @@ let check_cache_modes () =
   let raw = Bytecode.encode [|Contract_vm.FHE_PEDERSEN_IDENTITY 0; Contract_vm.STOP|] in
   ignore (loaded raw);
   let expected = match Bytecode.decode ~active:false raw with
-    | Error reason -> Admission.Decode_error reason
+    | Error reason -> Code_check.Decode_error reason
     | Ok _ -> failwith "historical decoder admitted point opcode" in
-  require (Admission.decode ~point_ops:false raw = Error expected)
+  require (Code_check.decode ~point_ops:false raw = Error expected)
     "cache changed historical refusal";
   ignore (loaded raw);
   let raw = Bytecode.encode [|Contract_vm.LDI (0, Contract_vm.VInt (Z.of_int 77));
@@ -83,11 +83,11 @@ let check_cache_modes () =
     let input = String.sub raw 0 size in
     List.iter (fun point_ops ->
       let expected = match Bytecode.decode ~active:point_ops input with
-        | Error reason -> Error (Admission.Decode_error reason)
-        | Ok code -> Admission.of_code ~point_ops code in
-      let observe = Result.map (fun value -> Admission.code value, Admission.profile value) in
+        | Error reason -> Error (Code_check.Decode_error reason)
+        | Ok code -> Code_check.of_code ~point_ops code in
+      let observe = Result.map (fun value -> Code_check.code value, Code_check.profile value) in
       for _ = 1 to 2 do
-        require (observe (Admission.decode ~point_ops input) = observe expected)
+        require (observe (Code_check.decode ~point_ops input) = observe expected)
           "cached decode changed result"
       done) [true; false]
   done
@@ -202,17 +202,17 @@ let check_cache_trust () =
   let raw = match compiled.program_envelope with
     | Some raw when compiled.error = None -> raw
     | _ -> failwith "signed compile failed" in
-  require (Result.is_ok (Admission.decode_program ~trusted:[good] raw)) "signed decode refused";
+  require (Result.is_ok (Code_check.decode_program ~trusted:[good] raw)) "signed decode refused";
   List.iter (fun trusted ->
-    require (Result.is_error (Admission.decode_program ~trusted raw))
+    require (Result.is_error (Code_check.decode_program ~trusted raw))
       "cached code bypassed compiler trust") [[]; [wrong]; [wrong; good]];
-  require (Result.is_ok (Admission.decode_program ~trusted:[good; wrong] raw))
+  require (Result.is_ok (Code_check.decode_program ~trusted:[good; wrong] raw))
     "compiler key order changed";
   let compiled = Oct_compile.compile_program
     "program SourceOnly { public view fn read(): int { return 8 } }" in
   let raw = Option.get compiled.program_envelope in
-  require (Result.is_ok (Admission.decode_program_source raw)) "source decode refused";
-  require (Result.is_error (Admission.decode_program ~trusted:[good] raw))
+  require (Result.is_ok (Code_check.decode_program_source raw)) "source decode refused";
+  require (Result.is_error (Code_check.decode_program ~trusted:[good] raw))
     "source cache bypassed attestation"
 
 let check_cache_threads () =
@@ -234,7 +234,7 @@ let check_cache_threads () =
   Array.iter (function None -> () | Some error -> raise error) errors
 
 let () =
-  check_admission ();
+  check_code ();
   check_fixed_input ();
   check_decode_cache ();
   check_large_cache ();

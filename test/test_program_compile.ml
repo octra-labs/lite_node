@@ -38,6 +38,263 @@ let require_error name source fragment =
 let hash value =
   Digestif.SHA256.(digest_string value |> to_hex)
 
+let const_policy () =
+  let module G = Octra_core.Rule_graph in
+  let module P = Octra_vm.Program_package in
+  let module S = Octra_node_runtime.Consensus_epoch_vm_shell in
+  let chain_id = "octra-devnet-9871-cluster" in
+  let plan = Option.get (G.program_records_activation_for_chain chain_id) in
+  let graph = G.create ~chain_id ~root_at:(fun epoch ->
+    require (epoch = plan.anchor_epoch) "constant policy anchor differs";
+    G.Root plan.anchor_state_root) in
+  let source expr = "program Constants { const A: int = " ^ expr
+    ^ " public fn get(): int { return A } }" in
+  List.iter (fun compiler ->
+    let good = match P.compile_at ~loops:true ~compiler ~point_ops:true ~main:"main.aml"
+        ~sources:[P.{path = "main.aml"; body = source "7"}] with
+      | Ok value -> value
+      | Error error -> failwith (P.error_message error) in
+    let replace expr =
+      let body = source expr in
+      let bytes = Bytes.of_string good.package in
+      let count_at = 10 + Bytes.get_uint16_le bytes 8 in
+      let length_at = count_at + 4 + Bytes.get_uint16_le bytes (count_at + 2) in
+      let body_at = length_at + 4 in
+      let after = body_at + Int32.to_int (Bytes.get_int32_le bytes length_at) in
+      let prefix = Bytes.sub bytes 0 body_at in
+      Bytes.set_int32_le prefix length_at (Int32.of_int (String.length body));
+      Bytes.to_string prefix ^ body ^ String.sub good.package after
+        (String.length good.package - after) in
+    let prepare epoch raw =
+      let records = match G.program_records graph ~epoch with
+        | Ok mode -> mode | Error _ -> failwith "constant policy invalid" in
+      let preview = if compiler = P.Preview then G.Active else G.Prior in
+      let tx = Octra_core.Transaction.{
+        from = "sender"; to_ = "program"; amount = Z.zero; nonce = 1;
+        ou = Z.of_int 1_000_000; timestamp = 0.; signature = "";
+        public_key = None; message = None; op_type = ProgramDeploy;
+        encrypted_data = Some (Base64.encode_exn raw);
+      } in
+      try Lwt_main.run (S.prepare_program_package ~records ~preview
+        ~proof_exec:G.Active ~program_mode:G.Active ~overlap:false ~point_ops:true tx)
+      with Octra_core.Exec_resource.Unavailable _ ->
+        failwith "constant refusal became resource failure" in
+    List.iter (fun epoch ->
+      begin match prepare epoch good.package with
+      | Ok value -> require (value.envelope = good.envelope) "constant policy changed valid code"
+      | Error reason -> failwith reason
+      end;
+      List.iter (fun expr ->
+        let expected = if epoch < plan.activation_epoch then
+          if expr = "1 + A" then
+            "Program compile failed: source = main.aml line 1 column 1: register capacity exceeded maximum = 64"
+          else "Program compile failed: direct form variable is absent = A"
+          else "Program compile failed: constant dependency is cyclic" in
+        match prepare epoch (replace expr) with
+        | Error reason -> require (reason = expected) ("constant refusal differs: " ^ reason)
+        | Ok _ -> failwith "constant cycle accepted")
+        ["1 + A"; "let once x: int = 1 in A"])
+      [1_702_238; plan.activation_epoch - 1; plan.activation_epoch; plan.activation_epoch + 1])
+    [P.Source; P.Preview]
+
+let const_cycles () =
+  let module C = Octra_vm.Oct_compile in
+  let load source path = if path = "main.aml" then Some source else None in
+  let compilers = [
+    "prior", Octra_vm.Prior_compile.compile_program;
+    "runtime", C.compile_program;
+    "checked", C.compile_program_checked;
+    "source", (fun source -> C.compile_program_source (load source) "main.aml");
+    "preview", (fun source -> C.compile_program_preview (load source) "main.aml");
+    "multi", (fun source -> C.compile_program_multi_first (load source) "main.aml");
+  ] in
+  let source consts body =
+    "program Constants { " ^ consts ^ " public fn get(): int { " ^ body ^ " } }" in
+  let text = source "const A: int = 1 + A" "return A" in
+  let expected = "line 1: too many local variables (max 63 registers)" in
+  List.iter (fun compile ->
+    let result = compile text in
+    require (result.C.error = Some expected)
+      ("historical constant refusal differs: " ^ Option.value ~default:"accepted" result.C.error))
+    [C.compile_program; (fun text -> C.compile_program_multi_first (load text) "main.aml")];
+  let module P = Octra_vm.Program_package in
+  let good = P.compile_at ~loops:false ~compiler:P.Protocol ~point_ops:true
+      ~main:"main.aml" ~sources:[P.{path = "main.aml"; body = source "" "return 7"}]
+    |> Result.map_error P.error_message |> Result.get_ok in
+  let bytes = Bytes.of_string good.package in
+  let count_at = 10 + Bytes.get_uint16_le bytes 8 in
+  let length_at = count_at + 4 + Bytes.get_uint16_le bytes (count_at + 2) in
+  let body_at = length_at + 4 in
+  let after = body_at + Int32.to_int (Bytes.get_int32_le bytes length_at) in
+  let prefix = Bytes.sub bytes 0 body_at in
+  Bytes.set_int32_le prefix length_at (Int32.of_int (String.length text));
+  let encoded = Base64.encode_exn (Bytes.to_string prefix ^ text
+    ^ String.sub good.package after (String.length good.package - after)) in
+  let check_package expected = function
+    | Error error -> require (P.error_message error = expected)
+        ("historical package refusal differs: " ^ P.error_message error)
+    | Ok _ -> failwith "historical cyclic package accepted" in
+  check_package ("Program compile failed: " ^ expected)
+    (P.admit_base64 ~compiler:P.Protocol ~point_ops:true encoded);
+  check_package "Program compile failed: source = main.aml line 1 column 1: register capacity exceeded maximum = 64"
+    (P.admit_transition ~point_ops:true encoded);
+  List.iter (fun run ->
+    List.iter (fun value ->
+      let text = source ("const A: int = " ^ value) "return A" in
+      let result =
+        try run (load text) "main.aml"
+        with Stack_overflow -> failwith "prior compile refusal became resource failure" in
+      require (Option.is_some result.C.error) "prior compile refusal disappeared")
+      ["1 + A"; "let once x: int = 1 in A"])
+    [C.compile_program_source; C.compile_program_preview];
+  List.iter (fun name ->
+    let run = C.compile_program in
+    let direct = run (source ("const " ^ name ^ ": int = 5") ("return " ^ name)) in
+    let linked = run (source ("const " ^ name ^ ": int = 5 const X: int = " ^ name) "return X") in
+    require (direct.C.error = None && linked.C.error = None
+      && direct.bytecode = linked.bytecode) ("contextual alias changed " ^ name))
+    ["epoch"; "epoch_time"; "value"];
+  List.iter (fun (name, run) -> try
+    let before = (run (source "" "return 7 + 7")).C.bytecode in
+    List.iter (fun consts ->
+      let result = run (source consts "return A + A") in
+      require (result.C.error = None && result.bytecode = before)
+        (name ^ " repeated constant changed bytecode"))
+      ["const A: int = 7"; "const A: int = B const B: int = 7"];
+    let chain = List.init 2048 (fun i ->
+      Printf.sprintf "const A%d: int = %s" i
+        (if i = 2047 then "7" else "A" ^ string_of_int (i + 1)))
+      |> String.concat " " in
+    let text = source chain "return A0 + A0" in
+    require (String.length text <= 65_536) "constant source exceeds package limit";
+    let text = text ^ String.make (65_536 - String.length text) ' ' in
+    let linked = run text in
+    require (linked.C.error = None && linked.bytecode = before)
+      (name ^ " finite alias chain changed bytecode");
+    let chain = List.init 2600 (fun i ->
+      Printf.sprintf "const A%d: int = %s" i
+        (if i = 2599 then "7" else "-A" ^ string_of_int (i + 1)))
+      |> String.concat " " in
+    let text = source chain "return A0" in
+    require (String.length text <= 65_536) "expression chain exceeds source limit";
+    let text = text ^ String.make (65_536 - String.length text) ' ' in
+    let result = run text in
+    require (Option.fold ~none:false ~some:(fun reason ->
+      let expected = if name = "source" || name = "preview"
+        then "register capacity exceeded" else "too many local variables" in
+      let rec contains at = at + String.length expected <= String.length reason
+        && (String.sub reason at (String.length expected) = expected || contains (at + 1)) in
+      contains 0) result.C.error) (name ^ " expression chain changed refusal: "
+        ^ Option.value ~default:"accepted" result.C.error);
+    let alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" in
+    let rec label n =
+      let letter = String.make 1 alphabet.[n mod String.length alphabet] in
+      if n < String.length alphabet then letter
+      else label (n / String.length alphabet - 1) ^ letter in
+    let count = 4600 in
+    let chain = List.init count (fun i ->
+      "const " ^ label i ^ "=" ^
+        (if i = count - 1 then "7" else "-" ^ label (i + 1)))
+      |> String.concat " " in
+    let text = source chain ("return " ^ label 0) in
+    require (String.length text <= 65_536) "worker source exceeds package limit";
+    let result =
+      try Lwt_main.run (Octra_core.Exec_resource.detach run text)
+      with Octra_core.Exec_resource.Unavailable _ ->
+        failwith (name ^ " worker stack exhausted") in
+    require (Option.is_some result.C.error)
+      (name ^ " worker accepted excess registers");
+    let unused = run (source "const A: int = A" "return 7 + 7") in
+    require ((name = "checked" && unused.C.error <> None)
+      || (unused.C.error = None && unused.bytecode = before))
+      (name ^ " unused constant changed bytecode");
+    List.iter (fun (consts, body) ->
+      let refused =
+        try (run (source consts body)).C.error <> None
+        with Stack_overflow -> true
+      in
+      require refused (name ^ " cyclic constant accepted")) [
+      "const A: int = A", "return A";
+      "const A: int = B const B: int = A", "return A";
+      "const A: int = (A)", "return A";
+      "const A = A", "A return 0";
+      "const A = B const B = A", "A return 0";
+      "const A: int = A", "if true { A } return 0";
+      "const A = balance(A)", "return A";
+      "const A = to_int(A)", "return A";
+      "const A = -B const B = A", "return A";
+    ];
+    if name <> "prior" then begin
+      let finite = run (source "const A: int = let once x: int = 1 in x" "return A") in
+      require (finite.C.error = None) (name ^ " finite let refused");
+      let refused =
+        try (run (source "const A: int = let once x: int = 1 in A" "return A")).C.error <> None
+        with Stack_overflow -> true in
+      require refused (name ^ " let cycle accepted")
+    end;
+    let refused =
+      try (run (source "const A: int = 1 + A" "return A")).C.error <> None
+      with Stack_overflow -> true in
+    require refused (name ^ " register exhaustion changed to success")
+    with Stack_overflow -> failwith (name ^ " unexpected stack exhaustion")
+  ) compilers;
+  let module P = Octra_vm.Program_package in
+  List.iter (fun (compiler, point_ops) ->
+    List.iter (fun loops ->
+      let sources = [P.{path = "main.aml"; body = source "" "return 7"}] in
+      let good = match P.compile_at ~loops ~compiler ~point_ops ~main:"main.aml" ~sources with
+        | Ok value -> value
+        | Error error -> failwith (P.error_message error) in
+      begin match P.admit_base64 ~loops ~compiler ~point_ops (Base64.encode_exn good.package) with
+      | Ok value -> require (value.envelope = good.envelope) "valid package changed"
+      | Error error -> failwith (P.error_message error)
+      end;
+      let body = source "const A: int = A" "return A" in
+      let bytes = Bytes.of_string good.package in
+      let count_at = 10 + Bytes.get_uint16_le bytes 8 in
+      require (Bytes.get_uint16_le bytes count_at = 1) "package source count changed";
+      let length_at = count_at + 4 + Bytes.get_uint16_le bytes (count_at + 2) in
+      let body_at = length_at + 4 in
+      let after = body_at + Int32.to_int (Bytes.get_int32_le bytes length_at) in
+      let prefix = Bytes.sub bytes 0 body_at in
+      Bytes.set_int32_le prefix length_at (Int32.of_int (String.length body));
+      let raw = Bytes.to_string prefix ^ body
+        ^ String.sub good.package after (String.length good.package - after)
+        |> Base64.encode_exn in
+      require (P.validate_base64 raw = Ok ()) "cyclic package shape was invalid";
+      let stopped =
+        try
+          Lwt_main.run (Octra_core.Exec_resource.run ~hash:"cycle" (fun () ->
+            ignore (P.admit_base64 ~loops ~compiler ~point_ops raw);
+            Lwt.return_unit));
+          false
+        with Octra_core.Exec_resource.Exhausted ("cycle", Octra_core.Exec_resource.Stack) -> true in
+      require stopped "cyclic package did not report resource failure") [false; true]
+  ) [P.Protocol, false; P.Protocol, true; P.Source, true; P.Preview, true];
+  Printf.printf "status = pass test = const_cycles\n%!"
+
+let () =
+  match Unix.fork () with
+  | 0 ->
+    begin try const_policy (); const_cycles (); exit 0
+    with error -> prerr_endline (Printexc.to_string error); exit 1 end
+  | pid ->
+    let until = Unix.gettimeofday () +. 120. in
+    let rec wait () =
+      match Unix.waitpid [Unix.WNOHANG] pid with
+      | 0, _ when Unix.gettimeofday () < until -> Unix.sleepf 0.01; wait ()
+      | 0, _ ->
+        Unix.kill pid Sys.sigkill;
+        ignore (Unix.waitpid [] pid);
+        failwith "constant compilation did not terminate"
+      | _, Unix.WEXITED 0 -> ()
+      | _, Unix.WEXITED code ->
+        failwith ("constant compilation exit = " ^ string_of_int code)
+      | _, Unix.WSIGNALED code | _, Unix.WSTOPPED code ->
+        failwith ("constant compilation signal = " ^ string_of_int code)
+    in
+    wait ()
+
 let ledger_source = {|
 contract Ledger {
   state {
@@ -513,6 +770,7 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
                     object_cost = false; int_work = Octra_vm.Int_work.Active;
                     fhe_work = Octra_core.Rule_graph.Prior;
                     proof_exec = Octra_core.Rule_graph.Prior;
+                    proof_key = Octra_core.Rule_graph.Prior;
                     wasm_float = Octra_core.Rule_graph.Prior}
           ~store
           ~ledger
@@ -567,7 +825,7 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
            ~version:"OCTB/1"
            ~owner
            ~ctype:"CUSTOM"
-           ~admission:"binary"
+           ~check:"binary"
            ~bytecode_b64:(Base64.encode_exn compiled.octb));
       let address2 = Octra_vm.Contract.addr_from_code compiled.octb owner 1 in
       Lwt_main.run
@@ -578,7 +836,7 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
            ~version:"OCTB/1"
            ~owner
            ~ctype:"CUSTOM"
-           ~admission:"binary"
+           ~check:"binary"
            ~bytecode_b64:(Base64.encode_exn compiled.octb));
       let program_page params =
         Lwt_main.run
@@ -639,6 +897,7 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
                        object_cost = false; int_work = Octra_vm.Int_work.Active;
                        fhe_work = Octra_core.Rule_graph.Prior;
                        proof_exec = Octra_core.Rule_graph.Prior;
+                       proof_key = Octra_core.Rule_graph.Prior;
                        wasm_float = Octra_core.Rule_graph.Prior})
              ~store
              ~ledger
@@ -880,7 +1139,7 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
            ~version:"OCTB/1"
            ~owner
            ~ctype:"CUSTOM"
-           ~admission:"binary"
+           ~check:"binary"
            ~bytecode_b64:(Base64.encode_exn next_code));
       begin
         match
@@ -1152,20 +1411,20 @@ let () =
   in
   let point_envelope = Option.get points.program_envelope in
   begin
-    match Octra_vm.Admission.decode_program_source point_envelope with
-    | Error (Octra_vm.Admission.Decode_error reason) ->
+    match Octra_vm.Code_check.decode_program_source point_envelope with
+    | Error (Octra_vm.Code_check.Decode_error reason) ->
       require (String.equal reason point_error) "inactive point reason differs"
-    | Error error -> failwith (Octra_vm.Admission.error_message error)
+    | Error error -> failwith (Octra_vm.Code_check.error_message error)
     | Ok _ -> failwith "inactive point program admitted"
   end;
   begin
     match
-      Octra_vm.Admission.decode_program_source
+      Octra_vm.Code_check.decode_program_source
         ~point_ops:true
         point_envelope
     with
     | Ok _ -> ()
-    | Error error -> failwith (Octra_vm.Admission.error_message error)
+    | Error error -> failwith (Octra_vm.Code_check.error_message error)
   end;
   let marker_code = [|
     Octra_vm.Contract_vm.LDI
@@ -1217,15 +1476,15 @@ let () =
   in
   let code = point_code left right in
   begin
-    match Octra_vm.Admission.of_code code with
-    | Error (Octra_vm.Admission.Unsafe_error _) -> ()
-    | Error error -> failwith (Octra_vm.Admission.error_message error)
+    match Octra_vm.Code_check.of_code code with
+    | Error (Octra_vm.Code_check.Unsafe_error _) -> ()
+    | Error error -> failwith (Octra_vm.Code_check.error_message error)
     | Ok _ -> failwith "inactive point opcode admitted"
   end;
   begin
-    match Octra_vm.Admission.of_code ~point_ops:true code with
+    match Octra_vm.Code_check.of_code ~point_ops:true code with
     | Ok _ -> ()
-    | Error error -> failwith (Octra_vm.Admission.error_message error)
+    | Error error -> failwith (Octra_vm.Code_check.error_message error)
   end;
   begin
     match

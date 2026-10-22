@@ -233,12 +233,15 @@ type work = {
   finished : unit Lwt.t;
 }
 
+type file_entry = { key : string * string * string; value : reply Lwt.t }
+
 type t = {
   deps : deps;
   mutable state : state;
   mutable serial : int64;
   mutable replies : reply Lwt.u Ids.t;
   mutable work : work option;
+  mutable files : file_entry list;
 }
 
 let launch t (job : job) run =
@@ -288,7 +291,7 @@ and execute t = function
   | Interrupt id ->
     Option.iter (fun work -> if work.id = id then work.interrupted := true) t.work
 
-let create deps = { deps; state = empty; serial = 0L; replies = Ids.empty; work = None }
+let create deps = { deps; state = empty; serial = 0L; replies = Ids.empty; work = None; files = [] }
 
 type stats = {
   active : int;
@@ -334,7 +337,46 @@ let load t ~path trust =
       Lwt.return_unit);
     promise
 
+let load_file t ~stamp ~fresh ~path trust =
+  let open Lwt.Syntax in
+  let* before = stamp () in
+  if not t.state.open_ then Lwt.return_error Stopped else match before with
+  | None -> Lwt.return_error (Invalid "state sync certificate stat failed")
+  | Some before ->
+    let key = path, trust_hash trust, before in
+    let valid entry = match Lwt.state entry.value with
+      | Lwt.Sleep -> true
+      | Lwt.Return (Ok loaded) -> fresh loaded.certificate
+      | Lwt.Return (Error _) | Lwt.Fail _ -> false in
+    t.files <- List.filter valid t.files;
+    let found = List.find_opt (fun entry -> entry.key = key) t.files in
+    let* result = match found with
+      | Some entry -> Lwt.protected entry.value
+      | None when List.length t.files >= 8
+          && List.for_all (fun entry -> Lwt.is_sleeping entry.value) t.files ->
+        Lwt.return_error Busy
+      | None ->
+        if List.length t.files >= 8 then begin
+          let rec drop = function
+            | [] -> []
+            | entry :: rest when Lwt.is_sleeping entry.value -> entry :: drop rest
+            | _ :: rest -> rest in
+          t.files <- drop t.files
+        end;
+        let value = load t ~path trust in
+        t.files <- { key; value } :: t.files;
+        Lwt.protected value in
+    let* after = stamp () in
+    if not t.state.open_ then Lwt.return_error Stopped
+    else if after <> Some before then
+      Lwt.return_error (Invalid "state sync certificate changed during verification")
+    else match result with
+      | Ok loaded when not (fresh loaded.certificate) ->
+        Lwt.return_error (Invalid "state sync certificate is outside its validity window")
+      | result -> Lwt.return result
+
 let shutdown t =
+  t.files <- [];
   let pending = Option.map (fun work -> work.finished) t.work in
   dispatch t Stop;
   match pending with

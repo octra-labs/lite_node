@@ -166,7 +166,7 @@ let test_cancel () =
     Lwt.return_unit);
   expect "cancel between rows" (!calls = 1)
 
-let test_admission () =
+let test_check () =
   let lock = Lwt_mutex.create () in
   let work, _ = Lwt.task () in
   let first = Page.admit lock (fun () -> work) in
@@ -286,14 +286,23 @@ let test_journal () =
     in
     let result = run ~head:(Some (anchor 0)) ~load (request 0) |> page in
     expect "journal page" (result.stop = Page.Complete && result.rows = [first]);
-    let offset = (Unix.fstat journal.fd).Unix.st_size - 1 in
-    ignore (Unix.lseek journal.fd offset Unix.SEEK_SET);
-    expect "checksum byte read" (Unix.read journal.fd (Bytes.create 1) 0 1 = 1);
-    ignore (Unix.lseek journal.fd offset Unix.SEEK_SET);
-    let last = (Journal.checksum raw).[3] in
-    expect "checksum byte changed"
-      (Unix.write journal.fd (Bytes.make 1 (Char.chr (Char.code last lxor 1))) 0 1 = 1);
-    expect "checksum mismatch" (Journal.read_entry journal ~max_bytes:Page.max_record 0 = Error `Invalid))
+    let size = (Unix.fstat journal.fd).Unix.st_size in
+    let offset = size - 1 in
+    let fd = Unix.openfile path [Unix.O_RDWR; Unix.O_CLOEXEC] 0 in
+    Fun.protect ~finally:(fun () -> Unix.close fd) (fun () ->
+      ignore (Unix.lseek fd offset Unix.SEEK_SET);
+      let original = Bytes.create 1 in
+      expect "checksum byte read" (Unix.read fd original 0 1 = 1);
+      let changed = Bytes.make 1 (Char.chr (Bytes.get_uint8 original 0 lxor 1)) in
+      ignore (Unix.lseek fd offset Unix.SEEK_SET);
+      expect "checksum byte changed" (Unix.write fd changed 0 1 = 1);
+      expect "checksum rewrite did not append" ((Unix.fstat fd).Unix.st_size = size);
+      expect "checksum mismatch"
+        (Journal.read_entry journal ~max_bytes:Page.max_record 0 = Error `Invalid);
+      ignore (Unix.lseek fd offset Unix.SEEK_SET);
+      expect "checksum restored" (Unix.write fd original 0 1 = 1);
+      expect "journal read after restore"
+        (Journal.read_entry journal ~max_bytes:Page.max_record 0 = Ok (Some raw))))
 
 let listen port =
   let module Config = Octra_node_runtime.Grpc_config in
@@ -344,7 +353,7 @@ let tests () =
   test_partition ();
   test_limits ();
   test_cancel ();
-  test_admission ();
+  test_check ();
   test_proto ();
   test_journal ();
   print_endline "status = pass test = epoch_page"

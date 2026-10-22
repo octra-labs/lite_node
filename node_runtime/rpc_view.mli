@@ -243,6 +243,7 @@ val pvac_status :
   Yojson.Safe.t
 
 val pvac_migration_status :
+  keyed:bool ->
   addr:string ->
   cipher:string ->
   epoch:int ->
@@ -251,7 +252,7 @@ val pvac_migration_status :
   cipher_mode:Octra_core.Rule_graph.mode ->
   proof_mode:Octra_core.Rule_graph.mode ->
   Octra_core.Pvac_migration.status ->
-  Octra_core.Pvac_migration_admission.t ->
+  Octra_core.Pvac_migration_check.t ->
   Yojson.Safe.t
 
 val encrypted_cipher :

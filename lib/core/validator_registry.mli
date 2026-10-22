@@ -31,7 +31,7 @@ type ready_payload = {
 val meta_key : string
 val escrow_address : string
 val empty : t
-val candidates : t -> Validator_admission.candidate list
+val entries : t -> Validator_entry.entry list
 val slashes : t -> slash_record list
 val bond_message :
   chain_id:string ->
@@ -47,9 +47,9 @@ val verify_bond_proof :
   nonce:int ->
   bond_payload ->
   (string, string) result
-val find : string -> t -> Validator_admission.candidate option
+val find : string -> t -> Validator_entry.entry option
 val apply_bond :
-  Validator_admission.parameters ->
+  Validator_entry.parameters ->
   chain_id:string ->
   epoch:int64 ->
   address:string ->
@@ -71,7 +71,7 @@ val request_exit :
   t ->
   (t, string) result
 val withdraw :
-  Validator_admission.parameters ->
+  Validator_entry.parameters ->
   current_epoch:int64 ->
   active_addresses:string list ->
   address:string ->
@@ -84,10 +84,10 @@ val apply_slash :
   t ->
   ((t * Z.t), string) result
 val snapshot :
-  Validator_admission.parameters ->
+  Validator_entry.parameters ->
   activate_epoch:int64 ->
   t ->
-  (Validator_admission.snapshot, string) result
+  (Validator_entry.snapshot, string) result
 val to_yojson : t -> Yojson.Safe.t
 val of_yojson : Yojson.Safe.t -> (t, string) result
 val to_string : t -> string

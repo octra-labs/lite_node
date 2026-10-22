@@ -77,6 +77,8 @@ type read_error =
   | Log_record_truncated of int
   | Log_checksum_mismatch of int
   | Log_payload_invalid of int
+  | Log_epoch_missing of int
+  | Log_epoch_identity of int * int * int
   | Log_epoch_duplicate of int
   | Log_record_rejected of int * string
   | Log_io of string
@@ -97,6 +99,8 @@ let record_length_valid ~remaining record_len =
   record_len >= 4
   && record_len <= max_record_len
   && record_len <= remaining
+
+let read_exact_at = Disk_read.exact
 
 let checksum payload =
   let d = Digestif.SHA256.digest_string payload in
@@ -120,6 +124,11 @@ let read_error_message = function
       Printf.sprintf "epochlog checksum mismatch: offset = %d" offset
   | Log_payload_invalid offset ->
       Printf.sprintf "epochlog payload is invalid: offset = %d" offset
+  | Log_epoch_missing epoch ->
+      Printf.sprintf "epochlog offset is missing: epoch = %d" epoch
+  | Log_epoch_identity (offset, expected, actual) ->
+      Printf.sprintf "epochlog record identity differs: offset = %d expected = %d actual = %d"
+        offset expected actual
   | Log_epoch_duplicate epoch ->
       Printf.sprintf "epochlog contains duplicate epoch: %d" epoch
   | Log_record_rejected (offset, reason) ->
@@ -240,9 +249,8 @@ let write_file_header fd =
 
 let validate_file_header fd =
   let buf = Bytes.create header_size in
-  let _ = Unix.lseek fd 0 Unix.SEEK_SET in
-  let n = Unix.read fd buf 0 header_size in
-  if n < header_size then failwith "epochlog: truncated header";
+  if not (read_exact_at fd 0 buf 0 header_size) then
+    failwith "epochlog: truncated header";
   if Bytes.sub_string buf 0 4 <> magic then failwith "epochlog: bad magic";
   let v = Bytes.get_uint8 buf 4 lor (Bytes.get_uint8 buf 5 lsl 8) in
   if v <> 1 && v <> version then failwith (Printf.sprintf "epochlog: version %d not in [1,%d]" v version)
@@ -250,24 +258,17 @@ let validate_file_header fd =
 let scan_records fd =
   let offsets = Hashtbl.create 1024 in
   let tip = ref None in
-  let file_size = Unix.lseek fd 0 Unix.SEEK_END in
-  let _ = Unix.lseek fd header_size Unix.SEEK_SET in
+  let file_size = (Unix.fstat fd).Unix.st_size in
   let pos = ref header_size in
   (try while !pos < file_size do
     let hdr = Bytes.create 4 in
-    let n = Unix.read fd hdr 0 4 in
-    if n < 4 then raise Exit;
+    if not (read_exact_at fd !pos hdr 0 4) then raise Exit;
     let record_len = read_u32_le hdr 0 in
     let remaining = file_size - !pos - 4 in
     if not (record_length_valid ~remaining record_len) then raise Exit;
     let payload_len = record_len - 4 in
     let record_buf = Bytes.create record_len in
-    let rd = ref 0 in
-    (try while !rd < record_len do
-      let n = Unix.read fd record_buf !rd (record_len - !rd) in
-      if n = 0 then raise Exit;
-      rd := !rd + n
-    done with Exit -> raise Exit);
+    if not (read_exact_at fd (!pos + 4) record_buf 0 record_len) then raise Exit;
     let payload = Bytes.sub_string record_buf 0 payload_len in
     let stored_chk = Bytes.sub_string record_buf payload_len 4 in
     let expected_chk = checksum payload in
@@ -291,7 +292,7 @@ let open_log ?(readonly=false) path =
   let exists = Sys.file_exists path in
   if not exists && readonly then failwith "epochlog: read-only file is missing";
   let flags =
-    if not exists then [Unix.O_RDWR; Unix.O_CREAT; Unix.O_TRUNC]
+    if not exists then [Unix.O_RDWR; Unix.O_CREAT; Unix.O_TRUNC; Unix.O_APPEND]
     else if readonly then [Unix.O_RDONLY]
     else [Unix.O_RDWR; Unix.O_APPEND] in
   let fd = Unix.openfile path (Unix.O_CLOEXEC :: flags) 0o644 in
@@ -320,7 +321,7 @@ let append t h =
   write_u32_le buf 0 record_len;
   Bytes.blit_string payload 0 buf 4 payload_len;
   Bytes.blit_string chk 0 buf (4 + payload_len) 4;
-  let pos = Unix.lseek t.fd 0 Unix.SEEK_END in
+  let pos = (Unix.fstat t.fd).Unix.st_size in
   let total = 4 + record_len in
   let written = ref 0 in
   while !written < total do
@@ -331,25 +332,17 @@ let append t h =
   t.tip <- Some h
 
 let read_all t =
-  let _ = Unix.lseek t.fd 0 Unix.SEEK_END in
-  let file_size = Unix.lseek t.fd 0 Unix.SEEK_END in
-  let _ = Unix.lseek t.fd header_size Unix.SEEK_SET in
+  let file_size = (Unix.fstat t.fd).Unix.st_size in
   let pos = ref header_size in
   let results = ref [] in
   (try while !pos < file_size do
     let hdr = Bytes.create 4 in
-    let n = Unix.read t.fd hdr 0 4 in
-    if n < 4 then raise Exit;
+    if not (read_exact_at t.fd !pos hdr 0 4) then raise Exit;
     let record_len = read_u32_le hdr 0 in
     let remaining = file_size - !pos - 4 in
     if not (record_length_valid ~remaining record_len) then raise Exit;
     let record_buf = Bytes.create record_len in
-    let rd = ref 0 in
-    (try while !rd < record_len do
-      let n = Unix.read t.fd record_buf !rd (record_len - !rd) in
-      if n = 0 then raise Exit;
-      rd := !rd + n
-    done with Exit -> raise Exit);
+    if not (read_exact_at t.fd (!pos + 4) record_buf 0 record_len) then raise Exit;
     let payload_len = record_len - 4 in
     let payload = Bytes.sub_string record_buf 0 payload_len in
     (match epoch_of_json payload with
@@ -364,9 +357,8 @@ let fold_strict ?end_at t ~init ~f =
     let physical = (Unix.fstat t.fd).Unix.st_size in
     let size = Option.value ~default:physical end_at in
     let header = Bytes.create header_size in
-    ignore (Unix.lseek t.fd 0 Unix.SEEK_SET);
     if size > physical then Error (Log_io "epoch cut exceeds file length")
-    else if size < header_size || not (read_exact t.fd header 0 header_size) then
+    else if size < header_size || not (read_exact_at t.fd 0 header 0 header_size) then
       Error Log_header_truncated
     else if Bytes.sub_string header 0 4 <> magic then
       Error Log_header_marker
@@ -384,8 +376,7 @@ let fold_strict ?end_at t ~init ~f =
             Error (Log_prefix_truncated offset)
           else
             let prefix = Bytes.create 4 in
-            ignore (Unix.lseek t.fd offset Unix.SEEK_SET);
-            if not (read_exact t.fd prefix 0 4) then
+            if not (read_exact_at t.fd offset prefix 0 4) then
               Error (Log_prefix_truncated offset)
             else
               let length = read_u32_le prefix 0 in
@@ -394,7 +385,7 @@ let fold_strict ?end_at t ~init ~f =
                 Error (Log_length_invalid (offset, length))
               else
                 let bytes = Bytes.create length in
-                if not (read_exact t.fd bytes 0 length) then
+                if not (read_exact_at t.fd (offset + 4) bytes 0 length) then
                   Error (Log_record_truncated offset)
                 else
                   let payload_length = length - 4 in
@@ -428,27 +419,8 @@ let read_all_strict ?end_at t =
 let last t = t.tip
 
 let current_offset t =
-  try Unix.lseek t.fd 0 Unix.SEEK_END
+  try (Unix.fstat t.fd).Unix.st_size
   with _ -> 0
-
-let offset_after t epoch_id =
-  if epoch_id < 0 then Some header_size
-  else if Hashtbl.mem t.offsets epoch_id then begin
-    let off = Hashtbl.find t.offsets epoch_id in
-    let _ = Unix.lseek t.fd off Unix.SEEK_SET in
-    let hdr = Bytes.create 4 in
-    let n = Unix.read t.fd hdr 0 4 in
-    if n < 4 then None
-    else
-      let record_len = read_u32_le hdr 0 in
-      let file_size = (Unix.fstat t.fd).Unix.st_size in
-      let remaining = file_size - off - 4 in
-      if record_length_valid ~remaining record_len then
-        Some (off + 4 + record_len)
-      else
-        None
-  end else
-    None
 
 let fsync ?(sync = Unix.fsync) t =
   if not t.readonly then begin
@@ -474,34 +446,42 @@ let truncate_to ?(sync = Unix.fsync) t ~offset =
   t.tip <- tip;
   t.cut <- None
 
-let get t epoch_id =
-  if Hashtbl.mem t.offsets epoch_id then begin
-    let off = Hashtbl.find t.offsets epoch_id in
-    let _ = Unix.lseek t.fd off Unix.SEEK_SET in
+let read_record ~on_error t epoch_id =
+  let refuse reason = on_error reason; None in
+  try
+  match Hashtbl.find_opt t.offsets epoch_id with
+  | Some off ->
     let hdr = Bytes.create 4 in
-    let n = Unix.read t.fd hdr 0 4 in
-    if n < 4 then None
+    if not (read_exact_at t.fd off hdr 0 4) then refuse (Log_prefix_truncated off)
     else begin
       let record_len = read_u32_le hdr 0 in
       let file_size = (Unix.fstat t.fd).Unix.st_size in
       let remaining = file_size - off - 4 in
-      if not (record_length_valid ~remaining record_len) then None
+      if not (record_length_valid ~remaining record_len) then refuse (Log_length_invalid (off, record_len))
       else
         let payload_len = record_len - 4 in
         let record_buf = Bytes.create record_len in
-        let rd = ref 0 in
-        (try while !rd < record_len do
-          let n = Unix.read t.fd record_buf !rd (record_len - !rd) in
-          if n = 0 then raise Exit;
-          rd := !rd + n
-        done with Exit -> ());
-        if !rd < record_len then None
+        if not (read_exact_at t.fd (off + 4) record_buf 0 record_len) then refuse (Log_record_truncated off)
         else
           let payload = Bytes.sub_string record_buf 0 payload_len in
-          epoch_of_json payload
+          if checksum payload <> Bytes.sub_string record_buf payload_len 4 then refuse (Log_checksum_mismatch off)
+          else match epoch_of_json payload with
+            | None -> refuse (Log_payload_invalid off)
+            | Some header when header.id = epoch_id -> Some (off, record_len, header)
+            | Some header -> refuse (Log_epoch_identity (off, epoch_id, header.id))
     end
-  end else
-    None
+  | None -> refuse (Log_epoch_missing epoch_id)
+  with Unix.Unix_error (error, call, path) as exn ->
+    on_error (Log_io (Printf.sprintf "%s: %s: %s" call path (Unix.error_message error)));
+    raise exn
+
+let get ?(on_error = fun _ -> ()) t epoch_id =
+  Option.map (fun (_, _, header) -> header) (read_record ~on_error t epoch_id)
+
+let offset_after t epoch_id =
+  if epoch_id < 0 then Some header_size
+  else Option.map (fun (off, length, _) -> off + 4 + length)
+    (read_record ~on_error:ignore t epoch_id)
 
 let read_entry t ~max_bytes epoch_id =
   if max_bytes < 0 then Error `Limit
@@ -510,9 +490,8 @@ let read_entry t ~max_bytes epoch_id =
     | None -> Ok None
     | Some offset ->
       try
-        ignore (Unix.lseek t.fd offset Unix.SEEK_SET);
         let prefix = Bytes.create 4 in
-        if not (read_exact t.fd prefix 0 4) then Error `Invalid
+        if not (read_exact_at t.fd offset prefix 0 4) then Error `Invalid
         else
           let length = read_u32_le prefix 0 in
           let remaining = (Unix.fstat t.fd).Unix.st_size - offset - 4 in
@@ -520,9 +499,11 @@ let read_entry t ~max_bytes epoch_id =
           else if length - 4 > max_bytes then Error `Limit
           else
             let bytes = Bytes.create length in
-            if not (read_exact t.fd bytes 0 length) then Error `Invalid
+            if not (read_exact_at t.fd (offset + 4) bytes 0 length) then Error `Invalid
             else
               let payload = Bytes.sub_string bytes 0 (length - 4) in
               if checksum payload <> Bytes.sub_string bytes (length - 4) 4 then Error `Invalid
-              else Ok (Some payload)
+              else match epoch_of_json payload with
+                | Some header when header.id = epoch_id -> Ok (Some payload)
+                | _ -> Error `Invalid
       with Unix.Unix_error _ -> Error `Io

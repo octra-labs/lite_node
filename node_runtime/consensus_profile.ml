@@ -250,7 +250,7 @@ let put_standard_component buf name value =
   Octra_net.Oce1.put_string buf name;
   Octra_net.Oce1.put_string buf value
 
-let standard_hash ~chain_id ~epoch getenv =
+let standard_hash ?policy ~chain_id ~epoch getenv =
   let validator_policy = Octra_core.Validator_policy.of_env_exn getenv in
   let schedule = emission_schedule getenv in
   Octra_net.Hash_domain.hash_encoded "octra:consensus_standard" (fun buf ->
@@ -260,7 +260,9 @@ let standard_hash ~chain_id ~epoch getenv =
     put_standard_component buf "activation_graph"
       (Octra_core.Rule_graph.consensus_id ~chain_id ~epoch);
     put_standard_component buf "quorum"
-      (Octra_consensus.C_quorum_policy.consensus_id ~chain_id);
+      (Octra_consensus.C_quorum_policy.id_at
+        (Option.value policy ~default:(Octra_consensus.C_quorum_policy.for_chain chain_id))
+        ~chain_id ~epoch_id:(Int64.of_int epoch));
     put_standard_component buf "set_fold_bootstrap"
       (Octra_core.Set_fold.consensus_id Octra_core.Set_fold.standard);
     put_standard_component buf "set_fold_participating"
@@ -285,6 +287,9 @@ let standard_hash ~chain_id ~epoch getenv =
     put_standard_component buf "integer_work" Octra_vm.Int_work.consensus_id;
     put_standard_component buf "program_compiler" Octra_vm.Program_package.standard_id;
     put_standard_component buf "vm_undo" "nested_commit";
+    if Octra_consensus.C_quorum_policy.linear_weight ~chain_id
+      ~epoch_id:(Int64.of_int epoch) then
+      put_standard_component buf "relief_authors" "source_roles_state_proof";
     put_standard_component buf "proposal_protocol"
       (Octra_consensus.C_protocol.consensus_id getenv);
     begin
@@ -364,16 +369,47 @@ let standard_hash ~chain_id ~epoch getenv =
     | Octra_core.Rule_graph.Active ->
       put_standard_component buf "compute_settle" Octra_core.Compute_bill.consensus_id
     end;
+    begin match Octra_core.Rule_graph.program_records_at ~chain_id ~epoch with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      put_standard_component buf "program_records" Octra_vm.Program_record.consensus_id
+    end;
+    begin match Octra_core.Rule_graph.proof_key_at ~chain_id ~epoch with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      put_standard_component buf "proof_key" "pvac.proof.public_key.fields";
+      put_standard_component buf "key_powers" "cyclic";
+      put_standard_component buf "key_owner" "zero_proof_stored_amount";
+      put_standard_component buf "wasm_table" "elements_65536:tables_1";
+      put_standard_component buf "wasm_shape"
+        "source:functions_10000:globals_1000:segments_1000:types_10000:imports_256:exports_256:arity_32:locals_4096:memories_1:tables_1";
+      put_standard_component buf "wasm_errors" "input_fields"
+    end;
+    begin match Octra_core.Rule_graph.duty_marks_at ~chain_id ~epoch with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      put_standard_component buf "duty_marks" Octra_core.Set_fold.marks_id
+    end;
     match Octra_core.Rule_graph.cipher_migration_at ~chain_id ~epoch with
     | Octra_core.Rule_graph.Prior -> ()
     | Octra_core.Rule_graph.Active ->
       put_standard_component buf "cipher_migration" Octra_core.Private_ledger.cipher_proof_id)
 
-let hash ~chain_id ~epoch getenv =
+let hash ?policy ~chain_id ~epoch getenv =
   match Octra_core.Rule_graph.standard_at ~chain_id ~epoch with
   | Octra_core.Rule_graph.Prior -> compat_hash getenv
-  | Octra_core.Rule_graph.Active -> standard_hash ~chain_id ~epoch getenv
+  | Octra_core.Rule_graph.Active -> standard_hash ?policy ~chain_id ~epoch getenv
+
+let epochs ?policy chain_id =
+  let policy = Option.value policy ~default:(Octra_consensus.C_quorum_policy.for_chain chain_id) in
+  let stake = Octra_consensus.C_quorum_policy.epochs policy |> List.map (fun epoch ->
+    if epoch > Int64.of_int max_int then invalid_arg "stake epoch exceeds platform limit";
+    Int64.to_int epoch) in
+  List.sort_uniq Int.compare (stake @ Octra_core.Rule_graph.profile_epochs ~chain_id)
+
+let switch_for policy ~chain_id ~applied_epoch =
+  applied_epoch < max_int
+  && List.mem (applied_epoch + 1) (epochs ~policy chain_id)
 
 let switch_after ~chain_id ~applied_epoch =
-  applied_epoch < max_int
-  && List.mem (applied_epoch + 1) (Octra_core.Rule_graph.profile_epochs ~chain_id)
+  switch_for (Octra_consensus.C_quorum_policy.for_chain chain_id) ~chain_id ~applied_epoch

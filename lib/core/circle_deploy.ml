@@ -121,6 +121,7 @@ let validate_runtime
     ?(execution_profile=Circle_wasm_host.Standard)
     ?(float_mode=Rule_graph.Prior)
     ?(inspect_mode = Rule_graph.Prior)
+    ~table_mode
     (payload : Circles.deploy_payload) =
   match payload.Circles.runtime with
   | Circles.Octb ->
@@ -134,7 +135,7 @@ let validate_runtime
              ("circle_program_missing", "wasm_v1 circles require program code"))
       | Some code_b64 ->
         let* validate_result =
-          Circle_wasm_host.describe ~execution_profile ~float_mode ~inspect_mode code_b64 in
+          Circle_wasm_host.describe ~execution_profile ~float_mode ~inspect_mode ~table_mode code_b64 in
         begin
           match validate_result with
           | Ok descriptor ->
@@ -160,6 +161,7 @@ let check_available
     ?(execution_profile=Circle_wasm_host.Standard)
     ?(float_mode=Rule_graph.Prior)
     ?(inspect_mode = Rule_graph.Prior)
+    ~table_mode
     store
     source
     (payload : Circles.deploy_payload) =
@@ -172,7 +174,7 @@ let check_available
       Lwt.return (Error ("circle_exists", "circle already exists"))
     else
       let* runtime_ok = validate_runtime ~resource_errors ~execution_profile
-        ~float_mode ~inspect_mode payload in
+        ~float_mode ~inspect_mode ~table_mode payload in
       begin
         match runtime_ok with
         | Error e -> Lwt.return (Error e)
@@ -215,10 +217,11 @@ let apply
     ?(execution_profile=Circle_wasm_host.Standard)
     ?(float_mode=Rule_graph.Prior)
     ?(inspect_mode = Rule_graph.Prior)
+    ~table_mode
     store
     source
     (payload : Circles.deploy_payload) =
-  let* checked = check_available ~execution_profile ~float_mode ~inspect_mode store source payload in
+  let* checked = check_available ~execution_profile ~float_mode ~inspect_mode ~table_mode store source payload in
   match checked with
   | Error e ->
     Lwt.return (Error e)

@@ -84,7 +84,7 @@ let proposal_bundle_of_accepted bundle =
   }
 
 let join ~ready query =
-  Lwt.pick [Lwt.protected query; Lwt.map (fun () -> None) ready]
+  Lwt.pick [query; Lwt.map (fun () -> None) ready]
 
 let fetch_finalized (deps : finalized_deps) ~epoch_id =
   let open Lwt.Syntax in

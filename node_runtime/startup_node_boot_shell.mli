@@ -61,4 +61,4 @@ val run_store :
 
 val run_node :
   deps ->
-  int
+  int * Genesis_start.t option

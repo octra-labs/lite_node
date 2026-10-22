@@ -15,6 +15,7 @@ type deps = {
 }
 
 type node_deps = {
+  finish_applied : Octra_consensus.C_types.finalize -> bool;
   check_finality : Octra_consensus.C_types.finalize -> unit;
   write_finality : Octra_consensus.C_types.finalize -> unit;
   persist_finality_certificate :
@@ -52,8 +53,10 @@ type node_deps = {
   remove_pending_finalized : epoch:int -> unit;
   set_state_attested : head:int -> root:string -> unit;
   apply_timeout_seconds : float;
+  stall_timeout_seconds : float;
+  defer_apply : epoch:int -> reason:string -> unit;
+  recover_apply : epoch:int -> reason:string -> unit;
   bundle_wait_expired : epoch_id:int64 -> unit;
-  bundle_wait_recovered : epoch_id:int64 -> unit;
   require_sync : Sync_need.t -> unit;
   fatal_exit : unit -> unit;
   catchup_active : unit -> bool;
@@ -62,6 +65,7 @@ type node_deps = {
 }
 
 type node_runtime = {
+  committed_epoch_root_raw : int -> string option;
   data_dir : string;
   bundles : Consensus_bundle_cache.node_runtime;
   driver_ref : Octra_consensus.C_driver.t option ref;
@@ -75,6 +79,7 @@ type node_runtime = {
   read_commit_root : unit -> string option Lwt.t;
   read_local_root_raw : unit -> string Lwt.t;
   apply_timeout_seconds : float;
+  stall_timeout_seconds : float;
   require_sync : Sync_need.t -> unit;
   fatal_exit : unit -> unit;
   catchup_active : bool ref;
@@ -94,8 +99,12 @@ type t = {
 
 val create : deps -> t
 
-val create_node : node_deps -> t
+val create_node :
+  ?before_apply:(Octra_consensus.C_types.validator_set ->
+    Octra_consensus.C_types.finalize -> unit Lwt.t) -> node_deps -> t
 
 val node_deps_of_runtime : node_runtime -> node_deps
 
-val create_node_runtime : node_runtime -> t
+val create_node_runtime :
+  ?before_apply:(Octra_consensus.C_types.validator_set ->
+    Octra_consensus.C_types.finalize -> unit Lwt.t) -> node_runtime -> t

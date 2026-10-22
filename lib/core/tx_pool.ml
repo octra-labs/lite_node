@@ -81,15 +81,15 @@ let add_smart ~lookup tx =
   else if not (check_virtual_balance tx.from total_cost) then
     Error "Insufficient balance (including pending)"
   else if Z.gt (Z.add !total_ou ou) max_ou then
-    let candidates =
+    let entries =
       Hashtbl.fold (fun _ e acc ->
         if Transaction.compare_by_priority e.tx tx > 0 then e :: acc else acc
       ) pool []
     in
-    match candidates with
+    match entries with
     | [] -> Error "Staging pool full (low priority)"
     | _ ->
-      let victim = candidates
+      let victim = entries
         |> List.sort (fun a b -> Transaction.compare_by_priority a.tx b.tx)
         |> List.hd in
       evict victim; insert tx; Ok ()

@@ -27,7 +27,15 @@ let validator_set_hash (vs : C_types.validator_set) =
         | None -> invalid_arg "validator weight missing"
         | Some weight ->
           Octra_net.Oce1.put_string buf (Z.to_string weight))
-      buf vs.validators)
+      buf vs.validators;
+    Option.iter (fun (height, entries) ->
+      Octra_net.Oce1.put_string buf "octra:relief_authors";
+      Octra_net.Oce1.put_u64 buf height;
+      Octra_net.Oce1.put_list (fun buf (member, weight) ->
+        Octra_net.Oce1.put_string buf member.C_types.address;
+        Octra_net.Oce1.put_bytes buf member.pubkey;
+        Octra_net.Oce1.put_string buf (Z.to_string weight)) buf entries)
+      vs.authors)
 
 let network_hash ~chain_id ?program_trust_hash ?runtime_profile_hash () =
   Octra_net.Hash_domain.hash_encoded "octra:consensus_network" (fun buf ->

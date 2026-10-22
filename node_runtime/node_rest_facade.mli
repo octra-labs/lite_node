@@ -14,6 +14,7 @@ type runtime = {
   proof_mode : unit -> Octra_core.Rule_graph.mode;
   compute_mode : unit -> Octra_core.Rule_graph.mode;
   settle_mode : unit -> Octra_core.Rule_graph.mode;
+  marks_mode : unit -> Octra_core.Rule_graph.mode;
   queue_head : unit -> int64 option;
   preverify_admit : Transaction.t -> (unit, string) result;
   save_drops : Octra_core.Tx_staging.drop_record list -> unit;
@@ -83,7 +84,7 @@ val start :
   validator_view_sk:string ->
   validator_view_pub:string ->
   program_trust:Octra_vm.Program_trust.t ->
-  migration_admissions:Octra_core.Pvac_migration_admission.t ->
+  migration_checks:Octra_core.Pvac_migration_check.t ->
   rules:Octra_core.Rule_graph.t ->
   chaindata:Store_chaindata.t ->
   consensus_driver_ref:Octra_consensus.C_driver.t option ref ->
@@ -111,7 +112,7 @@ val start_task :
   validator_view_sk:string ->
   validator_view_pub:string ->
   program_trust:Octra_vm.Program_trust.t ->
-  migration_admissions:Octra_core.Pvac_migration_admission.t ->
+  migration_checks:Octra_core.Pvac_migration_check.t ->
   rules:Octra_core.Rule_graph.t ->
   chaindata:Store_chaindata.t ->
   consensus_driver_ref:Octra_consensus.C_driver.t option ref ->

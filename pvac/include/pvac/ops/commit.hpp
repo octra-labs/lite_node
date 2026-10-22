@@ -6,11 +6,117 @@
 #include <cstdint>
 #include <cstring>
 #include <array>
+#include <limits>
+#include <string_view>
+#include <type_traits>
 
 #include "../core/types.hpp"
 #include "../core/hash.hpp"
 
 namespace pvac {
+
+struct KeyHash {
+    Sha256 state;
+
+    KeyHash() { state.init(); }
+
+    void word(uint64_t value) { sha256_acc_u64(state, value); }
+
+    void tag(std::string_view value) {
+        word(value.size());
+        state.update(value.data(), value.size());
+    }
+
+    template<typename... T>
+    void group(std::string_view name, const T&... fields) {
+        tag("record");
+        tag(name);
+        word(sizeof...(T));
+        (add(fields), ...);
+    }
+
+    template<typename T>
+    std::enable_if_t<std::is_integral_v<T>> add(T value) {
+        static_assert(sizeof(T) <= sizeof(uint64_t));
+        tag(std::is_signed_v<T> ? "signed" : "unsigned");
+        word(static_cast<uint64_t>(value));
+    }
+
+    template<typename T>
+    std::enable_if_t<!std::is_integral_v<T>> add(const T&) = delete;
+
+    void add(double value) {
+        static_assert(sizeof(double) == sizeof(uint64_t));
+        static_assert(std::numeric_limits<double>::is_iec559);
+        uint64_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        tag("real");
+        word(bits);
+    }
+
+    template<typename T>
+    void add(const std::vector<T>& values) {
+        tag("list");
+        word(values.size());
+        for (const auto& value : values) add(value);
+    }
+
+    template<size_t N>
+    void add(const std::array<uint8_t, N>& value) {
+        tag("bytes");
+        word(N);
+        state.update(value.data(), N);
+    }
+
+    void add(const Fp& value) {
+        const auto& [lo, hi] = value;
+        group("field", lo, hi);
+    }
+
+    void add(const BitVec& value) {
+        const auto& [bits, words] = value;
+        group("bits", bits, words);
+    }
+
+    void add(const Ubk& value) {
+        const auto& [perm, inv] = value;
+        group("index", perm, inv);
+    }
+
+    void add(const Params& value) {
+        const auto& [branches, rows, columns, h_weight, x_weight, error,
+            entropy, fraction, depth, budget, lpn_rows, lpn_columns,
+            tau_num, tau_den, low, high, rounds] = value;
+        group("params", branches, rows, columns, h_weight, x_weight, error,
+            entropy, fraction, depth, budget, lpn_rows, lpn_columns,
+            tau_num, tau_den, low, high, rounds);
+    }
+
+    void add(CircuitPrfProfile value) {
+        tag("profile");
+        word(static_cast<uint8_t>(value));
+    }
+
+    void add(const PubKey& value) {
+        const auto& [params, tag, matrix, index, digest, omega, powers,
+            commitment, profile] = value;
+        group("public_key", params, tag, matrix, index, digest, omega, powers,
+            commitment, profile);
+    }
+
+    std::array<uint8_t, 32> finish() {
+        std::array<uint8_t, 32> digest{};
+        state.finish(digest.data());
+        return digest;
+    }
+};
+
+inline std::array<uint8_t, 32> proof_key_digest(const PubKey& pk) {
+    KeyHash hash;
+    hash.tag("pvac.proof.public_key.fields");
+    hash.add(pk);
+    return hash.finish();
+}
 
 inline std::array<uint8_t, 32> commit_ct(const PubKey & pk, const Cipher & C)
 {

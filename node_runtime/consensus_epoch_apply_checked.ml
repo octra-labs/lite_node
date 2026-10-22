@@ -1,7 +1,7 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-module Admission = Consensus_epoch_apply_admission
+module Apply_check = Consensus_epoch_apply_check
 module Catchup = Consensus_catchup_shell
 
 type apply_result =
@@ -15,7 +15,7 @@ type deps = {
   queue_gap : active:bool -> target_epoch:int64 -> reason:string -> Catchup.queue_event;
   clear_state_attested : unit -> unit;
   log_already : current_epoch:int -> head:int -> unit;
-  log_defer : Admission.catchup -> Catchup.queue_event -> unit;
+  log_defer : Apply_check.catchup -> Catchup.queue_event -> unit;
   preflight : unit -> (unit, string) result;
   defer : string -> unit;
   apply : unit -> apply_result Lwt.t;
@@ -23,12 +23,12 @@ type deps = {
 }
 
 let run deps ~consensus_mode ~current_epoch =
-  match Admission.plan ~consensus_mode ~head:(deps.head ()) ~current_epoch with
-  | Admission.Already_applied applied ->
+  match Apply_check.plan ~consensus_mode ~head:(deps.head ()) ~current_epoch with
+  | Apply_check.Already_applied applied ->
     deps.log_already ~current_epoch ~head:applied.head;
     deps.set_current_epoch applied.next_epoch;
     Lwt.return_unit
-  | Admission.Need_catchup catchup ->
+  | Apply_check.Need_catchup catchup ->
     let event =
       deps.queue_gap
         ~active:(deps.catchup_active ())
@@ -38,7 +38,7 @@ let run deps ~consensus_mode ~current_epoch =
     deps.clear_state_attested ();
     deps.log_defer catchup event;
     Lwt.return_unit
-  | Admission.Apply_now ->
+  | Apply_check.Apply_now ->
     (match deps.preflight () with
      | Ok () ->
        let open Lwt.Syntax in
@@ -72,7 +72,7 @@ let run_node ~consensus_mode ~current_epoch ~head ~catchup_queue
       log_defer = (fun catchup event ->
         Log.warn "finality"
           "defer apply: %s queued = %s active = %b"
-          catchup.Admission.reason
+          catchup.Apply_check.reason
           event.Catchup.queued_label
           event.queued_active);
       preflight;

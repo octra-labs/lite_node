@@ -28,6 +28,7 @@ type tx_context = {
 
 type rejected_record = {
   hash : string;
+  op_type : Transaction.op_type;
   from_addr : string;
   to_addr : string;
   amount : string;

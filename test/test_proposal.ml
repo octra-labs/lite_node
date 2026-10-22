@@ -555,10 +555,10 @@ let test_preview_exec_env () =
     expect "env readiness callback"
       (Lwt_main.run (fn 9) = Some "root-9")
 
-let test_admission_plan () =
+let test_check_plan () =
   let plan ?(state_attested = true) ?(quarantine_active = false)
       ?(quarantine_reason = "") ~epoch_id ~current_epoch () =
-    C.admission_plan
+    C.check_plan
       ~epoch_id:(Int64.of_int epoch_id)
       ~current_epoch
       ~state_attested
@@ -588,11 +588,11 @@ let test_admission_plan () =
    | C.Proceed -> ()
    | _ -> fail "proceed plan")
 
-let test_admission_proceed () =
+let test_check_proceed () =
   let started = ref [] in
   let result =
     Lwt_main.run
-      (C.handle_proposal_admission
+      (C.handle_proposal_check
          ~start_height:(fun height ->
            started := height :: !started;
            Lwt.return_unit)
@@ -605,11 +605,11 @@ let test_admission_proceed () =
   expect "admission shell proceed" (result = C.Proposal_admit);
   expect "admission shell proceed no start" (!started = [])
 
-let test_admission_realign () =
+let test_check_realign () =
   let started = ref [] in
   let result =
     Lwt_main.run
-      (C.handle_proposal_admission
+      (C.handle_proposal_check
          ~start_height:(fun height ->
            started := height :: !started;
            Lwt.return_unit)
@@ -622,11 +622,11 @@ let test_admission_realign () =
   expect "admission shell realign defer" (result = C.Proposal_defer);
   expect "admission shell realign start" (!started = [10L])
 
-let test_admission_quarantine () =
+let test_check_quarantine () =
   let started = ref [] in
   let result =
     Lwt_main.run
-      (C.handle_proposal_admission
+      (C.handle_proposal_check
          ~start_height:(fun height ->
            started := height :: !started;
            Lwt.return_unit)
@@ -1706,6 +1706,7 @@ let test_proposal_roots () =
 let test_prev_root_decision_match () =
   match
     C.prev_root_decision
+      ~certified_root:None
       ~epoch_id:10L
       ~target_root:(raw 'r')
       ~current_root:(raw 'r')
@@ -1720,6 +1721,7 @@ let test_prev_root_decision_match () =
 let test_prev_root_mismatch_grace () =
   match
     C.prev_root_decision
+      ~certified_root:(Some (raw 't'))
       ~epoch_id:10L
       ~target_root:(raw 't')
       ~current_root:(raw 'c')
@@ -1737,6 +1739,7 @@ let test_prev_root_mismatch_grace () =
 let test_prev_root_quarantine () =
   match
     C.prev_root_decision
+      ~certified_root:(Some (raw 't'))
       ~epoch_id:10L
       ~target_root:(raw 't')
       ~current_root:(raw 'c')
@@ -2112,9 +2115,8 @@ let test_verify_prev_root_quarantine () =
     (verdict_rejects
        (Lwt_main.run
           (C.verify_proposal deps ~chain_id:"octra-test" proposal)));
-  expect "verify prev mismatch streak" (!prev_streak_ref = 4);
-  expect "verify prev mismatch quarantine"
-    (!quarantines = ["prev_state_root_mismatch_streak = 4 epoch = 12"]);
+  expect "verify unproven mismatch streak" (!prev_streak_ref = 3);
+  expect "verify unproven mismatch quarantine" (!quarantines = []);
   expect "verify prev mismatch no sleep" (!sleeps = []);
   expect "verify prev mismatch no store" (!stores = []);
   expect "verify prev mismatch no set" (!set_proposals = []);
@@ -2129,6 +2131,28 @@ let test_verify_missing_prev_time () =
     (verdict_waits
        (Lwt_main.run
           (C.verify_proposal deps ~chain_id:"octra-test" proposal)))
+
+let test_unproven_roots () =
+  let proposal = proposal_for_txs [tx 1] in
+  List.iter (fun root ->
+    let deps, quarantines, prev, state, _, _, _, _ =
+      verify_proposal_deps ~root ~prev_streak:3 ~state_streak:3 ~staging:[tx 1]
+        ~preview_result:(fun request ->
+          exec_result ~confirmed:request.C.txs ~rejected:[] ~post_state_root:(raw 'x')) () in
+    for _ = 1 to 6 do
+      expect "unproven root rejected"
+        (verdict_rejects (Lwt_main.run
+          (C.verify_proposal deps ~chain_id:"octra-test" proposal)))
+    done;
+    expect "unproven roots did not quarantine" (!quarantines = []);
+    expect "unproven roots preserved counters" (!prev = 3 && !state = 3))
+    [raw 'p'; raw 'x'];
+  List.iter (fun certified_root ->
+    match C.prev_root_decision ~certified_root ~epoch_id:12L
+      ~target_root:(raw 'p') ~current_root:(raw 'x') ~max_wait_tries:0
+      ~tries_left:0 ~current_streak:9 ~quarantine_threshold:4 with
+    | C.Prev_root_mismatch {streak_after = 9; quarantine_reason = None; _} -> ()
+    | _ -> fail "unrelated certificate caused quarantine") [None; Some (raw 'z')]
 
 let test_prev_time_retry () =
   let item = tx 1 in
@@ -2758,10 +2782,10 @@ let test_verify_invalid_valid_round () =
           (C.verify_proposal deps ~chain_id:"octra-test" proposal)));
   expect "invalid valid round previewed" (!previews = [])
 
-let test_tx_hash_admission_match () =
+let test_tx_hash_check_match () =
   let tx_hashes = [String.make 64 'a'; C.raw32_to_hex (raw 'b')] in
   match
-    C.tx_hash_admission
+    C.tx_hash_check
       ~expected_tx_list_hash:(C.tx_list_hash tx_hashes)
       ~tx_hashes
   with
@@ -2769,9 +2793,9 @@ let test_tx_hash_admission_match () =
     expect "hash admission payload" (got = tx_hashes)
   | C.Tx_hash_mismatch -> fail "tx hash admission accept"
 
-let test_tx_hash_admission_mismatch () =
+let test_tx_hash_check_mismatch () =
   match
-    C.tx_hash_admission
+    C.tx_hash_check
       ~expected_tx_list_hash:(raw 'x')
       ~tx_hashes:[String.make 64 'a']
   with
@@ -3368,10 +3392,10 @@ let () =
   test_layera_env_diag_context ();
   test_validator_pubkeys_local ();
   test_preview_exec_env ();
-  test_admission_plan ();
-  test_admission_proceed ();
-  test_admission_realign ();
-  test_admission_quarantine ();
+  test_check_plan ();
+  test_check_proceed ();
+  test_check_realign ();
+  test_check_quarantine ();
   test_make_unattested_defer ();
   test_make_epoch_time_defer ();
   test_preverify_single_flight ();
@@ -3420,6 +3444,7 @@ let () =
   test_preview_output_reject_retry ();
   test_verify_txid_hi_mismatch ();
   test_verify_prev_root_quarantine ();
+  test_unproven_roots ();
   test_verify_missing_prev_time ();
   test_prev_time_retry ();
   test_verify_missing_bundle_wait ();
@@ -3438,8 +3463,8 @@ let () =
   test_future_reproposal_active ();
   test_time_recovery ();
   test_verify_invalid_valid_round ();
-  test_tx_hash_admission_match ();
-  test_tx_hash_admission_mismatch ();
+  test_tx_hash_check_match ();
+  test_tx_hash_check_mismatch ();
   test_build_header_non_empty ();
   test_empty_header_head_txid ();
   test_empty_header_next_txid ();

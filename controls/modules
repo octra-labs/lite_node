@@ -82,7 +82,7 @@ lib/consensus/epoch_time.ml
 lib/consensus/epoch_time.mli
 lib/consensus/finality_log.ml
 lib/consensus/finality_recovery.ml
-lib/consensus/resource_attestation_admission.ml
+lib/consensus/resource_attestation_check.ml
 lib/consensus/resource_attestation_flow.ml
 lib/consensus/resource_attestations.ml
 lib/consensus/resource_compute_capability.ml
@@ -95,7 +95,7 @@ lib/consensus/resource_compute_selection.ml
 lib/consensus/resource_compute_selection.mli
 lib/core/account_pack.ml
 lib/core/account_pack.mli
-lib/core/bft_control_admission.ml
+lib/core/bft_control_check.ml
 lib/core/blob_chunk.ml
 lib/core/blob_chunk.mli
 lib/core/chaindata_index.ml
@@ -219,8 +219,8 @@ lib/core/pvac_legacy_public_replay.ml
 lib/core/pvac_legacy_public_replay.mli
 lib/core/pvac_migration.ml
 lib/core/pvac_migration.mli
-lib/core/pvac_migration_admission.ml
-lib/core/pvac_migration_admission.mli
+lib/core/pvac_migration_check.ml
+lib/core/pvac_migration_check.mli
 lib/core/pvac_registry.ml
 lib/core/pvac_registry.mli
 lib/core/pvac_verify_direct.ml
@@ -258,8 +258,8 @@ lib/core/tx_pool.ml
 lib/core/tx_savepoint.ml
 lib/core/tx_staging.ml
 lib/core/txlog.ml
-lib/core/validator_admission.ml
-lib/core/validator_admission.mli
+lib/core/validator_entry.ml
+lib/core/validator_entry.mli
 lib/core/validator_evidence.ml
 lib/core/validator_evidence.mli
 lib/core/validator_policy.ml
@@ -289,8 +289,8 @@ lib/vm/rpc/token_rpc_actor.ml
 lib/vm/rpc/token_rpc_actor.mli
 lib/vm/rpc/token_rpc_policy.ml
 lib/vm/rpc/token_rpc_policy.mli
-lib/vm/runtime/admission.ml
-lib/vm/runtime/admission.mli
+lib/vm/runtime/code_check.ml
+lib/vm/runtime/code_check.mli
 lib/vm/runtime/call_plan.ml
 lib/vm/runtime/call_plan.mli
 lib/vm/runtime/contract.ml
@@ -382,8 +382,8 @@ node_runtime/consensus_catchup_shell.ml
 node_runtime/consensus_catchup_shell.mli
 node_runtime/consensus_circle_cell_preverify.ml
 node_runtime/consensus_circle_cell_preverify.mli
-node_runtime/consensus_circle_code_admission.ml
-node_runtime/consensus_circle_code_admission.mli
+node_runtime/consensus_circle_code_check.ml
+node_runtime/consensus_circle_code_check.mli
 node_runtime/consensus_circle_preverify.ml
 node_runtime/consensus_circle_preverify.mli
 node_runtime/consensus_driver_boot_shell.ml
@@ -394,8 +394,8 @@ node_runtime/consensus_driver_read.ml
 node_runtime/consensus_driver_read.mli
 node_runtime/consensus_driver_wiring.ml
 node_runtime/consensus_driver_wiring.mli
-node_runtime/consensus_epoch_apply_admission.ml
-node_runtime/consensus_epoch_apply_admission.mli
+node_runtime/consensus_epoch_apply_check.ml
+node_runtime/consensus_epoch_apply_check.mli
 node_runtime/consensus_epoch_apply_broadcast.ml
 node_runtime/consensus_epoch_apply_broadcast.mli
 node_runtime/consensus_epoch_apply_checked.ml

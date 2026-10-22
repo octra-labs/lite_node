@@ -288,8 +288,10 @@ val range_response :
   Octra_consensus.C_driver.catchup_range_response_record option
 
 val http_range :
+  ?health:Sync_sources.t ->
   ?fetch_json:(string -> Yojson.Safe.t Lwt.t) ->
   ?timeout:float ->
+  ?budget:float ->
   (string -> string option) ->
   from_epoch:int64 ->
   max_epochs:int ->
@@ -304,8 +306,10 @@ val proved_head :
   bool
 
 val http_head :
+  ?health:Sync_sources.t ->
   ?fetch_json:(string -> Yojson.Safe.t Lwt.t) ->
   ?timeout:float ->
+  ?budget:float ->
   (string -> string option) ->
   chain_id:string ->
   validator_hash:(int64 -> string) ->
@@ -342,6 +346,7 @@ val run_catchup :
   outcome Lwt.t
 
 val run_node_catchup :
+  ?budget:float ->
   node_deps ->
   string ->
   outcome Lwt.t

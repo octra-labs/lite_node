@@ -2,7 +2,7 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type t = {
-  candidates : Validator_admission.candidate list;
+  entries : Validator_entry.entry list;
   slashes : slash_record list;
 }
 
@@ -38,8 +38,8 @@ let escrow_address =
   |> Digestif.SHA256.to_raw_string
   |> Base64.encode_exn
   |> Crypto.Address.address_from_pubkey
-let empty = { candidates = []; slashes = [] }
-let candidates registry = registry.candidates
+let empty = { entries = []; slashes = [] }
+let entries registry = registry.entries
 let slashes registry = registry.slashes
 
 let put_string buffer value =
@@ -91,28 +91,28 @@ let verify_bond_proof ~chain_id ~address ~amount ~nonce
 
 let find address (registry : t) =
   List.find_opt
-    (fun (candidate : Validator_admission.candidate) ->
-      String.equal candidate.Validator_admission.address address)
-    registry.candidates
+    (fun (entry : Validator_entry.entry) ->
+      String.equal entry.Validator_entry.address address)
+    registry.entries
 
-let validate_unique (candidates : Validator_admission.candidate list) =
-  let addresses = Hashtbl.create (List.length candidates) in
-  let pubkeys = Hashtbl.create (List.length candidates) in
-  let rec loop (remaining : Validator_admission.candidate list) =
+let validate_unique (entries : Validator_entry.entry list) =
+  let addresses = Hashtbl.create (List.length entries) in
+  let pubkeys = Hashtbl.create (List.length entries) in
+  let rec loop (remaining : Validator_entry.entry list) =
     match remaining with
     | [] -> Ok ()
-    | candidate :: rest ->
-      if Hashtbl.mem addresses candidate.Validator_admission.address then
+    | entry :: rest ->
+      if Hashtbl.mem addresses entry.Validator_entry.address then
         Error "duplicate validator address"
-      else if Hashtbl.mem pubkeys candidate.Validator_admission.pubkey then
+      else if Hashtbl.mem pubkeys entry.Validator_entry.pubkey then
         Error "duplicate validator consensus public key"
       else begin
-        Hashtbl.add addresses candidate.Validator_admission.address ();
-        Hashtbl.add pubkeys candidate.Validator_admission.pubkey ();
+        Hashtbl.add addresses entry.Validator_entry.address ();
+        Hashtbl.add pubkeys entry.Validator_entry.pubkey ();
         loop rest
       end
   in
-  loop candidates
+  loop entries
 
 let valid_hash value =
   try
@@ -146,14 +146,14 @@ let validate_slashes records =
   in
   loop records
 
-let canonical (candidates : Validator_admission.candidate list) =
+let canonical (entries : Validator_entry.entry list) =
   List.sort
-    (fun (left : Validator_admission.candidate)
-         (right : Validator_admission.candidate) ->
+    (fun (left : Validator_entry.entry)
+         (right : Validator_entry.entry) ->
       String.compare
-        left.Validator_admission.address
-        right.Validator_admission.address)
-    candidates
+        left.Validator_entry.address
+        right.Validator_entry.address)
+    entries
 
 let canonical_slashes records =
   List.sort
@@ -161,38 +161,38 @@ let canonical_slashes records =
     records
 
 let validate (registry : t) =
-  let rec validate_candidates
-      (remaining : Validator_admission.candidate list) =
+  let rec validate_entries
+      (remaining : Validator_entry.entry list) =
     match remaining with
     | [] -> Ok ()
-    | candidate :: rest ->
-      if not (Crypto.Address.is_valid_address candidate.Validator_admission.address) then
+    | entry :: rest ->
+      if not (Crypto.Address.is_valid_address entry.Validator_entry.address) then
         Error "invalid validator address"
       else
-        match Validator_admission.validate_candidate candidate with
+        match Validator_entry.validate_entry entry with
         | Error _ as error -> error
-        | Ok () -> validate_candidates rest
+        | Ok () -> validate_entries rest
   in
-  match validate_candidates registry.candidates with
+  match validate_entries registry.entries with
   | Error _ as error -> error
   | Ok () ->
     begin
-      match validate_unique registry.candidates with
+      match validate_unique registry.entries with
       | Error _ as error -> error
       | Ok () -> validate_slashes registry.slashes
     end
 
-let replace (candidate : Validator_admission.candidate) (registry : t) =
+let replace (entry : Validator_entry.entry) (registry : t) =
   {
-    candidates =
-      candidate
+    entries =
+      entry
       :: List.filter
-           (fun (current : Validator_admission.candidate) ->
+           (fun (current : Validator_entry.entry) ->
              not
                (String.equal
-                  current.Validator_admission.address
-                  candidate.Validator_admission.address))
-           registry.candidates
+                  current.Validator_entry.address
+                  entry.Validator_entry.address))
+           registry.entries
       |> canonical;
     slashes = registry.slashes;
   }
@@ -201,7 +201,7 @@ let apply_bond parameters ~chain_id ~epoch ~address ~sender_pubkey_b64
     ~amount ~nonce (payload : bond_payload) (registry : t) =
   if not (Crypto.Address.is_valid_address address) then
     Error "invalid validator address"
-  else if Z.lt amount parameters.Validator_admission.min_bond then
+  else if Z.lt amount parameters.Validator_entry.min_bond then
     Error "validator bond is below minimum"
   else if Int64.compare epoch 0L < 0 then
     Error "validator bond epoch is negative"
@@ -219,20 +219,20 @@ let apply_bond parameters ~chain_id ~epoch ~address ~sender_pubkey_b64
       begin
         match
           List.find_opt
-            (fun (candidate : Validator_admission.candidate) ->
-              String.equal candidate.Validator_admission.pubkey pubkey
+            (fun (entry : Validator_entry.entry) ->
+              String.equal entry.Validator_entry.pubkey pubkey
               && not
                    (String.equal
-                      candidate.Validator_admission.address
+                      entry.Validator_entry.address
                       address))
-            registry.candidates
+            registry.entries
         with
         | Some _ -> Error "validator consensus public key is already bonded"
         | None ->
-          let candidate =
+          let entry =
             match find address registry with
             | None ->
-              Validator_admission.{
+              Validator_entry.{
                 address;
                 pubkey;
                 bond = amount;
@@ -241,7 +241,7 @@ let apply_bond parameters ~chain_id ~epoch ~address ~sender_pubkey_b64
                 exit_epoch = None;
               }
             | Some current ->
-              if current.Validator_admission.exit_epoch <> None then
+              if current.Validator_entry.exit_epoch <> None then
                 current
               else if not (String.equal current.pubkey pubkey) then
                 current
@@ -250,12 +250,12 @@ let apply_bond parameters ~chain_id ~epoch ~address ~sender_pubkey_b64
           in
           begin
             match find address registry with
-            | Some current when current.Validator_admission.exit_epoch <> None ->
+            | Some current when current.Validator_entry.exit_epoch <> None ->
               Error "exiting validator cannot add bond"
             | Some current when not (String.equal current.pubkey pubkey) ->
               Error "validator consensus key rotation requires withdrawal"
             | _ ->
-              let next = replace candidate registry in
+              let next = replace entry registry in
               begin
                 match validate next with
                 | Ok () -> Ok next
@@ -271,18 +271,18 @@ let mark_ready ~epoch ~address ~consensus_pubkey_b64 (registry : t) =
     match raw_pubkey consensus_pubkey_b64, find address registry with
     | Error _ as error, _ -> error
     | _, None -> Error "validator bond not found"
-    | Ok pubkey, Some candidate ->
-      if candidate.Validator_admission.exit_epoch <> None then
+    | Ok pubkey, Some entry ->
+      if entry.Validator_entry.exit_epoch <> None then
         Error "exiting validator cannot become ready"
-      else if not (String.equal candidate.pubkey pubkey) then
+      else if not (String.equal entry.pubkey pubkey) then
         Error "validator ready consensus key mismatch"
       else
         let ready_epoch =
-          match candidate.ready_epoch with
+          match entry.ready_epoch with
           | None -> Some epoch
           | Some current -> Some (Int64.min current epoch)
         in
-        Ok (replace { candidate with ready_epoch } registry)
+        Ok (replace { entry with ready_epoch } registry)
 
 let request_exit ~epoch ~address (registry : t) =
   if Int64.compare epoch 0L < 0 then
@@ -290,41 +290,41 @@ let request_exit ~epoch ~address (registry : t) =
   else
     match find address registry with
     | None -> Error "validator bond not found"
-    | Some candidate when candidate.Validator_admission.exit_epoch <> None ->
+    | Some entry when entry.Validator_entry.exit_epoch <> None ->
       Error "validator exit already requested"
-    | Some candidate ->
-      Ok (replace { candidate with exit_epoch = Some epoch } registry)
+    | Some entry ->
+      Ok (replace { entry with exit_epoch = Some epoch } registry)
 
 let withdraw parameters ~current_epoch ~active_addresses ~address
     (registry : t) =
   match find address registry with
   | None -> Error "validator bond not found"
-  | Some candidate ->
+  | Some entry ->
     if List.mem address active_addresses then
       Error "active validator cannot withdraw"
     else
       match
-        Validator_admission.can_withdraw
+        Validator_entry.can_withdraw
           parameters
           ~current_epoch
-          candidate
+          entry
       with
       | Error _ as error -> error
       | Ok false -> Error "validator unbonding period is not complete"
       | Ok true ->
         Ok (
           {
-            candidates =
+            entries =
               List.filter
-                (fun (current : Validator_admission.candidate) ->
+                (fun (current : Validator_entry.entry) ->
                   not
                     (String.equal
-                       current.Validator_admission.address
+                       current.Validator_entry.address
                        address))
-                registry.candidates;
+                registry.entries;
             slashes = registry.slashes;
           },
-          candidate.bond)
+          entry.bond)
 
 let evidence_fresh ~current_epoch ~evidence_epochs record =
   Int64.compare record.evidence_epoch current_epoch <= 0
@@ -344,23 +344,23 @@ let apply_slash ~current_epoch ~evidence_epochs
   else
     match find evidence.offender registry with
     | None -> Error "validator bond not found"
-    | Some candidate ->
+    | Some entry ->
       let record = {
         id = evidence.id;
         offender = evidence.offender;
         evidence_epoch = evidence.evidence_epoch;
         applied_epoch = current_epoch;
-        amount = candidate.Validator_admission.bond;
+        amount = entry.Validator_entry.bond;
       } in
       let next = {
-        candidates =
+        entries =
           List.filter
-            (fun (current : Validator_admission.candidate) ->
+            (fun (current : Validator_entry.entry) ->
               not
                 (String.equal
-                   current.Validator_admission.address
+                   current.Validator_entry.address
                    evidence.offender))
-            registry.candidates;
+            registry.entries;
         slashes = canonical_slashes (record :: retained);
       } in
       begin
@@ -370,29 +370,29 @@ let apply_slash ~current_epoch ~evidence_epochs
       end
 
 let snapshot parameters ~activate_epoch (registry : t) =
-  Validator_admission.snapshot
+  Validator_entry.snapshot
     parameters
     ~activate_epoch
-    registry.candidates
+    registry.entries
 
-let candidate_to_yojson (candidate : Validator_admission.candidate) =
+let entry_to_yojson (entry : Validator_entry.entry) =
   `Assoc [
-    "address", `String candidate.Validator_admission.address;
+    "address", `String entry.Validator_entry.address;
     "consensus_pubkey",
-      `String (Base64.encode_exn candidate.Validator_admission.pubkey);
-    "bond", `String (Z.to_string candidate.Validator_admission.bond);
+      `String (Base64.encode_exn entry.Validator_entry.pubkey);
+    "bond", `String (Z.to_string entry.Validator_entry.bond);
     "bonded_epoch",
-      `String (Int64.to_string candidate.Validator_admission.bonded_epoch);
+      `String (Int64.to_string entry.Validator_entry.bonded_epoch);
     "ready_epoch",
       Option.fold
         ~none:`Null
         ~some:(fun value -> `String (Int64.to_string value))
-        candidate.Validator_admission.ready_epoch;
+        entry.Validator_entry.ready_epoch;
     "exit_epoch",
       Option.fold
         ~none:`Null
         ~some:(fun value -> `String (Int64.to_string value))
-        candidate.Validator_admission.exit_epoch;
+        entry.Validator_entry.exit_epoch;
   ]
 
 let slash_to_yojson record =
@@ -468,7 +468,7 @@ let parse_bond = function
     end
   | _ -> Error "validator bond must be string"
 
-let candidate_of_yojson = function
+let entry_of_yojson = function
   | `Assoc fields ->
     begin
       match
@@ -494,7 +494,7 @@ let candidate_of_yojson = function
             parse_optional_int64 "validator exit epoch" exit_epoch_json
           with
           | Ok pubkey, Ok bond, Ok bonded_epoch, Ok ready_epoch, Ok exit_epoch ->
-            Ok Validator_admission.{
+            Ok Validator_entry.{
               address;
               pubkey;
               bond;
@@ -553,7 +553,7 @@ let to_yojson registry =
   `Assoc [
     "standard", `String Validator_policy.standard_name;
     "candidates",
-      `List (List.map candidate_to_yojson (canonical registry.candidates));
+      `List (List.map entry_to_yojson (canonical registry.entries));
     "slashes",
       `List (List.map slash_to_yojson (canonical_slashes registry.slashes));
   ]
@@ -568,13 +568,13 @@ let of_yojson = function
       with
       | Some (`String standard), Some (`List values), slashes_json
           when String.equal standard Validator_policy.standard_name ->
-        let parsed_candidates =
+        let parsed_entries =
           List.fold_left
             (fun result value ->
-              match result, candidate_of_yojson value with
+              match result, entry_of_yojson value with
               | (Error _ as error), _ -> error
               | _, (Error _ as error) -> error
-              | Ok candidates, Ok candidate -> Ok (candidate :: candidates))
+              | Ok entries, Ok entry -> Ok (entry :: entries))
             (Ok [])
             values
         in
@@ -593,12 +593,12 @@ let of_yojson = function
           | Some _ -> Error "validator slashes must be list"
         in
         begin
-          match parsed_candidates, parsed_slashes with
+          match parsed_entries, parsed_slashes with
           | (Error _ as error), _
           | _, (Error _ as error) -> error
-          | Ok candidates, Ok slashes ->
+          | Ok entries, Ok slashes ->
             let registry = {
-              candidates = canonical candidates;
+              entries = canonical entries;
               slashes = canonical_slashes slashes;
             } in
             begin

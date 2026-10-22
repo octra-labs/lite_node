@@ -27,8 +27,8 @@ let digest value = Digestif.SHA256.(digest_string value |> to_hex)
 
 let compiler_files () =
   let files = [
-    "prior_compile.ml", "a087065e9c7adbd47578d4005a442fcbf9866d4774f14e7030591505a086213e";
-    "prior_gen.ml", "b0c5d166fb4b0a7615d28c6e65d01aae6fb89d4897f8079673c002da3cdbe631";
+    "prior_compile.ml", "a817462c2a4a84a0fef469468500092d367069f605dc57303614518e1d1ebf1f";
+    "prior_gen.ml", "7ac678f118860a666095d8664c5e176fdd0ce24daf88b64deb58dee5fcb6b7b2";
     "prior_lang.ml", "8b57b70ca6ef70f759545aa6b9b874afa26992ea70ee9e6e09adc07f1a2635fb";
     "prior_lex.ml", "ccd669e0f5b5ad3b853b5552c2f5db6ca06c63707078319cb31d6a02b64488fc";
     "prior_parse.ml", "8a3f43a05e9df9defa4b42cf92268a7adbab6a97101ec1ae9e5c6eabe5cafc88";
@@ -52,7 +52,7 @@ let compiler_files () =
       else n
     in
     let body = String.sub body 0 (end_at (String.length body)) in
-    expect (name ^ " differs from frozen compiler") (digest body = expected)
+    expect (name ^ " differs from reviewed compiler") (digest body = expected)
   ) files
 
 let constant_header () =

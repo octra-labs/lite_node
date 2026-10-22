@@ -125,7 +125,7 @@ val kat_state : Ledger.t -> string -> kat
 val backfill_kat : Ledger.t -> string -> unit
 
 val encrypt_plan :
-  ?math:bool ->
+  keyed:bool -> ?math:bool ->
   field_policy:field_policy ->
   strict:bool ->
   ?worker_priority:Compute_pool.priority ->
@@ -143,7 +143,7 @@ val prepare_encrypt_plan :
   (balance_plan, failure) result Lwt.t
 
 val decrypt_plan :
-  ?math:bool ->
+  keyed:bool -> ?math:bool ->
   field_policy:field_policy ->
   strict:bool ->
   ?worker_priority:Compute_pool.priority ->
@@ -173,7 +173,7 @@ val apply_decrypt_plan :
   (balance_plan, failure) result Lwt.t
 
 val apply_encrypt :
-  ?math:bool ->
+  keyed:bool -> ?math:bool ->
   field_policy:field_policy ->
   strict:bool ->
   ?result_policy:Private_result_policy.t ->
@@ -182,7 +182,7 @@ val apply_encrypt :
   (balance_plan, failure) result Lwt.t
 
 val apply_decrypt :
-  ?math:bool ->
+  keyed:bool -> ?math:bool ->
   field_policy:field_policy ->
   strict:bool ->
   ?result_policy:Private_result_policy.t ->
@@ -191,7 +191,7 @@ val apply_decrypt :
   (balance_plan, failure) result Lwt.t
 
 val key_switch_plan :
-  ?math:bool ->
+  keyed:bool -> ?math:bool ->
   ?cipher_mode:Rule_graph.mode ->
   field_policy:field_policy ->
   strict:bool ->
@@ -201,7 +201,7 @@ val key_switch_plan :
   (key_switch_plan, failure) result Lwt.t
 
 val preverify_key_switch_artifact :
-  ?math:bool ->
+  keyed:bool -> ?math:bool ->
   ?cipher_mode:Rule_graph.mode ->
   field_policy:field_policy ->
   strict:bool ->
@@ -217,7 +217,7 @@ val private_failure_retryable : failure -> bool
 val failure_action : failure -> failure_action
 
 val bind_key_switch_artifact :
-  ?math:bool ->
+  keyed:bool -> ?math:bool ->
   ?cipher_mode:Rule_graph.mode ->
   field_policy:field_policy ->
   strict:bool ->
@@ -227,7 +227,7 @@ val bind_key_switch_artifact :
   key_switch_binding Lwt.t
 
 val preverify_private_artifact :
-  ?math:bool ->
+  keyed:bool -> ?math:bool ->
   field_policy:field_policy ->
   strict:bool ->
   ?worker_priority:Compute_pool.priority ->
@@ -237,7 +237,7 @@ val preverify_private_artifact :
   (private_artifact, failure) result Lwt.t
 
 val verify_private :
-  ?math:bool ->
+  keyed:bool -> ?math:bool ->
   field_policy:field_policy ->
   strict:bool ->
   ?worker_priority:Compute_pool.priority ->
@@ -247,7 +247,7 @@ val verify_private :
   (prepared, private_rejection) result Lwt.t
 
 val bind_private_artifact :
-  ?math:bool ->
+  keyed:bool -> ?math:bool ->
   field_policy:field_policy ->
   strict:bool ->
   ?result_policy:Private_result_policy.t ->
@@ -265,7 +265,7 @@ val prepared_current :
   bool Lwt.t
 
 val key_switch_cache_key :
-  ?math:bool ->
+  keyed:bool -> ?math:bool ->
   ?cipher_mode:Rule_graph.mode ->
   field_policy ->
   bool ->
@@ -274,7 +274,7 @@ val key_switch_cache_key :
   string Lwt.t
 
 val prepare_key_switch_plan :
-  ?math:bool ->
+  keyed:bool -> ?math:bool ->
   ?cipher_mode:Rule_graph.mode ->
   field_policy:field_policy ->
   ?cap:bool ->
@@ -302,7 +302,7 @@ val key_switch_requests_legacy_audit :
   bool
 
 val apply_key_switch :
-  ?math:bool ->
+  keyed:bool -> ?math:bool ->
   ?cipher_mode:Rule_graph.mode ->
   field_policy:field_policy ->
   strict:bool ->
@@ -336,7 +336,7 @@ val prepare_stealth_plan :
   (stealth_plan, failure) result Lwt.t
 
 val stealth_inline_range :
-  ?math:bool ->
+  keyed:bool -> ?math:bool ->
   strict:bool ->
   ?worker_priority:Compute_pool.priority ->
   Ledger.t ->
@@ -349,7 +349,7 @@ val stealth_accept_range :
   (unit, failure) result
 
 val stealth_binding :
-  ?math:bool ->
+  keyed:bool -> ?math:bool ->
   field_policy:field_policy ->
   strict:bool ->
   ?worker_priority:Compute_pool.priority ->
@@ -359,7 +359,7 @@ val stealth_binding :
   (unit, failure) result Lwt.t
 
 val claim_plan :
-  ?math:bool ->
+  keyed:bool -> ?math:bool ->
   field_policy:field_policy ->
   strict:bool ->
   ?worker_priority:Compute_pool.priority ->

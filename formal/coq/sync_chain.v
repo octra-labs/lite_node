@@ -439,3 +439,211 @@ Print Assumptions failed_keeps_image.
 Print Assumptions stable_head.
 
 End Capture_cycle.
+
+Module Single_source.
+
+Inductive reward_rule := Full_set | Parent | Prior_without_parent.
+
+Record entry := Entry {
+  rule : reward_rule;
+  supplied : nat;
+  expected : nat;
+  certificate_ok : bool
+}.
+
+Definition check_reward (value : entry) :=
+  match rule value with
+  | Prior_without_parent => false
+  | Full_set | Parent => supplied value =? expected value
+  end.
+
+Definition check_entry (value : entry) :=
+  andb (certificate_ok value) (check_reward value).
+
+Fixpoint prefix (values : list entry) : list entry :=
+  match values with
+  | [] => []
+  | value :: rest =>
+    if check_entry value then value :: prefix rest else []
+  end.
+
+Lemma reward_proven : forall value,
+  check_reward value = true ->
+  rule value <> Prior_without_parent /\ supplied value = expected value.
+Proof.
+  intros [kind actual wanted checked]. unfold check_reward. simpl.
+  destruct kind; simpl; intros accepted.
+  - apply Nat.eqb_eq in accepted. split; [discriminate | exact accepted].
+  - apply Nat.eqb_eq in accepted. split; [discriminate | exact accepted].
+  - discriminate.
+Qed.
+
+Theorem prefix_proven : forall values value,
+  In value (prefix values) ->
+  certificate_ok value = true /\ rule value <> Prior_without_parent /\
+  supplied value = expected value.
+Proof.
+  induction values as [|first rest step]; intros value present; simpl in present.
+  - contradiction.
+  - destruct (check_entry first) eqn:checked; [|contradiction].
+    destruct present as [same | later].
+    + subst. unfold check_entry in checked.
+      apply Bool.andb_true_iff in checked as [signed reward].
+      apply reward_proven in reward. tauto.
+    + apply step. exact later.
+Qed.
+
+Theorem unproved_stops : forall before actual wanted signed after,
+  Forall (fun value => check_entry value = true) before ->
+  prefix (before ++ Entry Prior_without_parent actual wanted signed :: after)
+  = before.
+Proof.
+  induction before as [|first rest step]; intros actual wanted signed after checked.
+  - simpl. destruct signed; reflexivity.
+  - inversion checked; subst. simpl. rewrite H1. f_equal. apply step. assumption.
+Qed.
+
+Theorem proved_passes : forall values,
+  Forall (fun value => certificate_ok value = true /\
+    rule value <> Prior_without_parent /\ supplied value = expected value) values ->
+  prefix values = values.
+Proof.
+  induction values as [|value rest step]; intros valid.
+  - reflexivity.
+  - inversion valid as [|first remaining proof following]; subst.
+    destruct proof as [cert [kind_ok amount]].
+    assert (check_entry value = true) as checked.
+    { unfold check_entry. rewrite cert. simpl. unfold check_reward.
+      destruct (rule value); try contradiction; rewrite amount, Nat.eqb_refl;
+        reflexivity. }
+    simpl. rewrite checked. f_equal. apply step. exact following.
+Qed.
+
+Print Assumptions prefix_proven.
+Print Assumptions unproved_stops.
+Print Assumptions proved_passes.
+
+End Single_source.
+
+Module Request_life.
+
+Record state := State { open : bool; deadline : nat }.
+Inductive event := Fetch (now : nat) | Reply (now : nat) | Close.
+Inductive effect := Send | Accept.
+
+Definition step (value : state) (input : event) : state * list effect :=
+  match input with
+  | Close => (State false (deadline value), [])
+  | Fetch now | Reply now =>
+    if andb (open value) (now <? deadline value) then
+      (value, [match input with Fetch _ => Send | _ => Accept end])
+    else (State false (deadline value), [])
+  end.
+
+Fixpoint run (value : state) (inputs : list event) : state :=
+  match inputs with
+  | [] => value
+  | input :: rest => run (fst (step value input)) rest
+  end.
+
+Lemma step_deadline : forall value input,
+  deadline (fst (step value input)) = deadline value.
+Proof.
+  intros [active limit] [now|now|]; simpl; try reflexivity;
+    destruct active; destruct (now <? limit); reflexivity.
+Qed.
+
+Theorem deadline_retained : forall inputs value,
+  deadline (run value inputs) = deadline value.
+Proof.
+  induction inputs as [|input rest next]; intros value; simpl; [reflexivity|].
+  rewrite next. apply step_deadline.
+Qed.
+
+Theorem closed_quiet : forall limit input,
+  step (State false limit) input = (State false limit, []).
+Proof. intros limit [now|now|]; reflexivity. Qed.
+
+Theorem closed_stays_closed : forall inputs limit,
+  run (State false limit) inputs = State false limit.
+Proof.
+  induction inputs as [|input rest next]; intros limit; simpl; [reflexivity|].
+  rewrite closed_quiet. apply next.
+Qed.
+
+Theorem expired_quiet : forall value now,
+  deadline value <= now ->
+  snd (step value (Fetch now)) = [] /\ snd (step value (Reply now)) = [].
+Proof.
+  intros [active limit] now expired. simpl in *.
+  assert (now <? limit = false) as late by (apply Nat.ltb_ge; exact expired).
+  rewrite late. destruct active; simpl; auto.
+Qed.
+
+Print Assumptions deadline_retained.
+Print Assumptions closed_quiet.
+Print Assumptions closed_stays_closed.
+Print Assumptions expired_quiet.
+
+End Request_life.
+
+Module Local_relief.
+
+Record link := Link { source : nat; target : nat; checked : bool }.
+
+Definition step current item :=
+  if andb (current =? source item) (checked item) then Some (target item) else None.
+
+Fixpoint run current links :=
+  match links with
+  | [] => Some current
+  | item :: rest => match step current item with
+    | Some next => run next rest | None => None end
+  end.
+
+Theorem join_paths prefix suffix start middle finish :
+  run start prefix = Some middle -> run middle suffix = Some finish ->
+  run start (prefix ++ suffix) = Some finish.
+Proof.
+  revert start. induction prefix as [|item rest ih]; intros start first second; simpl in *.
+  - inversion first; subst. exact second.
+  - destruct (step start item) as [next|] eqn:valid; [|discriminate].
+    eapply ih; eauto.
+Qed.
+
+Theorem accepted_path_checks_source current item rest finish :
+  run current (item :: rest) = Some finish ->
+  current = source item /\ checked item = true.
+Proof.
+  simpl. unfold step. destruct (andb (current =? source item) (checked item)) eqn:yes;
+    [|discriminate].
+  intros _. apply Bool.andb_true_iff in yes as [same proof].
+  apply Nat.eqb_eq in same. auto.
+Qed.
+
+Theorem local_proof_does_not_set_trust :
+  run 1 [Link 1 2 true] = Some 2 /\ run 0 [Link 1 2 true] = None.
+Proof. split; reflexivity. Qed.
+
+Theorem broken_prefix_refuses prefix suffix start :
+  run start prefix = None -> run start (prefix ++ suffix) = None.
+Proof.
+  revert start. induction prefix as [|item rest ih]; intros start failed; simpl in *.
+  - discriminate.
+  - destruct (step start item) as [next|]; [apply ih; exact failed|reflexivity].
+Qed.
+
+Theorem saved_step_checks prefix start local finish :
+  run start prefix = Some (source local) -> checked local = true ->
+  run start (prefix ++ local :: finish) = run (target local) finish.
+Proof.
+  revert start. induction prefix as [|item rest ih]; intros start before valid; simpl in *.
+  - inversion before; subst. unfold step. rewrite Nat.eqb_refl, valid. reflexivity.
+  - destruct (step start item) as [next|]; [apply ih; assumption|discriminate].
+Qed.
+
+Print Assumptions join_paths.
+Print Assumptions accepted_path_checks_source.
+Print Assumptions broken_prefix_refuses.
+Print Assumptions saved_step_checks.
+End Local_relief.

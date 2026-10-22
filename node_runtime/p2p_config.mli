@@ -1,6 +1,11 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
+val standard_profiles :
+  ?policy:Octra_consensus.C_quorum_policy.t -> chain_id:string ->
+  ?program_trust_hash:string -> (string -> string option) ->
+  Octra_net.P2p_swarm.profile list
+
 type t = {
   config_hash : string;
   binary_hash : string;

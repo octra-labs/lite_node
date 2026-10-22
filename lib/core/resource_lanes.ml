@@ -245,7 +245,7 @@ let over b u =
 let within b u =
   over b u = None
 
-let circle_admission tx =
+let circle_check tx =
   if tx.Transaction.op_type <> Transaction.CircleCall then Ok ()
   else match over (default_budget Circle_compute) (cost tx) with
     | None -> Ok ()
@@ -258,7 +258,7 @@ let queue_check ~mode tx =
     | None -> Ok ()
     | Some reason -> Error (to_string lane ^ " resource limit: " ^ reason)
     end
-  | _ -> circle_admission tx
+  | _ -> circle_check tx
 
 let admit b u tx =
   let next = add u (cost tx) in

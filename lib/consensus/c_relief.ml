@@ -223,5 +223,14 @@ let restore ~chain_id ~height ~current ~activate_epoch ~target ~fingerprint
         | Error _ as error -> error
         | Ok (round, _) when round <> mark.round ->
           Error "validator relief marker round differs"
-        | Ok _ -> Ok (Some target)
+        | Ok _ ->
+          let target =
+            if height = mark.height
+              && C_quorum_policy.linear_weight ~chain_id ~epoch_id:height then
+              let entries = C_types.weights_of_set current
+                |> List.filter (fun (member, _) ->
+                  not (C_types.is_validator target member.C_types.address)) in
+              {target with C_types.authors = Some (height, entries)}
+            else target in
+          Ok (Some target)
       end

@@ -117,14 +117,15 @@ let run ?compute deps sender_txs =
         tag
         reason
     in
-    let proof_mode, program_mode, program_overlap, math, fhe_work, wasm_float, proof_exec, vm_bytes =
+    let proof_mode, program_mode, program_overlap, math, fhe_work, wasm_float, proof_exec, proof_key, vm_bytes, program_records =
       match deps.fold (deps.current_epoch ()) with
       | Ok fold ->
         fold.Octra_core.Epoch_exec.standard_mode, fold.program_mode,
         fold.program_overlap, fold.math, fold.fhe_work, fold.wasm_float, fold.proof_exec,
-        fold.vm_bytes
+        fold.proof_key, fold.vm_bytes, fold.program_records
       | Error reason -> failwith reason
     in
+    let keyed = proof_key = Octra_core.Rule_graph.Active in
     let vm_tx_deps =
       Consensus_epoch_vm_shell.make_live_sender_vm_tx_deps
         Consensus_epoch_vm_shell.{
@@ -141,7 +142,9 @@ let run ?compute deps sender_txs =
           program_overlap;
           fhe_work;
           proof_exec;
+          proof_key;
           vm_bytes;
+          program_records;
           wasm_float;
           math;
           current_epoch = deps.current_epoch;
@@ -187,7 +190,7 @@ let run ?compute deps sender_txs =
     in
     let handle_circle_tx () =
       let* admitted =
-        Consensus_circle_code_admission.admit
+        Consensus_circle_code_check.admit
           ~resource_errors:(proof_exec = Octra_core.Rule_graph.Active)
           ~store:deps.store
           ~program_trust:deps.program_trust
@@ -251,7 +254,7 @@ let run ?compute deps sender_txs =
                 (balance_op_deps
                    ~gate:fhe_gate
                    ~plan:(fun () ->
-                     Octra_core.Private_ledger.apply_encrypt ~math
+                     Octra_core.Private_ledger.apply_encrypt ~keyed:(proof_key = Octra_core.Rule_graph.Active) ~math
                        ~field_policy:deps.private_field_policy
                        ~strict:(proof_mode = Octra_core.Rule_graph.Active)
                        ~result_policy:
@@ -278,7 +281,7 @@ let run ?compute deps sender_txs =
                        fhe_gate ();
                      ])
                    ~plan:(fun () ->
-                     Octra_core.Private_ledger.apply_decrypt ~math
+                     Octra_core.Private_ledger.apply_decrypt ~keyed:(proof_key = Octra_core.Rule_graph.Active) ~math
                        ~field_policy:deps.private_field_policy
                        ~strict:(proof_mode = Octra_core.Rule_graph.Active)
                        ~result_policy:
@@ -294,6 +297,7 @@ let run ?compute deps sender_txs =
                   field_policy = deps.private_field_policy;
                   strict = (proof_mode = Octra_core.Rule_graph.Active);
                   math;
+                  keyed;
                   cipher_mode = deps.cipher_mode;
                   legacy_replay = (fun address ->
                     let cipher =
@@ -328,6 +332,7 @@ let run ?compute deps sender_txs =
                   field_policy = deps.private_field_policy;
                   strict = (proof_mode = Octra_core.Rule_graph.Active);
                   math;
+                  keyed;
                   stealth_count = !(deps.stealth_in_epoch_counter);
                   max_stealth_per_epoch = deps.max_stealth_per_epoch;
                   max_stealth_defer = deps.max_stealth_defer;
@@ -363,6 +368,7 @@ let run ?compute deps sender_txs =
                   field_policy = deps.private_field_policy;
                   strict = (proof_mode = Octra_core.Rule_graph.Active);
                   math;
+                  keyed;
                   private_result_policy = deps.private_result_policy;
                   current_epoch = deps.current_epoch;
                   trace_cipher = trace_enc_balance ~short:deps.short_addr;
@@ -389,6 +395,7 @@ let run ?compute deps sender_txs =
               | Error (tag, reason) -> reject_current_tx tag reason)
             | ContractUpgrade ->
               Consensus_epoch_vm_shell.run_program_upgrade_tx
+                ~records:program_records
                 vm_tx_deps.runtime
                 ~trusted_program_keys:deps.program_trust
                 ~program_journal:vm_value.program_journal

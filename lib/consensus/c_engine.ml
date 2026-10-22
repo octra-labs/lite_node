@@ -86,11 +86,11 @@ let weight_for_pid vs pid =
   | Some weight -> weight
   | None -> Z.zero
 
-let nil_quorum votes ~chain_id ~epoch_id ~validator_set =
-  C_types.quorum_reached_at ~chain_id ~epoch_id validator_set
+let nil_quorum ?policy votes ~chain_id ~epoch_id ~validator_set =
+  C_types.quorum_reached_at ?policy ~chain_id ~epoch_id validator_set
     ~signer_count:votes.count_nil ~signed_weight:votes.weight_nil
 
-let add_vote vs (v : vote) ~validator_set =
+let add_vote ?policy vs (v : vote) ~validator_set =
   if Hashtbl.mem vs.votes v.validator then `Duplicate
   else
     match C_types.weight_of_addr validator_set v.validator with
@@ -103,9 +103,10 @@ let add_vote vs (v : vote) ~validator_set =
       if is_nil then begin
         vs.count_nil <- vs.count_nil + 1;
         vs.weight_nil <- Z.add vs.weight_nil weight;
-        if nil_quorum vs ~chain_id:v.chain_id ~epoch_id:v.epoch_id ~validator_set then
+        if nil_quorum ?policy vs ~chain_id:v.chain_id ~epoch_id:v.epoch_id ~validator_set then
           `QuorumOf v.proposal_id
         else if C_types.quorum_reached_at
+             ?policy
              ~chain_id:v.chain_id
              ~epoch_id:v.epoch_id
              validator_set
@@ -120,6 +121,7 @@ let add_vote vs (v : vote) ~validator_set =
         Hashtbl.replace vs.by_pid v.proposal_id count;
         Hashtbl.replace vs.by_pid_weight v.proposal_id proposal_weight;
         if C_types.quorum_reached_at
+             ?policy
              ~chain_id:v.chain_id
              ~epoch_id:v.epoch_id
              validator_set
@@ -127,6 +129,7 @@ let add_vote vs (v : vote) ~validator_set =
              ~signed_weight:proposal_weight then
           `QuorumOf v.proposal_id
         else if C_types.quorum_reached_at
+                  ?policy
                   ~chain_id:v.chain_id
                   ~epoch_id:v.epoch_id
                   validator_set
@@ -215,11 +218,13 @@ type proposal_cache_entry = {
 
 type t = {
   chain_id : string;
+  policy : C_quorum_policy.t;
   my_addr : string;
   mutable vs : validator_set;
   mutable state : engine_state;
   mutable prevotes : vote_set;
   mutable prevotes_by_round : (int, vote_set) Hashtbl.t;
+  mutable source_prevotes : (int, vote_set) Hashtbl.t;
   mutable precommits : vote_set;
   mutable precommits_by_round : (int, vote_set) Hashtbl.t;
   mutable current_proposal : propose option;
@@ -237,7 +242,7 @@ type t = {
   mutable round_skip_ready : unit -> bool;
 }
 
-let create ~chain_id ~my_addr ~validator_set ~start_height ~can_vote =
+let create_for_policy policy ~chain_id ~my_addr ~validator_set ~start_height ~can_vote =
   let prevotes = create_vote_set () in
   let prevotes_by_round = Hashtbl.create 8 in
   let precommits = create_vote_set () in
@@ -246,11 +251,13 @@ let create ~chain_id ~my_addr ~validator_set ~start_height ~can_vote =
   Hashtbl.add precommits_by_round 0 precommits;
   {
     chain_id;
+    policy;
     my_addr;
     vs = validator_set;
     state = initial_engine_state start_height;
     prevotes;
     prevotes_by_round;
+    source_prevotes = Hashtbl.create 8;
     precommits;
     precommits_by_round;
     current_proposal = None;
@@ -268,14 +275,15 @@ let create ~chain_id ~my_addr ~validator_set ~start_height ~can_vote =
     round_skip_ready = (fun () -> true);
   }
 
+let create ~chain_id ~my_addr ~validator_set ~start_height ~can_vote =
+  create_for_policy (C_quorum_policy.for_chain chain_id)
+    ~chain_id ~my_addr ~validator_set ~start_height ~can_vote
+
 let set_round_skip_ready t ready =
   t.round_skip_ready <- ready
 
 let round_skip_ready t =
   try t.round_skip_ready () with _ -> false
-
-let replace_validator_set t validator_set =
-  t.vs <- validator_set
 
 let is_pristine t =
   t.generation = 0
@@ -318,7 +326,7 @@ let find_parent_commit t pid =
   | None -> None
 
 let promote_known_header t round proposal_id =
-  if round > t.state.valid_round then
+  if round > max t.state.valid_round t.state.locked_round then
     match find_header t proposal_id with
     | None -> ()
     | Some header ->
@@ -414,7 +422,44 @@ let conflicting_vote t (vote : vote) =
       | Some prior when prior.proposal_id <> vote.proposal_id -> Some prior
       | _ -> None
 
+let lock_allows t (proposal_id : string) (valid_round : int option) : bool =
+  if t.state.locked_round < 0 then true
+  else
+    let locked_pid = match t.state.locked_value with
+      | Some h -> C_hash.proposal_id h
+      | None -> ""
+    in
+    if proposal_id = locked_pid then true
+    else
+      match valid_round with
+      | None -> false
+      | Some vr ->
+        if vr <= t.state.locked_round then false
+        else if vr >= t.state.round then false
+        else
+          match Hashtbl.find_opt t.polc_by_round vr with
+          | Some pid when pid = proposal_id -> true
+          | _ -> false
+
+let local_prevote t proposal_id =
+  let valid_round =
+    Option.bind (find_proposal_message t ~proposal_id ~round:t.state.round)
+      (fun proposal -> proposal.valid_round)
+  in
+  if Octra_net.Hash_domain.is_nil proposal_id
+     || lock_allows t proposal_id valid_round then proposal_id
+  else begin
+    log_node t.my_addr
+      "event = refuse_local_prevote reason = lock height = %Ld round = %d"
+      t.state.height t.state.round;
+    Octra_net.Hash_domain.nil_hash
+  end
+
 let cast_local_vote t ~sign_fn ~vote_type ~proposal_id =
+  let proposal_id = match vote_type with
+    | Prevote -> local_prevote t proposal_id
+    | Precommit -> proposal_id
+  in
   let vs = vote_set_for t vote_type in
   match Hashtbl.find_opt vs.votes t.my_addr with
   | Some prior when prior.proposal_id = proposal_id ->
@@ -458,7 +503,7 @@ let cast_local_vote t ~sign_fn ~vote_type ~proposal_id =
     } in
     let sign_bytes = C_hash.vote_sign_bytes vote in
     let vote = { vote with signature = sign_fn sign_bytes } in
-    let result = add_vote vs vote ~validator_set:t.vs in
+    let result = add_vote ~policy:t.policy vs vote ~validator_set:t.vs in
     emit t (SendVote (vote, proposal));
     LocalVoteCast result
 
@@ -616,6 +661,7 @@ let prune_round_history t =
       table
   in
   prune t.prevotes_by_round;
+  prune t.source_prevotes;
   prune t.precommits_by_round
 
 let start_round t round =
@@ -645,22 +691,22 @@ let realign_round t round =
   t.generation <- t.generation + 1;
   start_round t round
 
-let project_votes validator_set votes =
+let project_votes ?policy validator_set votes =
   let projected = create_vote_set () in
   Hashtbl.iter
-    (fun _ vote -> ignore (add_vote projected vote ~validator_set))
+    (fun _ vote -> ignore (add_vote ?policy projected vote ~validator_set))
     votes.votes;
   projected
 
-let project_rounds validator_set rounds =
+let project_rounds ?policy validator_set rounds =
   let projected = Hashtbl.create (Hashtbl.length rounds) in
   Hashtbl.iter
     (fun round votes ->
-      Hashtbl.add projected round (project_votes validator_set votes))
+      Hashtbl.add projected round (project_votes ?policy validator_set votes))
     rounds;
   projected
 
-let quorum_pid ~chain_id ~epoch_id validator_set votes =
+let quorum_pid ?policy ~chain_id ~epoch_id validator_set votes =
   Hashtbl.fold
     (fun proposal_id signed_weight found ->
       let signer_count = count_for_pid votes proposal_id in
@@ -668,6 +714,7 @@ let quorum_pid ~chain_id ~epoch_id validator_set votes =
         Octra_net.Hash_domain.is_nil proposal_id
         || not
              (C_types.quorum_reached_at
+                ?policy
                 ~chain_id
                 ~epoch_id
                 validator_set
@@ -690,6 +737,7 @@ let projected_polc t validator_set rounds =
       Option.iter
         (fun proposal_id -> Hashtbl.add polc round proposal_id)
         (quorum_pid
+           ~policy:t.policy
            ~chain_id:t.chain_id
            ~epoch_id:t.state.height
            validator_set
@@ -702,6 +750,7 @@ let projected_finalize t validator_set rounds =
     (fun round votes found ->
       match
         quorum_pid
+          ~policy:t.policy
           ~chain_id:t.chain_id
           ~epoch_id:t.state.height
           validator_set
@@ -718,19 +767,29 @@ let projected_finalize t validator_set rounds =
     rounds
     None
 
-let reconfigure_validator_set t ~round validator_set =
-  if round <= t.state.round then
-    invalid_arg "consensus reconfiguration round must advance";
-  let prevotes_by_round = project_rounds validator_set t.prevotes_by_round in
-  let precommits_by_round = project_rounds validator_set t.precommits_by_round in
-  let polc_by_round = projected_polc t validator_set prevotes_by_round in
-  let finalize = projected_finalize t validator_set precommits_by_round in
+let projected_state t validator_set =
+  let prevotes = project_rounds ~policy:t.policy validator_set t.prevotes_by_round in
+  let precommits = project_rounds ~policy:t.policy validator_set t.precommits_by_round in
+  let polc = projected_polc t validator_set prevotes in
+  (match C_types.source_set ~chain_id:t.chain_id ~epoch_id:t.state.height validator_set with
+   | None -> ()
+   | Some source ->
+     Hashtbl.iter (fun round votes ->
+       let saved = match Hashtbl.find_opt t.source_prevotes round with
+         | Some saved -> saved
+         | None -> let saved = create_vote_set () in
+           Hashtbl.add t.source_prevotes round saved; saved in
+       Hashtbl.iter (fun _ vote ->
+         ignore (add_vote ~policy:t.policy saved vote ~validator_set:source)) votes.votes)
+       t.prevotes_by_round;
+     Hashtbl.iter (fun round pid -> Hashtbl.replace polc round pid)
+       (projected_polc t source t.source_prevotes));
   let valid =
     match t.state.valid_value with
     | Some header when t.state.valid_round >= 0 ->
       begin
-        match Hashtbl.find_opt polc_by_round t.state.valid_round with
-        | Some proposal_id when String.equal proposal_id (C_hash.proposal_id header) ->
+        match Hashtbl.find_opt polc t.state.valid_round with
+        | Some pid when String.equal pid (C_hash.proposal_id header) ->
           t.state.valid_round, Some header
         | Some _
         | None -> -1, None
@@ -738,6 +797,39 @@ let reconfigure_validator_set t ~round validator_set =
     | Some _
     | None -> -1, None
   in
+  let valid =
+    if fst valid < t.state.locked_round then
+      t.state.locked_round, t.state.locked_value
+    else valid
+  in
+  prevotes, precommits, polc, valid
+
+let replace_validator_set t validator_set =
+  if not (String.equal
+      (C_config.validator_set_hash t.vs)
+      (C_config.validator_set_hash validator_set)) then begin
+    let prevotes, precommits, polc, valid = projected_state t validator_set in
+    t.prevotes_by_round <- prevotes;
+    t.precommits_by_round <- precommits;
+    let current rounds = match Hashtbl.find_opt rounds t.state.round with
+      | Some votes -> votes
+      | None -> let votes = create_vote_set () in
+        Hashtbl.add rounds t.state.round votes; votes in
+    t.prevotes <- current prevotes;
+    t.precommits <- current precommits;
+    t.polc_by_round <- polc;
+    t.polc_requests <- Hashtbl.create 4;
+    t.higher_round_evidence <- Hashtbl.create 4;
+    t.state <- {t.state with valid_round = fst valid; valid_value = snd valid}
+  end;
+  t.vs <- validator_set
+
+let reconfigure_validator_set t ~round validator_set =
+  if round <= t.state.round then
+    invalid_arg "consensus reconfiguration round must advance";
+  let prevotes_by_round, precommits_by_round, polc_by_round, valid =
+    projected_state t validator_set in
+  let finalize = projected_finalize t validator_set precommits_by_round in
   t.vs <- validator_set;
   t.generation <- t.generation + 1;
   t.outputs <- [];
@@ -770,17 +862,35 @@ let reconfigure_validator_set t ~round validator_set =
   start_round t round
 
 let start_height t height =
+  let same_height = Int64.equal height t.state.height in
+  let round =
+    if not same_height then 0
+    else
+      let after_votes rounds minimum =
+        Hashtbl.fold (fun round votes minimum ->
+          if Hashtbl.mem votes.votes t.my_addr then max minimum (round + 1)
+          else minimum) rounds minimum
+      in
+      max t.state.round (t.state.locked_round + 1)
+      |> after_votes t.prevotes_by_round
+      |> after_votes t.precommits_by_round
+  in
   t.generation <- t.generation + 1;
   t.outputs <- [];
-  t.state <- initial_engine_state height;
-  t.proposal_cache <- Hashtbl.create 8;
-  t.proposal_messages <- Hashtbl.create 8;
-  t.polc_by_round <- Hashtbl.create 4;
+  if not same_height then begin
+    t.state <- initial_engine_state height;
+    t.proposal_cache <- Hashtbl.create 8;
+    t.proposal_messages <- Hashtbl.create 8
+  end;
   t.polc_requests <- Hashtbl.create 4;
-  t.prevotes_by_round <- Hashtbl.create 8;
-  t.precommits_by_round <- Hashtbl.create 8;
+  if not same_height then begin
+    t.polc_by_round <- Hashtbl.create 4;
+    t.prevotes_by_round <- Hashtbl.create 8;
+    t.source_prevotes <- Hashtbl.create 8;
+    t.precommits_by_round <- Hashtbl.create 8
+  end;
   t.higher_round_evidence <- Hashtbl.create 4;
-  start_round t 0
+  start_round t round
 
 let polc_matches t ~round ~proposal_id =
   match Hashtbl.find_opt t.polc_by_round round with
@@ -791,13 +901,21 @@ let polc_request_pending t round =
   Hashtbl.mem t.polc_requests round
 
 let historical_prevote_known t ~round ~validator =
-  match Hashtbl.find_opt t.prevotes_by_round round with
-  | None -> false
-  | Some vote_set -> Hashtbl.mem vote_set.votes validator
+  List.exists (fun rounds -> match Hashtbl.find_opt rounds round with
+    | None -> false
+    | Some vote_set -> Hashtbl.mem vote_set.votes validator)
+    [t.prevotes_by_round; t.source_prevotes]
 
 let polc_votes_for_round t round =
+  let rounds = if Hashtbl.mem t.source_prevotes round then
+    match C_types.source_set ~chain_id:t.chain_id ~epoch_id:t.state.height t.vs with
+    | Some source when Option.is_some (quorum_pid ~policy:t.policy ~chain_id:t.chain_id
+        ~epoch_id:t.state.height source (Hashtbl.find t.source_prevotes round)) ->
+      t.source_prevotes
+    | _ -> t.prevotes_by_round
+    else t.prevotes_by_round in
   match Hashtbl.find_opt t.polc_by_round round,
-        Hashtbl.find_opt t.prevotes_by_round round with
+        Hashtbl.find_opt rounds round with
   | Some proposal_id, Some vote_set ->
     Hashtbl.fold
       (fun _ (vote : vote) votes ->
@@ -811,7 +929,19 @@ let polc_votes_for_round t round =
 let record_historical_prevote t (vote : vote) =
   if vote.round >= 0
      && vote.round < t.state.round
-     && round_retained t vote.round then begin
+     && (round_retained t vote.round
+       || (C_quorum_policy.select t.policy t.state.height = C_quorum_policy.Stake
+         && polc_matches t ~round:vote.round ~proposal_id:vote.proposal_id)) then begin
+    (match C_types.source_set ~chain_id:t.chain_id ~epoch_id:t.state.height t.vs with
+     | None -> ()
+     | Some source ->
+       let saved = match Hashtbl.find_opt t.source_prevotes vote.round with
+         | Some saved -> saved
+         | None -> let saved = create_vote_set () in
+           Hashtbl.add t.source_prevotes vote.round saved; saved in
+       match add_vote ~policy:t.policy saved vote ~validator_set:source with
+       | `QuorumOf pid -> record_polc t vote.round pid
+       | _ -> ());
     let vote_set =
       match Hashtbl.find_opt t.prevotes_by_round vote.round with
       | Some value -> value
@@ -820,7 +950,7 @@ let record_historical_prevote t (vote : vote) =
         Hashtbl.add t.prevotes_by_round vote.round value;
         value
     in
-    match add_vote vote_set vote ~validator_set:t.vs with
+    match add_vote ~policy:t.policy vote_set vote ~validator_set:t.vs with
     | `QuorumOf proposal_id -> record_polc t vote.round proposal_id
     | `Duplicate
     | `Rejected
@@ -905,6 +1035,7 @@ let round_skip_target t =
       let signed_weight = Z.add signed_weight validator_weight in
       if
         C_types.round_skip_reached_at
+          ~policy:t.policy
           ~chain_id:t.chain_id
           ~epoch_id:t.state.height
           t.vs
@@ -937,29 +1068,10 @@ let on_round_sync t ~round ~validator =
   end else
     false
 
-let lock_allows t (proposal_id : string) (valid_round : int option) : bool =
-  if t.state.locked_round < 0 then true
-  else
-    let locked_pid = match t.state.locked_value with
-      | Some h -> C_hash.proposal_id h
-      | None -> ""
-    in
-    if proposal_id = locked_pid then true
-    else
-      match valid_round with
-      | None -> false
-      | Some vr ->
-        if vr <= t.state.locked_round then false
-        else if vr >= t.state.round then false
-        else
-          match Hashtbl.find_opt t.polc_by_round vr with
-          | Some pid when pid = proposal_id -> true
-          | _ -> false
-
 let allow_valid_value_reuse t =
   t.vs.quorum >= 1
 
-let quorum_result votes ~chain_id ~epoch_id ~validator_set =
+let quorum_result ?policy votes ~chain_id ~epoch_id ~validator_set =
   let proposal_id =
     Hashtbl.fold
       (fun pid weight found ->
@@ -967,6 +1079,7 @@ let quorum_result votes ~chain_id ~epoch_id ~validator_set =
         | Some _ -> found
         | None when
             C_types.quorum_reached_at
+              ?policy
               ~chain_id
               ~epoch_id
               validator_set
@@ -978,10 +1091,11 @@ let quorum_result votes ~chain_id ~epoch_id ~validator_set =
   in
   match proposal_id with
   | Some pid -> `QuorumOf pid
-  | None when nil_quorum votes ~chain_id ~epoch_id ~validator_set ->
+  | None when nil_quorum ?policy votes ~chain_id ~epoch_id ~validator_set ->
     `QuorumOf Octra_net.Hash_domain.nil_hash
   | None when
       C_types.quorum_reached_at
+        ?policy
         ~chain_id
         ~epoch_id
         validator_set
@@ -1026,7 +1140,7 @@ let finalize_quorum t proposal_id =
 let precommit_nil t ~sign_fn =
   if local_voting_allowed t
      && t.state.step = PrevoteStep
-     && nil_quorum t.prevotes ~chain_id:t.chain_id ~epoch_id:t.state.height
+     && nil_quorum ~policy:t.policy t.prevotes ~chain_id:t.chain_id ~epoch_id:t.state.height
           ~validator_set:t.vs then begin
     t.state <- { t.state with step = PrecommitStep };
     match cast_local_vote t ~sign_fn ~vote_type:Precommit
@@ -1061,6 +1175,7 @@ let resume_voting t ~sign_fn =
     precommit_nil t ~sign_fn;
     (match
        quorum_result
+         ~policy:t.policy
          t.prevotes
          ~chain_id:t.chain_id
          ~epoch_id:t.state.height
@@ -1098,6 +1213,7 @@ let resume_voting t ~sign_fn =
     if Int64.compare t.state.height t.finalized_height > 0 then
       match
         quorum_result
+          ~policy:t.policy
           t.precommits
           ~chain_id:t.chain_id
           ~epoch_id:t.state.height
@@ -1143,7 +1259,9 @@ let do_propose ?parent_commit t (header : epoch_header)
     let resolved =
       if allow_valid_value_reuse t then
         match t.state.valid_value with
-        | Some v when t.state.valid_round >= 0 ->
+        | Some v when t.state.valid_round >= 0
+                      && C_types.is_author ~chain_id:t.chain_id
+                           ~epoch_id:t.state.height t.vs v.creator_addr ->
           let v_pid = C_hash.proposal_id v in
           (match find_tx_hashes t v_pid with
            | None ->
@@ -1212,7 +1330,9 @@ let do_propose ?parent_commit t (header : epoch_header)
       cast_local_vote t ~sign_fn ~vote_type:Prevote ~proposal_id
     in
     (match prevote_outcome with
-     | LocalVoteCast (`QuorumOf _) ->
+     | LocalVoteCast (`QuorumOf pid) when pid = proposal_id ->
+       if C_quorum_policy.select t.policy t.state.height = C_quorum_policy.Stake then
+         record_polc t t.state.round proposal_id;
        t.state <- { t.state with
          locked_round = t.state.round;
          locked_value = Some header;
@@ -1224,7 +1344,7 @@ let do_propose ?parent_commit t (header : epoch_header)
          cast_local_vote t ~sign_fn ~vote_type:Precommit ~proposal_id
        in
        (match pc_outcome with
-        | LocalVoteCast (`QuorumOf _) ->
+        | LocalVoteCast (`QuorumOf pid) when pid = proposal_id ->
           log_node t.my_addr
             "event = local_finalize_self height = %Ld round = %d pid = %s creator = %s lock_round = %d valid_round = %d"
             t.state.height t.state.round
@@ -1282,7 +1402,13 @@ let on_propose t (p : propose) ~verify_fn ~execute_fn ~sign_fn =
     in
     let root_valid = envelope_valid && execute_fn p in
     let proposal_valid = proposer_valid && envelope_valid && root_valid in
-    let lock_ok = proposal_valid && lock_allows t proposal_id p.valid_round in
+    let author_ok = C_types.is_validator t.vs p.header.creator_addr
+      || Option.fold ~none:false
+           ~some:(fun header -> C_hash.proposal_id header = proposal_id)
+           t.state.locked_value
+      || Option.fold ~none:false ~some:(fun round -> polc_matches t ~round ~proposal_id)
+           p.valid_round in
+    let lock_ok = proposal_valid && author_ok && lock_allows t proposal_id p.valid_round in
     let accept = proposal_valid && lock_ok in
     if proposal_valid then begin
       cache_proposal_message t p;
@@ -1295,6 +1421,7 @@ let on_propose t (p : propose) ~verify_fn ~execute_fn ~sign_fn =
       &&
       match
         quorum_result
+          ~policy:t.policy
           t.precommits
           ~chain_id:t.chain_id
           ~epoch_id:t.state.height
@@ -1322,6 +1449,7 @@ let on_propose t (p : propose) ~verify_fn ~execute_fn ~sign_fn =
       let proposal_quorum =
         match
           quorum_result
+            ~policy:t.policy
             t.prevotes
             ~chain_id:t.chain_id
             ~epoch_id:t.state.height
@@ -1408,7 +1536,7 @@ let record_historical_precommit t (vote : vote) =
         Hashtbl.add t.precommits_by_round vote.round value;
         value
     in
-    let result = add_vote votes vote ~validator_set:t.vs in
+    let result = add_vote ~policy:t.policy votes vote ~validator_set:t.vs in
     Option.iter
       (fun (round, proposal_id) ->
         emit t (RequestProposal { round; proposal_id }))
@@ -1467,7 +1595,7 @@ let on_vote t (v : vote) ~sign_fn =
   else
     match v.vote_type with
     | Prevote ->
-      let result = add_vote t.prevotes v ~validator_set:t.vs in
+      let result = add_vote ~policy:t.policy t.prevotes v ~validator_set:t.vs in
       Option.iter
         (fun (round, proposal_id) ->
           emit t (RequestProposal { round; proposal_id }))
@@ -1534,7 +1662,7 @@ let on_vote t (v : vote) ~sign_fn =
        | _ -> ())
 
     | Precommit ->
-      let result = add_vote t.precommits v ~validator_set:t.vs in
+      let result = add_vote ~policy:t.policy t.precommits v ~validator_set:t.vs in
       Option.iter
         (fun (round, proposal_id) ->
           emit t (RequestProposal { round; proposal_id }))
@@ -1606,7 +1734,7 @@ let accept_finalize_batch t (f : finalize) =
           t.state with
           locked_round = max t.state.locked_round f.commit_round;
           locked_value = Some f.header;
-          valid_round = f.commit_round;
+          valid_round = max t.state.locked_round f.commit_round;
           valid_value = Some f.header;
         };
         emit_finalized ~send:false t f

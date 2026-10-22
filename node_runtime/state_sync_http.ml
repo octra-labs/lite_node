@@ -277,7 +277,16 @@ let load_certificate_at ~path ~chain_id =
   match configured () with
   | Error reason -> Lwt.return_error reason
   | Ok trust ->
-    Sync_cert.load (Lazy.force certificate_actor) ~path trust >|= function
+    let stamp () = Lwt_preemptive.detach (fun () ->
+      try
+        let s = Unix.stat path in
+        if s.st_kind <> Unix.S_REG then None
+        else Some (Marshal.to_string
+          (s.st_dev, s.st_ino, s.st_size, s.st_mtime, s.st_ctime) [])
+      with Unix.Unix_error _ -> None) () in
+    let fresh certificate =
+      Manifest.fresh ~now:(Int64.of_float (Unix.gettimeofday ())) certificate in
+    Sync_cert.load_file (Lazy.force certificate_actor) ~stamp ~fresh ~path trust >|= function
     | Error reason -> Error reason
     | Ok loaded ->
       match configured () with
@@ -362,10 +371,10 @@ let handle_head ~data_dir ~chain_id ~config_hash ~validator_set ~current_epoch =
   if not (state_sync_enabled ()) then
     respond_state_sync_disabled ()
   else
-    load_certificate ~data_dir ~chain_id ~config_hash ~validator_set >>= function
-    | Error reason when Sync_cert.retryable reason ->
-      certificate_error ~error_type:"state_sync_unavailable" `Service_unavailable reason
-    | result ->
+    Lwt.pick [
+      load_certificate ~data_dir ~chain_id ~config_hash ~validator_set;
+      (Lwt_unix.sleep 1. >|= fun () -> Error Sync_cert.Busy);
+    ] >>= fun result ->
       let snapshot_epoch = Result.to_option result
         |> Option.map (fun cached -> cached.Sync_cert.certificate.Manifest.checkpoint.epoch) in
       let head_epoch = committed_epoch current_epoch in

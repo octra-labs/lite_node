@@ -26,6 +26,7 @@ let vote_ok ~chain_id ~epoch_id ~round ~proposal_id (vote : vote) =
   && vote.proposal_id = proposal_id
 
 let validate_certificate_with_policy
+    ?policy
     ~strict_quorum
     ~chain_id
     ~validator_set
@@ -35,6 +36,7 @@ let validate_certificate_with_policy
   else
     let vote_set =
       validator_set_for_epoch
+        ?policy
         ~chain_id
         ~epoch_id:certificate.epoch_id
         validator_set
@@ -48,7 +50,8 @@ let validate_certificate_with_policy
       && certificate.header.proto_version <> proto_version_current
     then
       invalid "header_proto_version"
-    else if not (is_validator vote_set certificate.header.creator_addr) then
+    else if not (is_author ~chain_id ~epoch_id:certificate.epoch_id
+                   vote_set certificate.header.creator_addr) then
       invalid "header_creator"
     else if Octra_net.Hash_domain.is_nil certificate.proposal_id then
       invalid "nil_proposal"
@@ -66,6 +69,7 @@ let validate_certificate_with_policy
       else
         let policy_ok =
           C_types.has_quorum_at
+            ?policy
             ~chain_id
             ~epoch_id:certificate.epoch_id
             validator_set
@@ -73,10 +77,9 @@ let validate_certificate_with_policy
         in
         let strict_ok =
           not strict_quorum
-          || not
-               (C_quorum_policy.count_floor_required
-                  ~chain_id
-                  ~epoch_id:certificate.epoch_id)
+          || C_quorum_policy.select
+               (Option.value policy ~default:(C_quorum_policy.for_chain chain_id))
+               certificate.epoch_id = C_quorum_policy.Prior
           || C_types.has_quorum vote_set addrs
         in
         if not (policy_ok && strict_ok) then invalid "quorum"
@@ -114,15 +117,16 @@ let validate_certificate_with_policy
       end
     end
 
-let validate_certificate ~chain_id ~validator_set ~verify_vote certificate =
+let validate_certificate ?policy ~chain_id ~validator_set ~verify_vote certificate =
   validate_certificate_with_policy
+    ?policy
     ~strict_quorum:false
     ~chain_id
     ~validator_set
     ~verify_vote
     certificate
 
-let validate_finalize_with ~version_valid ~strict_quorum ~chain_id ~validator_set
+let validate_finalize_with ?policy ~version_valid ~strict_quorum ~chain_id ~validator_set
     ~verify_vote (finalize : finalize) =
   if not (version_valid finalize) then
     invalid "header_proto_version"
@@ -133,14 +137,16 @@ let validate_finalize_with ~version_valid ~strict_quorum ~chain_id ~validator_se
     invalid "parent_commit_hash"
   else
     validate_certificate_with_policy
+      ?policy
       ~strict_quorum
       ~chain_id
       ~validator_set
       ~verify_vote
       (C_types.certificate_of_finalize finalize)
 
-let validate_finalize ~chain_id ~validator_set ~verify_vote finalize =
+let validate_finalize ?policy ~chain_id ~validator_set ~verify_vote finalize =
   validate_finalize_with
+    ?policy
     ~strict_quorum:false
     ~version_valid:(fun finalize ->
       finalize.header.proto_version
@@ -150,8 +156,9 @@ let validate_finalize ~chain_id ~validator_set ~verify_vote finalize =
     ~verify_vote
     finalize
 
-let validate_persisted_finalize ~chain_id ~validator_set ~verify_vote finalize =
+let validate_persisted_finalize ?policy ~chain_id ~validator_set ~verify_vote finalize =
   validate_finalize_with
+    ?policy
     ~strict_quorum:false
     ~version_valid:(fun finalize ->
       C_protocol.supported_version finalize.header.proto_version)
@@ -161,11 +168,13 @@ let validate_persisted_finalize ~chain_id ~validator_set ~verify_vote finalize =
     finalize
 
 let validate_persisted_finalize_strict
+    ?policy
     ~chain_id
     ~validator_set
     ~verify_vote
     finalize =
   validate_finalize_with
+    ?policy
     ~strict_quorum:true
     ~version_valid:(fun finalize ->
       C_protocol.supported_version finalize.header.proto_version)

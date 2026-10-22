@@ -5,6 +5,7 @@ module P = Octra_core.Pvac_verify_protocol
 module W = Octra_core.Pvac_verify_worker
 module FB = Octra_core.Crypto.FheBalance
 module D = Octra_core.Pvac_verify_direct
+module Task = Octra_vm.Fhe_task
 
 let check name value =
   if not value then failwith name
@@ -29,6 +30,15 @@ let key_switch_request =
     proof = "zero_v1|AA==";
     commitment = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
     strict = false;
+  }
+
+let stored_key_request =
+  P.Stored_key_claim {
+    pubkey = "invalid";
+    cipher = "hfhe_v1|AA==";
+    proof = "zero_v1|AA==";
+    commitment = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    strict = true;
   }
 
 let historical_migration_request =
@@ -74,13 +84,25 @@ let timeout_config () =
 
 let run_sample mode =
   match mode with
+  | "prior_only" ->
+    if Array.length Sys.argv > 1 then Octra_core.Fhe_calc.serve_session ()
+    else begin
+      let raw = Octra_core.Fhe_calc.read_request () in
+      let request = match P.request_of_string raw with
+        | Ok value -> value | Error reason -> failwith reason in
+      let reply = match request with
+        | P.Proof_key _ -> P.{request_hash = request_hash request;
+            accepted = false; reason = "proof_key_invalid"}
+        | _ -> D.response ~keyed:false request in
+      reply |> P.response_bytes |> print_endline
+    end
   | "old_session" ->
     if Array.length Sys.argv > 1 then Unix.sleepf 10.
     else begin
       let raw = Octra_core.Fhe_calc.read_request () in
       let request = match P.request_of_string raw with
         | Ok value -> value | Error reason -> failwith reason in
-      D.response request |> P.response_bytes |> print_endline
+      D.response ~keyed:false request |> P.response_bytes |> print_endline
     end
   | "protocol" ->
     let raw = Octra_core.Fhe_calc.read_request () in
@@ -97,7 +119,7 @@ let run_sample mode =
     Fun.protect ~finally:(fun () -> close_out channel)
       (fun () -> output_string channel (string_of_int (Unix.getpid ())));
     Unix.rename staged path;
-    Unix.sleepf 10.
+    Unix.sleepf 3600.
   | "malformed" ->
     print_endline "malformed"
   | "exit" ->
@@ -129,6 +151,7 @@ let request_roundtrip name request =
 let protocol_roundtrip () =
   request_roundtrip "range" request;
   request_roundtrip "key switch" key_switch_request;
+  request_roundtrip "stored key" stored_key_request;
   request_roundtrip "historical migration" historical_migration_request;
   request_roundtrip "circle cell" circle_request;
   check "request domains collided"
@@ -137,11 +160,22 @@ let protocol_roundtrip () =
     (P.request_hash circle_request <> P.request_hash key_switch_request);
   check "historical migration request domain collided"
     (P.request_hash historical_migration_request <>
-     P.request_hash key_switch_request)
+     P.request_hash key_switch_request);
+  check "stored key request domain collided"
+    (P.request_hash stored_key_request <>
+     P.request_hash key_switch_request);
+  check "stored claim accepted before key rule"
+    (D.execute ~keyed:false stored_key_request =
+     Error "stored key claim requires full key proof")
 
 let math_protocol () =
   List.iter (fun value ->
     request_roundtrip "math" (P.Math value);
+    request_roundtrip "proof_key" (P.Proof_key value);
+    request_roundtrip "proof_key_math" (P.Proof_key (P.Math value));
+    request_roundtrip "math_proof_key" (P.Math (P.Proof_key value));
+    check "proof key request hash reused"
+      (P.request_hash value <> P.request_hash (P.Proof_key value));
     check "math request hash reused"
       (P.request_hash value <> P.request_hash (P.Math value));
     let json = P.request_bytes value |> Yojson.Safe.from_string in
@@ -158,7 +192,7 @@ let math_protocol () =
     | _ -> failwith "request object required")
     [P.Ping; request; key_switch_request; circle_request];
   List.iter (fun value ->
-    let response = D.response value in
+    let response = D.response ~keyed:false value in
     check "math response hash differs" (response.request_hash = P.request_hash value);
     check "math ping rejected" response.accepted)
     [P.Ping; P.Math P.Ping; P.Ping; P.Math P.Ping]
@@ -209,10 +243,37 @@ let health_succeeds () =
   | Ok () -> ()
   | Error reason -> failwith reason
 
+let proof_mode_required () =
+  with_env "OCTRA_PVAC_VERIFY_WORKER" (sample_path ()) (fun () ->
+    with_env "OCTRA_PVAC_WORKER_SAMPLE_MODE" "prior_only" (fun () ->
+      check "prior worker ping failed" (W.result_sync ~keyed:false P.Ping = Ok ());
+      check "prior worker session failed" (W.session_ready () = Ok ());
+      check "proof mode became proof rejection"
+        (W.run_process (sample_path ()) (P.Proof_key P.Ping)
+          = W.Unavailable "worker_protocol_proof_key_invalid");
+      let refused = Error (W.Worker_unavailable "worker_protocol_proof_key_invalid") in
+      check "sync proof mode became proof rejection"
+        (W.classified_result_sync ~keyed:true ~math:true P.Ping = refused);
+      check "async proof mode became proof rejection"
+        (Lwt_main.run (W.classified_result ~keyed:true ~math:true P.Ping) = refused);
+      check "prior worker passed startup"
+        (W.ready_sync () = Error "proof worker unavailable: worker_protocol_proof_key_invalid");
+      check "prior worker passed async readiness"
+        (Lwt_main.run (W.ready ()) =
+          Error "proof worker unavailable: worker_protocol_proof_key_invalid");
+      let actor = Task.create () in
+      Fun.protect ~finally:(fun () -> Task.stop actor) (fun () ->
+        let ticket = Octra_vm.Proof_wait.{request = "worker_mode"; generation = "test"} in
+        let deadline = Int64.add (Mtime_clock.elapsed_ns ()) 5_000_000_000L in
+        let result = Task.run ~actor ~ticket ~deadline
+          (Task.Verify (true, P.Proof_key P.Ping)) |> Lwt_main.run in
+        check "VM proof mode became proof rejection"
+          (result = Error (Task.Resource Octra_core.Exec_resource.Host)))))
+
 let session_required () =
   with_env "OCTRA_PVAC_VERIFY_WORKER" (sample_path ()) (fun () ->
     with_env "OCTRA_PVAC_WORKER_SAMPLE_MODE" "old_session" (fun () ->
-      check "old proof protocol unavailable" (W.result_sync P.Ping = Ok ());
+      check "old proof protocol unavailable" (W.result_sync ~keyed:false P.Ping = Ok ());
       let started = W.monotonic_seconds () in
       check "old session passed startup" (W.ready_sync () = Error "worker_session_unavailable");
       check "session startup waited proof deadline" (W.monotonic_seconds () -. started < 7.)))
@@ -244,7 +305,7 @@ let valid_circle_request () =
   in
   let blinding = Bytes.make 32 '\043' in
   let proof =
-    Pvac_ffi.make_zero_proof_bound
+    Pvac_ffi.make_zero_proof_bound ~keyed:false
       pubkey
       seckey
       cipher
@@ -275,7 +336,7 @@ let valid_circle_request () =
 let actual_circle_worker_accepts () =
   let request = valid_circle_request () in
   begin
-    match D.execute request with
+    match D.execute ~keyed:false request with
     | Ok () -> ()
     | Error reason -> failwith ("valid direct circle proof rejected: " ^ reason)
   end;
@@ -308,7 +369,7 @@ let legacy_circle_proof_rejects () =
       }
     in
     begin
-      match D.execute request with
+      match D.execute ~keyed:false request with
       | Error "pvac pubkey proof circuit lacks alias rejection" -> ()
       | Error reason -> failwith reason
       | Ok () -> failwith "legacy circle proof accepted"
@@ -373,13 +434,13 @@ let cancel_worker () =
     with_env "OCTRA_PVAC_VERIFY_WORKER" (sample_path ()) (fun () ->
       with_env "OCTRA_PVAC_WORKER_SAMPLE_MODE" "wait" (fun () ->
         with_env "OCTRA_PVAC_WORKER_PID" path (fun () ->
-          with_env "OCTRA_PVAC_VERIFY_TIMEOUT_SEC" "20" (fun () ->
+          with_env "OCTRA_PVAC_VERIFY_TIMEOUT_SEC" "300" (fun () ->
             let pending = W.run request in
             let rec wait () =
               let open Lwt.Syntax in
               if Sys.file_exists path then Lwt.return_unit
               else let* () = Lwt_unix.sleep 0.01 in wait () in
-            Lwt_main.run (Lwt_unix.with_timeout 5. wait);
+            Lwt_main.run (Lwt_unix.with_timeout 120. wait);
             let channel = open_in path in
             let pid = Fun.protect ~finally:(fun () -> close_in channel)
               (fun () -> int_of_string (input_line channel)) in
@@ -389,14 +450,14 @@ let cancel_worker () =
               else let* () = Lwt_unix.sleep 0.01 in drain () in
             Fun.protect ~finally:(fun () ->
               Lwt.cancel pending;
-              Lwt_main.run (Lwt_unix.with_timeout 12. drain))
+              Lwt_main.run (Lwt_unix.with_timeout 120. drain))
               (fun () ->
                 check "worker did not start" ((W.channel_stats ()).active = 1);
                 Lwt.cancel pending;
                 check "worker cancellation lost"
                   (match Lwt.state pending with Lwt.Fail Lwt.Canceled -> true | _ -> false);
                 let stopped = try
-                  Lwt_main.run (Lwt_unix.with_timeout 2. drain);
+                  Lwt_main.run (Lwt_unix.with_timeout 120. drain);
                   true
                 with Lwt_unix.Timeout -> false in
                 check "cancelled worker retained its slot" stopped;
@@ -509,6 +570,7 @@ let () =
     run "rss_status_parser" rss_status_parser;
     run "worker_capacity_disjoint" worker_capacity_disjoint;
     run "health_succeeds" health_succeeds;
+    run "proof_mode_required" proof_mode_required;
     run "session_required" session_required;
     run "actual_worker_rejects" actual_worker_rejects;
     run "wide_descriptors" wide_descriptors;

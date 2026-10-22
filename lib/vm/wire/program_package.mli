@@ -14,7 +14,10 @@ type compiled = {
 
 type admitted = {
   envelope : string;
-  program : Admission.t;
+  program : Code_check.t;
+  main : string;
+  sources : source list;
+  result : Oct_compile.compile_result;
 }
 
 type error
@@ -24,9 +27,10 @@ type compiler = Protocol | Source | Preview
 val compiler_mode : ?preview:Octra_core.Rule_graph.mode -> Octra_core.Rule_graph.mode -> compiler
 val source_id : string
 val preview_id : string
-val admit_transition : ?loops:bool -> point_ops:bool -> string -> (admitted, error) result
+val admit_transition : ?loops:bool -> ?consts:bool -> point_ops:bool -> string -> (admitted, error) result
 
 val error_message : error -> string
+val normalize : main:string -> source list -> (source list, error) result
 
 val compiler_profile_id : string
 val standard_id : string
@@ -65,5 +69,6 @@ val admit_base64 :
   ?compiler:compiler ->
   ?point_ops:bool ->
   ?loops:bool ->
+  ?consts:bool ->
   string ->
   (admitted, error) result

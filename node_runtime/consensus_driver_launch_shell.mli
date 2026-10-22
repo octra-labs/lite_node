@@ -31,6 +31,7 @@ type runtime = {
   health : Consensus_health_wiring.node_driver_health_runtime;
   pending : Consensus_pending_commit_recovery.node_driver_runtime;
   recovery_pending : unit -> bool;
+  replay_pending : unit -> unit;
   poll_interval : float;
   pending_delay : float;
   role_label : string;
@@ -43,6 +44,7 @@ type health_runtime_input = {
   health : Consensus_health_wiring.node_driver_health_runtime;
   pending : Consensus_pending_commit_recovery.node_driver_runtime;
   recovery_pending : unit -> bool;
+  replay_pending : unit -> unit;
   poll_interval : float;
   pending_delay : float;
   role_label : string;
@@ -51,6 +53,7 @@ type health_runtime_input = {
 val recover_before_start :
   recover_pending:(unit -> bool Lwt.t) ->
   replay_stashed:(source:string -> unit Lwt.t) ->
+  replay_pending:(unit -> unit) ->
   recovery_pending:(unit -> bool) ->
   bool Lwt.t
 
@@ -101,5 +104,6 @@ val publish :
   unit
 
 val run :
+  ?resolve:(int64 -> (Octra_consensus.C_types.validator_set, string) result) ->
   runtime ->
   Octra_consensus.C_driver.t

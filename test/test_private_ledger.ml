@@ -76,7 +76,7 @@ let payload pk sk amount seed_ch =
   let ct = Pvac_ffi.enc_value_seeded pk sk amount_i64 (seed (Char.chr (Char.code seed_ch + 1))) in
   let cipher = FB.encode_cipher ct in
   let commitment = b64 (Pvac_ffi.pedersen_commit_amount amount_i64 blind) in
-  let proof = FB.encode_zero_proof (Pvac_ffi.make_zero_proof_bound pk sk ct amount_i64 blind) in
+  let proof = FB.encode_zero_proof (Pvac_ffi.make_zero_proof_bound ~keyed:false pk sk ct amount_i64 blind) in
   cipher, commitment, proof, b64 blind
 
 let payload_json ?range_proof_balance (cipher, amount_commitment, zero_proof, blinding) =
@@ -139,18 +139,18 @@ let expect_error tag user_reason result =
     ok ("user reason " ^ user_reason) (String.equal e.user_reason user_reason)
 
 let test_encrypt_missing () =
-  P.encrypt_plan ~strict:true ~field_policy:P.Unique_fields (ledger "encrypt_missing") (tx ())
+  P.encrypt_plan ~keyed:false ~strict:true ~field_policy:P.Unique_fields (ledger "encrypt_missing") (tx ())
   |> expect_error "malformed_transaction" "encrypt: malformed encrypted_data"
 
 let test_decrypt_invalid_amount () =
-  P.decrypt_plan ~strict:true
+  P.decrypt_plan ~keyed:false ~strict:true
     ~field_policy:P.Unique_fields
     (ledger "decrypt_invalid_amount")
     (tx ~op:T.DecryptOp ~encrypted_data:"{}" ~amount:Z.zero ())
   |> expect_error "invalid_amount" "decrypt amount must be positive"
 
 let test_key_switch_bad_json () =
-  P.key_switch_plan ~strict:true
+  P.key_switch_plan ~keyed:false ~strict:true
     ~field_policy:P.Unique_fields
     (ledger "key_switch_bad_json")
     (tx ~op:T.KeySwitch ~encrypted_data:"{" ())
@@ -172,7 +172,7 @@ let test_private_version_wrong_type () =
       |> expect_error
            "version_rejected"
            "only version 5 stealth transfers are accepted";
-      P.claim_plan ~strict:true
+      P.claim_plan ~keyed:false ~strict:true
         ~field_policy
         (ledger ("claim_wrong_version_type_" ^ suffix))
         (tx ~op:T.ClaimOp ~encrypted_data:payload ())
@@ -195,28 +195,28 @@ let test_balance_fields () =
   let store = ledger "balance_payload_policy" in
   let first_encrypt =
     Lwt_main.run
-      (P.encrypt_plan ~strict:true
+      (P.encrypt_plan ~keyed:false ~strict:true
          ~field_policy:P.First_field
          store
          (tx ~encrypted_data:payload ()))
   in
   let unique_encrypt =
     Lwt_main.run
-      (P.encrypt_plan ~strict:true
+      (P.encrypt_plan ~keyed:false ~strict:true
          ~field_policy:P.Unique_fields
          store
          (tx ~encrypted_data:payload ()))
   in
   let first_decrypt =
     Lwt_main.run
-      (P.decrypt_plan ~strict:true
+      (P.decrypt_plan ~keyed:false ~strict:true
          ~field_policy:P.First_field
          store
          (tx ~op:T.DecryptOp ~encrypted_data:payload ()))
   in
   let unique_decrypt =
     Lwt_main.run
-      (P.decrypt_plan ~strict:true
+      (P.decrypt_plan ~keyed:false ~strict:true
          ~field_policy:P.Unique_fields
          store
          (tx ~op:T.DecryptOp ~encrypted_data:payload ()))
@@ -273,11 +273,11 @@ let test_key_switch_field_policy () =
   let store = ledger "key_switch_duplicate_policy" in
   let prior =
     Lwt_main.run
-      (P.key_switch_plan ~strict:false ~field_policy:P.First_field store reset_tx)
+      (P.key_switch_plan ~keyed:false ~strict:false ~field_policy:P.First_field store reset_tx)
   in
   let active =
     Lwt_main.run
-      (P.key_switch_plan ~strict:true ~field_policy:P.Unique_fields store reset_tx)
+      (P.key_switch_plan ~keyed:false ~strict:true ~field_policy:P.Unique_fields store reset_tx)
   in
   begin
     match prior, active with
@@ -287,7 +287,24 @@ let test_key_switch_field_policy () =
       ok "active decoder rejected duplicate"
         (String.equal active.P.reason "duplicate legacy_zero_reset")
     | _ -> fail "duplicate key switch policy did not reject deterministically"
-  end
+  end;
+  let base = ["new_pubkey", `String "key"; "aes_kat", `String "kat"] in
+  List.iter (fun policy ->
+    let inspect fields =
+      let operation = tx ~op:T.KeySwitch
+        ~encrypted_data:(Yojson.Safe.to_string (`Assoc (base @ fields))) () in
+      let verify = Lwt_main.run
+        (P.key_switch_plan ~keyed:false ~strict:true ~field_policy:policy store operation) in
+      let prepare = Lwt_main.run
+        (P.prepare_key_switch_plan ~keyed:false ~field_policy:policy store operation) in
+      verify, prepare in
+    let expected = inspect [] in
+    List.iter (fun fields ->
+      ok "prior owner fields changed parsing" (inspect fields = expected))
+      [["owner_cipher", `Int 1]; ["owner_proof", `List []];
+       ["owner_cipher", `String "a"; "owner_cipher", `String "b"];
+       ["owner_proof", `String "a"; "owner_proof", `String "b"]])
+    [P.First_field; P.Unique_fields]
 
 let test_key_switch_types () =
   let store = ledger "key_switch_wrong_types" in
@@ -319,7 +336,7 @@ let test_key_switch_types () =
   in
   let reject policy fields =
     let payload = Yojson.Safe.to_string (`Assoc fields) in
-    P.key_switch_plan ~strict:true
+    P.key_switch_plan ~keyed:false ~strict:true
       ~field_policy:policy
       store
       (tx ~op:T.KeySwitch ~encrypted_data:payload ())
@@ -346,7 +363,7 @@ let test_key_switch_types () =
   reject P.Unique_fields [];
   List.iter
     (fun policy ->
-      P.key_switch_plan ~strict:true
+      P.key_switch_plan ~keyed:false ~strict:true
         ~field_policy:policy
         store
         (tx ~op:T.KeySwitch ~encrypted_data:"[]" ())
@@ -368,7 +385,7 @@ let test_key_switch_fields () =
   let artifact =
     match
       Lwt_main.run
-        (P.preverify_key_switch_artifact ~strict:true
+        (P.preverify_key_switch_artifact ~keyed:false ~strict:true
            ~field_policy:P.First_field
            store
            operation)
@@ -378,7 +395,7 @@ let test_key_switch_fields () =
   in
   match
     Lwt_main.run
-      (P.bind_key_switch_artifact ~strict:true
+      (P.bind_key_switch_artifact ~keyed:false ~strict:true
          ~field_policy:P.Unique_fields
          store
          operation
@@ -396,7 +413,7 @@ let test_key_cache () =
     tx ~op:T.KeySwitch ?encrypted_data:(key_switch_json blob) ()
   in
   let check ?(strict = true) ?(fields = P.Unique_fields) operation =
-    Lwt_main.run (P.key_switch_plan ~field_policy:fields ~strict state operation)
+    Lwt_main.run (P.key_switch_plan ~keyed:false ~field_policy:fields ~strict state operation)
   in
   let plan = function
     | Ok value -> value
@@ -415,7 +432,7 @@ let test_key_cache () =
   ok "key metadata preserves receipt"
     (String.equal (digest first) (digest { first with old_pubkey = None }));
   let prepared = plan (Lwt_main.run
-    (P.prepare_key_switch_plan ~field_policy:P.First_field state operation)) in
+    (P.prepare_key_switch_plan ~keyed:false ~field_policy:P.First_field state operation)) in
   ok "prepared key captured" (prepared.old_pubkey = first.old_pubkey);
   ok "prepared receipt preserved" (String.equal (digest first) (digest prepared));
   let again = plan (check operation) in
@@ -473,7 +490,7 @@ let test_key_cache () =
   let artifact =
     match
       Lwt_main.run
-        (P.preverify_key_switch_artifact ~field_policy:P.Unique_fields
+        (P.preverify_key_switch_artifact ~keyed:false ~field_policy:P.Unique_fields
            ~strict:true state operation)
     with
     | Ok value -> value
@@ -482,7 +499,7 @@ let test_key_cache () =
   let verified =
     match
       Lwt_main.run
-        (P.bind_key_switch_artifact ~field_policy:P.Unique_fields
+        (P.bind_key_switch_artifact ~keyed:false ~field_policy:P.Unique_fields
            ~strict:true state operation artifact)
     with
     | P.Key_switch_bound (P.Prepared_key_switch value) -> value
@@ -509,11 +526,11 @@ let test_claim_not_self () =
     (tx ~op:T.ClaimOp ~encrypted_data:"{}" ()) with
     T.to_ = "octOther";
   } in
-  P.claim_plan ~strict:true ~field_policy:P.Unique_fields (ledger "claim_not_self") tx
+  P.claim_plan ~keyed:false ~strict:true ~field_policy:P.Unique_fields (ledger "claim_not_self") tx
   |> expect_error "claim_not_self" "claim operation must target sender (from == to)"
 
 let test_claim_missing () =
-  P.claim_plan ~strict:true
+  P.claim_plan ~keyed:false ~strict:true
     ~field_policy:P.Unique_fields
     (ledger "claim_missing")
     (tx ~op:T.ClaimOp ())
@@ -524,7 +541,7 @@ let test_apply_encrypt () =
   let pk, sk = pvac ledger (Z.of_int 1000) in
   let encrypted_data = payload_json (payload pk sk (Z.of_int 10) '\003') in
   match run_responsive "encrypt proof blocked event loop"
-    (P.apply_encrypt ~strict:true
+    (P.apply_encrypt ~keyed:false ~strict:true
        ~field_policy:P.Unique_fields
        ledger
        (tx ?encrypted_data ~amount:(Z.of_int 10) ~ou:Z.one ())) with
@@ -553,12 +570,12 @@ let test_apply_decrypt () =
   let next_ct = Pvac_ffi.ct_sub pk current_ct delta_ct in
   let next_range =
     FB.encode_bound_range_proof
-      (Pvac_ffi.make_zero_proof_bound_range pk sk next_ct 15L (seed '\014'))
+      (Pvac_ffi.make_zero_proof_bound_range ~keyed:false pk sk next_ct 15L (seed '\014'))
   in
   ignore (Octra_core.Ledger.update_enc_balance ledger "octFrom" (FB.encode_cipher current_ct));
   let encrypted_data = payload_json ~range_proof_balance:next_range delta_payload in
   match run_responsive "decrypt proof blocked event loop"
-    (P.apply_decrypt ~strict:true
+    (P.apply_decrypt ~keyed:false ~strict:true
        ~field_policy:P.Unique_fields
        ledger
        (tx ~op:T.DecryptOp ?encrypted_data ~amount:(Z.of_int 5) ~ou:Z.one ())) with
@@ -596,14 +613,14 @@ let test_private_ops_require_refresh () =
   let encrypted_data =
     payload_json ("hfhe_v1|bad", "bad", "bad", "bad")
   in
-  P.encrypt_plan ~strict:true
+  P.encrypt_plan ~keyed:false ~strict:true
     ~field_policy:P.Unique_fields
     ledger
     (tx ?encrypted_data ~amount:Z.one ())
   |> expect_error
       "encrypt_balance_failed"
       "encrypt: encrypted balance compact refresh required (8 base layers)";
-  P.decrypt_plan ~strict:true ~field_policy:P.Unique_fields ledger
+  P.decrypt_plan ~keyed:false ~strict:true ~field_policy:P.Unique_fields ledger
     (tx ~op:T.DecryptOp ?encrypted_data ~amount:Z.one ())
   |> expect_error
       "decrypt_cipher_failed"
@@ -611,7 +628,7 @@ let test_private_ops_require_refresh () =
   let expect_preverify op =
     match
       Lwt_main.run
-        (W.run ~strict:true
+        (W.run ~keyed:false ~strict:true
            ~field_policy:P.Unique_fields
            ~ledger
            (tx ~op ?encrypted_data ~amount:Z.one ()))
@@ -632,14 +649,14 @@ let test_claim_marked_output () =
   let amount_commitment = Base64.encode_exn (String.make 32 '\001') in
   let output_id = claim_output ledger (Z.of_int 7) amount_commitment "" in
   let encrypted_data = claim_json output_id in
-  P.claim_plan ~strict:true
+  P.claim_plan ~keyed:false ~strict:true
     ~field_policy:P.Unique_fields
     ledger
     (tx ~op:T.ClaimOp ?encrypted_data ())
   |> expect_error "legacy_stealth_output" "stealth output predates key-bound PVAC send verification; legacy output migration is required";
   match
     Lwt_main.run
-      (W.run ~strict:true
+      (W.run ~keyed:false ~strict:true
          ~field_policy:P.Unique_fields
          ~ledger
          (tx ~op:T.ClaimOp ?encrypted_data ()))
@@ -652,7 +669,7 @@ let test_key_switch_debit () =
   let ledger = ledger "key_switch_debit_failure" in
   match
     Lwt_main.run
-      (P.apply_key_switch ~strict:true
+      (P.apply_key_switch ~keyed:false ~strict:true
          ~field_policy:P.Unique_fields
          ledger
          (tx ~op:T.KeySwitch ~encrypted_data:"{}" ~amount:Z.zero ~ou:Z.one ()))
@@ -669,7 +686,7 @@ let test_key_switch_payload () =
   | Error e -> fail e);
   match
     Lwt_main.run
-      (P.apply_key_switch ~strict:true
+      (P.apply_key_switch ~keyed:false ~strict:true
          ~field_policy:P.Unique_fields
          ledger
          (tx ~op:T.KeySwitch ~encrypted_data:"{" ~amount:Z.zero ~ou:Z.one ()))
@@ -691,7 +708,7 @@ let test_key_switch_locked () =
   let encrypted_data = key_switch_json new_blob in
   match
     Lwt_main.run
-      (P.apply_key_switch ~strict:true
+      (P.apply_key_switch ~keyed:false ~strict:true
          ~field_policy:P.Unique_fields
          ledger
          (tx ~op:T.KeySwitch ?encrypted_data ~amount:Z.zero ~ou:Z.one ()))
@@ -716,7 +733,7 @@ let test_apply_key_switch_success () =
   let encrypted_data = key_switch_json new_blob in
   match
     Lwt_main.run
-      (P.apply_key_switch ~strict:true
+      (P.apply_key_switch ~keyed:false ~strict:true
          ~field_policy:P.Unique_fields
          ledger
          (tx ~op:T.KeySwitch ?encrypted_data ~amount:Z.zero ~ou:Z.one ()))
@@ -733,7 +750,7 @@ let test_apply_key_switch_success () =
     match Lwt_main.run (Octra_core.Ledger.get_pvac_pubkey ledger "octFrom") with
     | None -> fail "key switch missing new key"
     | Some stored ->
-      match Octra_core.Pvac_registry.canonicalize_blob new_blob with
+      match Octra_core.Pvac_registry.key_blob ~keyed:false new_blob with
       | Error e -> fail e
       | Ok reserialized ->
         ok "key switch stored new key" (String.equal stored reserialized);
@@ -747,9 +764,9 @@ let test_json_tree () =
       let deep = String.make 250_000 '[' ^ "0" ^ String.make 250_000 ']' in
       let payload padding = "{\"cipher\":false,\"padding\":" ^ padding ^ "}" in
       List.iter (fun field_policy ->
-        let encrypt raw = Lwt_main.run (P.encrypt_plan ~strict:true ~field_policy
+        let encrypt raw = Lwt_main.run (P.encrypt_plan ~keyed:false ~strict:true ~field_policy
           store (tx ~encrypted_data:raw ())) in
-        let key raw = Lwt_main.run (P.key_switch_plan ~strict:true ~field_policy
+        let key raw = Lwt_main.run (P.key_switch_plan ~keyed:false ~strict:true ~field_policy
           store (tx ~op:T.KeySwitch ~encrypted_data:raw ())) in
         let same name left right = match left, right with
           | Error a, Error b ->

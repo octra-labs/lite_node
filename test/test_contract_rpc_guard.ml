@@ -54,6 +54,14 @@ let with_chaindata run =
       remove_tree root)
     (fun () -> run chaindata)
 
+let store_source ~main ~files_json store address source =
+  let meta = Lwt_main.run (Octra_core.Store_irmin.get_contract_meta store address) in
+  let stored = Lwt_main.run (Octra_core.Store_irmin.read store
+    ["contracts"; address; "bytecode"]) |> Option.get |> Base64.decode_exn in
+  match Octra_vm.Contract_rpc.compile_record ~main ~meta ~source ~files_json ~stored with
+  | Error reason -> fail reason
+  | Ok record -> Lwt_main.run (Octra_vm.Program_record.stage store (address, record))
+
 let test_view_effort_limit () =
   let expected = Z.to_int (Octra_core.Resource_lanes.default_budget Program).max_ou in
   if Octra_vm.Contract_rpc.view_effort_limit <> expected then
@@ -290,17 +298,23 @@ let test_source_paths () =
         | Ok (`Assoc fields)
           when List.assoc_opt "verified" fields = Some (`Bool true)
             && List.assoc_opt "published" fields = Some (`Bool true)
+            && List.assoc_opt "committed" fields = Some (`Bool false)
             && List.assoc_opt "code_hash" fields = Some (`String code_hash)
             && List.mem_assoc "verification" fields
             && List.mem_assoc "certificate" fields -> ()
-        | Ok _ -> fail "named source verification was not published"
+        | Ok _ -> fail "named source verification result differs"
         | Error error -> fail ("named source verification: " ^ error.Octra_core.Rpc.message)
       end;
+      if Lwt_main.run (Octra_core.Store_irmin.read store
+          (Octra_vm.Program_record.key address)) <> None then
+        fail "RPC verification wrote chain state";
+      store_source ~main ~files_json:(Some [List.nth files 1]) store address source;
       let published = read () in
       begin
         match published with
         | Ok (`Assoc fields)
           when List.assoc_opt "source" fields = Some (`String source)
+            && List.assoc_opt "committed" fields = Some (`Bool true)
             && List.assoc_opt "main" fields = Some (`String main) ->
           begin
             match List.assoc_opt "files" fields with
@@ -366,7 +380,7 @@ let test_source_program_verify () =
             ~version:"1"
             ~owner:address
             ~ctype:"CUSTOM"
-            ~admission:"source"
+            ~check:"source"
            ~bytecode_b64:(Base64.encode_exn compiled.envelope)));
     with_chaindata (fun chaindata ->
       let verify value =
@@ -378,18 +392,22 @@ let test_source_program_verify () =
              ~source:value
              ~files_json:None)
       in
-      let verify_exact () =
+      let verify_exact committed =
         match verify source with
         | Ok (`Assoc fields) ->
           if List.assoc_opt "published" fields <> Some (`Bool true) then
-            fail "source Program metadata was not published";
+            fail "source Program publication flag differs";
+          if List.assoc_opt "committed" fields <> Some (`Bool committed) then
+            fail "source Program commitment flag differs";
           if List.assoc_opt "code_hash" fields <> Some (`String code_hash) then
             fail "source Program verification hash differs"
         | Ok _ -> fail "source Program verification response is invalid"
         | Error error -> fail error.Octra_core.Rpc.message
       in
-      verify_exact ();
-      verify_exact ();
+      verify_exact false;
+      store_source ~main:"main.aml" ~files_json:None store address source;
+      verify_exact true;
+      verify_exact true;
       begin
         match verify (source ^ "\n") with
         | Error error when error.Octra_core.Rpc.code = -32000 -> ()
@@ -403,9 +421,8 @@ let test_source_program_verify () =
             ~address
             ~code_hash
         with
-        | Ok (Some record) when String.equal record.source source -> ()
-        | Ok (Some _) -> fail "source Program record changed"
-        | Ok None -> fail "source Program record is absent"
+        | Ok (Some _) -> ()
+        | Ok None -> fail "source Program local publication missing"
         | Error reason -> fail reason
       end;
       match
@@ -413,7 +430,8 @@ let test_source_program_verify () =
           (Octra_vm.Contract_rpc.source ~store ~chaindata ~addr:address)
       with
       | Ok (`Assoc fields)
-        when List.assoc_opt "source" fields = Some (`String source) -> ()
+        when List.assoc_opt "source" fields = Some (`String source)
+          && List.assoc_opt "committed" fields = Some (`Bool true) -> ()
       | Ok _ -> fail "source Program metadata response differs"
       | Error error -> fail error.Octra_core.Rpc.message);
     let ledger = Octra_core.Ledger.create store in
@@ -425,6 +443,7 @@ let test_source_program_verify () =
                      object_cost = false; int_work = Octra_vm.Int_work.Active;
                      fhe_work = Octra_core.Rule_graph.Prior;
                      proof_exec = Octra_core.Rule_graph.Prior;
+                     proof_key = Octra_core.Rule_graph.Prior;
                      wasm_float = Octra_core.Rule_graph.Prior})
            ~store
            ~ledger
@@ -451,6 +470,7 @@ let test_balance_dispatch () =
           object_cost = false; int_work = V.Int_work.Active;
           fhe_work = Octra_core.Rule_graph.Prior;
           proof_exec = Octra_core.Rule_graph.Prior;
+          proof_key = Octra_core.Rule_graph.Prior;
           wasm_float = Octra_core.Rule_graph.Prior})
         ~store ~ledger ~get_fhe_pubkey:(fun _ -> None)
         ~storage_json:(fun pairs -> `Assoc (List.map (fun (k, v) -> k, `String v) pairs))
@@ -473,7 +493,7 @@ program Balance {
     let hash = Digestif.SHA256.(digest_string compiled.envelope |> to_hex) in
     ignore (Lwt_main.run (Octra_core.Store_irmin.deploy_contract store
       ~address ~code_hash:hash ~version:"1" ~owner:holder ~ctype:"CUSTOM"
-      ~admission:"source" ~bytecode_b64:(Base64.encode_exn compiled.envelope)));
+      ~check:"source" ~bytecode_b64:(Base64.encode_exn compiled.envelope)));
     let storage = Hashtbl.create 2 in
     Hashtbl.replace storage ("@aml/map/balances/47#" ^ holder) "41";
     Hashtbl.replace storage ("balances:" ^ holder) "999";
@@ -511,7 +531,7 @@ let install_token store ~address ~owner fields =
           ~version:"1"
           ~owner
           ~ctype:"OCS01"
-          ~admission:"source"
+          ~check:"source"
           ~bytecode_b64:""));
   let storage = Hashtbl.create 8 in
   List.iter (fun (key, value) -> Hashtbl.replace storage key value) fields;
@@ -698,7 +718,7 @@ let test_nested_view_stop () =
       (Octra_core.Store_irmin.deploy_contract store
         ~address
         ~code_hash:Digestif.SHA256.(digest_string raw |> to_hex)
-        ~version:"1" ~owner:address ~ctype:"CUSTOM" ~admission:"bytecode"
+        ~version:"1" ~owner:address ~ctype:"CUSTOM" ~check:"bytecode"
         ~bytecode_b64:(Base64.encode_exn raw));
     let ledger = Octra_core.Ledger.create store in
     let run running =
@@ -707,6 +727,7 @@ let test_nested_view_stop () =
                   object_cost = false; int_work = Octra_vm.Int_work.Active;
                   fhe_work = Octra_core.Rule_graph.Prior;
                   proof_exec = Octra_core.Rule_graph.Prior;
+                  proof_key = Octra_core.Rule_graph.Prior;
                   wasm_float = Octra_core.Rule_graph.Prior}
         ~get_fhe_pubkey:(fun _ -> None) () in
       Lwt_main.run (Lwt_preemptive.detach
@@ -769,13 +790,14 @@ let test_view_release_keys () =
     let address = token_address '3' in
     Lwt_main.run (Octra_core.Store_irmin.deploy_contract store ~address
       ~code_hash:Digestif.SHA256.(digest_string raw |> to_hex)
-      ~version:"1" ~owner:address ~ctype:"CUSTOM" ~admission:"binary"
+      ~version:"1" ~owner:address ~ctype:"CUSTOM" ~check:"binary"
       ~bytecode_b64:(Base64.encode_exn raw));
     let ledger = Octra_core.Ledger.create store in
     let profile = V.Contract_rpc.{epoch = 0; math = false; point_ops = true;
       object_cost = false; int_work = V.Int_work.Active;
       fhe_work = Octra_core.Rule_graph.Prior;
       proof_exec = Octra_core.Rule_graph.Prior;
+      proof_key = Octra_core.Rule_graph.Prior;
       wasm_float = Octra_core.Rule_graph.Prior} in
     let read trusted =
       V.Contract_rpc.call_params ~trusted ~profile:(fun ~epoch:_ -> Ok profile) ~store ~ledger
@@ -834,7 +856,7 @@ let test_view_cache_upgrade () =
     let address = token_address '4' in
     Lwt_main.run (Octra_core.Store_irmin.deploy_contract store ~address
       ~code_hash:"stored-code" ~version:"1" ~owner:address ~ctype:"CUSTOM"
-      ~admission:"binary" ~bytecode_b64:first);
+      ~check:"binary" ~bytecode_b64:first);
     let journal = V.Program_journal.create () in
     let call value =
       let run () = V.Contract.execute_call ~journal store address "read" [] address Z.zero in
@@ -845,7 +867,7 @@ let test_view_cache_upgrade () =
     call 7;
     V.Program_journal.add_deploy journal {
       address; code_hash = "stored-code"; bytecode_b64 = second;
-      owner = address; ctype = "CUSTOM"; admission = "binary"; version = "1";
+      owner = address; ctype = "CUSTOM"; check = "binary"; version = "1";
       storage = Hashtbl.create 0;
     };
     call 8;
@@ -853,7 +875,7 @@ let test_view_cache_upgrade () =
     V.Program_journal.add_upgrade journal {
       address; expected_code_hash = "stored-code"; code_hash = "next-code";
       bytecode_b64 = third; owner = address; ctype = "CUSTOM";
-      admission = "binary"; version = "1";
+      check = "binary"; version = "1";
     };
     call 9;
     V.Program_journal.restore journal saved;
@@ -868,6 +890,7 @@ let test_view_overlap () =
       object_cost = false; int_work = V.Int_work.Prior;
       fhe_work = Octra_core.Rule_graph.Prior;
       proof_exec = Octra_core.Rule_graph.Prior;
+      proof_key = Octra_core.Rule_graph.Prior;
       wasm_float = Octra_core.Rule_graph.Prior} in
     let ctx = V.Contract_rpc.make_view_ctx ~trusted:[] ~profile ~store
       ~ledger:(Octra_core.Ledger.create store) ~get_fhe_pubkey:(fun _ -> None) () in
@@ -892,6 +915,7 @@ let test_view_memory () =
           object_cost = false; int_work = mode;
           fhe_work = Octra_core.Rule_graph.Prior;
           proof_exec = Octra_core.Rule_graph.Prior;
+          proof_key = Octra_core.Rule_graph.Prior;
           wasm_float = Octra_core.Rule_graph.Prior} in
         let ctx = V.Contract_rpc.make_view_ctx ~trusted:[] ~profile ~store
           ~ledger:(Octra_core.Ledger.create store) ~get_fhe_pubkey:(fun _ -> None) () in
@@ -940,13 +964,14 @@ program WorkRead {
     let address = token_address '5' in
     Lwt_main.run (Octra_core.Store_irmin.deploy_contract store ~address
       ~code_hash:Digestif.SHA256.(digest_string compiled.bytecode |> to_hex)
-      ~version:"1" ~owner:address ~ctype:"CUSTOM" ~admission:"binary"
+      ~version:"1" ~owner:address ~ctype:"CUSTOM" ~check:"binary"
       ~bytecode_b64:(Base64.encode_exn compiled.bytecode));
     let ledger = Octra_core.Ledger.create store in
     let profile = V.Contract_rpc.{epoch = 0; math = false; point_ops = false;
       object_cost = false; int_work = V.Int_work.Prior;
       fhe_work = Octra_core.Rule_graph.Prior;
       proof_exec = Octra_core.Rule_graph.Prior;
+      proof_key = Octra_core.Rule_graph.Prior;
       wasm_float = Octra_core.Rule_graph.Prior} in
     let read name params =
       Lwt_main.run (V.Contract_rpc.call_params ~trusted:[]

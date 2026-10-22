@@ -54,6 +54,8 @@ let encode json =
 
 let digest encoded = encoded.digest
 
+let size encoded = String.length encoded.raw
+
 let render ?index encoded =
   match encoded.digest with
   | None ->

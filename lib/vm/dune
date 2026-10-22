@@ -1,5 +1,34 @@
 (include_subdirs unqualified)
 
+(rule
+ (targets source_stamp.ml)
+ (deps
+  (source_tree compiler)
+  (source_tree aml)
+  (source_tree policy)
+  (source_tree wire)
+  (source_tree runtime))
+ (action
+  (with-stdout-to source_stamp.ml
+   (run python3 -c
+    "import hashlib
+import sys
+from pathlib import Path
+
+header = b'(* SPDX-License-Identifier: BSD-3-Clause *)\\n(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)\\n\\n'
+paths = sorted(path for name in ('compiler', 'aml', 'policy', 'wire', 'runtime')
+    for path in Path(name).rglob('*') if path.is_file() and path.suffix in ('.ml', '.mli'))
+digest = hashlib.sha256()
+for path in paths:
+    body = path.read_bytes().removeprefix(header).rstrip(b'\\n')
+    item = hashlib.sha256(body).hexdigest()
+    digest.update((item + '  ' + path.as_posix() + '\\n').encode())
+actual = digest.hexdigest()
+expected = 'b21391865660ba35426eaabc15e8d8a4d5a04a3754b73042bf57d5697fe108b6'
+if actual != expected:
+    sys.exit('source compiler content differs actual = ' + actual)
+print('let id = ' + repr(actual).replace(chr(39), chr(34)))"))))
+
 (library
  (name octra_vm)
  (libraries

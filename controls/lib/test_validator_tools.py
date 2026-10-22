@@ -2,6 +2,7 @@
 # Copyright (c) 2023-2026 Octra Labs <dev@octra.org>
 
 import base64
+import sync_tip
 import datetime
 import hashlib
 import json
@@ -12,7 +13,11 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
+import time
 import unittest
+from test_sync_tip import SyncTipTest
+from test_sync_start import SyncStartTest
 from pathlib import Path
 from multiprocessing import get_context
 from unittest import mock
@@ -25,6 +30,7 @@ from nacl.signing import SigningKey
 from sync_need import make as make_need
 
 from validator_common import ValidatorError
+from validator_common import write_private_json
 from validator_common import address_from_pubkey
 from validator_common import copy_private
 from validator_common import ensure_wallet
@@ -105,6 +111,7 @@ from validator_recover import recover
 from validator_recover import need_of
 from validator_recover import read_need
 from validator_recover import preserved_state_path
+from sync_need import carry_guard
 from validator_rejoin import configured_data
 from validator_rejoin import confirmed_node
 from validator_rejoin import captured_round
@@ -247,6 +254,9 @@ def release_value(public="a" * 40, source="b" * 40, notice="consensus_recovery")
         "signature": "A" * 86 + "==",
     }
 
+def rust_report(version="1.88.0"):
+    return f"rustc {version}\ncommit-hash: 6b00bc3880198600130e1cf62b8f8a93494488cc\n"
+
 def write_need(data, chain, cause="root", epoch=100, head=99, target=None):
     path = data / "recovery/sync_need.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -281,12 +291,16 @@ def signed_release_value():
 
 class ValidatorToolsTest(unittest.TestCase):
     def setUp(self):
+        self.addCleanup(os.umask, os.umask(0o077))
         if WORK.exists():
             shutil.rmtree(WORK)
         WORK.mkdir(parents=True)
         identity = mock.patch("validator_config.IDENTITY_WALLET", WORK / "wallet.json")
         identity.start()
         self.addCleanup(identity.stop)
+        tip = mock.patch("validator_recover.sync_head", return_value = {"head": 100, "snapshot": 100})
+        tip.start()
+        self.addCleanup(tip.stop)
 
     def test_store_external_wallet(self):
         data, config, wallet, _ = self.recovery_identity("store-external")
@@ -374,6 +388,23 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertTrue(data.is_dir())
         self.assertTrue(prior.is_dir())
         self.assertFalse(rejected.exists())
+
+    def test_group_write_refused(self):
+        data = WORK / "devnet"
+        data.mkdir()
+        saved = WORK / "devnet.rejected-10"
+        prior = os.umask(0o002)
+        try:
+            saved.mkdir()
+        finally:
+            os.umask(prior)
+        (saved / "ledger.dat").write_bytes(b"preserve")
+        self.assertTrue(saved.stat().st_mode & 0o020)
+        with mock.patch("validator_store.pm2_entries", return_value = []), mock.patch(
+            "validator_store.data_pids", return_value = []
+        ):
+            self.assertEqual(remove_rejected(data), (0, 0, 1))
+        self.assertEqual((saved / "ledger.dat").read_bytes(), b"preserve")
 
     def test_rejected_refusals(self):
         from validator_exit import command_lock
@@ -942,7 +973,7 @@ class ValidatorToolsTest(unittest.TestCase):
         rollback = {**prior, "sequence": 1}
         reused = {**prior, "action": "recommended"}
         for update, message in (
-            (rollback, "would roll back"),
+            (rollback, "expired"),
             (reused, "was reused"),
         ):
             with mock.patch.object(release_tool, "cache_path", return_value=WORK / "release"), mock.patch.object(
@@ -981,6 +1012,130 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(release_tool.read(path, fresh=True, now=now), marker)
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
         self.assertEqual(list(WORK.glob("*.staged")), [])
+
+    def test_marker_origin_behind(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cached = {**release_value(), "issued_at": (now - datetime.timedelta(hours=1)).isoformat(),
+                  "expires_at": (now + datetime.timedelta(hours=1)).isoformat()}
+        with mock.patch.object(release_tool, "cache_path", return_value=WORK / "release"), \
+                mock.patch.object(release_tool, "read", return_value=cached), \
+                mock.patch.object(release_tool, "fetch", return_value={**cached, "sequence": 1}), \
+                mock.patch.object(release_tool, "write") as write:
+            self.assertEqual(release_tool.trusted(WORK), (cached, "cache"))
+        write.assert_not_called()
+
+    def test_marker_non_git(self):
+        with mock.patch.object(release_tool.subprocess, "run", side_effect=FileNotFoundError), \
+                mock.patch.object(Path, "exists", return_value = False):
+            self.assertEqual(release_tool.cache_path(WORK), WORK / "runtime_data/release/latest.json")
+
+    def test_marker_git_failure(self):
+        root = WORK / "marker_git"
+        root.mkdir()
+        (root / ".git").mkdir()
+        for error in (FileNotFoundError(), subprocess.CalledProcessError(128, ["git"])):
+            with mock.patch.object(release_tool.subprocess, "run", side_effect = error):
+                with self.assertRaisesRegex(ValidatorError, "cannot locate signed release cache"):
+                    release_tool.cache_path(root)
+
+    def test_faults_saved_head(self):
+        old = ("vote_record_unreadable", WORK / ("00000000000000000040_00000000_" + "a" * 64 + ".vote"))
+        current = ("vote_record_unreadable", WORK / ("00000000000000000041_00000000_" + "b" * 64 + ".vote"))
+        with mock.patch.object(upgrade_tool, "load_head", return_value = {"epoch": 41}), \
+                mock.patch.object(upgrade_tool, "inspect_pending", return_value = []), \
+                mock.patch.object(upgrade_tool, "inspect_votes", return_value = [old, current]):
+            self.assertEqual(upgrade_tool.durable_faults(WORK), [current])
+        with mock.patch.object(upgrade_tool, "load_head", side_effect = ValidatorError("invalid head")), \
+                mock.patch.object(upgrade_tool, "inspect_pending", return_value = []), \
+                mock.patch.object(upgrade_tool, "inspect_votes", return_value = [old, current]):
+            self.assertEqual(upgrade_tool.durable_faults(WORK), [old, current])
+
+    def test_marker_repair(self):
+        path = WORK / "broken-marker.json"
+        path.write_text("broken", encoding="utf-8")
+        with mock.patch.object(release_tool, "cache_path", return_value=path), \
+                mock.patch.object(release_tool, "fetch", return_value=release_value()) as fetch:
+            with self.assertRaisesRegex(ValidatorError, "--repair-cache"):
+                release_tool.trusted(WORK)
+            fetch.assert_not_called()
+            value, source = release_tool.trusted(WORK, repair=True)
+        self.assertEqual(value, release_value())
+        self.assertEqual(source, "origin_recovered")
+        saved = list(WORK.glob(".broken-marker.json.invalid.*.staged"))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0].read_text(encoding="utf-8"), "broken")
+
+    def test_marker_reason(self):
+        with mock.patch.object(release_tool, "cache_path", return_value = WORK / "release"), \
+                mock.patch.object(release_tool, "read", side_effect = ValidatorError("signature differs")), \
+                mock.patch.object(release_tool, "fetch") as fetch:
+            with self.assertRaisesRegex(ValidatorError, "signature differs"):
+                release_tool.trusted(WORK)
+            fetch.assert_not_called()
+
+    def test_marker_repair_signature(self):
+        path = WORK / "broken-marker.json"
+        path.write_text("broken", encoding="utf-8")
+        with mock.patch.object(release_tool, "cache_path", return_value=path), \
+                mock.patch.object(release_tool, "fetch", side_effect=ValidatorError("signature rejected")):
+            with self.assertRaisesRegex(ValidatorError, "signature rejected"):
+                release_tool.trusted(WORK, repair=True)
+        self.assertEqual(path.read_text(encoding="utf-8"), "broken")
+
+    def test_marker_field_types(self):
+        now = datetime.datetime(2026, 8, 16, 20, tzinfo = datetime.timezone.utc)
+        marker = signed_release_value()
+        for field in ("action", "notice_code"):
+            for invalid in ([], {}, None, 1):
+                with self.subTest(field = field, invalid = invalid):
+                    value = {**marker, field: invalid}
+                    with self.assertRaisesRegex(ValidatorError, "is invalid"):
+                        release_tool.decode(json.dumps(value).encode(), now = now)
+
+    def test_marker_type_repair(self):
+        path = WORK / "broken-marker.json"
+        for field in ("action", "notice_code"):
+            raw = json.dumps({**signed_release_value(), field: []})
+            path.write_text(raw, encoding = "utf-8")
+            with self.subTest(field = field), \
+                    mock.patch.object(release_tool, "cache_path", return_value = path), \
+                    mock.patch.object(release_tool, "fetch", return_value = release_value()) as fetch:
+                with self.assertRaisesRegex(ValidatorError, "--repair-cache"):
+                    release_tool.trusted(WORK)
+                fetch.assert_not_called()
+                value, source = release_tool.trusted(WORK, repair = True)
+            self.assertEqual(value, release_value())
+            self.assertEqual(source, "origin_recovered")
+            self.assertTrue(any(saved.read_text(encoding = "utf-8") == raw
+                for saved in WORK.glob(".broken-marker.json.invalid.*.staged")))
+
+    def test_durable_scope(self):
+        old = ("vote_record_unreadable", Path("00000000000000000040_00000000_" + "a" * 64 + ".vote"))
+        current = ("vote_record_unreadable", Path("00000000000000000041_00000000_" + "a" * 64 + ".vote"))
+        wal = ("wal_store_unreadable", Path("wal"), "invalid")
+        with mock.patch.object(upgrade_tool, "inspect_pending", return_value=[wal]), \
+                mock.patch.object(upgrade_tool, "inspect_votes", return_value=[old, current]):
+            self.assertEqual(upgrade_tool.durable_faults(WORK, 41), [wal, current])
+            self.assertEqual(upgrade_tool.durable_faults(WORK), [wal, old, current])
+
+    def test_built_identity(self):
+        folder = WORK / "_build/default/bin"
+        folder.mkdir(parents=True)
+        values = {}
+        for name, path_key, hash_key in (
+            ("octra_node.exe", "OCTRA_OPERATOR_BINARY", "OCTRA_BINARY_HASH"),
+            ("octra_pvac_worker.exe", "OCTRA_PVAC_VERIFY_WORKER", "OCTRA_PVAC_VERIFY_WORKER_HASH"),
+            ("octra_state_sync_client.exe", "OCTRA_OPERATOR_SYNC_BINARY", "OCTRA_OPERATOR_SYNC_BINARY_HASH"),
+        ):
+            path = folder / name
+            path.write_bytes(name.encode())
+            values[path_key] = str(path)
+            values[hash_key] = hashlib.sha256(name.encode()).hexdigest()
+        upgrade_tool.check_built(WORK, values)
+        wrong = WORK / "different.exe"
+        wrong.write_bytes(b"different")
+        with self.assertRaisesRegex(ValidatorError, "differs from selected runtime"):
+            upgrade_tool.check_built(WORK, {**values, "OCTRA_OPERATOR_BINARY": str(wrong)})
 
     def test_upgrade_cache_link(self):
         target = WORK / "target.json"
@@ -1132,6 +1287,37 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertTrue(pending.is_file())
         self.assertTrue(vote.is_file())
 
+    def test_vote_rotation(self):
+        votes = WORK / "vote_log"
+        votes.mkdir()
+        vote = votes / ("00000000000000000041_00000003_" + "a" * 64 + ".vote")
+        vote.write_bytes(b"vote")
+        original = Path.lstat
+
+        def rotated(path):
+            if path == vote:
+                raise FileNotFoundError(str(path))
+            return original(path)
+
+        with mock.patch.object(Path, "lstat", rotated):
+            self.assertEqual(inspect_votes(WORK), [])
+
+    def test_wal_rotation(self):
+        wal = WORK / "wal"
+        wal.mkdir()
+        record = wal / "0000000041.wal"
+        record.write_text("record", encoding = "utf-8")
+        original = Path.read_text
+
+        def rotated(path, *args, **kwargs):
+            if path == record:
+                raise FileNotFoundError(str(path))
+            return original(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "read_text", rotated):
+            self.assertEqual(inspect_pending(WORK), [])
+        self.assertEqual(inspect_pending(WORK)[0][0], "wal_store_unreadable")
+
     def test_upgrade_role(self):
         common = {
             "process": "online",
@@ -1238,10 +1424,10 @@ class ValidatorToolsTest(unittest.TestCase):
             "rpc": "ready",
             "head_epoch": 100,
         }
-        self.assertIsNone(sync_plan(values, state, 5100))
+        self.assertIsNone(sync_plan(values, state, 4196))
         self.assertEqual(
-            sync_plan(values, state, 5101),
-            make_need("octra-devnet-9871-cluster", "range", 101, 100, 5101),
+            sync_plan(values, state, 4197),
+            make_need("octra-devnet-9871-cluster", "range", 101, 100, 4197),
         )
         self.assertIsNone(sync_plan(values, {**state, "rpc": "unavailable"}, 5101))
 
@@ -1263,13 +1449,14 @@ class ValidatorToolsTest(unittest.TestCase):
         second = mock.MagicMock()
         second.__enter__.return_value.read.return_value = certificate
         with mock.patch.object(
-            upgrade_tool,
-            "urlopen",
+            sync_tip.http,
+            "open",
             side_effect=[first, second],
         ) as opened:
             self.assertEqual(
                 upgrade_tool.sync_epoch("https://seed.example"),
-                {"head": 41, "snapshot": 40},
+                {"head": 41, "snapshot": 40, "latest": 40, "status": "ready",
+                    "advertised_status": "unknown", "source": "https://seed.example", "reason": None},
             )
         self.assertEqual(len(opened.call_args_list), 2)
         for item in opened.call_args_list:
@@ -1277,7 +1464,7 @@ class ValidatorToolsTest(unittest.TestCase):
             self.assertEqual(request.get_header("Accept"), "application/json")
             self.assertEqual(request.get_header("User-agent"), "octra-upgrade/1")
         first.__enter__.return_value.read.return_value = b"x" * 65_537
-        with mock.patch.object(upgrade_tool, "urlopen", return_value=first):
+        with mock.patch.object(sync_tip.http, "open", return_value = first):
             with self.assertRaisesRegex(ValidatorError, "byte limit"):
                 upgrade_tool.sync_epoch("https://seed.example")
 
@@ -1298,13 +1485,14 @@ class ValidatorToolsTest(unittest.TestCase):
         second = mock.MagicMock()
         second.__enter__.return_value.read.return_value = certificate
         with mock.patch.object(
-            upgrade_tool,
-            "urlopen",
+            sync_tip.http,
+            "open",
             side_effect=[first, second],
         ):
             self.assertEqual(
                 upgrade_tool.sync_epoch("https://seed.example"),
-                {"head": 41, "snapshot": 39},
+                {"head": 41, "snapshot": 39, "latest": None, "status": "ready",
+                    "advertised_status": "unknown", "source": "https://seed.example", "reason": None},
             )
 
     def test_upgrade_root_window(self):
@@ -1325,12 +1513,14 @@ class ValidatorToolsTest(unittest.TestCase):
         second = mock.MagicMock()
         second.__enter__.return_value.read.return_value = certificate
         with mock.patch.object(
-            upgrade_tool,
-            "urlopen",
+            sync_tip.http,
+            "open",
             side_effect=[first, second],
         ):
-            with self.assertRaisesRegex(ValidatorError, "root window"):
-                upgrade_tool.sync_epoch("https://seed.example")
+            self.assertEqual(upgrade_tool.sync_epoch("https://seed.example"),
+                {"head": 41, "snapshot": None, "latest": 40, "status": "unavailable",
+                    "advertised_status": "unknown", "source": "https://seed.example",
+                    "reason": "state sync root window is unavailable"})
 
     def test_upgrade_epoch_unsigned(self):
         head = json.dumps({
@@ -1350,12 +1540,14 @@ class ValidatorToolsTest(unittest.TestCase):
         second = mock.MagicMock()
         second.__enter__.return_value.read.return_value = certificate
         with mock.patch.object(
-            upgrade_tool,
-            "urlopen",
+            sync_tip.http,
+            "open",
             side_effect=[first, second],
         ):
-            with self.assertRaisesRegex(ValidatorError, "fields differ"):
-                upgrade_tool.sync_epoch("https://seed.example")
+            self.assertEqual(upgrade_tool.sync_epoch("https://seed.example"),
+                {"head": 41, "snapshot": None, "latest": 40, "status": "unavailable",
+                    "advertised_status": "unknown", "source": "https://seed.example",
+                    "reason": "state sync certificate epoch differs"})
 
     def test_upgrade_snapshot_wait(self):
         values = {"OCTRA_STATE_SYNC_SOURCES": "https://a.example,https://b.example"}
@@ -1381,8 +1573,40 @@ class ValidatorToolsTest(unittest.TestCase):
         ), mock.patch.object(
             upgrade_tool.time, "monotonic", side_effect=[0.0, 0.0]
         ):
-            with self.assertRaisesRegex(ValidatorError, "metadata is unavailable"):
+            with self.assertRaisesRegex(ValidatorError, "head = unknown.*snapshot_status = unavailable"):
                 upgrade_tool.sync_wait(values, need, 0.0, 0.1)
+
+    def test_wait_independent(self):
+        need = make_need("octra-test", "root", 101, 100, None)
+        for epoch in [need.epoch, need.epoch + 1]:
+            with self.subTest(epoch = epoch), mock.patch.object(upgrade_tool, "sync_head",
+                    return_value = {"head": None, "snapshot": epoch}), \
+                    mock.patch.object(upgrade_tool.time, "sleep") as sleep:
+                with self.assertRaisesRegex(ValidatorError, "head_status = independent_unavailable"):
+                    upgrade_tool.sync_wait({}, need, 0.0, 0.1)
+                sleep.assert_not_called()
+
+    def test_wait_route_config(self):
+        need = make_need("octra-test", "root", 101, 100, None)
+        values = {"OCTRA_STATE_SYNC_SOURCES": "https://a.example", "OCTRA_JOIN_RPC": "https://a.example"}
+        with mock.patch.object(sync_tip.http, "open") as read, \
+                mock.patch.object(upgrade_tool.time, "sleep") as sleep:
+            with self.assertRaisesRegex(ValidatorError, "state sync configuration error"):
+                upgrade_tool.sync_wait(values, need, 120.0, 1.0)
+            read.assert_not_called()
+            sleep.assert_not_called()
+
+    def test_upgrade_saved_floor(self):
+        values = {"OCTRA_STATE_SYNC_SOURCES": "https://seed.example"}
+        for cause in ("root", "conflict"):
+            need = make_need("octra-test", cause, 101, 100, None)
+            with mock.patch.object(upgrade_tool, "sync_head", side_effect = [
+                {"head": 5000, "snapshot": 1000},
+                {"head": 5000, "snapshot": 4904},
+            ]), mock.patch.object(upgrade_tool.time, "sleep") as wait:
+                self.assertEqual(upgrade_tool.sync_wait(values, need, 10.0, 0.1, min_epoch = 4904),
+                    {"head": 5000, "snapshot": 4904, "required": 4904})
+                wait.assert_called_once()
 
     def test_upgrade_snapshot_old(self):
         values = {"OCTRA_STATE_SYNC_SOURCES": "https://seed.example"}
@@ -1394,7 +1618,7 @@ class ValidatorToolsTest(unittest.TestCase):
         ), mock.patch.object(
             upgrade_tool.time, "monotonic", side_effect=[0.0, 0.0]
         ):
-            with self.assertRaisesRegex(ValidatorError, "below recovery boundary"):
+            with self.assertRaisesRegex(ValidatorError, "snapshot_status = below_minimum"):
                 upgrade_tool.sync_wait(values, need, 0.0, 0.1)
 
     def test_upgrade_snapshot_future(self):
@@ -1416,7 +1640,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 {
                     "head": 1344077,
                     "snapshot": 1342801,
-                    "required": 1339077,
+                    "required": 1341077,
                 },
             )
 
@@ -1663,6 +1887,7 @@ class ValidatorToolsTest(unittest.TestCase):
             upgrade_tool,
             release_target=mock.Mock(return_value=("a" * 40, "b" * 40)),
             preflight=mock.Mock(),
+            check_built=mock.Mock(),
             verify_unit=mock.Mock(return_value=None),
             git_update=mock.Mock(return_value=("a" * 40, "b" * 40, False)),
             verify_release_tree=mock.Mock(),
@@ -1783,8 +2008,9 @@ class ValidatorToolsTest(unittest.TestCase):
             events.append("network")
             return values
 
-        def wait(*_):
+        def wait(*_, **options):
             events.append("wait")
+            self.assertEqual(options["min_epoch"], expected)
             raise SystemExit(0)
 
         with mock.patch.object(upgrade_tool, "preflight"), mock.patch.object(
@@ -1810,10 +2036,13 @@ class ValidatorToolsTest(unittest.TestCase):
         ) as run, mock.patch.object(
             upgrade_tool, "stop"
         ) as stop_node:
-            with self.assertRaises(SystemExit):
-                upgrade_tool.apply(WORK, supervisor, values, args, release_value())
+            for saved, expected in ((None, 0),
+                    (make_need(values["OCTRA_CHAIN_ID"], "range", 100, 99, 9000), 6000)):
+                with mock.patch.object(upgrade_tool, "remember_plan", return_value = saved):
+                    with self.assertRaises(SystemExit):
+                        upgrade_tool.apply(WORK, supervisor, values, args, release_value())
 
-        self.assertEqual(events, ["git", "tree", "network", "wait"])
+        self.assertEqual(events, ["git", "tree", "network", "wait"] * 2)
         run.assert_not_called()
         stop_node.assert_not_called()
 
@@ -1869,7 +2098,9 @@ class ValidatorToolsTest(unittest.TestCase):
             return "a" * 40, "b" * 40, False
 
         with mock.patch.object(
-            upgrade_tool, "preflight", side_effect=lambda *_: events.append("preflight")
+            upgrade_tool, "preflight", side_effect=lambda *_, **__: events.append("preflight")
+        ), mock.patch.object(
+            upgrade_tool, "check_built", side_effect = lambda *_: events.append("built")
         ), mock.patch.object(
             upgrade_tool, "verify_unit", side_effect=lambda *_: events.append("verify")
         ), mock.patch.object(
@@ -1886,6 +2117,8 @@ class ValidatorToolsTest(unittest.TestCase):
             upgrade_tool, "inspect_pending", return_value=[]
         ), mock.patch.object(
             upgrade_tool, "inspect_votes", return_value=[]
+        ), mock.patch.object(
+            upgrade_tool, "durable_faults", side_effect = lambda *_: events.append("durable") or []
         ), mock.patch.object(
             upgrade_tool, "stop", side_effect=lambda *_: events.append("stop")
         ) as stop_node, mock.patch.object(
@@ -1925,6 +2158,8 @@ class ValidatorToolsTest(unittest.TestCase):
                 "network",
                 "runtime",
                 "validator_guard.py",
+                "built",
+                "durable",
                 "stop",
                 "recover",
                 "start",
@@ -4199,6 +4434,96 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertTrue((target / ".state_sync/snapshot_verified.json").is_file())
         self.assertFalse(data.exists())
 
+    def test_sync_stage_identity(self):
+        saved = WORK / "snapshot"
+        source = saved / "data"
+        source.mkdir(parents = True)
+        target = WORK / "installed"
+        identity = WORK / "identity.json"
+        owner = ensure_wallet(identity)
+        other = ensure_wallet(source / "wallet.json")
+        for name in ("snapshot_verified.json", "certificate.json"):
+            (saved / name).write_text("{}", encoding = "ascii")
+        with self.assertRaisesRegex(ValidatorError, "stage identity differs: path = .*wallet.json"):
+            install_verified_snapshot(saved, target, identity = (identity, owner))
+        self.assertFalse(target.exists())
+        self.assertEqual(load_wallet(source / "wallet.json"), other)
+        copy_private(source / "wallet.json", identity)
+        (source / "wallet.json").unlink()
+        with self.assertRaisesRegex(ValidatorError, "copied identity differs"):
+            install_verified_snapshot(saved, target, identity = (identity, owner))
+        self.assertFalse(target.exists())
+        self.assertEqual(load_wallet(source / "wallet.json"), other)
+        write_private_json(identity, owner)
+        copy_private(identity, source / "wallet.json")
+        install_verified_snapshot(saved, target, identity = (identity, owner))
+        self.assertEqual(load_wallet(target / "wallet.json"), owner)
+        self.assertFalse(source.exists())
+
+    def test_sync_prepare_retry(self):
+        saved = WORK / "snapshot"
+        source = saved / "data"
+        source.mkdir(parents = True)
+        target = WORK / "installed"
+        prior = WORK / "prior"
+        (prior / "validator-control").mkdir(parents = True, mode = 0o700)
+        write_private_json(prior / "validator-control/exit.json", {"signed": "intent"})
+        for name in ("snapshot_verified.json", "certificate.json"):
+            (saved / name).write_text("{}", encoding = "ascii")
+        guard = make_need("octra-test", "root", 101, 100, None)
+        control = prior / "validator-control"
+        control.chmod(0o755)
+        with self.assertRaisesRegex(ValidatorError, "^preserved validator control directory is not private$"):
+            install_verified_snapshot(saved, target, guard = guard, prior = prior)
+        self.assertFalse(target.exists())
+        control.chmod(0o700)
+        intent = control / "exit.json"
+        intent.write_text("[", encoding = "ascii")
+        with self.assertRaisesRegex(ValidatorError, "^invalid validator exit outbox JSON$"):
+            install_verified_snapshot(saved, target, guard = guard, prior = prior)
+        self.assertFalse(target.exists())
+        write_private_json(intent, {"signed": "intent"})
+        with mock.patch("validator_config.write_private_json", side_effect = OSError("disk write failed")):
+            with self.assertRaisesRegex(OSError, "disk write failed"):
+                install_verified_snapshot(saved, target, guard = guard, prior = prior)
+        self.assertFalse(target.exists())
+        copied = source / "validator-control/exit.json"
+        original = copied.read_bytes()
+        write_private_json(copied, {"signed": "changed"})
+        with self.assertRaisesRegex(ValidatorError, "stage control records differ: path = .*validator-control"):
+            install_verified_snapshot(saved, target, guard = guard, prior = prior)
+        copied.write_bytes(original)
+        extra = copied.with_name("extra.json")
+        write_private_json(extra, {})
+        with self.assertRaisesRegex(ValidatorError, "stage control records differ: path = .*validator-control"):
+            install_verified_snapshot(saved, target, guard = guard, prior = prior)
+        extra.unlink()
+        partial = copied.with_name("exit.json.new")
+        partial.write_text("partial", encoding = "ascii")
+        partial.chmod(0o600)
+        replace = os.replace
+        def interrupted(source, destination):
+            if Path(destination) == target:
+                raise OSError("rename failed")
+            replace(source, destination)
+        with mock.patch("validator_config.os.replace", side_effect = interrupted):
+            with self.assertRaisesRegex(OSError, "rename failed"):
+                install_verified_snapshot(saved, target, guard = guard, prior = prior)
+        self.assertFalse(target.exists())
+        self.assertFalse(partial.exists())
+        evidence = source / ".state_sync"
+        held = saved / "evidence"
+        evidence.replace(held)
+        evidence.symlink_to(held, target_is_directory = True)
+        with self.assertRaisesRegex(ValidatorError, "evidence directory is not private"):
+            install_verified_snapshot(saved, target, guard = guard, prior = prior)
+        evidence.unlink()
+        held.replace(evidence)
+        install_verified_snapshot(saved, target, guard = guard, prior = prior)
+        self.assertEqual(read_need(target, guard.chain), guard)
+        self.assertEqual((target / "validator-control/exit.json").read_bytes(),
+            (prior / "validator-control/exit.json").read_bytes())
+
     def test_sync_cleanup(self):
         stage = WORK / "stage"
         root = stage / "snapshots"
@@ -4253,7 +4578,7 @@ class ValidatorToolsTest(unittest.TestCase):
                     with self.assertRaisesRegex(ValidatorError, "without a valid checkpoint"):
                         sync_snapshot("sync", stage, target, network_values(), [], 2, 1)
                     prune.assert_not_called()
-                install.assert_called_once_with(selected, target)
+                install.assert_called_once_with(selected, target, guard = None, prior = None, identity = None)
 
     def test_sync_stage_lock(self):
         stage = WORK / "stage"
@@ -4271,6 +4596,25 @@ class ValidatorToolsTest(unittest.TestCase):
         result = subprocess.run([sys.executable, "-c", program, str(stage / "sync.lock")],
             capture_output=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_sync_prior_link(self):
+        data = WORK / "volume/data"
+        saved = data.with_name("data.prior-99")
+        saved.mkdir(parents = True)
+        link = WORK / "home/data"
+        link.parent.mkdir()
+        link.symlink_to(data, target_is_directory = True)
+        binary = WORK / "sync"
+        binary.write_bytes(b"checked client")
+        args = mock.Mock(yes = True, sync = True, sync_binary = str(binary),
+            sync_url = [], sync_stage = str(WORK / "stage"),
+            sync_concurrency = 1, sync_source_concurrency = 1)
+        for target in (data, link):
+            with self.subTest(target = target):
+                with mock.patch("validator_config.sync_snapshot") as sync:
+                    with self.assertRaisesRegex(ValidatorError, "preserved state.*--prior"):
+                        maybe_sync(args, target, network_values())
+                    sync.assert_not_called()
 
     def test_checkpoint_root(self):
         data = WORK / "data"
@@ -4587,7 +4931,7 @@ class ValidatorToolsTest(unittest.TestCase):
 
         def probe(command, **_):
             version = "1.80.1" if command[0].startswith("/old/") else "1.88.0"
-            return subprocess.CompletedProcess(command, 0, f"rustc {version}\n", "")
+            return subprocess.CompletedProcess(command, 0, rust_report(version), "")
 
         with mock.patch(
             "validator_config.rust_environment", side_effect=[old, fresh]
@@ -4600,7 +4944,7 @@ class ValidatorToolsTest(unittest.TestCase):
 
     def test_build_rust_missing(self):
         replies = [subprocess.CompletedProcess([], 1, "", "missing toolchain"),
-                   subprocess.CompletedProcess([], 0, "rustc 1.88.0\n", "")]
+                   subprocess.CompletedProcess([], 0, rust_report(), "")]
         with mock.patch("validator_config.rust_environment", return_value={"PATH": "local"}), \
                 mock.patch("validator_config.shutil.which", return_value="rustc"), \
                 mock.patch("validator_config.subprocess.run", side_effect=replies), \
@@ -4619,7 +4963,7 @@ class ValidatorToolsTest(unittest.TestCase):
         install.assert_called_once_with()
 
     def test_build_rust_current(self):
-        reply = subprocess.CompletedProcess([], 0, "rustc 1.88.0\n", "")
+        reply = subprocess.CompletedProcess([], 0, rust_report(), "")
         with mock.patch("validator_config.rust_environment", return_value={"PATH": "local"}), \
                 mock.patch("validator_config.shutil.which", return_value="rustc"), \
                 mock.patch("validator_config.subprocess.run", return_value=reply), \
@@ -4639,6 +4983,38 @@ class ValidatorToolsTest(unittest.TestCase):
             [str(CARGO_HOME / "bin/rustup"), "toolchain", "install", "1.88.0", "--profile", "minimal"],
             env=environment, timeout=900)
 
+    def test_rust_commit(self):
+        import validator_config
+        for commit, accepted in ((validator_config.RUST_COMMIT, True), ("0" * 40, False)):
+            reply = subprocess.CompletedProcess([], 0,
+                f"rustc 1.88.0\ncommit-hash: {commit}\n", "")
+            with mock.patch("validator_config.shutil.which", return_value="rustc"), \
+                    mock.patch.object(Path, "is_file", return_value=False), \
+                    mock.patch("validator_config.subprocess.run", return_value=reply):
+                self.assertEqual(validator_config.rust_version({"PATH": "local"}), (1, 88, 0) if accepted else None)
+
+    def test_rust_installer_hash(self):
+        import validator_config
+        expected = validator_config.RUSTUP_HASHES[("Linux", "x86_64")][1]
+        for digest, accepted in ((expected, True), ("0" * 64, False)):
+            with mock.patch.object(validator_config, "ROOT", WORK), \
+                    mock.patch.object(validator_config, "rust_version", return_value=None), \
+                    mock.patch.object(validator_config, "rust_environment", return_value={}), \
+                    mock.patch.object(Path, "is_file", return_value=False), \
+                    mock.patch.object(validator_config.os, "uname", return_value=mock.Mock(sysname="Linux", machine="x86_64")), \
+                    mock.patch.object(validator_config, "sha256_file", return_value=digest), \
+                    mock.patch.object(validator_config, "run") as run:
+                if accepted:
+                    validator_config.install_rust_toolchain()
+                    self.assertEqual(len(run.call_args_list), 2)
+                    self.assertNotEqual(run.call_args.args[0][0], "sh")
+                else:
+                    with self.assertRaisesRegex(ValidatorError, "installer digest differs"):
+                        validator_config.install_rust_toolchain()
+                    self.assertEqual(len(run.call_args_list), 1)
+                self.assertIn("/rustup/archive/1.28.2/", " ".join(run.call_args_list[0].args[0]))
+                self.assertEqual(list((WORK / "runtime_data/rustup").glob("*.staged")), [])
+
     def test_rust_probe_timeout(self):
         import validator_config
         with mock.patch("validator_config.shutil.which", return_value="rustc"), \
@@ -4655,7 +5031,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 mock.patch("validator_config.subprocess.run", return_value=reply) as run:
             self.assertIsNone(validator_config.rust_version({"PATH": "local"}))
         self.assertEqual(run.call_args.args[0], [str(CARGO_HOME / "bin/rustup"),
-            "run", "1.88.0", "rustc", "--version"])
+            "run", "1.88.0", "rustc", "--version", "--verbose"])
         self.assertNotIn("--install", run.call_args.args[0])
 
     def test_gate_python(self):
@@ -4703,6 +5079,18 @@ class ValidatorToolsTest(unittest.TestCase):
         command = ["sh", str(controls / "check.sh")]
         result = subprocess.run(command, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+        readme = WORK / "README.md"
+        readme.write_text("documentation is not a node input")
+        result = subprocess.run(command, capture_output = True, text = True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = WORK / "MANIFEST.sha256"
+        content = manifest.read_text()
+        manifest.write_text(content +
+                            f"{hashlib.sha256(readme.read_bytes()).hexdigest()}  README.md\n")
+        result = subprocess.run(command, capture_output = True, text = True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("reason = manifest_document path = README.md", result.stderr)
+        manifest.write_text(content)
         result = subprocess.run(command + ["--tests"], capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("test suite invoked", result.stderr)
@@ -4800,12 +5188,14 @@ class ValidatorToolsTest(unittest.TestCase):
             str(WORK / "stage"),
             "--yes",
         ])
-        with mock.patch("validator_config.run", side_effect=RuntimeError("captured")) as invoke:
+        with mock.patch("validator_config.run", side_effect = RuntimeError("captured")) as invoke, \
+                mock.patch("validator_config.sync_head", return_value = {"head": 5000, "snapshot": 4900}):
             with self.assertRaisesRegex(RuntimeError, "captured"):
                 maybe_sync(args, str(WORK / "data"), network_values())
         command = invoke.call_args.args[0]
         self.assertEqual(command[command.index("--concurrency") + 1], "4")
         self.assertEqual(command[command.index("--source-concurrency") + 1], "4")
+        self.assertEqual(command[command.index("--min-epoch") + 1], "2000")
         self.assertEqual(
             command[command.index("--migration-root") + 1],
             "2" * 64,
@@ -4840,7 +5230,7 @@ class ValidatorToolsTest(unittest.TestCase):
             check_sync_sources(
                 sync_binary,
                 WORK / "state_sync_check",
-                network_values(),
+                {**network_values(), "OCTRA_JOIN_RPC": "https://head.example"},
                 sources,
             )
         self.assertEqual(invoke.call_count, 2)
@@ -4872,9 +5262,17 @@ class ValidatorToolsTest(unittest.TestCase):
                 check_sync_sources(
                     sync_binary,
                     WORK / "state_sync_check",
-                    network_values(),
+                    {**network_values(), "OCTRA_JOIN_RPC": "https://head.example"},
                     ["https://seed-a.example"],
                 )
+
+    def test_sync_same_route(self):
+        values = {**network_values(), "OCTRA_JOIN_RPC": "https://seed-a.example"}
+        with mock.patch("validator_config.subprocess.run") as invoke:
+            with self.assertRaisesRegex(ValidatorError, "configuration error"):
+                check_sync_sources(WORK / "client", WORK / "stage", values,
+                    ["https://seed-a.example"])
+            invoke.assert_not_called()
 
     def test_unattended_sync(self):
         sync_binary = WORK / "state_sync_client"
@@ -4886,7 +5284,8 @@ class ValidatorToolsTest(unittest.TestCase):
             str(WORK / "stage"),
             "--yes",
         ])
-        with mock.patch("validator_config.run", side_effect=RuntimeError("captured")):
+        with mock.patch("validator_config.run", side_effect = RuntimeError("captured")), \
+                mock.patch("validator_config.sync_head", return_value = {"head": 100, "snapshot": 100}):
             with self.assertRaisesRegex(RuntimeError, "captured"):
                 maybe_sync(args, str(WORK / "data"), network_values())
 
@@ -4982,6 +5381,32 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertTrue(marker.is_file())
         self.assertTrue(conflict.is_file())
 
+    def test_recovery_guard(self):
+        chain = "octra-devnet-bft-v1"
+        root = make_need(chain, "root", 2001, 2000, None)
+        planned = make_need(chain, "range", 101, 100, 6000)
+        joined = make_need(chain, "range", 2001, 2000, 6000)
+        self.assertEqual(carry_guard(root, planned, chain), joined)
+        self.assertEqual(carry_guard(planned, root, chain), joined)
+        self.assertEqual(carry_guard(joined, joined, chain), joined)
+        for cause in ["conflict", "journal"]:
+            other = make_need(chain, cause, 101, 100, None)
+            self.assertEqual(carry_guard(root, other, chain), root)
+            self.assertIsNone(carry_guard(other, None, chain))
+        with self.assertRaisesRegex(ValidatorError, "binding differs"):
+            carry_guard(root, planned, "other-chain")
+
+    def test_saved_range_guard(self):
+        chain = "octra-devnet-bft-v1"
+        saved = make_need(chain, "range", 101, 100, 9000)
+        root = make_need(chain, "root", 201, 200, None)
+        conflict = make_need(chain, "conflict", 201, 200, None)
+        self.assertEqual(carry_guard(root, conflict, chain, saved = saved),
+            make_need(chain, "range", 201, 200, 9000))
+        self.assertEqual(carry_guard(None, conflict, chain, saved = saved), saved)
+        with self.assertRaisesRegex(ValidatorError, "binding differs"):
+            carry_guard(root, None, chain, saved = make_need("other", "range", 1, 0, 9000))
+
     def test_recovery_marker_fields(self):
         value = {
             "schema": "octra_sync_need_v1",
@@ -5075,13 +5500,14 @@ class ValidatorToolsTest(unittest.TestCase):
             "OCTRA_OPERATOR_SYNC_STAGE": str(WORK / "stage"),
         })
 
-        def install(*_, **__):
+        def install(*_, **options):
             (data / "irmin_store").mkdir(parents=True)
             (data / "chaindata").mkdir()
             (data / "HEAD.json").write_text(
                 '{"epoch_id":99,"state_root":"' + "3" * 64 + '","txid_hi":"500"}\n',
                 encoding="utf-8",
             )
+            copy_private(options["identity"][0], data / "wallet.json")
 
         with mock.patch("validator_recover.pm2_entries", return_value=[]):
             with mock.patch("validator_recover.sync_snapshot", side_effect=install) as sync:
@@ -5112,6 +5538,20 @@ class ValidatorToolsTest(unittest.TestCase):
         identity.start()
         self.addCleanup(identity.stop)
         return ensure_wallet(path)
+
+    def snapshot_install(self, data, options):
+        saved = data.parent / "download"
+        source = saved / "data"
+        (source / "irmin_store").mkdir(parents = True)
+        (source / "chaindata").mkdir()
+        (source / "HEAD.json").write_text(
+            '{"epoch_id":100,"state_root":"' + "4" * 64 + '","txid_hi":"501"}\n',
+            encoding = "utf-8",
+        )
+        for name in ("snapshot_verified.json", "certificate.json"):
+            (saved / name).write_text("{}", encoding = "ascii")
+        install_verified_snapshot(saved, data, guard = options["guard"], prior = options["prior"],
+            identity = options.get("identity"))
 
     def recovery_identity(self, name):
         root = WORK / name
@@ -5148,14 +5588,9 @@ class ValidatorToolsTest(unittest.TestCase):
             "OCTRA_OPERATOR_SYNC_STAGE": str(root / "stage"),
         })
 
-        def install(*_, **__):
+        def install(*_, **options):
             self.assertFalse(data.exists())
-            (data / "irmin_store").mkdir(parents=True)
-            (data / "chaindata").mkdir()
-            (data / "HEAD.json").write_text(
-                '{"epoch_id":100,"state_root":"' + "4" * 64 + '","txid_hi":"501"}\n',
-                encoding="utf-8",
-            )
+            self.snapshot_install(data, options)
 
         return data, config, wallet, install
 
@@ -5172,6 +5607,55 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(load_wallet(data / "wallet.json"), wallet)
         self.assertEqual((data / "validator-control/exit.json").read_text(),
                          (preserved / "validator-control/exit.json").read_text())
+
+    def test_recovery_publish_wallet(self):
+        data, config, wallet, install = self.recovery_identity("publish")
+        replace = os.replace
+        seen = []
+        def publish(source, target):
+            if Path(target) == data:
+                seen.append(load_wallet(Path(source) / "wallet.json"))
+                self.assertEqual(seen[-1], wallet)
+            replace(source, target)
+        with mock.patch("validator_recover.pm2_entries", return_value = []), \
+                mock.patch("validator_recover.sync_snapshot", side_effect = install), \
+                mock.patch("validator_config.os.replace", side_effect = publish):
+            recover(config, replace_state = True)
+        self.assertEqual(seen, [wallet])
+
+    def test_recovery_saved_floor(self):
+        import validator_recover
+        for cause in ("root", "conflict"):
+            data, config, _, install = self.recovery_identity("saved-" + cause)
+            values = parse_env(config)
+            chain = values["OCTRA_CHAIN_ID"]
+            marked = make_need(chain, cause, 100, 99, None)
+            saved = make_need(chain, "range", 100, 99, 9000)
+            with mock.patch.object(validator_recover, "read_need", return_value = marked), \
+                    mock.patch.object(validator_recover, "read_plan", return_value = saved), \
+                    mock.patch.object(validator_recover, "pm2_entries", return_value = []), \
+                    mock.patch.object(validator_recover, "sync_head",
+                        return_value = {"head": 5000, "snapshot": 1000}), \
+                    mock.patch.object(validator_recover, "sync_snapshot", side_effect = install) as sync:
+                with self.assertRaisesRegex(ValidatorError, "required = 6000"):
+                    recover(config, replace_state = True, plan = marked)
+                sync.assert_not_called()
+            self.assertTrue((data / "HEAD.json").is_file())
+
+    def test_recover_independent(self):
+        for epoch in [100, 101]:
+            data, config, _, _ = self.recovery_identity("no-head-" + str(epoch))
+            before = (data.stat().st_ino, (data / "HEAD.json").read_bytes())
+            with self.subTest(epoch = epoch), \
+                    mock.patch("validator_recover.pm2_entries", return_value = []), \
+                    mock.patch("validator_recover.sync_head", return_value = {"head": None, "snapshot": epoch}), \
+                    mock.patch("validator_recover.move_state") as move, \
+                    mock.patch("validator_recover.sync_snapshot") as sync:
+                with self.assertRaisesRegex(ValidatorError, "head_status = independent_unavailable"):
+                    recover(config, replace_state = True)
+                move.assert_not_called()
+                sync.assert_not_called()
+            self.assertEqual((data.stat().st_ino, (data / "HEAD.json").read_bytes()), before)
 
     def test_recovery_missing_state(self):
         data, config, wallet, install = self.recovery_identity("missing")
@@ -5193,17 +5677,17 @@ class ValidatorToolsTest(unittest.TestCase):
         from validator_common import copy_private
         from validator_exit import restore_control
 
-        for cut in ("move", "before", "control", "wallet"):
+        for cut in ("move", "before", "control", "wallet", "publish"):
             with self.subTest(cut = cut):
                 data, config, wallet, install = self.recovery_identity(cut)
 
                 def stop():
                     os.kill(os.getpid(), signal.SIGKILL)
 
-                def controls(source, target):
+                def controls(source, target, **options):
                     if cut == "before":
                         stop()
-                    restore_control(source, target)
+                    restore_control(source, target, **options)
 
                 def control_copy(source, target):
                     copy_private(source, target)
@@ -5212,7 +5696,13 @@ class ValidatorToolsTest(unittest.TestCase):
 
                 def wallet_copy(source, target):
                     copy_private(source, target)
-                    if cut == "wallet":
+                    if cut == "wallet" and Path(target).name == "wallet.json":
+                        stop()
+
+                replace = os.replace
+                def publish(source, target):
+                    replace(source, target)
+                    if cut == "publish" and Path(target) == data:
                         stop()
 
                 def snapshot(*args, **kwargs):
@@ -5224,9 +5714,10 @@ class ValidatorToolsTest(unittest.TestCase):
                     with (
                         mock.patch("validator_recover.pm2_entries", return_value = []),
                         mock.patch("validator_recover.sync_snapshot", side_effect = snapshot),
-                        mock.patch("validator_recover.restore_control", side_effect = controls),
+                        mock.patch("validator_config.restore_control", side_effect = controls),
                         mock.patch("validator_exit.copy_private", side_effect = control_copy),
-                        mock.patch("validator_recover.copy_private", side_effect = wallet_copy),
+                        mock.patch("validator_config.copy_private", side_effect = wallet_copy),
+                        mock.patch("validator_config.os.replace", side_effect = publish),
                     ):
                         recover(config, replace_state = True)
 
@@ -5244,7 +5735,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 preserved = preserved_state_path(data, 99)
                 expected = (preserved / "validator-control/exit.json").read_bytes()
                 self.assertEqual(load_wallet(preserved / "wallet.json"), wallet)
-                if cut == "wallet":
+                if cut == "publish":
                     self.assertEqual(load_wallet(data / "wallet.json"), wallet)
                     self.assertEqual((data / "validator-control/exit.json").read_bytes(), expected)
                     with mock.patch("validator_recover.pm2_entries", return_value = []):
@@ -5252,9 +5743,11 @@ class ValidatorToolsTest(unittest.TestCase):
                             recover(config, prior = preserved)
                 else:
                     self.assertFalse((data / "wallet.json").exists())
+                    with self.assertRaisesRegex(ValidatorError, "preserved state.*--prior"):
+                        maybe_sync(mock.Mock(yes = True, sync = True), data, parse_env(config))
                     if cut != "move":
                         with mock.patch("validator_recover.sync_snapshot") as sync:
-                            with self.assertRaisesRegex(ValidatorError, "identity.*--prior"):
+                            with self.assertRaisesRegex(ValidatorError, "identity.*--prior|preserved state"):
                                 recover(config)
                             sync.assert_not_called()
                     with mock.patch("validator_recover.pm2_entries", return_value = []):
@@ -5444,7 +5937,7 @@ class ValidatorToolsTest(unittest.TestCase):
             "OCTRA_OPERATOR_SYNC_STAGE": str(WORK / "stage"),
         })
 
-        def install(*args, **__):
+        def install(*args, **options):
             selected = args[2]
             (selected / "irmin_store").mkdir(parents=True)
             (selected / "chaindata").mkdir()
@@ -5452,6 +5945,7 @@ class ValidatorToolsTest(unittest.TestCase):
                 '{"epoch_id":100,"state_root":"' + "4" * 64 + '","txid_hi":"501"}\n',
                 encoding="utf-8",
             )
+            copy_private(options["identity"][0], selected / "wallet.json")
 
         with mock.patch("validator_recover.pm2_entries", return_value=[]), mock.patch(
             "validator_recover.sync_snapshot", side_effect=install
@@ -5464,7 +5958,8 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(load_wallet(target / "wallet.json"), wallet)
         self.assertFalse(home.joinpath("data.prior-99").exists())
         head_bytes = (target / "HEAD.json").read_bytes()
-        with mock.patch("validator_recover.pm2_entries", return_value=[]), mock.patch(
+        with mock.patch("validator_recover.sync_head", return_value = {"head": 101, "snapshot": 101}), \
+                mock.patch("validator_recover.pm2_entries", return_value=[]), mock.patch(
             "validator_recover.sync_snapshot",
             side_effect=ValidatorError("source unavailable"),
         ):
@@ -5503,15 +5998,73 @@ class ValidatorToolsTest(unittest.TestCase):
             "OCTRA_OPERATOR_SYNC_SOURCE_CONCURRENCY": "1",
             "OCTRA_OPERATOR_SYNC_STAGE": str(WORK / "stage"),
         })
-        with mock.patch("validator_recover.pm2_entries", return_value=[]):
-            with mock.patch(
-                "validator_recover.sync_snapshot",
-                side_effect=ValidatorError("source unavailable"),
-            ):
-                with self.assertRaisesRegex(ValidatorError, "source unavailable"):
-                    recover(config, replace_state=True)
+        def interrupted(*_args, **_kwargs):
+            signal.raise_signal(signal.SIGHUP)
+
+        cases = [(ValidatorError("source unavailable"), ValidatorError),
+            (KeyboardInterrupt(), KeyboardInterrupt), (SystemExit(3), SystemExit),
+            (interrupted, ValidatorError)]
+        for failure, expected in cases:
+            with self.subTest(failure = expected), \
+                    mock.patch("validator_recover.pm2_entries", return_value = []), \
+                    mock.patch("validator_recover.sync_snapshot", side_effect = failure):
+                with self.assertRaises(expected):
+                    recover(config, replace_state = True)
+            self.assertEqual((data / "HEAD.json").read_bytes(), head_bytes)
+            self.assertFalse(preserved_state_path(data, 99).exists())
+
+        pulse = WORK / "sync-pulse"
+        stop = threading.Event()
+        reached = threading.Event()
+        child = (
+            "import pathlib, sys, time\n"
+            "path = pathlib.Path(sys.argv[1])\n"
+            "while True:\n"
+            " with path.open('a') as stream: stream.write('x')\n"
+            " time.sleep(0.02)\n"
+        )
+
+        def signal_ready():
+            deadline = time.monotonic() + 5
+            while not stop.wait(0.01) and time.monotonic() < deadline:
+                if pulse.exists() and pulse.stat().st_size > 0:
+                    reached.set()
+                    os.kill(os.getpid(), signal.SIGHUP)
+                    return
+
+        def download(*_args, **_kwargs):
+            from validator_config import run
+            run([sys.executable, "-c", child, str(pulse)], timeout = 10, interruptible = True)
+
+        watcher = threading.Thread(target = signal_ready)
+        watcher.start()
+        try:
+            with mock.patch("validator_recover.pm2_entries", return_value = []), \
+                    mock.patch("validator_recover.sync_snapshot", side_effect = download):
+                with self.assertRaisesRegex(ValidatorError, "recovery interrupted"):
+                    recover(config, replace_state = True)
+        finally:
+            stop.set()
+            watcher.join(timeout = 6)
+        self.assertTrue(reached.is_set())
+        self.assertFalse(watcher.is_alive())
         self.assertEqual((data / "HEAD.json").read_bytes(), head_bytes)
+        before = pulse.stat().st_size
+        time.sleep(0.1)
+        self.assertEqual(pulse.stat().st_size, before)
         self.assertFalse(preserved_state_path(data, 99).exists())
+
+        values = parse_env(config)
+        plan = make_need(values["OCTRA_CHAIN_ID"], "range", 100, 99, 10_000)
+        from upgrade import remember_plan
+        remember_plan(config, values, {"head_epoch": 99, "rpc": "ready"}, plan)
+        with mock.patch("validator_recover.pm2_entries", return_value = []), \
+                mock.patch("validator_recover.sync_head", return_value = {"head": 10_000, "snapshot": 7000}), \
+                mock.patch("validator_recover.sync_snapshot", side_effect = ValidatorError("source busy")) as sync:
+            with self.assertRaisesRegex(ValidatorError, "source busy"):
+                recover(config, replace_state = True)
+            self.assertEqual(sync.call_args.kwargs["min_epoch"], 7000)
+        self.assertEqual((data / "HEAD.json").read_bytes(), head_bytes)
 
     def test_recovery_snapshot_old(self):
         data = WORK / "data"
@@ -5551,6 +6104,7 @@ class ValidatorToolsTest(unittest.TestCase):
 
         with mock.patch("validator_recover.pm2_entries", return_value=[]), mock.patch(
             "validator_recover.sync_snapshot", side_effect=install
+        ), mock.patch("validator_recover.sync_head", return_value = {"head": 3100, "snapshot": 100}
         ):
             with self.assertRaisesRegex(ValidatorError, "below recovery boundary"):
                 recover(config, replace_state=True)
@@ -5589,20 +6143,17 @@ class ValidatorToolsTest(unittest.TestCase):
             "OCTRA_OPERATOR_SYNC_STAGE": str(WORK / "stage"),
         })
 
-        def install(*_, **__):
-            (data / "irmin_store").mkdir(parents=True)
-            (data / "chaindata").mkdir()
-            (data / "HEAD.json").write_text(
-                '{"epoch_id":100,"state_root":"' + "4" * 64 + '","txid_hi":"501"}\n',
-                encoding="utf-8",
-            )
+        def install(*_, **options):
+            self.snapshot_install(data, options)
 
         with mock.patch("validator_recover.pm2_entries", return_value=[]), mock.patch(
             "validator_recover.sync_snapshot", side_effect=install
+        ), mock.patch("validator_recover.sync_head", return_value = {"head": 3100, "snapshot": 100}
         ):
             recover(config, replace_state=True)
         prior = preserved_state_path(data, 99)
-        self.assertIsNone(read_need(data, network["OCTRA_CHAIN_ID"]))
+        self.assertEqual(read_need(data, network["OCTRA_CHAIN_ID"]),
+            read_need(prior, network["OCTRA_CHAIN_ID"]))
         self.assertIsNotNone(read_need(prior, network["OCTRA_CHAIN_ID"]))
         self.assertEqual(load_wallet(data / "wallet.json"), wallet)
 
@@ -5660,13 +6211,13 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertIn("clang", install_value)
         self.assertIn("liblmdb-dev", install_value)
         self.assertIn("liblmdb0", install_value)
-        self.assertIn("https://sh.rustup.rs", install_value)
+        self.assertIn('validator_config.py" --install-rust', install_value)
         self.assertIn("OCAML_TOOLCHAIN=4.14.2", install_value)
         self.assertIn("RUST_TOOLCHAIN=1.88.0", install_value)
-        self.assertIn("--max-time 300", install_value)
-        self.assertIn('timeout 900 "$RUSTUP" toolchain install', install_value)
         config_path = Path(__file__).resolve().with_name("validator_config.py")
         config_value = config_path.read_text(encoding="utf-8")
+        self.assertIn('"--max-time", "300"', config_value)
+        self.assertIn('"toolchain", "install", RUST_TOOLCHAIN', config_value)
         self.assertIn("switch = str(OPAM_SWITCH)", config_value)
         self.assertIn('"--locked"', config_value)
         self.assertIn('"--require-checksums"', config_value)
@@ -6068,6 +6619,24 @@ class ValidatorToolsTest(unittest.TestCase):
         path.write_text(original)
         with mock.patch("validator_process.sha256_file", side_effect=PermissionError):
             self.assertFalse(node_owners([17, 18], 17, values, root=root))
+
+    def test_upgrade_artifacts(self):
+        root = WORK / "source"
+        folder = root / "artifacts"
+        folder.mkdir(parents = True)
+        with mock.patch.object(upgrade_tool, "data_pids") as owners:
+            for name in ("octra_node.exe", "octra_pvac_worker.exe", "octra_state_sync_client.exe",
+                         "bft_control_tx.exe", "vote_floor.exe"):
+                path = folder / name
+                path.write_bytes(b"binary")
+                with self.assertRaisesRegex(ValidatorError, "runtime_layout_artifacts"):
+                    upgrade_tool.preflight(root, {}, {}, False)
+                path.unlink()
+            path = folder / "octra_node.exe"
+            path.symlink_to(folder / "missing")
+            with self.assertRaisesRegex(ValidatorError, "runtime_layout_artifacts"):
+                upgrade_tool.preflight(root, {}, {}, False)
+            owners.assert_not_called()
 
     def test_upgrade_worker_owners(self):
         root, values = worker_case()

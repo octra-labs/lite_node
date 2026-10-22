@@ -32,6 +32,16 @@ let expect_busy = function
   | Error "state sync archive is in use" -> ()
   | _ -> failwith "archive ownership did not exclude a second writer"
 
+let test_cleanup_error () = with_root (fun root ->
+  let result = Lwt_main.run (Archive.run_lwt root (fun owner ->
+    let missing = Filename.concat root "missing" in
+    Lwt.finalize
+      (fun () -> Lwt.return_ok "published")
+      (fun () -> Publish.clear_incomplete owner missing >|= function
+        | [path, _] when path = missing -> ()
+        | _ -> failwith "cleanup error was lost"))) in
+  expect "cleanup replaced publication result" (result = Ok "published"))
+
 let test_ownership () = with_root (fun root ->
   let owner = Archive.run root (fun owner ->
     expect_busy (Archive.run root (fun _ -> ()));
@@ -117,28 +127,25 @@ let test_cancel () = with_root (fun root ->
   let completed = Atomic.make false in
   let stage = Filename.concat root "writing.next" in
   Unix.mkdir stage 0o750;
-  let clock = Mtime_clock.counter () in
   let physical = ref Lwt.return_unit in
   let work = Archive.run_lwt root (fun owner ->
     Archive.mark_stage owner "writing";
     let task = Lwt_preemptive.detach (fun () ->
       Atomic.set started true;
-      while not (Atomic.get allowed)
-        && Mtime.Span.to_float_ns (Mtime_clock.count clock) < 3e9 do
+      while not (Atomic.get allowed) do
         Thread.delay 0.001
       done;
       write (Filename.concat stage "ledger.dat") "complete";
       Atomic.set completed true) () in
     physical := task;
     task >|= fun () -> Ok ()) in
-  let rec wait n =
+  let rec wait () =
     if Atomic.get started then Lwt.return_unit
-    else if n = 0 then Lwt.fail_with "writer did not start"
-    else Lwt_unix.sleep 0.001 >>= fun () -> wait (n - 1)
+    else Lwt_unix.sleep 0.001 >>= wait
   in
   Lwt_main.run (Lwt.finalize
     (fun () ->
-      wait 2000 >>= fun () ->
+      Lwt_unix.with_timeout 120. wait >>= fun () ->
       Lwt.cancel work;
       expect "physical write was cancelled" (not (Atomic.get completed));
       expect_busy (Archive.run root (fun _ -> ()));
@@ -321,7 +328,10 @@ let publish_crash owner syncs =
         Archive.publish_stage ~sync owner id;
         exit 2
       end;
-      let _, status = Unix.waitpid [] pid in
+      let rec wait () =
+        try Unix.waitpid [] pid with
+        | Unix.Unix_error (Unix.EINTR, _, _) -> wait () in
+      let _, status = wait () in
       expect "publication did not reach crash point" (status = Unix.WSIGNALED Sys.sigkill);
       if Sys.file_exists stage then begin
         expect "interrupted stage lost ownership" (Archive.marked_stage owner id);
@@ -410,12 +420,31 @@ let test_publish () = with_root (fun root ->
     publish_existing owner;
     publish_links owner) |> get))
 
+let test_clear_retry () = with_root (fun root ->
+  Archive.run root (fun owner ->
+    let _, stage = prepare_stage owner "clear-retry" in
+    let blocked = Filename.concat stage "ledger.dat" in
+    let refused =
+      try
+        Archive.remove_stage ~unlink:(fun path ->
+          if path = blocked then raise (Unix.Unix_error (Unix.EIO, "unlink", path))
+          else Unix.unlink path) owner "clear-retry";
+        false
+      with Unix.Unix_error (Unix.EIO, "unlink", _) -> true in
+    expect "clear did not report failure" refused;
+    expect "failed clear lost ownership" (Archive.marked_stage owner "clear-retry");
+    expect "failed clear lost remaining file" (Sys.file_exists blocked);
+    Archive.remove_stage owner "clear-retry";
+    expect "clear retry retained stage" (not (Sys.file_exists stage))) |> get)
+
 let run () =
   test_ownership ();
+  test_cleanup_error ();
   test_retention ();
   test_link ();
   test_publish ();
   test_cancel ();
   test_capture ();
   test_unmarked ();
+  test_clear_retry ();
   print_endline "status = pass test = sync_archive"

@@ -12,7 +12,7 @@ module Verify = State_sync_verify
 module Store = Octra_core.Store_chaindata
 module Head = Octra_core.Head_manifest
 module Image = Octra_core.Ledger_image
-module Migration = Octra_core.Pvac_migration_admission
+module Migration = Octra_core.Pvac_migration_check
 module Anchor = Sync_anchor
 module Roots = Root_win
 module Floor = Octra_core.History_floor
@@ -251,8 +251,8 @@ let select_manifests (results : (Source.t * Manifest.certificate) list) =
   in
   if conflicting then
     fail "conflicting quorum checkpoints at the same snapshot epoch";
-  let manifest_groups candidates =
-    candidates
+  let manifest_groups entries =
+    entries
     |> List.fold_left
          (fun groups (source, (certificate : Manifest.certificate)) ->
            String_map.update
@@ -286,7 +286,7 @@ let select_manifests (results : (Source.t * Manifest.certificate) list) =
   in
   match collect ordered with
   | [] -> fail "no source returned a valid quorum certificate"
-  | candidates -> candidates
+  | entries -> entries
 
 let select_manifest results =
   match select_manifests results with
@@ -482,12 +482,12 @@ let verify_migration_state checkpoint data_dir =
             ~getenv
         with
         | Error _ as error -> error
-        | Ok admissions ->
+        | Ok checks ->
             if Int64.compare checkpoint.epoch (Int64.of_int max_int) > 0 then
               Error "migration floor epoch exceeds platform limit"
             else
               Migration.bind_floor
-                admissions
+                checks
                 ~config_hash:checkpoint.config_hash
                 ~floor_config_hash:checkpoint.config_hash
                 ~floor_epoch:(Int64.to_int checkpoint.epoch)

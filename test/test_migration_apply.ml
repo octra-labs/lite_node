@@ -1,7 +1,7 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-module A = Octra_core.Pvac_migration_admission
+module A = Octra_core.Pvac_migration_check
 module E = Octra_core.Epoch_exec
 module FB = Octra_core.Crypto.FheBalance
 module G = Octra_core.Rule_graph
@@ -49,7 +49,7 @@ let transaction ?(nonce = 1) fields =
 
 let replace name value fields = (name, value) :: List.remove_assoc name fields
 
-let admission ~root ~cipher commitment =
+let records ~root ~cipher commitment =
   let audit = R.{audit_class = Hidden_witness; can_public_migrate = false;
     public_net = None; commitment_net = Some commitment; blockers = []; effects = [];
     reason = "authenticated history requires commitment proof"} in
@@ -73,7 +73,7 @@ let execute ?preverify ?(owner_mode = G.Active) ?(fail_flush = false)
   let backend = if fail_flush then
     {backend with E.flush_dirty = (fun () -> Lwt.fail_with "migration flush interrupted")}
     else backend in
-  let transition = PT.create ~math ~preverify ~ledger ~epoch_id:epoch
+  let transition = PT.create ~keyed:false ~math ~preverify ~ledger ~epoch_id:epoch
     ~owner_migration_mode:owner_mode ~proof_mode:G.Active ~field_policy:PL.Unique_fields
     ~cipher_mode
     ~result_policy:Octra_core.Private_result_policy.Recoverable
@@ -88,7 +88,7 @@ let execute ?preverify ?(owner_mode = G.Active) ?(fail_flush = false)
   | Some preverify -> run (E.run_checked ~preverify ~backend ~env ~txs:[tx] ~process_tx)
 
 let preverify ?(cipher_mode = G.Prior) ~math ~epoch ledger admitted tx =
-  run (W.run ~math ~cipher_mode ~field_policy:PL.Unique_fields ~strict:true ~ledger
+  run (W.run ~keyed:false ~math ~cipher_mode ~field_policy:PL.Unique_fields ~strict:true ~ledger
     ~legacy_replay:(A.decision admitted ~epoch) tx)
 
 let refused ?reason ~math ~epoch store ledger admitted name tx =
@@ -124,7 +124,7 @@ let test_apply math =
   let point amount = P.pedersen_commit_amount amount blind |> b64 in
   let payload amount =
     let ct = P.enc_value_seeded pk sk amount (bytes '\005') in
-    let proof = P.make_zero_proof_bound ~math pk sk ct amount blind in
+    let proof = P.make_zero_proof_bound ~keyed:false ~math pk sk ct amount blind in
     ["migration_mode", `String "historical_owner_proof";
      "new_pubkey", `String (Base64.encode_exn key);
      "aes_kat", `String (Octra_core.Pvac_registry.expected_kat ());
@@ -149,7 +149,7 @@ let test_apply math =
       let root = run (S.get_head_hash store) |> Option.get in
       let state_root = I.folded_state_root ~ledger_state_root:root
         ~epoch_index_root:I.genesis_root in
-      let admitted = admission ~root:state_root ~cipher:source (point 3L) in
+      let admitted = records ~root:state_root ~cipher:source (point 3L) in
       let check_bad name reason fields =
         refused ~reason ~math ~epoch:1 store ledger admitted name (transaction fields) in
       check_bad "history point substitution"
@@ -167,7 +167,7 @@ let test_apply math =
       let tx = transaction good in
       refused ~reason:"migration entitlement artifact unavailable"
         ~math ~epoch:1 store ledger (A.disabled ~chain_id) "missing admission" tx;
-      let wrong = admission ~root:state_root ~cipher:(source ^ "other") (point 3L) in
+      let wrong = records ~root:state_root ~cipher:(source ^ "other") (point 3L) in
       refused ~reason:"migration entitlement source ciphertext mismatch"
         ~math ~epoch:1 store ledger wrong "admission source" tx;
       let before = capture store ledger in
@@ -225,7 +225,7 @@ let test_recovery tool =
   let blind = Bytes.make 32 '\000' in
   let payload amount =
     let ct = P.enc_value_seeded pk sk amount (bytes '\066') in
-    let proof = P.make_zero_proof_bound ~math:true pk sk ct amount blind in
+    let proof = P.make_zero_proof_bound ~keyed:false ~math:true pk sk ct amount blind in
     ["migration_mode", `String "public_history";
      "new_pubkey", `String (Base64.encode_exn key);
      "aes_kat", `String (Octra_core.Pvac_registry.expected_kat ());
@@ -338,7 +338,7 @@ let test_zero () =
   let key = P.serialize_pubkey pk |> raw in
   let blind = bytes '\104' in
   let cipher = P.enc_value_seeded pk sk 0L (bytes '\105') in
-  let proof = P.make_zero_proof_bound ~math:true pk sk cipher 0L blind in
+  let proof = P.make_zero_proof_bound ~keyed:false ~math:true pk sk cipher 0L blind in
   let fields = [
     "migration_mode", `String "verified_zero_reset";
     "new_pubkey", `String (Base64.encode_exn key);
@@ -376,10 +376,10 @@ let test_zero () =
           ~activation_epoch:1 [entry] |> get in
       let ready = records clean in
       let before = capture store ledger in
-      let checked = run (PL.key_switch_plan ~math:true ~cipher_mode:prior
+      let checked = run (PL.key_switch_plan ~keyed:false ~math:true ~cipher_mode:prior
         ~field_policy:PL.Unique_fields ~strict:true ledger tx) in
       check "prior zero check" (Result.is_ok checked);
-      let checked = run (PL.key_switch_plan ~math:true ~cipher_mode:active
+      let checked = run (PL.key_switch_plan ~keyed:false ~math:true ~cipher_mode:active
         ~field_policy:PL.Unique_fields ~strict:true ledger tx) in
       check "prior cache cannot authorize zero reset" (match checked with
         | Error failure -> failure.PL.reason = "zero reset requires verified zero public history"

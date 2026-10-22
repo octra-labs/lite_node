@@ -9,6 +9,8 @@ module Head_manifest = Octra_core.Head_manifest
 module Transaction = Octra_core.Transaction
 module Wal = Octra_core.Wal
 
+exception Store_fault of string
+
 type decision =
   | Confirmed_elsewhere of {
       agreed : int;
@@ -327,7 +329,7 @@ let hold_unreadable error =
   Octra_log.error "consensus"
     "event = pending_commit_recovery action = hold reason = store_unreadable error = %s"
     error;
-  Lwt.return_false
+  Lwt.fail (Store_fault ("pending store unreadable: " ^ error))
 
 let delete (deps : deps) p =
   deps.delete_pending_commit ~epoch_id:p.Wal.epoch_id ~round:p.round
@@ -398,7 +400,7 @@ let run_once (deps : deps) ~validator_count ~peer_quorum =
         first.epoch_id
         expected_epoch
         head;
-      Lwt.return_false
+      Lwt.fail (Store_fault "pending record is not contiguous")
     end else
       let latest =
         List.fold_left
@@ -422,7 +424,7 @@ let run_once (deps : deps) ~validator_count ~peer_quorum =
           latest.epoch_id
           latest.round
           error;
-        Lwt.return_false
+        Lwt.fail (Store_fault ("pending record invalid: " ^ error))
       | Legacy ->
         let open Lwt.Syntax in
         Octra_log.warn "consensus"

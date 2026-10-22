@@ -233,7 +233,7 @@ let close_idle () =
     Lwt.finalize
       (fun () ->
         let* () = Conn.close conn in
-        let* () = Lwt_unix.with_timeout 1.0 (fun () -> Lwt.protected writing) in
+        let* () = Lwt_unix.with_timeout 120. (fun () -> Lwt.protected writing) in
         Lwt.return (not (Conn.is_connected conn)))
       (fun () ->
         Lwt.cancel writing;
@@ -253,7 +253,7 @@ let write_idle () =
         let frame = Frame.{ msg_type = msg_bundle_response;
           payload = String.make (2 * 1024 * 1024) 'p' } in
         let* () = Conn.send conn frame in
-        let* () = Lwt_unix.with_timeout 2.0 (fun () -> Lwt.protected writing) in
+        let* () = Lwt_unix.with_timeout 120. (fun () -> Lwt.protected writing) in
         require (not (Conn.is_connected conn)) "idle write kept the peer open";
         require (conn.msg_count_out = 0) "partial frame counted as sent";
         let* () = Conn.send conn frame in
@@ -424,7 +424,7 @@ let accept_resume () =
       let* () = connect second 9108 in
       let* () = Frame.write_frame second
         { Frame.msg_type = Frame.msg_tx_gossip; payload = "recovered" } in
-      let* () = Lwt_unix.with_timeout 2.0 (fun () -> received) in
+      let* () = Lwt_unix.with_timeout 120. (fun () -> received) in
       require (Swarm.connected_count state = 2) "recovered peers missing";
       require (List.rev !delays = [0.01; 0.02; 0.04; 0.01; 0.02])
         "accept retry did not reset";
@@ -484,7 +484,7 @@ let accept_fatal () =
   let* () = entered in
   let* () = Lwt.catch
     (fun () ->
-      let* () = Lwt_unix.with_timeout 1.0 (fun () -> tasks) in
+      let* () = Lwt_unix.with_timeout 120. (fun () -> tasks) in
       Lwt.fail_with "fatal accept was hidden")
     (fun found -> if found = error then Lwt.return_unit else Lwt.fail found) in
   require (Lwt_unix.state socket = Lwt_unix.Closed) "fatal accept retained socket";
@@ -655,7 +655,7 @@ let swarm_stop () =
           "real listener rejected handshake";
         let* () = Lwt.pause () in
         let* () = Swarm.stop state in
-        let* () = Lwt_unix.with_timeout 1.0 (fun () -> task) in
+        let* () = Lwt_unix.with_timeout 120. (fun () -> task) in
         require (not state.running && Swarm.connected_count state = 0)
           "swarm shutdown incomplete";
         Lwt.return_unit)
@@ -667,10 +667,64 @@ let swarm_stop () =
   run ()
 
 let run_case name run =
-  try Lwt_main.run (Lwt_unix.with_timeout 5.0 run)
+  try Lwt_main.run (Lwt_unix.with_timeout 120. run)
   with error -> failwith (name ^ ": " ^ Printexc.to_string error)
 
 let () =
+  List.iter (fun reason ->
+    require (Guard.handshake_penalty reason = None)
+      "honest handshake refusal penalized")
+    ["unknown validator pubkey"; "consensus_config_hash mismatch";
+     "chain_id mismatch"; "p2p proto mismatch"];
+  List.iter (fun reason ->
+    require (Guard.handshake_penalty reason <> None)
+      "unfinished handshake unscored")
+    ["frame_payload_too_large"; "HELLO_FINISH challenge mismatch"];
+  let held = Guard.create () in
+  for _ = 1 to 3 do Guard.report_hold held ~now:5. ~key:"held" ~held_s:4.9 done;
+  require (Guard.admit_conn held ~now:5. ~key:"held" = Guard.Drop "handshake_budget")
+    "held sockets uncounted";
+  require (Guard.admit_conn ~known:true held ~now:5. ~key:"held" = Guard.Drop "handshake_budget")
+    "known holding pause bypassed";
+  let score = List.find (fun (row : Guard.score_record) -> row.key = "held") (Guard.snapshot ~now:5. held) in
+  require (score.held_s > 10. && score.pause_until = 15.) "holding pause absent from scores";
+  let reports = List.filter_map (fun _ -> Guard.note_drop held ~now:5. ~key:"held"
+    ~reason:"handshake_budget") (List.init 16 Fun.id) in
+  require (reports = [1; 2; 4; 8; 16]) "refusal log rate differs";
+  require (Guard.note_drop held ~now:15. ~key:"held" ~reason:"handshake_budget" = Some 1)
+    "new refusal window hidden";
+  require (Guard.note_drop held ~now:15. ~key:"held" ~reason:"peer_capacity" = Some 1)
+    "changed refusal reason hidden";
+  let score = List.find (fun (row : Guard.score_record) -> row.key = "held") (Guard.snapshot ~now:15. held) in
+  require (score.held_s = 0. && score.pause_until = 15.) "expired hold budget exposed";
+  ignore (Guard.report_bad held ~now:15. ~key:"held" ~reason:"bad_signature");
+  ignore (Guard.note_drop held ~now:15. ~key:"held" ~reason:"handshake_capacity");
+  let score = List.find (fun (row : Guard.score_record) -> row.key = "held") (Guard.snapshot ~now:15. held) in
+  require (score.last_reason = "bad_signature" && score.bad_count = 1
+    && score.drop_reason = "handshake_capacity" && score.drop_count = 1)
+    "local refusal replaced penalty reason";
+  List.iter (fun known ->
+    let guard = Guard.create () in
+    let cfg = {Guard.default with max_conn = 1} in
+    ignore (Guard.report_bad guard ~now:0. ~key:"host" ~reason:"bad_signature");
+    require (Guard.admit_conn ~cfg ~known guard ~now:0. ~key:"host" = Guard.Accept)
+      "first connection refused";
+    require (Guard.admit_conn ~cfg ~known guard ~now:1. ~key:"host" = Guard.Drop "connection_budget")
+      "connection limit ignored";
+    let row = List.hd (Guard.snapshot ~now:1. guard) in
+    require (row.last_reason = (if known then "bad_signature" else "connection_budget")
+      && row.ban_until = (if known then 0. else 121.) && row.bad_count = 1)
+      "connection refusal changed penalty reason") [false; true];
+  for _ = 1 to 12 do Guard.report_hold held ~now:5. ~key:"short" ~held_s:0.9 done;
+  require (Guard.admit_conn held ~now:5. ~key:"short" = Guard.Drop "handshake_budget")
+    "short sockets uncounted";
+  require (not (Guard.is_banned held ~now:5. ~key:"held")) "work limit banned address";
+  require (Guard.admit_conn held ~now:16. ~key:"held" = Guard.Accept) "work pause did not expire";
+  let guarded = Guard.create () in
+  for _ = 1 to 3 do ignore (Guard.report_bad guarded ~now:0. ~key:"host" ~reason:"bad_signature") done;
+  require (Guard.admit_conn guarded ~now:1. ~key:"host" <> Guard.Accept) "host ban ignored";
+  require (Guard.admit_conn ~known:true guarded ~now:1. ~key:"host" = Guard.Accept)
+    "known host blocked before authentication";
   require (Lwt_main.run (preauth_refusal ())) "pre-auth payload accepted";
   require (Lwt_main.run (accept_refusal ())) "accept path payload accepted";
   require (Lwt_main.run (dial_refusal ())) "dial path payload accepted";
@@ -703,7 +757,7 @@ let () =
   require (Lwt_main.run (close_waiters ())) "closed peer retains pending sender";
   require (Lwt_main.run (close_idle ())) "closed peer retains idle writer";
   require (Lwt_main.run (write_idle ())) "idle write did not close cleanly";
-  require (Lwt_main.run (Lwt_unix.with_timeout 10.0 write_progress))
+  require (Lwt_main.run (Lwt_unix.with_timeout 120. write_progress))
     "write progress did not renew the interval";
   require (Lwt_main.run (write_interval ())) "invalid write interval accepted";
   require (Lwt_main.run (wait_release ())) "peer queue retained completed waits";

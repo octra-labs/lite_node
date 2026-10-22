@@ -322,7 +322,7 @@ let test_duty_retry () =
   let admit ?(bft_mode = true) duty value =
     Admit.admit ~duty ~bft_mode ~now:1000. ~max_drift:300. ~sender_pk:(Some pub) value in
   let rest ?(bft_mode = true) duty value =
-    View.pre_route_admission ~duty ~bft_mode ~now:1000. ~max_timestamp_drift:300.
+    View.pre_route_check ~duty ~bft_mode ~now:1000. ~max_timestamp_drift:300.
       ~observer_rpc_mode:false value in
   List.iter (fun head ->
     let duty = Some (head, Rule.Active) in
@@ -349,7 +349,7 @@ let test_duty_retry () =
     ({ item with message = Some (message []) } |> signed ~priv);
   let malformed = { item with message = Some "invalid" } |> signed ~priv in
   assert_true "malformed ready fails payload precheck"
-    (Result.is_error (View.payload_size_admission ~limits:View.payload_limits malformed));
+    (Result.is_error (View.payload_size_check ~limits:View.payload_limits malformed));
   assert_verdict "malformed ready rejected before P2P timestamp check"
     Admit.Invalid_payload (admit duty malformed);
   assert_true "malformed ready cannot claim retry"
@@ -370,7 +370,7 @@ let test_duty_retry () =
       (match Admit.admit ~duty ~bft_mode:true ~now ~max_drift:300.
         ~sender_pk:(Some pub) item with Admit.Timestamp_drift _ -> true | _ -> false);
     assert_true (label ^ ": REST clock rejected")
-      (Result.is_error (View.pre_route_admission ~duty ~bft_mode:true ~now
+      (Result.is_error (View.pre_route_check ~duty ~bft_mode:true ~now
         ~max_timestamp_drift:300. ~observer_rpc_mode:false item)))
     ["NaN", nan; "positive infinity", infinity];
   let near_future = { item with timestamp = 1200. } |> signed ~priv in
@@ -381,7 +381,7 @@ let test_duty_retry () =
   assert_verdict "old duty still requires valid signature" Admit.Invalid_signature (admit duty bad);
   assert_true "REST signature check remains separate and mandatory"
     (rest duty bad = Ok ()
-     && Result.is_error (View.signature_admission ~account_public_key:(Some pub) bad));
+     && Result.is_error (View.signature_check ~account_public_key:(Some pub) bad));
   assert_verdict "old duty still requires sender key" Admit.Invalid_signature
     (Admit.admit ~duty ~bft_mode:true ~now:1000. ~max_drift:300. ~sender_pk:None item);
   assert_true "old caller has no implicit duty exception"

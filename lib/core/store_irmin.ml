@@ -1398,7 +1398,7 @@ type contract_meta = {
   version : string;
   owner : string;
   ctype : string;
-  admission : string;
+  check : string;
 }
 
 let contract_meta_json meta =
@@ -1408,13 +1408,13 @@ let contract_meta_json meta =
     "version", `String meta.version;
     "owner", `String meta.owner;
     "ctype", `String meta.ctype;
-    "admission", `String meta.admission;
+    "admission", `String meta.check;
   ])
 
-let deploy_contract t ~address ~code_hash ~version ~owner ~ctype ~admission
+let deploy_contract t ~address ~code_hash ~version ~owner ~ctype ~check
     ~bytecode_b64 =
   let meta =
-    contract_meta_json { address; code_hash; version; owner; ctype; admission } in
+    contract_meta_json { address; code_hash; version; owner; ctype; check } in
   let* () = write t ["contracts"; address; "meta"] meta in
   write t ["contracts"; address; "bytecode"] bytecode_b64
 
@@ -1463,7 +1463,7 @@ let get_contract_meta ?snapshot t addr =
            (match j |> member "ctype" with
             | `String value -> value
             | _ -> "CUSTOM");
-         admission =
+         check =
            (match j |> member "admission" with
             | `String value -> value
             | _ -> "binary");
@@ -1482,7 +1482,7 @@ let get_contract_info t addr =
        meta)
 
 let upgrade_contract t ~address ~expected_code_hash ~code_hash ~version
-    ~owner ~ctype ~admission ~bytecode_b64 =
+    ~owner ~ctype ~check ~bytecode_b64 =
   let* current = get_contract_meta t address in
   match current with
   | None ->
@@ -1494,7 +1494,7 @@ let upgrade_contract t ~address ~expected_code_hash ~code_hash ~version
   | Some _ ->
     let meta =
       contract_meta_json
-        { address; code_hash; version; owner; ctype; admission }
+        { address; code_hash; version; owner; ctype; check }
     in
     let* () = write t ["contracts"; address; "meta"] meta in
     let* () = write t ["contracts"; address; "bytecode"] bytecode_b64 in

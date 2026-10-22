@@ -81,7 +81,8 @@ let components ~epoch getenv =
   [
     "runtime_compatibility", P.compat_hash getenv;
     "activation_graph", Octra_core.Rule_graph.consensus_id ~chain_id ~epoch;
-    "quorum", Octra_consensus.C_quorum_policy.consensus_id ~chain_id;
+    "quorum", Octra_consensus.C_quorum_policy.consensus_id_at
+      ~chain_id ~epoch_id:(Int64.of_int epoch);
     "set_fold_bootstrap",
       Octra_core.Set_fold.consensus_id Octra_core.Set_fold.standard;
     "set_fold_participating",
@@ -102,8 +103,10 @@ let components ~epoch getenv =
     "integer_work", Octra_vm.Int_work.consensus_id;
     "program_compiler", Octra_vm.Program_package.standard_id;
     "vm_undo", "nested_commit";
-    "proposal_protocol", Octra_consensus.C_protocol.consensus_id getenv;
   ]
+  @ (if Octra_consensus.C_quorum_policy.linear_weight ~chain_id ~epoch_id:(Int64.of_int epoch)
+     then ["relief_authors", "source_roles_state_proof"] else [])
+  @ ["proposal_protocol", Octra_consensus.C_protocol.consensus_id getenv]
   @ (match Octra_core.Rule_graph.set_plan_at ~chain_id ~epoch with
      | Octra_core.Rule_graph.Prior -> []
      | Octra_core.Rule_graph.Active -> ["set_plan", "retain_until_activation"])
@@ -148,6 +151,20 @@ let components ~epoch getenv =
   @ (match Octra_core.Rule_graph.settle_at ~chain_id ~epoch with
      | Octra_core.Rule_graph.Prior -> []
      | Octra_core.Rule_graph.Active -> ["compute_settle", Octra_core.Compute_bill.consensus_id])
+  @ (match Octra_core.Rule_graph.program_records_at ~chain_id ~epoch with
+     | Octra_core.Rule_graph.Prior -> []
+     | Octra_core.Rule_graph.Active -> ["program_records", Octra_vm.Program_record.consensus_id])
+  @ (match Octra_core.Rule_graph.proof_key_at ~chain_id ~epoch with
+     | Octra_core.Rule_graph.Prior -> []
+     | Octra_core.Rule_graph.Active -> ["proof_key", "pvac.proof.public_key.fields";
+         "key_powers", "cyclic";
+         "key_owner", "zero_proof_stored_amount";
+         "wasm_table", "elements_65536:tables_1";
+         "wasm_shape", "source:functions_10000:globals_1000:segments_1000:types_10000:imports_256:exports_256:arity_32:locals_4096:memories_1:tables_1";
+         "wasm_errors", "input_fields"])
+  @ (match Octra_core.Rule_graph.duty_marks_at ~chain_id ~epoch with
+     | Octra_core.Rule_graph.Prior -> []
+     | Octra_core.Rule_graph.Active -> ["duty_marks", Octra_core.Set_fold.marks_id])
   @ (match Octra_core.Rule_graph.cipher_migration_at ~chain_id ~epoch with
      | Octra_core.Rule_graph.Prior -> []
      | Octra_core.Rule_graph.Active ->
@@ -274,9 +291,22 @@ let () =
   expect ("next profile golden = " ^ raw_hex next)
     (raw_hex next = "4b40557ade107a3f6cb618319ea1ea005df7c3c6b03c527279bcb50c6b499d6f");
   expect "next profile components" (next = derived ~epoch:1_688_734 devnet_env);
+  let activation = (Option.get
+    (Octra_core.Rule_graph.stake_activation_for_chain chain_id)).activation_epoch in
   List.iter (fun epoch ->
     expect "next profile persists" (next = P.hash ~chain_id ~epoch devnet_env))
-    [1_688_735; max_int];
+    [1_688_735; 1_692_238; 1_702_237; 1_702_238; 1_702_239;
+     1_709_237; 1_709_238; 1_709_239; 1_710_740; 1_710_741; 1_710_742; activation - 1];
+  let released = P.hash ~chain_id ~epoch:activation devnet_env in
+  expect "stake profile epoch" (activation = 1_737_333);
+  Printf.printf "event = stake_profile epoch = %d hash = %s\n%!" activation (raw_hex released);
+  expect "stake profile golden"
+    (raw_hex released = "dc5e4fe61b74b9ead7dcb6b2d56f851893be6796fc21b58b8db07db4a867d941");
+  expect "stake profile differs" (released <> next);
+  expect "stake profile components" (released = derived ~epoch:activation devnet_env);
+  List.iter (fun epoch ->
+    expect "stake profile persists" (released = P.hash ~chain_id ~epoch devnet_env))
+    [activation + 1; max_int];
   Printf.printf "event = next_profile epoch = 1688734 hash = %s\n%!" (raw_hex next);
   Printf.printf "event = proof_profile epoch = 1663000 hash = %s\n%!" (raw_hex proof);
   Printf.printf "event = exit_profile epoch = %d hash = %s\n" epoch (raw_hex current);
@@ -307,6 +337,10 @@ let () =
      1_681_998, false; 1_681_999, false; 1_682_000, false; 1_682_001, false;
      1_683_732, false; 1_683_733, false; 1_683_734, false; 1_683_735, false;
      1_688_732, false; 1_688_733, true; 1_688_734, false; 1_688_735, false;
+     1_702_236, false; 1_702_237, false; 1_702_238, false; 1_702_239, false;
+     1_709_237, false; 1_709_238, false; 1_709_239, false;
+     1_710_740, false; 1_710_741, false; 1_710_742, false;
+     activation - 2, false; activation - 1, true; activation, false; activation + 1, false;
      max_int, false];
   List.iter (fun epoch ->
     expect "other chain profile preserved"
@@ -323,7 +357,8 @@ let () =
      1_614_499; 1_614_500; 1_614_501; 1_639_999; 1_640_000; 1_640_001;
      1_649_999; 1_650_000; 1_650_001; 1_662_999; 1_663_000; 1_663_001;
      1_671_999; 1_672_000; 1_672_001; 1_681_999; 1_682_000; 1_682_001;
-     1_683_733; 1_683_734; 1_683_735; 1_688_733; 1_688_734; 1_688_735; max_int];
+     1_683_733; 1_683_734; 1_683_735; 1_688_733; 1_688_734; 1_688_735;
+     1_702_237; 1_702_238; 1_702_239; activation - 1; activation; activation + 1; max_int];
   expect "standard binds chain"
     (not (String.equal standard (P.standard_hash ~chain_id:"octra-mainnet" ~epoch:1_500_000 getenv)));
   print_endline "status = pass test = consensus_profile_golden"

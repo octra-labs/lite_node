@@ -1020,7 +1020,7 @@ let check_quiet_cycle () =
         state := Fold.note_pulse Fold.standard ~epoch ~active:false
           ~address:"octA" !state |> Result.get_ok;
         Lwt.return_ok ()
-      | Actor.Appeal _ -> Lwt.return_ok ());
+      | Actor.Appeal _ | Actor.Appeals _ -> Lwt.return_ok ());
     warn = (fun _ reason -> failwith reason);
   } in
   let tick epoch event =

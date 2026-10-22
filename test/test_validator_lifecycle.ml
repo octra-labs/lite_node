@@ -334,7 +334,7 @@ let run_lifecycle ?(ready_exec_mode = Octra_core.Rule_graph.Prior) ?(delay = 0) 
     |> expect_ok "stored registry"
   in
   expect "five registered validators"
-    (List.length (Registry.candidates registry) = 5);
+    (List.length (Registry.entries registry) = 5);
   let update =
     S.get_meta store Update.pending_meta_key
     |> Lwt_main.run
@@ -1095,9 +1095,9 @@ let run_ready_active ~delay store =
     let returning = Registry.find returning.address registry |> Option.get in
     let fresh = Registry.find fresh.address registry |> Option.get in
     expect "active ready marking follows credited eligibility"
-      (returning.Octra_core.Validator_admission.ready_epoch =
+      (returning.Octra_core.Validator_entry.ready_epoch =
          (if delay = 2 && epoch = 203 then Some source else None)
-       && fresh.Octra_core.Validator_admission.ready_epoch = None))
+       && fresh.Octra_core.Validator_entry.ready_epoch = None))
     (if delay = 2 then [201; 202; 203] else [201])
 
 let run_slots ~transition store =

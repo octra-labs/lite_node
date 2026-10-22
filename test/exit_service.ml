@@ -52,7 +52,7 @@ let actor (node : t) = Actor.create Actor.{
       (Ok Status.{
         head_epoch = node.head; state_root = node.view.root; chain_id; config_hash = "";
         head_proposal_id = None;
-        candidate = bond_entry node.view; duty = None; sets = (None, None);
+        entry = bond_entry node.view; duty = None; sets = (None, None);
       });
   });
   read = (fun ~epoch:_ -> Lwt.return_ok
@@ -135,7 +135,7 @@ let apply node epoch txs =
   Lwt.return_unit
 
 let set_value head =
-  let members = List.map (fun (key : key) -> Octra_core.Validator_admission.{
+  let members = List.map (fun (key : key) -> Octra_core.Validator_entry.{
     address = key.address; pubkey = key.public; weight = Z.one;
   }) peers in
   Octra_core.Validator_set_update.make_weighted
@@ -149,7 +149,7 @@ let enrollment node =
     head_epoch = node.head; state_root = node.view.root; chain_id; config_hash = "";
     head_proposal_id = None;
     duty = Some Octra_core.Set_fold.{ marked = []; pulse = None };
-    candidate = bond_entry node.view; sets = Some (set_value node.head), None;
+    entry = bond_entry node.view; sets = Some (set_value node.head), None;
   } in
   let* result = Status.validator_enrollment ~snapshot:(Ok snapshot)
     ~validator_address:owner.address ~validator_pubkey:pubkey in
@@ -207,6 +207,7 @@ let admit node =
     proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
     compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
     settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
+    marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
     queue_head = (fun () -> None);
     swarm_ref = ref None;
     duty_head = (fun () -> Some (Int64.of_int node.head,

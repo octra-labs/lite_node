@@ -20,9 +20,32 @@ let transaction ~dir (seg_id, offset, len) =
   with _ -> None
 
 let read ~chaindata ~data_dir ~chain_id ~read_finality ~cancelled (query : Range.query) =
+  let index = Store.index chaindata in
+  let extends_head () =
+    match query.head, Octra_core.Head_manifest.get_cached () with
+    | Some prior, Some current
+      when current.generation > prior.generation
+           && current.epoch_id > prior.epoch_id
+           && Int64.compare current.txid_hi prior.txid_hi >= 0 ->
+      begin match Index.get_epoch index prior.epoch_id with
+      | None -> false
+      | Some raw ->
+        begin match Epoch.epoch_of_json raw with
+        | None -> false
+        | Some epoch ->
+          epoch.id = prior.epoch_id
+          && epoch.state_root = prior.state_root
+          && Int64.pred
+               (Int64.add epoch.start_txid (Int64.of_int epoch.tx_count))
+             = prior.txid_hi
+        end
+      end
+    | _ -> false
+  in
   let check () =
     if cancelled () then raise (Interrupted Range.Stopped);
-    if Octra_core.Head_manifest.get_cached () <> query.head then
+    if Octra_core.Head_manifest.get_cached () <> query.head
+       && not (extends_head ()) then
       raise (Interrupted Range.Changed)
   in
   let step run =
@@ -35,7 +58,6 @@ let read ~chaindata ~data_dir ~chain_id ~read_finality ~cancelled (query : Range
   let stop epoch reason =
     Log.warn "state_sync" "event = catchup_range_stop epoch = %Ld reason = %s" epoch reason
   in
-  let index = Store.index chaindata in
   let dir = chaindata.Store.txlog.dir in
   let rec rows epoch position size found =
     check ();
@@ -90,7 +112,11 @@ let read ~chaindata ~data_dir ~chain_id ~read_finality ~cancelled (query : Range
   in
   let rec collect count size records =
     let target = Int64.add query.from_epoch (Int64.of_int count) in
-    if count >= min 16 query.max_epochs then Lwt.return (result records (Some target))
+    let past_head = match query.head with
+      | None -> true
+      | Some head -> target > Int64.of_int head.epoch_id in
+    if count >= min 16 query.max_epochs || past_head then
+      Lwt.return (result records (Some target))
     else
       let* record = load target in
       match record with
@@ -124,8 +150,11 @@ let read ~chaindata ~data_dir ~chain_id ~read_finality ~cancelled (query : Range
 let create ~chaindata ~data_dir ~chain_id =
   let read_finality epoch =
     let* record = Lwt_preemptive.detach (fun () ->
-      Consensus_finality_journal.read_committed_epoch ~chain_id
-        ~epoch:(Int64.of_int epoch) data_dir) () in
+      let read () = Consensus_finality_journal.read_committed_epoch ~chain_id
+        ~epoch:(Int64.of_int epoch) data_dir in
+      match read () with
+      | Consensus_finality_journal.Invalid "committed finality journal height mismatch" -> read ()
+      | record -> record) () in
     match record with
     | Consensus_finality_journal.Valid record ->
       Lwt.return_some Octra_consensus.C_codec.{

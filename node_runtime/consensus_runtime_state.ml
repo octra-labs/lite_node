@@ -114,10 +114,22 @@ let root_recovery_evidence
   else
     None
 
+let bundle_epoch reason =
+  let prefix = "finalized_bundle_unavailable:" in
+  if not (starts_with prefix reason) then None
+  else
+    let value = String.sub reason (String.length prefix)
+      (String.length reason - String.length prefix) in
+    match int_of_string_opt value with
+    | Some epoch when epoch >= 0 && string_of_int epoch = value -> Some epoch
+    | _ -> None
+
 let catchup_recovers reason =
   root_attestation_recovers reason
   || starts_with "lag_" reason
   || starts_with "catchup_" reason
+  || starts_with "rule anchor unreadable epoch = " reason
+  || Option.is_some (bundle_epoch reason)
 
 let recoverable_reason reason =
   catchup_recovers reason
@@ -141,6 +153,10 @@ let clear_allowed ~reason ~evidence =
       && starts_with "catchup_complete:root_verified:" evidence)
   || (root_attestation_recovers reason && root_evidence evidence)
   || (root_attestation_recovers reason
+      && starts_with "direct_finalized_apply:" evidence)
+  || (consensus_root_attestation_recovers reason
+      && starts_with "direct_finalized_apply:" evidence)
+  || (Option.is_some (bundle_epoch reason)
       && starts_with "direct_finalized_apply:" evidence)
   || (consensus_root_attestation_recovers reason
       && String.equal evidence "in_sync_consensus_quorum")
@@ -173,7 +189,13 @@ let clear_quarantine t ~evidence =
   if not (quarantine_active t) then Inactive
   else
     let reason = quarantine_reason t in
-    if clear_allowed ~reason ~evidence then begin
+    let restored = match bundle_epoch reason with
+      | None -> true
+      | Some epoch -> state_attested t &&
+        Option.fold ~none:false
+          ~some:(fun head -> head >= epoch && head >= quarantine_since_epoch t)
+          !(t.state_attested_head) in
+    if restored && clear_allowed ~reason ~evidence then begin
       reset_quarantine t;
       Cleared
     end else

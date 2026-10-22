@@ -82,7 +82,10 @@ type fold_ctx = {
   program_overlap : bool;
   fhe_work : Rule_graph.mode;
   proof_exec : Rule_graph.mode;
+  proof_key : Rule_graph.mode;
   vm_bytes : Rule_graph.mode;
+  program_records : Rule_graph.mode;
+  duty_marks : Rule_graph.mode;
   wasm_float : Rule_graph.mode;
   math : bool;
   cap_mode : Set_fold.cap_mode;
@@ -166,7 +169,10 @@ let prior_fold _ =
     program_overlap = false;
     fhe_work = Rule_graph.Prior;
     proof_exec = Rule_graph.Prior;
+    proof_key = Rule_graph.Prior;
     vm_bytes = Rule_graph.Prior;
+    program_records = Rule_graph.Prior;
+    duty_marks = Rule_graph.Prior;
     wasm_float = Rule_graph.Prior;
     math = false;
     cap_mode = Set_fold.Reject;
@@ -1004,6 +1010,7 @@ let process_circle_deploy_tx
     ?(wasm_profile=Circle_wasm_host.Standard)
     ?(float_mode=Rule_graph.Prior)
     ?(inspect_mode = Rule_graph.Prior)
+    ~table_mode
     ~(backend : backend)
     (tx : Transaction.t) =
   let open Lwt.Syntax in
@@ -1021,6 +1028,7 @@ let process_circle_deploy_tx
           ~execution_profile:wasm_profile
           ~float_mode
           ~inspect_mode
+          ~table_mode
           backend.store
           src
           payload in
@@ -1042,6 +1050,7 @@ let process_circle_program_update_tx
     ?(wasm_profile=Circle_wasm_host.Standard)
     ?(float_mode=Rule_graph.Prior)
     ?(inspect_mode = Rule_graph.Prior)
+    ~table_mode
     ~(backend : backend)
     (tx : Transaction.t) =
   let open Lwt.Syntax in
@@ -1078,6 +1087,7 @@ let process_circle_program_update_tx
                         ~execution_profile:wasm_profile
                         ~float_mode
                         ~inspect_mode
+                        ~table_mode
                         payload.code_b64 in
                     begin
                       match validate_result with
@@ -1654,8 +1664,13 @@ let circle_cell_plan ~backend ~current_epoch ~expected_transition_hash tx =
       | Ok plan when backend.proof_mode = Rule_graph.Prior ->
         Lwt.return_ok plan
       | Ok plan ->
+        let keyed = match backend.fold current_epoch with
+          | Ok ctx -> ctx.proof_key = Rule_graph.Active
+          | Error reason -> failwith reason in
         let* verified =
-          Circle_cell_transition.verify_classified ~math:backend.math ~strict:true plan
+          Circle_cell_transition.verify_classified
+            ~keyed
+            ~math:backend.math ~strict:true plan
         in
         begin
           match verified with
@@ -2414,6 +2429,7 @@ let apply_set_fold ~backend ~env =
       match
         Set_fold.advance
           ~cap_mode:ctx.cap_mode
+          ~marks:(ctx.duty_marks = Rule_graph.Active)
           cfg
           ~chain_id:env.chain_id
           ~start:(set_fold_start ctx)
@@ -2725,7 +2741,7 @@ let process_validator_evidence_tx ~backend ~env tx =
                   (Stdlib.Error
                      ("validator_evidence_rejected",
                       "validator bond not found"))
-              | Some candidate ->
+              | Some entry ->
                 begin
                   match
                     Validator_evidence.verify
@@ -2733,9 +2749,9 @@ let process_validator_evidence_tx ~backend ~env tx =
                       ~current_epoch
                       ~evidence_epochs
                       ~bonded_epoch:
-                        candidate.Validator_admission.bonded_epoch
+                        entry.Validator_entry.bonded_epoch
                       ~address:tx.to_
-                      ~pubkey:candidate.Validator_admission.pubkey
+                      ~pubkey:entry.Validator_entry.pubkey
                       proof
                   with
                   | Error error ->
@@ -2886,15 +2902,16 @@ let validate_validator_ready_reference ~mode ~env ~parent ~state ~proposal_id
 
 let validator_ready_proof ctx tx =
   match ctx.mode with
-  | Rule_graph.Prior -> Ok None
+  | Rule_graph.Prior -> Ok Set_fold.Pulse
   | Rule_graph.Active ->
     begin
-      match Set_fold.proof_of_message tx.Transaction.message with
+      match Set_fold.evidence_of_message ~marks:(ctx.duty_marks = Rule_graph.Active)
+        (set_fold_cfg ctx) tx.Transaction.message with
       | Error _ as error -> error
-      | Ok None -> Ok None
-      | Ok (Some proof) ->
+      | Ok (Set_fold.Pulse | Set_fold.Marks _) as result -> result
+      | Ok (Set_fold.Commit proof) ->
         if String.equal proof.Set_fold.vote.validator tx.from then
-          Ok (Some proof)
+          Ok (Set_fold.Commit proof)
         else
           Error "validator set fold proof owner mismatch"
     end
@@ -2952,10 +2969,10 @@ let update_ready_fold ~backend ~env ~head_epoch ~address proof =
       | Error _ as error -> Lwt.return error
       | Ok state ->
         let active = List.mem address ctx.members in
-        let result =
+        let* result =
           match proof with
-          | None ->
-            Set_fold.note_pulse
+          | Set_fold.Pulse ->
+            Lwt.return (Set_fold.note_pulse
               ~cap_mode:ctx.cap_mode
               ?credit:(match ctx.ready_exec_mode with
                 | Rule_graph.Prior -> None
@@ -2964,9 +2981,13 @@ let update_ready_fold ~backend ~env ~head_epoch ~address proof =
               ~epoch:(Int64.of_int env.epoch_id)
               ~active
               ~address
-              state
-          | Some proof ->
-            Set_fold.apply_proof
+              state)
+          | Set_fold.Commit proof ->
+            if ctx.duty_marks = Rule_graph.Active
+                && Option.fold ~none:false ~some:(fun (final : Set_fold.final) -> final.round <> None)
+                  (Set_fold.find_final proof.vote.epoch_id state) then
+              Lwt.return_error "validator duty commit replaced by marks"
+            else Lwt.return (Set_fold.apply_proof
               ~cap_mode:ctx.cap_mode
               cfg
               ~chain_id:env.chain_id
@@ -2974,7 +2995,17 @@ let update_ready_fold ~backend ~env ~head_epoch ~address proof =
               ~active
               ~address
               proof
-              state
+              state)
+          | Set_fold.Marks claims ->
+            let epoch = Int64.of_int env.epoch_id in
+            begin match Set_fold.check_mark_claims cfg ~epoch claims state with
+            | Error reason -> Lwt.return_error reason
+            | Ok () ->
+              let* sets = Lwt_list.filter_map_s (fun (claim : Set_fold.mark_claim) ->
+                Compute_input.retained_set backend.store claim.epoch) claims in
+              Lwt.return (Set_fold.apply_mark_claims ~cap_mode:ctx.cap_mode cfg
+                ~chain_id:env.chain_id ~epoch ~active ~address ~sets claims state)
+            end
         in
         Lwt.return (Result.map Option.some result)
     end
@@ -3206,10 +3237,12 @@ let process_circle_operation_tx
   match tx.op_type with
   | CircleDeploy ->
     process_circle_deploy_tx ~wasm_profile ~inspect_mode
+      ~table_mode:(fold_at backend current_epoch).proof_key
       ~calls:((fold_at backend current_epoch).proof_exec = Rule_graph.Active)
       ~float_mode:(fold_at backend current_epoch).wasm_float ~backend tx
   | CircleProgramUpdate ->
     process_circle_program_update_tx ~wasm_profile ~inspect_mode
+      ~table_mode:(fold_at backend current_epoch).proof_key
       ~calls:((fold_at backend current_epoch).proof_exec = Rule_graph.Active)
       ~float_mode:(fold_at backend current_epoch).wasm_float ~backend tx
   | CircleAssetPut ->
@@ -3544,7 +3577,7 @@ let validator_snapshot_input ?active ~backend ~env policy registry =
   | Rule_graph.Prior ->
     Lwt.return
       (policy.Validator_policy.parameters,
-       Validator_registry.candidates registry,
+       Validator_registry.entries registry,
        [])
   | Rule_graph.Active ->
     let cfg = set_fold_cfg ctx in
@@ -3563,12 +3596,12 @@ let validator_snapshot_input ?active ~backend ~env policy registry =
       if changed then save_set_fold backend state
       else Lwt.return_unit
     in
-    let candidates, counts =
+    let entries, counts =
       Set_fold.filter
         cfg
         ~start:(set_fold_start ctx)
         ~source
-        (Validator_registry.candidates registry)
+        (Validator_registry.entries registry)
         state
     in
     Octra_log.info
@@ -3599,10 +3632,10 @@ let validator_snapshot_input ?active ~backend ~env policy registry =
     in
     let parameters = {
       policy.parameters with
-      Validator_admission.max_validators;
+      Validator_entry.max_validators;
       activation_delay;
     } in
-    Lwt.return (parameters, candidates, incumbents)
+    Lwt.return (parameters, entries, incumbents)
 
 let schedule_validator_snapshot ?active ~backend ~env () =
   let open Lwt.Syntax in
@@ -3654,15 +3687,15 @@ let schedule_validator_snapshot ?active ~backend ~env () =
           match backend.validator_policy with
           | Validator_policy.Inactive -> Lwt.return_unit
           | Validator_policy.Bonded policy ->
-            let* parameters, candidates, incumbents =
+            let* parameters, entries, incumbents =
               validator_snapshot_input ?active ~backend ~env policy registry
             in
             match
-              Validator_admission.snapshot
+              Validator_entry.snapshot
                 ~incumbents
                 parameters
                 ~activate_epoch
-                candidates
+                entries
             with
             | Error "validator snapshot has fewer than four eligible members" ->
               Octra_log.info
@@ -3677,9 +3710,9 @@ let schedule_validator_snapshot ?active ~backend ~env () =
               begin
                 match
                   Validator_set_update.make_weighted
-                    ~source_epoch:snapshot.Validator_admission.source_epoch
-                    ~activate_epoch:snapshot.Validator_admission.activate_epoch
-                    snapshot.Validator_admission.validators
+                    ~source_epoch:snapshot.Validator_entry.source_epoch
+                    ~activate_epoch:snapshot.Validator_entry.activate_epoch
+                    snapshot.Validator_entry.validators
                 with
                 | Error error ->
                   failwith ("validator snapshot rejected: " ^ error)

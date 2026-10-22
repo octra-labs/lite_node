@@ -87,19 +87,19 @@ let test_worker_queue_is_not_held () =
   in
   let calls = [|
     (fun () ->
-      Backend.verify_zero_worker ~math:false
+      Backend.verify_zero_worker ~keyed:false ~math:false
         ~pubkey:"pubkey"
         ~cipher:"cipher"
         ~proof:"proof");
     (fun () ->
-      Backend.verify_range_worker ~math:false
+      Backend.verify_range_worker ~keyed:false ~math:false
         ~strict:false
         ~pubkey:"pubkey"
         ~cipher:"cipher"
         ~proof:"proof"
         ~commitment:"commitment");
     (fun () ->
-      Backend.verify_bound_worker ~math:false
+      Backend.verify_bound_worker ~keyed:false ~math:false
         ~strict:false
         ~pubkey:"pubkey"
         ~cipher:"cipher"
@@ -300,6 +300,36 @@ let test_pairs () =
     [["hfhe_pairs", `String "true"];
      ["hfhe_pairs", `Bool true; "hfhe_pairs", `Bool false]]
 
+let test_proof_key () =
+  let module F = Pvac_ffi in
+  let module B = Octra_core.Crypto.FheBalance in
+  let seed = Bytes.make 32 '\071' in
+  let pk, sk = F.keygen_from_seed (F.default_params ()) seed in
+  let cipher = F.enc_value_seeded pk sk 3L seed in
+  let blind = Bytes.make 32 '\072' in
+  let proof = F.make_zero_proof_bound ~math:true ~keyed:true pk sk cipher 3L blind in
+  let fields = [
+    "action", `String "verify_bound";
+    "cap", `Bool true;
+    "strict", `Bool true;
+    "math", `Bool true;
+    "pubkey_b64", `String (F.serialize_pubkey pk |> Bytes.to_string |> Base64.encode_exn);
+    "ciphertext", `String (B.encode_cipher cipher);
+    "proof", `String (B.encode_zero_proof proof);
+    "amount_commitment", `String (F.pedersen_commit_amount 3L blind |> Bytes.to_string |> Base64.encode_exn);
+  ] in
+  List.iter (fun keyed ->
+    let reply = Backend.run_action (("proof_key", `Bool keyed) :: fields) in
+    check "proof worker unavailable" (Yojson.Safe.Util.member "ok" reply = `Bool true);
+    check "proof key policy differs" (Yojson.Safe.Util.member "value" reply = `Bool keyed))
+    [true; false];
+  List.iter (fun mode ->
+    let reply = Backend.run_action (mode @ fields) in
+    check "invalid proof key mode accepted"
+      (Yojson.Safe.Util.member "error" reply = `String "invalid proof_key"))
+    [["proof_key", `String "true"];
+     ["proof_key", `Bool true; "proof_key", `Bool false]]
+
 let run () =
   check
     "request limit"
@@ -381,11 +411,16 @@ let run () =
   test_worker_queue_is_not_held ();
   test_math ();
   test_pairs ();
+  test_proof_key ();
   Printf.printf "status = pass test = circle_wasm_hfhe_policy\n%!"
 
 let () =
   if Array.length Sys.argv = 2 && Sys.argv.(1) = "--pairs" then begin
     test_pairs ();
     Printf.printf "status = pass test = hfhe_pairs\n%!"
+  end
+  else if Array.length Sys.argv = 2 && Sys.argv.(1) = "--proof-key" then begin
+    test_proof_key ();
+    Printf.printf "status = pass test = proof_key\n%!"
   end
   else run ()

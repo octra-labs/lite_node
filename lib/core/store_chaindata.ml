@@ -139,8 +139,33 @@ type tx_write = {
 
 type tx_writes = Pending of tx_write list | Write_failed
 
+type public_mark = { after : int64 option; seen : int }
+
+type public_page = {
+  first : int;
+  last : int;
+  cursor : public_mark;
+  rows : Yojson.Safe.t list;
+}
+
+type public_index = {
+  raw_count : int;
+  total : int;
+  after : int64 option;
+  stride : int;
+  marks : public_mark list;
+  mutable used : float;
+  mutable page : public_page option;
+}
+
+type public_reader = {
+  lock : Lwt_mutex.t;
+  mutable waiters : int;
+}
+
 type t = {
   resources : Store_scope.t;
+  origin : Store_origin.t option;
   txlog : Txlog.t;
   epochlog : Epochlog.t;
   index : Chaindata_index.t;
@@ -151,6 +176,11 @@ type t = {
   addr_rows_page_cache : (string, rows_status) Hashtbl.t;
   rejected_rows_page_cache : (string, Yojson.Safe.t list) Hashtbl.t;
   token_rows_page_cache : (string, token_rows_page) Hashtbl.t;
+  public_cache : (string, public_index) Hashtbl.t;
+  public_readers : (string, public_reader) Hashtbl.t;
+  mutable public_waiters : int;
+  mutable public_epoch : int;
+  mutable closed : bool;
 }
 
 let rec mkdir_p path =
@@ -165,6 +195,9 @@ let open_chaindata ?(readonly = false) ?(lock_wait = 0.) base_dir =
   let owner = if readonly then None else Some (Store_lock.acquire ~wait_seconds:lock_wait base_dir) in
   let resources = Store_scope.create ~release:(fun () -> Option.iter Store_lock.release owner) in
   Store_scope.guard resources (fun () ->
+  let origin = Store_scope.acquire resources
+    (fun () -> if readonly then None else Store_origin.capture base_dir)
+    (Option.iter Store_origin.close) in
   let txlog_dir = Filename.concat base_dir "txlog" in
   let epochlog_path = Filename.concat (Filename.concat base_dir "epochlog") "epochs.dat" in
   let index_dir = Filename.concat base_dir "index" in
@@ -180,6 +213,7 @@ let open_chaindata ?(readonly = false) ?(lock_wait = 0.) base_dir =
     | None -> 0L in
   {
     resources;
+    origin;
     txlog;
     epochlog;
     index;
@@ -190,6 +224,11 @@ let open_chaindata ?(readonly = false) ?(lock_wait = 0.) base_dir =
     addr_rows_page_cache = Hashtbl.create 256;
     rejected_rows_page_cache = Hashtbl.create 128;
     token_rows_page_cache = Hashtbl.create 128;
+    public_cache = Hashtbl.create 64;
+    public_readers = Hashtbl.create 8;
+    public_waiters = 0;
+    public_epoch = 0;
+    closed = false;
   })
 
 let program_record_legacy_key address =
@@ -332,6 +371,8 @@ let save_program_record t address record =
            ("program record write failed reason = " ^ Printexc.to_string exn))
 
 let close t =
+  t.closed <- true;
+  t.public_epoch <- t.public_epoch + 1;
   Store_scope.close t.resources
 
 let begin_batch t =
@@ -404,9 +445,13 @@ let save_tx t ~hash ~epoch_id ~from_addr ~to_addr ~tx_json
     t.tx_writes <- Pending (row :: rows);
     t.next_txid <- Int64.succ t.next_txid
 
-let save_rejected t ~hash ~from_addr ~to_addr ~amount ~nonce
+let save_rejected ?(op_type = Transaction.Standard) t ~hash ~from_addr ~to_addr ~amount ~nonce
     ~error_type ~reason ~epoch_id ~ts =
-  let rj = Yojson.Safe.to_string (`Assoc [
+  let private_row = op_type = Transaction.StealthOp || op_type = Transaction.ClaimOp in
+  let from_addr = if private_row then "-" else from_addr in
+  let to_addr = if op_type = Transaction.ClaimOp then "-" else to_addr in
+  let nonce = if private_row then 0 else nonce in
+  let fields = [
     "hash", `String hash;
     "from_addr", `String from_addr;
     "to_addr", `String to_addr;
@@ -416,10 +461,17 @@ let save_rejected t ~hash ~from_addr ~to_addr ~amount ~nonce
     "reason", `String reason;
     "epoch_id", `Int epoch_id;
     "ts", `Float ts;
-  ]) in
-  Chaindata_index.buffer_rejected t.index ~hash ~addr:from_addr ~json:rj ~epoch_id;
-  if to_addr <> from_addr then
+  ] in
+  let fields = if private_row then
+    ("op_type", `String (Transaction.op_type_to_string op_type)) :: fields else fields in
+  let rj = Yojson.Safe.to_string (`Assoc fields) in
+  if private_row then
+    Chaindata_index.buffer_rejected t.index ~hash ~json:rj ~epoch_id
+  else begin
+    Chaindata_index.buffer_rejected t.index ~hash ~addr:from_addr ~json:rj ~epoch_id;
+    if to_addr <> from_addr then
     Chaindata_index.buffer_rejected t.index ~hash ~addr:to_addr ~json:rj ~epoch_id
+  end
 
 let save_receipt t ~tx_hash ~contract_addr ~method_name
     ~success ~effort_used ~events_json ~error ~epoch_id =
@@ -1440,31 +1492,183 @@ let txs_by_addr_rows t addr ~limit ~offset =
   let status = txs_by_addr_rows_status t addr ~limit ~offset in
   (status.total, status.rows)
 
+exception Public_read of string
+
+let cache_public_index t addr index =
+  if Hashtbl.length t.public_cache >= 64 && not (Hashtbl.mem t.public_cache addr) then begin
+    let oldest = Hashtbl.fold (fun key entry oldest ->
+      if Hashtbl.mem t.public_readers key then oldest
+      else match oldest with
+        | Some (_, used) when used <= entry.used -> oldest
+        | _ -> Some (key, entry.used)) t.public_cache None in
+    Option.iter (fun (key, _) -> Hashtbl.remove t.public_cache key) oldest
+  end;
+  Hashtbl.replace t.public_cache addr index
+
+let public_addr_rows t addr ~limit ~offset =
+  let open Lwt.Syntax in
+  let limit = max 0 (min 1000 limit) and offset = max 0 offset in
+  let epoch = t.public_epoch in
+  let now () = Mtime.Span.to_float_ns (Mtime_clock.elapsed ()) /. 1e9 in
+  let deadline = now () +. 15. in
+  let remaining = ref 1024 in
+  let check () =
+    if t.closed || epoch <> t.public_epoch then raise (Public_read "address history changed");
+    if now () >= deadline then raise (Public_read "address history deadline") in
+  let row txid =
+    check ();
+    decr remaining;
+    let location = match Chaindata_index.get_txid_loc t.index txid with
+      | Some value -> value
+      | None -> raise (Public_read "address history record missing") in
+    let dir = t.txlog.Txlog.dir in
+    let* result = Lwt_preemptive.detach (fun () ->
+      let seg_id, offset, len = location in
+      let epoch_id, raw = Txlog.read_location ~dir ~seg_id ~offset ~len in
+      let hash, json = split_payload raw in
+      match tx_json_to_summary_row hash epoch_id (visible_tx_json hash json) with
+      | Some (`Assoc fields as row) ->
+        begin match List.assoc_opt "op_type" fields with
+        | Some (`String ("stealth" | "claim")) -> None
+        | _ when summary_row_mentions_addr addr row -> Some row
+        | _ -> None
+        end
+      | _ -> raise (Public_read "address history record invalid")) () in
+    check ();
+    Lwt.return result in
+  let rec count goal (index : public_index) =
+    check ();
+    if index.raw_count = goal then Lwt.return index
+    else if !remaining = 0 then Lwt.fail (Public_read "address history pending")
+    else match Chaindata_index.addr_chunk t.index addr ~after:index.after
+      ~limit:(min !remaining (min 64 (goal - index.raw_count))) with
+    | [] -> Lwt.fail (Public_read "address history index incomplete")
+    | txids ->
+      let* total = Lwt_list.fold_left_s (fun total txid ->
+        let* item = row txid in Lwt.return (total + (if Option.is_some item then 1 else 0))) index.total txids in
+      let raw_count = index.raw_count + List.length txids in
+      let after = Some (List.hd (List.rev txids)) in
+      let stride = index.stride in
+      let marks = if raw_count / stride > index.raw_count / stride then
+        {after; seen = total} :: index.marks else index.marks in
+      let stride, marks = if List.length marks > 4096 then
+        stride * 2, List.filteri (fun i _ -> i mod 2 = 0) marks else stride, marks in
+      let index = {raw_count; total; after; stride; marks; used = now (); page = None} in
+      cache_public_index t addr index;
+      count goal index in
+  let rec page index progress =
+    check ();
+    if progress.cursor.seen >= progress.last then Lwt.return progress.rows
+    else if !remaining = 0 then Lwt.fail (Public_read "address history pending")
+    else match Chaindata_index.addr_chunk t.index addr ~after:progress.cursor.after
+      ~limit:(min 64 !remaining) with
+    | [] -> Lwt.fail (Public_read "address history index incomplete")
+    | txids ->
+      let* seen, rows = Lwt_list.fold_left_s (fun (seen, rows) txid ->
+        if seen >= progress.last then Lwt.return (seen, rows)
+        else let* item = row txid in
+          match item with
+          | None -> Lwt.return (seen, rows)
+          | Some _ when seen < progress.first -> Lwt.return (seen + 1, rows)
+          | Some item -> Lwt.return (seen + 1, item :: rows))
+        (progress.cursor.seen, progress.rows) txids in
+      let cursor = {after = Some (List.hd (List.rev txids)); seen} in
+      let progress = {progress with cursor; rows} in
+      index.page <- Some progress;
+      page index progress in
+  let run () =
+    check ();
+    let raw_count = Chaindata_index.addr_tx_count t.index addr in
+    let empty = {raw_count = 0; total = 0; after = None; stride = 64;
+      marks = [{after = None; seen = 0}]; used = now (); page = None} in
+    let start = match Hashtbl.find_opt t.public_cache addr with
+      | Some cached when cached.raw_count <= raw_count -> cached
+      | _ -> empty in
+    start.used <- now ();
+    cache_public_index t addr start;
+    let* index = count raw_count start in
+    let last = max 0 (index.total - offset) in
+    let first = max 0 (last - limit) in
+    let progress = match index.page with
+      | Some progress when progress.first = first && progress.last = last -> progress
+      | _ -> {first; last; cursor = List.find (fun mark -> mark.seen <= first) index.marks;
+          rows = []} in
+    index.page <- Some progress;
+    let* rows = if offset >= index.total || limit = 0 then Lwt.return []
+      else page index progress in
+    check ();
+    if Chaindata_index.addr_tx_count t.index addr < raw_count then
+      raise (Public_read "address history changed");
+    Lwt.return_ok {total = index.total; rows; missing = 0; incomplete = false} in
+  if t.public_waiters >= 8 then Lwt.return_error "address history busy"
+  else begin
+    let reader = match Hashtbl.find_opt t.public_readers addr with
+      | Some reader -> reader
+      | None ->
+        let reader = {lock = Lwt_mutex.create (); waiters = 0} in
+        Hashtbl.add t.public_readers addr reader;
+        reader in
+    reader.waiters <- reader.waiters + 1;
+    t.public_waiters <- t.public_waiters + 1;
+    Lwt.no_cancel (Lwt.finalize
+      (fun () -> Lwt.catch (fun () -> Lwt_mutex.with_lock reader.lock run)
+        (function Public_read reason -> Lwt.return_error reason
+          | _ -> Lwt.return_error "address history unavailable"))
+      (fun () ->
+        reader.waiters <- reader.waiters - 1;
+        if reader.waiters = 0 then Hashtbl.remove t.public_readers addr;
+        t.public_waiters <- t.public_waiters - 1;
+        Lwt.return_unit))
+  end
+
 let token_history_scan_limit = 4096
 
 let compute_token_txs_by_addr_page_profile t addr ~limit ~offset =
+  let open Lwt.Syntax in
   let t0 = Unix.gettimeofday () in
+  let epoch = t.public_epoch in
+  let deadline = Mtime.Span.to_float_ns (Mtime_clock.elapsed ()) /. 1e9 +. 15. in
+  let check () =
+    if t.closed || epoch <> t.public_epoch then raise (Public_read "token history changed");
+    if Mtime.Span.to_float_ns (Mtime_clock.elapsed ()) /. 1e9 >= deadline then
+      raise (Public_read "token history deadline") in
   let addr_total = Chaindata_index.addr_tx_count t.index addr in
   let scan_limit = min addr_total token_history_scan_limit in
   let (_total, txids) =
     Chaindata_index.addr_txids_rev t.index addr ~limit:scan_limit ~offset:0
   in
   let t1 = Unix.gettimeofday () in
-  let incoming = ref 0 in
-  let outgoing = ref 0 in
-  let missing = ref 0 in
-  let token_rows = List.filter_map (fun txid ->
-    match read_tx_at_txid t txid with
-    | Some (hash, epoch_id, tx_json) ->
-        (match token_transfer_row_for_addr addr hash epoch_id tx_json with
-         | Token_transfer_present (is_incoming, is_outgoing, row) ->
-             if is_incoming then incr incoming;
-             if is_outgoing then incr outgoing;
-             Some (epoch_id, txid, row)
-         | Token_transfer_absent -> None
-         | Token_transfer_malformed -> incr missing; None)
-    | None -> incr missing; None
-  ) txids in
+  let dir = t.txlog.Txlog.dir in
+  let rec chunks acc count rest = match count, rest with
+    | 0, _ | _, [] -> List.rev acc, rest
+    | _, txid :: remainder -> chunks ((txid, Chaindata_index.get_txid_loc t.index txid) :: acc)
+        (count - 1) remainder in
+  let read totals (txid, location) =
+    let incoming, outgoing, missing, rows = totals in
+    let item = try match location with
+      | None -> None
+      | Some (seg_id, offset, len) ->
+        let epoch_id, raw = Txlog.read_location ~dir ~seg_id ~offset ~len in
+        let hash, json = split_payload raw in
+        Some (epoch_id, token_transfer_row_for_addr addr hash epoch_id
+          (visible_tx_json hash json))
+      with _ -> None in
+    match item with
+    | Some (epoch_id, Token_transfer_present (is_incoming, is_outgoing, row)) ->
+      incoming + (if is_incoming then 1 else 0),
+      outgoing + (if is_outgoing then 1 else 0), missing, (epoch_id, txid, row) :: rows
+    | Some (_, Token_transfer_absent) -> totals
+    | Some (_, Token_transfer_malformed) | None -> incoming, outgoing, missing + 1, rows in
+  let rec resolve totals rest =
+    check ();
+    match rest with
+    | [] -> Lwt.return totals
+    | _ ->
+      let batch, rest = chunks [] 64 rest in
+      let* totals = Lwt_preemptive.detach (fun () -> List.fold_left read totals batch) () in
+      resolve totals rest in
+  let* incoming, outgoing, missing, reversed = resolve (0, 0, 0, []) txids in
+  let token_rows = List.rev reversed in
   let t2 = Unix.gettimeofday () in
   let rec drop n = function
     | l when n <= 0 -> l
@@ -1479,14 +1683,14 @@ let compute_token_txs_by_addr_page_profile t addr ~limit ~offset =
   let total = List.length token_rows in
   let page_rows = take limit (drop offset token_rows) in
   let t3 = Unix.gettimeofday () in
-  ({
+  Lwt.return ({
     total;
     rows = List.map (fun (_, _, row) -> row) page_rows;
-    incoming = !incoming;
-    outgoing = !outgoing;
+    incoming;
+    outgoing;
     has_more = offset + List.length page_rows < total;
-    missing = !missing;
-    incomplete = !missing > 0 || scan_limit < addr_total;
+    missing;
+    incomplete = missing > 0 || scan_limit < addr_total;
   }, {
     fetched = List.length txids;
     selected = List.length token_rows;
@@ -1499,6 +1703,8 @@ let compute_token_txs_by_addr_page_profile t addr ~limit ~offset =
   })
 
 let token_txs_by_addr_page ?(profile_tag = "") t addr ~limit ~offset =
+  let open Lwt.Syntax in
+  let run () =
   let use_cache = offset = 0 && limit <= 100 in
   if use_cache then
     let key = token_rows_page_cache_key t addr ~limit ~offset in
@@ -1522,9 +1728,9 @@ let token_txs_by_addr_page ?(profile_tag = "") t addr ~limit ~offset =
             page_ms = 0.0;
             total_ms = 0.0;
           };
-        page
+        Lwt.return page
     | None ->
-        let (page, profile) =
+        let* (page, profile) =
           compute_token_txs_by_addr_page_profile t addr ~limit ~offset
         in
         if not page.incomplete then
@@ -1538,9 +1744,9 @@ let token_txs_by_addr_page ?(profile_tag = "") t addr ~limit ~offset =
           ~total:page.total
           ~missing:page.missing
           profile;
-        page
+        Lwt.return page
   else
-    let (page, profile) =
+    let* (page, profile) =
       compute_token_txs_by_addr_page_profile t addr ~limit ~offset
     in
     emit_history_profile
@@ -1552,7 +1758,16 @@ let token_txs_by_addr_page ?(profile_tag = "") t addr ~limit ~offset =
       ~total:page.total
       ~missing:page.missing
       profile;
-    page
+    Lwt.return page in
+  if t.public_waiters >= 8 then Lwt.return_error "token history busy"
+  else begin
+    t.public_waiters <- t.public_waiters + 1;
+    Lwt.no_cancel (Lwt.finalize
+      (fun () -> Lwt.catch (fun () -> let* page = run () in Lwt.return_ok page)
+        (function Public_read reason -> Lwt.return_error reason
+          | _ -> Lwt.return_error "token history unavailable"))
+      (fun () -> t.public_waiters <- t.public_waiters - 1; Lwt.return_unit))
+  end
 
 let txs_by_epoch_rows_status t epoch_id ~limit ~offset =
   let empty = { total = 0; rows = []; missing = 0; incomplete = false } in
@@ -1769,11 +1984,32 @@ let get_epoch_header t epoch_id =
   | Some s -> Epochlog.epoch_of_json s
 
 let get_bound_epoch_header t epoch_id =
-  match get_epoch_header t epoch_id, Epochlog.get t.epochlog epoch_id with
-  | None, _ -> Error "epoch not found"
-  | Some _, None -> Error "epoch log entry missing"
-  | Some indexed, Some durable when indexed = durable -> Ok durable
-  | Some _, Some _ -> Error "epoch metadata does not match epoch log"
+  let report reason =
+    let bytes, device, inode =
+      try let stat = Unix.fstat t.epochlog.fd in stat.st_size, stat.st_dev, stat.st_ino
+      with Unix.Unix_error _ -> -1, -1, -1 in
+    Octra_log.warn "epochlog"
+      "event = read_refused epoch = %d thread = %d file_bytes = %d device = %d inode = %d reason = %s"
+      epoch_id (Thread.id (Thread.self ())) bytes device inode
+      reason in
+  let indexed = match Chaindata_index.get_epoch t.index epoch_id with
+    | None -> report "index_entry_missing"; Error "epoch not found"
+    | Some raw ->
+      match Epochlog.epoch_of_json raw with
+      | None -> report "index_header_invalid"; Error "epoch index header invalid"
+      | Some header -> Ok header in
+  match indexed with
+  | Error _ as error -> error
+  | Ok indexed ->
+    try
+      match Epochlog.get ~on_error:(fun error -> report (Epochlog.read_error_message error))
+              t.epochlog epoch_id with
+      | None -> Error "epoch log entry missing"
+      | Some durable when indexed = durable -> Ok durable
+      | Some _ ->
+        report "index_header_mismatch";
+        Error "epoch metadata does not match epoch log"
+    with Unix.Unix_error _ -> Error "epoch log read failed"
 
 type epoch_boundary = {
   header : Epochlog.epoch_header;
@@ -1907,13 +2143,16 @@ let rejected_to_row hash rj_json =
   try
     let j = Yojson.Safe.from_string rj_json in
     let open Yojson.Safe.Util in
+    let private_op = match j |> member "op_type" with
+      | `String ("stealth" | "claim") -> true
+      | _ -> false in
     Some (`Assoc [
       "hash", `String hash;
       "epoch", `Int (j |> member "epoch_id" |> to_int);
       "from", `String (j |> member "from_addr" |> to_string);
       "to", `String (j |> member "to_addr" |> to_string);
       "amount", `String (j |> member "amount" |> to_string);
-      "nonce", `Int (j |> member "nonce" |> to_int);
+      "nonce", (if private_op then `Int 0 else `Int (j |> member "nonce" |> to_int));
       "error_type", `String (j |> member "error_type" |> to_string);
       "reason", `String (j |> member "reason" |> to_string);
       "timestamp", j |> member "ts";
@@ -2086,6 +2325,8 @@ let rollback_to_head t ~(head : Head_manifest.t) ~inflight_start_txid ~inflight_
   Hashtbl.clear t.epoch_status_cache;
   Hashtbl.clear t.epoch_rows_page_cache;
   Hashtbl.clear t.addr_rows_page_cache;
+  Hashtbl.clear t.public_cache;
+  t.public_epoch <- t.public_epoch + 1;
   Hashtbl.clear t.rejected_rows_page_cache;
   Hashtbl.clear t.token_rows_page_cache;
   (n_tx, n_ep, n_addr, n_txid)
@@ -2314,6 +2555,8 @@ let rebuild_index ?(public_key_of = fun _ -> None) t =
             Hashtbl.clear t.epoch_status_cache;
             Hashtbl.clear t.epoch_rows_page_cache;
             Hashtbl.clear t.addr_rows_page_cache;
+            Hashtbl.clear t.public_cache;
+            t.public_epoch <- t.public_epoch + 1;
             Hashtbl.clear t.rejected_rows_page_cache;
             Hashtbl.clear t.token_rows_page_cache;
             Ok {

@@ -6,6 +6,9 @@ module C_codec = Octra_consensus.C_codec
 module C_config = Octra_consensus.C_config
 module C_hash = Octra_consensus.C_hash
 module C_qc = Octra_consensus.C_qc
+module C_relief = Octra_consensus.C_relief
+module C_relief_log = Octra_consensus.C_relief_log
+module C_quorum_policy = Octra_consensus.C_quorum_policy
 module C_types = Octra_consensus.C_types
 module Eic = Octra_core.Epoch_index_commitment
 module Irmin = Octra_core.Store_irmin
@@ -15,6 +18,7 @@ module Update = Octra_core.Validator_set_update
 type source =
   | Pending
   | Active
+  | Relief of C_relief.mark
 
 type step = {
   source : source;
@@ -29,6 +33,7 @@ type t = {
   steps : step list;
   finalize : C_types.finalize;
   validator_set : C_types.validator_set;
+  stake : (int64 * C_types.validator_set) option;
 }
 
 type origin = {
@@ -50,13 +55,34 @@ let max_proof_bytes = 4_000_000
 let max_root_bytes = 256
 
 let make ~steps ~finalize ~validator_set =
-  { steps; finalize; validator_set }
+  { steps; finalize; validator_set; stake = None }
 
 let steps t =
   t.steps
 
 let validator_set t =
   t.validator_set
+
+let transition_base t =
+  match t.stake with
+  | Some stake -> Ok stake
+  | None -> Error "validator transition path is not verified"
+
+let live_relief t =
+  let live step = match step.source with
+    | Relief mark when t.finalize.C_types.epoch_id < mark.activate_epoch -> Some mark
+    | _ -> None in
+  List.find_map live (List.rev t.steps)
+
+let relief t =
+  match t.stake with
+  | None -> Error "validator transition path is not verified"
+  | Some _ -> Ok (live_relief t)
+
+let path_epoch t =
+  match List.rev t.steps with
+  | [] -> -1L
+  | step :: _ -> step.finalize.C_types.epoch_id
 
 let finality t =
   t.finalize
@@ -72,6 +98,7 @@ let protect f =
 let source_to_u8 = function
   | Pending -> 1
   | Active -> 2
+  | Relief _ -> 3
 
 let source_of_u8 = function
   | 1 -> Pending
@@ -80,6 +107,9 @@ let source_of_u8 = function
 
 let put_step buffer (step : step) =
   O.put_u8 buffer (source_to_u8 step.source);
+  (match step.source with
+   | Relief mark -> O.put_bytes buffer (C_relief_log.encode mark)
+   | Pending | Active -> ());
   O.put_bytes buffer (C_codec.encode_finalize step.finalize);
   O.put_string buffer step.ledger_state_root;
   O.put_string buffer step.epoch_index_root;
@@ -87,7 +117,13 @@ let put_step buffer (step : step) =
   O.put_bytes buffer step.proof
 
 let get_step cursor =
-  let source = source_of_u8 (O.get_u8 cursor) in
+  let source = match O.get_u8 cursor with
+    | 3 ->
+      let wire = O.get_bytes_bounded ~max:C_relief_log.max_wire_bytes cursor in
+      (match C_relief_log.decode wire with
+       | Ok mark -> Relief mark
+       | Error reason -> failwith reason)
+    | tag -> source_of_u8 tag in
   let finalize =
     O.get_bytes_bounded ~max:max_finalize_bytes cursor
     |> C_codec.decode_finalize
@@ -126,7 +162,7 @@ let decode encoded =
               O.get_bytes_bounded ~max:max_set_bytes cursor
               |> C_codec.decode_validator_set
             in
-            { steps; finalize; validator_set })
+            { steps; finalize; validator_set; stake = None })
           bytes)
     in
     if raw value <> bytes then Error "finality encoding is not exact"
@@ -153,10 +189,19 @@ let raw_validator_set validator_set =
       validator_set.C_types.validators
     |> Result.map List.rev
   in
-  if validator_set.weighted then
+  let* result = if validator_set.weighted then
     C_types.make_weighted_validator_set entries
   else
-    Ok (C_types.make_validator_set (List.map fst entries))
+    Ok (C_types.make_validator_set (List.map fst entries)) in
+  let* authors = match validator_set.authors with
+    | None -> Ok None
+    | Some (height, entries) ->
+      let* entries = List.fold_left (fun result (member, weight) ->
+        let* result = result in
+        let* pubkey = Checkpoint.raw_pubkey member.C_types.pubkey in
+        Ok ((C_types.{member with pubkey}, weight) :: result)) (Ok []) entries in
+      Ok (Some (height, List.rev entries)) in
+  Ok {result with authors}
 
 let encoded_validator_set validator_set =
   let* validators =
@@ -182,7 +227,11 @@ let encoded_validator_set validator_set =
   if validators = [] then
     Error "finality validator set is empty"
   else
-    Ok C_types.{ validator_set with validators }
+    let authors = Option.map (fun (height, entries) -> height,
+      List.map (fun (member, weight) ->
+        C_types.{member with pubkey = Base64.encode_exn member.pubkey}, weight)
+        entries) validator_set.authors in
+    Ok C_types.{ validator_set with validators; authors }
 
 let finalize_hash finalize =
   C_codec.encode_finalize finalize
@@ -201,7 +250,7 @@ let lower_hex lengths value =
          | _ -> false)
        value
 
-let verify_finalize ~chain_id ~validator_set finalize =
+let verify_finalize ?policy ~chain_id ~validator_set finalize =
   if finalize.C_types.chain_id <> chain_id
      || finalize.header.chain_id <> chain_id then
     Error "finality chain mismatch"
@@ -210,6 +259,7 @@ let verify_finalize ~chain_id ~validator_set finalize =
   else
     match
       C_qc.validate_persisted_finalize_strict
+        ?policy
         ~chain_id
         ~validator_set
         ~verify_vote:(verify_vote validator_set)
@@ -218,10 +268,11 @@ let verify_finalize ~chain_id ~validator_set finalize =
     | C_qc.Valid -> Ok ()
     | C_qc.Invalid reason -> Error ("finality qc " ^ reason)
 
-let verify_anchor_finalize ~chain_id ~validator_set finalize =
-  let* () = verify_finalize ~chain_id ~validator_set finalize in
+let verify_anchor_finalize ?policy ~chain_id ~validator_set finalize =
+  let* () = verify_finalize ?policy ~chain_id ~validator_set finalize in
   let vote_set =
     C_types.validator_set_for_epoch
+      ?policy
       ~chain_id
       ~epoch_id:finalize.C_types.epoch_id
       validator_set
@@ -232,7 +283,7 @@ let verify_anchor_finalize ~chain_id ~validator_set finalize =
   if C_types.has_quorum vote_set signers then Ok ()
   else Error "finality qc signer quorum"
 
-let step_input ~chain_id ~prior_epoch validator_set (step : step) =
+let step_input ?policy ~chain_id ~prior_epoch validator_set (step : step) =
   let epoch = step.finalize.C_types.epoch_id in
   match prior_epoch with
   | Some prior when Int64.compare epoch prior <= 0 ->
@@ -264,11 +315,17 @@ let step_input ~chain_id ~prior_epoch validator_set (step : step) =
         | Active ->
             ["meta"; Update.active_meta_key],
             Int64.compare update.activate_epoch epoch <= 0
+        | Relief mark ->
+            ["meta"; Update.pending_meta_key],
+            mark.height = Int64.succ epoch
+            && mark.activate_epoch = update.activate_epoch
+            && mark.fingerprint = update.fingerprint
+            && C_quorum_policy.linear_weight ~chain_id ~epoch_id:mark.height
       in
       if not activation_valid then
         Error "validator transition activation epoch mismatch"
       else
-      let* () = verify_anchor_finalize ~chain_id ~validator_set step.finalize in
+      let* () = verify_anchor_finalize ?policy ~chain_id ~validator_set step.finalize in
       let folded =
         Eic.folded_state_root
           ~ledger_state_root:step.ledger_state_root
@@ -277,26 +334,52 @@ let step_input ~chain_id ~prior_epoch validator_set (step : step) =
       if Checkpoint.raw_to_hex step.finalize.header.proposed_state_root <> folded then
         Error "validator transition folded root mismatch"
       else
-        Ok (epoch, update, path)
+        let* next = Update.validator_set update in
+        let* next = match step.source with
+          | Pending | Active -> Ok next
+          | Relief mark ->
+            let current = C_types.validator_set_for_epoch ?policy ~chain_id
+              ~epoch_id:mark.height validator_set in
+            let target = C_types.validator_set_for_epoch ?policy ~chain_id
+              ~epoch_id:update.activate_epoch next in
+            let* selected = C_relief.restore ~chain_id ~height:mark.height ~current
+              ~activate_epoch:update.activate_epoch ~target
+              ~fingerprint:update.fingerprint mark in
+            (match selected with Some set -> Ok set
+             | None -> Error "validator relief step is expired") in
+        Ok (epoch, next, path)
 
-let step_output ~chain_id step (epoch, update, path) =
+let step_output step (epoch, next, path) =
   let* value = Irmin.verify_merkle_proof_det
     ~ledger_state_root:step.ledger_state_root ~path ~proof:step.proof in
   if value <> Some step.update then Error "validator transition state proof mismatch"
   else
-    let* next = Update.validator_set update in
-    let next = C_types.validator_set_for_epoch ~chain_id ~epoch_id:update.activate_epoch next in
     Ok (Some epoch, next)
 
-let verify_step ~chain_id ~prior_epoch validator_set step =
-  let* input = step_input ~chain_id ~prior_epoch validator_set step in
-  step_output ~chain_id step input
+let verify_step ?policy ~chain_id ~prior_epoch validator_set step =
+  let* input = step_input ?policy ~chain_id ~prior_epoch validator_set step in
+  step_output step input
 
-let derive ~validator_set:trusted value =
+let effective ?policy value stake =
+  C_types.validator_set_for_epoch ?policy ~chain_id:value.finalize.chain_id
+    ~epoch_id:value.finalize.epoch_id stake
+
+let derived_set ?policy value stake =
+  let policy = Option.value policy ~default:(C_quorum_policy.for_chain value.finalize.chain_id) in
+  if C_quorum_policy.select policy value.finalize.epoch_id = C_quorum_policy.Stake then
+    effective ~policy value stake
+  else match List.rev value.steps with
+    | [] -> stake
+    | step :: _ ->
+      let update = Update.of_string step.update |> Result.get_ok in
+      C_types.validator_set_for_epoch ~policy ~chain_id:value.finalize.chain_id
+        ~epoch_id:update.activate_epoch stake
+
+let derive_stake ?policy ~validator_set:trusted value =
   let* trusted = raw_validator_set trusted in
   let rec loop prior_epoch current = function
     | [] ->
-        if same_set current value.validator_set then Ok current
+        if same_set (derived_set ?policy value current) value.validator_set then Ok current
         else Error "finality validator transition is incomplete"
     | (step : step) :: rest ->
         if Int64.compare step.finalize.epoch_id value.finalize.epoch_id >= 0 then
@@ -304,6 +387,7 @@ let derive ~validator_set:trusted value =
         else
           let* prior_epoch, next =
             verify_step
+              ?policy
               ~chain_id:value.finalize.chain_id
               ~prior_epoch
               current
@@ -313,7 +397,17 @@ let derive ~validator_set:trusted value =
   in
   loop None trusted value.steps
 
-let verify_checkpoint checkpoint value =
+let derive ?policy ~validator_set value =
+  Result.map (derived_set ?policy value) (derive_stake ?policy ~validator_set value)
+
+let verify_path ?policy ~validator_set encoded =
+  let* value = decode encoded in
+  let* stake = derive_stake ?policy ~validator_set value in
+  let* () = verify_anchor_finalize ?policy ~chain_id:value.finalize.chain_id
+    ~validator_set:value.validator_set value.finalize in
+  Ok {value with stake = Some (path_epoch value, stake)}
+
+let verify_checkpoint ?policy checkpoint value =
   let* () = Checkpoint.validate checkpoint in
   let finalize = value.finalize in
   let header = finalize.C_types.header in
@@ -354,18 +448,19 @@ let verify_checkpoint checkpoint value =
     Error "finality certificate hash mismatch"
   else
     verify_anchor_finalize
+      ?policy
       ~chain_id:checkpoint.chain_id
       ~validator_set:value.validator_set
       finalize
 
-let verify ~validator_set checkpoint encoded =
+let verify ?policy ~validator_set checkpoint encoded =
   let* value = decode encoded in
-  let* derived = derive ~validator_set value in
-  if not (same_set derived value.validator_set) then
+  let* stake = derive_stake ?policy ~validator_set value in
+  if not (same_set (derived_set ?policy value stake) value.validator_set) then
     Error "finality validator transition mismatch"
   else
-    let* () = verify_checkpoint checkpoint value in
-    Ok value
+    let* () = verify_checkpoint ?policy checkpoint value in
+    Ok {value with stake = Some (path_epoch value, stake)}
 
 let origin_shape ~max_bytes ~chain_id ~epoch_id ~state_root ~set_root encoded =
   if max_bytes <= 0 || String.length encoded > max_bytes then
@@ -375,7 +470,7 @@ let origin_shape ~max_bytes ~chain_id ~epoch_id ~state_root ~set_root encoded =
     Error "origin context is invalid"
   else Ok ()
 
-let check_origin ~chain_id ~epoch_id ~state_root ~set_root validators value =
+let check_origin ?policy ~chain_id ~epoch_id ~state_root ~set_root validators value =
   let finalize = value.finalize in
   if finalize.C_types.chain_id <> chain_id || finalize.header.chain_id <> chain_id then
     Error "origin chain differs"
@@ -386,16 +481,16 @@ let check_origin ~chain_id ~epoch_id ~state_root ~set_root validators value =
   else if C_config.validator_set_hash validators <> set_root then
     Error "origin validator set differs"
   else
-    let* () = verify_anchor_finalize ~chain_id ~validator_set:validators finalize in
+    let* () = verify_anchor_finalize ?policy ~chain_id ~validator_set:validators finalize in
     Ok {chain_id; epoch_id; state_root; validators}
 
-let verify_origin ~max_bytes ~trusted ~chain_id ~epoch_id ~state_root ~set_root encoded =
+let verify_origin ?policy ~max_bytes ~trusted ~chain_id ~epoch_id ~state_root ~set_root encoded =
   let* () = origin_shape ~max_bytes ~chain_id ~epoch_id ~state_root ~set_root encoded in
   let* value = decode encoded in
-  let* validators = derive ~validator_set:trusted value in
-  check_origin ~chain_id ~epoch_id ~state_root ~set_root validators value
+  let* validators = derive ?policy ~validator_set:trusted value in
+  check_origin ?policy ~chain_id ~epoch_id ~state_root ~set_root validators value
 
-let derive_lwt ?(cancelled = fun () -> false) ~validator_set value =
+let derive_stake_lwt ?policy ?(cancelled = fun () -> false) ~validator_set value =
   let open Lwt.Syntax in
   if cancelled () then Lwt.return_error "state sync verification cancelled" else
   match raw_validator_set validator_set with
@@ -405,7 +500,7 @@ let derive_lwt ?(cancelled = fun () -> false) ~validator_set value =
         | [] ->
           let* () = Lwt.pause () in
           if cancelled () then Lwt.return_error "state sync verification cancelled"
-          else if not (same_set current value.validator_set) then
+          else if not (same_set (derived_set ?policy value current) value.validator_set) then
             Lwt.return_error "finality validator transition is incomplete"
           else Lwt.return_ok current
         | (step : step) :: rest ->
@@ -416,8 +511,8 @@ let derive_lwt ?(cancelled = fun () -> false) ~validator_set value =
           else
             let chain_id = value.finalize.chain_id in
             let* checked = Lwt_preemptive.detach (fun () ->
-              Result.bind (step_input ~chain_id ~prior_epoch:prior current step)
-                (step_output ~chain_id step)) () in
+              Result.bind (step_input ?policy ~chain_id ~prior_epoch:prior current step)
+                (step_output step)) () in
             if cancelled () then Lwt.return_error "state sync verification cancelled"
             else match checked with
             | Error reason -> Lwt.return_error reason
@@ -425,70 +520,147 @@ let derive_lwt ?(cancelled = fun () -> false) ~validator_set value =
       in
       loop None trusted value.steps
 
-module Paths = Map.Make(String)
+let derive_lwt ?policy ?cancelled ~validator_set value =
+  Lwt.map (Result.map (derived_set ?policy value))
+    (derive_stake_lwt ?policy ?cancelled ~validator_set value)
+
+module Paths = Map.Make(struct
+  type t = string * string
+  let compare = Stdlib.compare
+end)
 
 type path = {
-  length : int;
+  bytes : int;
+  prior : int64 option;
+  validators : C_types.validator_set;
   reversed : step list;
 }
 
-let compact_lwt ?(cancelled = fun () -> false) ~validator_set value =
+let restrict validators (finalize : C_types.finalize) =
+  if not (C_types.is_author ~chain_id:finalize.chain_id ~epoch_id:finalize.epoch_id
+      validators finalize.header.creator_addr) then None
+  else Some C_types.{finalize with precommits = List.filter
+    (fun (vote : C_types.vote) -> C_types.is_validator validators vote.validator)
+    finalize.precommits}
+
+let step_bytes (step : step) =
+  let source = match step.source with
+    | Pending | Active -> 1
+    | Relief mark -> 5 + String.length (C_relief_log.encode mark) in
+  source + 20 + String.length (C_codec.encode_finalize step.finalize)
+  + String.length step.ledger_state_root + String.length step.epoch_index_root
+  + String.length step.update + String.length step.proof
+
+let raw_size value =
+  12 + List.fold_left (fun bytes step -> bytes + step_bytes step) 0 value.steps
+  + String.length (C_codec.encode_finalize value.finalize)
+  + String.length (C_codec.encode_validator_set value.validator_set)
+
+let encoded_size value = 4 * ((raw_size value + 2) / 3)
+
+let extend_path ?policy ~chain_id path (step : step) =
+  match restrict path.validators step.finalize with
+  | None -> None
+  | Some finalize ->
+    let voters = C_types.validator_set_for_epoch ?policy ~chain_id
+      ~epoch_id:finalize.epoch_id path.validators in
+    if not (C_types.has_quorum voters
+      (List.map (fun (vote : C_types.vote) -> vote.validator) finalize.precommits)) then None
+    else
+      let step = {step with finalize} in
+      Some (path.bytes + step_bytes step, path, step)
+
+let compact_lwt ?policy ?(cancelled = fun () -> false) ~validator_set value =
   let open Lwt.Syntax in
-  let* checked = derive_lwt ~cancelled ~validator_set value in
+  let* checked = derive_stake_lwt ?policy ~cancelled ~validator_set value in
   match checked with
   | Error _ as error -> Lwt.return error
   | Ok _ ->
-      let empty = { length = 0; reversed = [] } in
-      let initial = Result.map C_config.validator_set_hash (raw_validator_set validator_set) in
-      begin match initial with
+      begin match raw_validator_set validator_set with
       | Error reason -> Lwt.return_error reason
       | Ok initial ->
-          let rec loop paths selected = function
-            | [] -> Lwt.return_ok { value with steps = List.rev selected.reversed }
+          let chain_id = value.finalize.chain_id in
+          let retained = live_relief value in
+          let empty = {bytes = 0; prior = None; validators = initial; reversed = []} in
+          let path_key path =
+            let steps = match path.reversed with [] -> [] | step :: _ -> [step] in
+            let ending = derived_set ?policy {value with steps} path.validators in
+            C_config.validator_set_hash path.validators, C_config.validator_set_hash ending in
+          let rec loop paths selected prior current = function
+            | [] ->
+              let selected = Paths.fold (fun _ path best ->
+                let short = {value with steps = List.rev path.reversed; stake = None} in
+                if same_set (derived_set ?policy short path.validators) value.validator_set
+                  && (path.bytes < best.bytes
+                    || (path.bytes = best.bytes && compare path.prior best.prior < 0))
+                then path else best) paths selected in
+              Lwt.return_ok {value with steps = List.rev selected.reversed; stake = None}
             | step :: rest ->
                 let* () = Lwt.pause () in
                 if cancelled () then Lwt.return_error "state sync verification cancelled"
                 else
                   let* next = Lwt_preemptive.detach (fun () ->
-                    Result.bind (Update.of_string step.update) (fun update ->
-                      Result.map (fun next ->
-                        C_types.validator_set_for_epoch
-                          ~chain_id:value.finalize.chain_id ~epoch_id:update.activate_epoch next
-                        |> C_config.validator_set_hash)
-                        (Update.validator_set update))) () in
+                    step_input ?policy ~chain_id ~prior_epoch:prior current step) () in
                   match next with
                   | Error reason -> Lwt.return_error reason
-                  | Ok next ->
-                      let extended = { length = selected.length + 1;
-                        reversed = step :: selected.reversed } in
-                      let selected = match Paths.find_opt next paths with
-                        | Some prior when prior.length <= extended.length -> prior
+                  | Ok (epoch, next, _) ->
+                    let* choices = Lwt_preemptive.detach (fun () ->
+                      Paths.fold (fun _ path acc ->
+                        match extend_path ?policy ~chain_id path step with
+                        | None -> acc | Some item -> item :: acc) paths []
+                      |> List.stable_sort (fun (left, _, _) (right, _, _) -> compare left right)) () in
+                    let rec choose = function
+                      | [] -> Lwt.return_error "validator path has no checked link"
+                      | (bytes, path, link) :: rest ->
+                        let* () = Lwt.pause () in
+                        if cancelled () then Lwt.return_error "state sync verification cancelled"
+                        else
+                          let* checked = Lwt_preemptive.detach (fun () ->
+                            step_input ?policy ~chain_id ~prior_epoch:path.prior path.validators link) () in
+                          match checked with
+                          | Ok (_, reached, _) when same_set reached next ->
+                            Lwt.return_ok {bytes; prior = Some epoch; validators = next;
+                              reversed = link :: path.reversed}
+                          | _ -> choose rest in
+                    let* extended = choose choices in
+                    match extended with
+                    | Error _ as error -> Lwt.return error
+                    | Ok extended ->
+                      let paths = match step.source with
+                        | Relief mark when retained = Some mark -> Paths.empty
+                        | _ -> paths in
+                      let key = path_key extended in
+                      let selected = match Paths.find_opt key paths with
+                        | Some old when old.bytes <= extended.bytes -> old
                         | _ -> extended in
-                      loop (Paths.add next selected paths) selected rest
+                      loop (Paths.add key selected paths) selected (Some epoch) next rest
           in
-          let* result = loop (Paths.singleton initial empty) empty value.steps in
+          let* result = loop (Paths.singleton (path_key empty) empty)
+            empty None initial value.steps in
           match result with
           | Error _ as error -> Lwt.return error
           | Ok reduced ->
-              let* verified = derive_lwt ~cancelled ~validator_set reduced in
-              Lwt.return (Result.map (fun _ -> reduced) verified)
+              let* verified = derive_stake_lwt ?policy ~cancelled ~validator_set reduced in
+              Lwt.return (Result.map (fun _ ->
+                if raw_size reduced < raw_size value then reduced else value) verified)
       end
 
-let verify_lwt ?(cancelled = fun () -> false) ~validator_set checkpoint encoded =
+let verify_lwt ?policy ?(cancelled = fun () -> false) ~validator_set checkpoint encoded =
   let open Lwt.Syntax in
   if cancelled () then Lwt.return_error "state sync verification cancelled" else
   let* decoded = Lwt_preemptive.detach decode encoded in
   match decoded with
   | Error reason -> Lwt.return_error reason
   | Ok value ->
-      let* derived = derive_lwt ~cancelled ~validator_set value in
+      let* derived = derive_stake_lwt ?policy ~cancelled ~validator_set value in
       match derived with
       | Error reason -> Lwt.return_error reason
-      | Ok _ ->
+      | Ok stake ->
           Lwt_preemptive.detach (fun () ->
-            Result.map (fun () -> value) (verify_checkpoint checkpoint value)) ()
+            Result.map (fun () -> {value with stake = Some (path_epoch value, stake)})
+              (verify_checkpoint ?policy checkpoint value)) ()
 
-let verify_origin_lwt ?(cancelled = fun () -> false) ~max_bytes ~trusted
+let verify_origin_lwt ?policy ?(cancelled = fun () -> false) ~max_bytes ~trusted
     ~chain_id ~epoch_id ~state_root ~set_root encoded =
   let open Lwt.Syntax in
   if cancelled () then Lwt.return_error "state sync verification cancelled"
@@ -499,14 +671,14 @@ let verify_origin_lwt ?(cancelled = fun () -> false) ~max_bytes ~trusted
     match decoded with
     | Error reason -> Lwt.return_error reason
     | Ok value ->
-      let* derived = derive_lwt ~cancelled ~validator_set:trusted value in
+      let* derived = derive_lwt ?policy ~cancelled ~validator_set:trusted value in
       match derived with
       | Error reason -> Lwt.return_error reason
       | Ok validators ->
         if cancelled () then Lwt.return_error "state sync verification cancelled"
         else
           let* checked = Lwt_preemptive.detach (fun () ->
-            check_origin ~chain_id ~epoch_id ~state_root ~set_root validators value) () in
+            check_origin ?policy ~chain_id ~epoch_id ~state_root ~set_root validators value) () in
           if cancelled () then Lwt.return_error "state sync verification cancelled"
           else Lwt.return checked
 

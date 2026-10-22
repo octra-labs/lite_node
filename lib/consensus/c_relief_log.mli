@@ -3,6 +3,10 @@
 
 type t
 
+val max_wire_bytes : int
+val encode : C_relief.mark -> string
+val decode : string -> (C_relief.mark, string) result
+
 val disk : data_dir:string -> t
 val memory : unit -> t
 val keep : t -> C_relief.mark -> (C_relief.mark, string) result

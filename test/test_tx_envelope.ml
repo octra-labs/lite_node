@@ -113,6 +113,7 @@ let runtime checked = Rest.{
   proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
   compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
   settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
+  marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
   queue_head = (fun () -> None);
   preverify_admit = (fun tx -> checked := tx :: !checked; Ok ());
   save_drops = ignore; find_drop = (fun _ -> None);

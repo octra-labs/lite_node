@@ -88,4 +88,9 @@ type t
 
 val create : deps -> t
 val load : t -> path:string -> trust -> reply Lwt.t
+val load_file :
+  t -> stamp:(unit -> string option Lwt.t) ->
+  fresh:(Octra_bootstrap.State_sync_manifest.certificate -> bool) ->
+  path:string -> trust -> reply Lwt.t
+
 val shutdown : t -> unit Lwt.t

@@ -96,6 +96,7 @@ let check_route route ~epoch ~trusted txs receipts =
     let writes = ref 0 in
     let touched () = incr writes in
     let deps = Apply.{check_finality = (fun _ -> ());
+      finish_applied = (fun _ -> false);
       write_finality = (fun _ -> touched ());
       persist_finality_certificate = (fun ~validator_set:_ value -> touched (); value);
       store_proposer = (fun _ -> touched ()); persist_finality_bundle = (fun _ _ -> touched ());
@@ -106,10 +107,11 @@ let check_route route ~epoch ~trusted txs receipts =
       query_bundle = (fun ~epoch_id:_ ~proposal_id:_ ~validate:_ -> Lwt.return_none);
       store_accepted_bundle = (fun ~proposal_id:_ _ -> touched ());
       sleep = (fun _ -> failwith "unexpected wait"); bundle_wait_timeout_seconds = 1.;
+      range_bundle = (fun _ ~timeout:_ -> Lwt.return_none);
       bundle_wait_expired = (fun ~epoch_id:_ -> touched ());
-      bundle_wait_recovered = (fun ~epoch_id:_ -> touched ());
-      post_finalize = (fun ~epoch_id:_ ~proposed_root:_ -> touched (); Lwt.return_unit)} in
-    let accepted = try Lwt_main.run (Apply.run deps ~validator_set finalize); true
+      post_finalize = (fun ~epoch_id:_ ~proposed_root:_ ->
+        touched (); Lwt.return Octra_node_runtime.Consensus_post_finalize.Applied)} in
+    let accepted = try ignore (Lwt_main.run (Apply.run deps ~validator_set finalize)); true
       with Failure _ -> false in
     if not accepted then expect "cached invalid bundle precedes writes" (!writes = 0);
     accepted

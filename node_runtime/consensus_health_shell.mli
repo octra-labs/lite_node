@@ -21,7 +21,7 @@ type deps = {
   catchup_next_target : unit -> int64 option;
   attested_head : int -> bool;
   clear_state_attested : unit -> unit;
-  set_catchup_in_progress : bool -> unit;
+  catchup_active : unit -> bool;
   set_state_attested : head:int -> root:string -> unit;
   clear_quarantine : string -> unit;
   mark_quarantine : string -> unit;

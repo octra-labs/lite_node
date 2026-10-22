@@ -349,6 +349,90 @@ let test_circle_tx_code () =
     ["op_type", `String "circle_program_update"; "message", `String (payload "public")];
   ]
 
+let test_public_calls () =
+  let module R = Octra_node_runtime.Rpc_view in
+  let module Rest = Octra_node_runtime.Rest_view in
+  let address, private_key, public_key = test_keys () in
+  let message = {|{"method":"transfer","params":["octrecipient",123]}|} in
+  List.iter (fun op ->
+    List.iter (fun encoded ->
+      let tx = {(sample_tx op) with from = address;
+        public_key = Some public_key; message = Some encoded}
+        |> fun tx -> Transaction.sign_with_privkey tx private_key in
+      let raw = Yojson.Safe.to_string (Transaction.to_yojson tx) in
+      let hash = Transaction.hash tx in
+      let fields = Tx_view.tx_fields ~decode_message:Octra_node_runtime.Text.decode_message_if_hex tx in
+      let check row =
+        if member "message" row <> `String message then
+          fail "public call message was hidden" in
+      check (`Assoc fields);
+      check (Tx_view.staging_row ~decode_message:Octra_node_runtime.Text.decode_message_if_hex tx);
+      List.iter (fun lookup ->
+        let row = Result.get_ok (Tx_view.transaction_lookup_response
+          ~decode_message:Octra_node_runtime.Text.decode_message_if_hex ~hash lookup) in
+        check row)
+        [Tx_view.Lookup_pending tx; Tx_view.Lookup_confirmed (19, raw)];
+      let confirmed = Tx_view.rest_confirmed ~hash ~epoch:19 ~tx_json:raw ~fields in
+      check confirmed;
+      check (member "parsed_tx" confirmed);
+      if member "data" confirmed <> `String raw then
+        fail "public signed transaction was hidden";
+      let listed = Rest.txs_response [19, hash, raw] in
+      let row = List.hd (list_field "transactions" listed) in
+      if member "data" row <> `String raw then
+        fail "public transaction list lost signed bytes";
+      if R.public_tx_data raw <> `String raw
+         || R.tx_json_value raw <> Transaction.to_yojson tx then
+        fail "public proof body was hidden";
+      match Transaction.parse_raw_json raw with
+      | Some parsed when Transaction.hash parsed = hash
+        && Transaction.verify parsed public_key -> ()
+      | _ -> fail "public transaction hash could not be checked")
+      [message; Octra_node_runtime.Text.raw_to_hex message])
+    [Transaction.ContractCall; Transaction.ProgramExec; Transaction.MultiExec;
+     Transaction.ContractDeploy; Transaction.ProgramDeploy]
+
+let test_private_views () =
+  let module R = Octra_node_runtime.Rpc_view in
+  let secret = "private-payload-marker" in
+  List.iter (fun op ->
+    let tx = {(sample_tx op) with message = Some secret} in
+    let raw = Yojson.Safe.to_string (Transaction.to_yojson tx) in
+    let hash = Transaction.hash tx in
+    let fields = Tx_view.tx_fields ~decode_message:Fun.id tx |> fun fields -> `Assoc fields in
+    if member "message" fields <> `Null then fail "private fields exposed payload";
+    if (op = Transaction.StealthOp || op = Transaction.ClaimOp)
+       && member "nonce" fields <> `Null then fail "private fields exposed nonce";
+    if R.public_tx_data raw <> `Null || R.tx_json_value raw <> `Null then
+      fail "private raw transaction exposed payload";
+    List.iter (fun lookup ->
+      let row = Result.get_ok (Tx_view.transaction_lookup_response
+        ~decode_message:Fun.id ~hash lookup) in
+      if member "message" row <> `Null then fail "private lookup exposed payload")
+      [Tx_view.Lookup_pending tx; Tx_view.Lookup_confirmed (19, raw)];
+    if Transaction.hash tx <> hash
+       || Yojson.Safe.to_string (Transaction.to_yojson tx) <> raw then
+      fail "private projection changed signed bytes") [
+    Transaction.CircleAssetPutEncrypted;
+    Transaction.CircleSealedSlotPut;
+    Transaction.CircleBalanceCellPut;
+    Transaction.CircleRegisterCellPut;
+    Transaction.CircleCall;
+    Transaction.StealthOp;
+    Transaction.ClaimOp;
+  ];
+  let module S = Octra_core.Tx_staging in
+  let standard = sample_tx Transaction.Standard in
+  let rows = [standard; sample_tx Transaction.StealthOp; sample_tx Transaction.ClaimOp] in
+  let stats = S.stats_of ~sender:Tx_view.display_from rows in
+  if fst (Hashtbl.find stats "-") <> 2
+     || fst (Hashtbl.find stats "octfrom") <> 1
+     || Hashtbl.length stats <> 2 then fail "public statistics exposed private senders";
+  let old = S.stats_of [standard; standard] in
+  let visible = S.stats_of ~sender:Tx_view.display_from [standard; standard] in
+  if Hashtbl.find old "octfrom" <> Hashtbl.find visible "octfrom" then
+    fail "ordinary statistics changed"
+
 let test_transaction_lookup_response () =
   let tx = sample_tx Transaction.Standard in
   let selected =
@@ -483,50 +567,50 @@ let route_tx ?(from_addr = route_from) ?(to_addr = route_to) op_type =
     to_ = to_addr;
   }
 
-let test_route_admission () =
+let test_route_check () =
   expect_payload_ok "standard route address"
-    (Tx_view.address_route_admission (route_tx Transaction.Standard));
+    (Tx_view.address_route_check (route_tx Transaction.Standard));
   expect_payload_ok "stealth sentinel route"
-    (Tx_view.address_route_admission (route_tx ~to_addr:"stealth" Transaction.StealthOp));
+    (Tx_view.address_route_check (route_tx ~to_addr:"stealth" Transaction.StealthOp));
   expect_payload_ok "multi exec sentinel route"
-    (Tx_view.address_route_admission (route_tx ~to_addr:"multi_exec" Transaction.MultiExec));
+    (Tx_view.address_route_check (route_tx ~to_addr:"multi_exec" Transaction.MultiExec));
   expect_payload_error "invalid route address"
     ("invalid_address", "malformed sender or recipient address")
-    (Tx_view.address_route_admission (route_tx ~to_addr:"bad" Transaction.Standard));
+    (Tx_view.address_route_check (route_tx ~to_addr:"bad" Transaction.Standard));
   expect_payload_error "truncated route address"
     ("invalid_address", "malformed sender or recipient address")
-    (Tx_view.address_route_admission
+    (Tx_view.address_route_check
        (route_tx
           ~to_addr:(String.sub route_to 0 (String.length route_to - 1))
           Transaction.Standard));
   expect_payload_error "extended route address"
     ("invalid_address", "malformed sender or recipient address")
-    (Tx_view.address_route_admission
+    (Tx_view.address_route_check
        (route_tx ~to_addr:(route_to ^ "1") Transaction.Standard));
   expect_payload_error "bad stealth recipient"
     ("invalid_address", "malformed sender or recipient address")
-    (Tx_view.address_route_admission (route_tx Transaction.StealthOp));
+    (Tx_view.address_route_check (route_tx Transaction.StealthOp));
   expect_payload_ok "standard non-self"
-    (Tx_view.self_route_admission (route_tx Transaction.Standard));
+    (Tx_view.self_route_check (route_tx Transaction.Standard));
   expect_payload_error "standard self"
     ("self_transfer", "sender and recipient are the same")
-    (Tx_view.self_route_admission (route_tx ~to_addr:route_from Transaction.Standard));
+    (Tx_view.self_route_check (route_tx ~to_addr:route_from Transaction.Standard));
   expect_payload_error "encrypt non-self"
     ("self_only_operation", "encrypt operation must target sender")
-    (Tx_view.self_route_admission (route_tx Transaction.EncryptOp));
+    (Tx_view.self_route_check (route_tx Transaction.EncryptOp));
   expect_payload_ok "encrypt self"
-    (Tx_view.self_route_admission (route_tx ~to_addr:route_from Transaction.EncryptOp));
+    (Tx_view.self_route_check (route_tx ~to_addr:route_from Transaction.EncryptOp));
   expect_payload_error "private self"
     ("self_transfer", "private transfer must target different address")
-    (Tx_view.self_route_admission (route_tx ~to_addr:route_from Transaction.PrivateOp));
+    (Tx_view.self_route_check (route_tx ~to_addr:route_from Transaction.PrivateOp));
   expect_payload_error "claim non-self"
     ("self_only_operation", "claim operation must target sender")
-    (Tx_view.self_route_admission (route_tx Transaction.ClaimOp));
+    (Tx_view.self_route_check (route_tx Transaction.ClaimOp));
   expect_payload_error "op01 burn non-self"
     ("self_only_operation", "op01_burn must target sender (self-tx)")
-    (Tx_view.self_route_admission (route_tx Transaction.Op01Burn))
+    (Tx_view.self_route_check (route_tx Transaction.Op01Burn))
 
-let test_admission_semantics () =
+let test_check_semantics () =
   if not (Tx_view.requires_heavy_preverify (sample_tx Transaction.StealthOp)) then
     fail "stealth not classified heavy";
   if not (Tx_view.requires_heavy_preverify (sample_tx Transaction.EncryptOp)) then
@@ -545,11 +629,11 @@ let test_admission_semantics () =
     fail "low fee heavy sweep mismatch";
   expect_error "heavy low fee"
     "fee too low: stealth requires ou >= 100, got 9"
-    (Tx_view.admission_fee_check ~min_ou:(Z.of_int 100) (sample_tx Transaction.StealthOp));
+    (Tx_view.intake_fee_check ~min_ou:(Z.of_int 100) (sample_tx Transaction.StealthOp));
   expect_ok "heavy sufficient fee"
-    (Tx_view.admission_fee_check ~min_ou:(Z.of_int 9) (sample_tx Transaction.StealthOp));
+    (Tx_view.intake_fee_check ~min_ou:(Z.of_int 9) (sample_tx Transaction.StealthOp));
   expect_ok "standard fee bypass"
-    (Tx_view.admission_fee_check ~min_ou:(Z.of_int 100) (sample_tx Transaction.Standard));
+    (Tx_view.intake_fee_check ~min_ou:(Z.of_int 100) (sample_tx Transaction.Standard));
   expect_error "negative amount"
     "amount must not be negative"
     (Tx_view.semantic_check (sample_tx ~amount:(Z.of_int (-1)) Transaction.ProgramExec));
@@ -580,19 +664,19 @@ let test_admission_semantics () =
     "amount must be positive for op01_burn"
     (Tx_view.semantic_check (sample_tx ~amount:Z.zero Transaction.Op01Burn));
   expect_ok "staging submit ok"
-    (Tx_view.staging_submit_admission
+    (Tx_view.staging_submit_check
        ~min_ou:(Z.of_int 100)
        ~min_relay_fee:(Z.of_int 9)
        (sample_tx ~ou:(Z.of_int 1_000) Transaction.Standard));
   expect_error "staging heavy fee"
     "fee too low: stealth requires ou >= 100, got 9"
-    (Tx_view.staging_submit_admission
+    (Tx_view.staging_submit_check
        ~min_ou:(Z.of_int 100)
        ~min_relay_fee:(Z.of_int 9)
        (sample_tx Transaction.StealthOp));
   expect_error "staging min relay"
     "fee too low (min: 1000)"
-    (Tx_view.staging_submit_admission
+    (Tx_view.staging_submit_check
        ~min_ou:(Z.of_int 100)
        ~min_relay_fee:(Z.of_int 10)
        (sample_tx Transaction.Standard));
@@ -605,18 +689,18 @@ let test_admission_semantics () =
   in
   expect_error "staging Program fee floor"
     "fee too low (min: 204000)"
-    (Tx_view.staging_submit_admission
+    (Tx_view.staging_submit_check
        ~min_ou:Z.one
        ~min_relay_fee:Z.one
        program);
   expect_ok "staging Program fee floor accepted"
-    (Tx_view.staging_submit_admission
+    (Tx_view.staging_submit_check
        ~min_ou:Z.one
        ~min_relay_fee:Z.one
        { program with Transaction.ou = Z.of_int 204_000 });
   expect_error "staging semantic"
     "amount must not be negative"
-    (Tx_view.staging_submit_admission
+    (Tx_view.staging_submit_check
        ~min_ou:(Z.of_int 100)
        ~min_relay_fee:(Z.of_int 9)
        (sample_tx ~amount:(Z.of_int (-1)) Transaction.ProgramExec))
@@ -770,7 +854,7 @@ let test_standard_fields () =
   if string_field "amount_raw" json <> "1000000" then fail "standard amount mismatch";
   if string_field "message" json <> "hi" then fail "standard message mismatch"
 
-let test_encrypted_payload_admission () =
+let test_encrypted_payload_check () =
   if Tx_view.encrypted_payload_ok (sample_tx Transaction.EncryptOp) then
     fail "encrypt without payload admitted";
   if Tx_view.encrypted_payload_ok (sample_tx ~encrypted_data:"{}" Transaction.EncryptOp) then
@@ -786,7 +870,7 @@ let test_encrypted_payload_admission () =
   if not (Tx_view.encrypted_payload_ok (sample_tx Transaction.Standard)) then
     fail "standard tx rejected"
 
-let test_call_params_admission () =
+let test_call_params_check () =
   let harmless =
     { (sample_tx Transaction.ProgramExec) with
       Transaction.message = Some "[\"hello\",\"2 < 3\"]";
@@ -826,9 +910,9 @@ let payload_limits = Tx_view.{
   message_program_len = 100;
 }
 
-let test_payload_admission () =
+let test_payload_check () =
   expect_payload_ok "standard payload"
-    (Tx_view.payload_admission ~limits:payload_limits (sample_tx Transaction.Standard));
+    (Tx_view.payload_check ~limits:payload_limits (sample_tx Transaction.Standard));
   let message_too_large =
     { (sample_tx Transaction.Standard) with
       Transaction.message = Some "12345";
@@ -836,15 +920,15 @@ let test_payload_admission () =
   in
   expect_payload_error "message too large"
     ("malformed_transaction", "encrypted_data or message exceeds size limit")
-    (Tx_view.payload_admission ~limits:payload_limits message_too_large);
+    (Tx_view.payload_check ~limits:payload_limits message_too_large);
   expect_payload_error "encrypted data too large"
     ("malformed_transaction", "encrypted_data or message exceeds size limit")
-    (Tx_view.payload_admission
+    (Tx_view.payload_check
        ~limits:payload_limits
        (sample_tx ~encrypted_data:"123456" Transaction.Standard));
   expect_payload_error "encrypt missing payload"
     ("malformed_transaction", "malformed or oversized encrypted_data")
-    (Tx_view.payload_admission ~limits:payload_limits (sample_tx Transaction.EncryptOp));
+    (Tx_view.payload_check ~limits:payload_limits (sample_tx Transaction.EncryptOp));
   let malicious =
     { (sample_tx Transaction.ProgramExec) with
       Transaction.message = Some "[\"<script>alert(1)</script>\"]";
@@ -852,7 +936,7 @@ let test_payload_admission () =
   in
   expect_payload_error "program params html"
     ("malformed_transaction", "contract call params contain invalid characters")
-    (Tx_view.payload_admission ~limits:payload_limits malicious)
+    (Tx_view.payload_check ~limits:payload_limits malicious)
 
 let test_deep_message () =
   let deep = String.make 250_000 '[' ^ "0" ^ String.make 250_000 ']' in
@@ -861,25 +945,25 @@ let test_deep_message () =
     if not (Tx_view.call_params_ok tx) then fail "deep message refused";
     if op <> Transaction.ProgramDeploy then
       expect_payload_ok "deep message"
-        (Tx_view.payload_admission ~limits:{ payload_limits with
+        (Tx_view.payload_check ~limits:{ payload_limits with
           message_program_len = 10_000_000 } tx))
     [Transaction.ContractCall; Transaction.ProgramExec; Transaction.MultiExec;
      Transaction.ContractDeploy; Transaction.ProgramDeploy; Transaction.CircleCall]
 
 let pre_route_ok tx =
-  Tx_view.pre_route_admission
+  Tx_view.pre_route_check
     ~now:12.5
     ~max_timestamp_drift:1.0
     ~observer_rpc_mode:false
     ~bft_mode:false
     tx
 
-let test_pre_route_admission () =
+let test_pre_route_check () =
   expect_payload_ok "pre route standard"
     (pre_route_ok (sample_tx Transaction.Standard));
   expect_payload_error "pre route timestamp"
     ("malformed_transaction", "timestamp drift 8s exceeds 1s limit")
-    (Tx_view.pre_route_admission
+    (Tx_view.pre_route_check
        ~now:20.5
        ~max_timestamp_drift:1.0
        ~observer_rpc_mode:false
@@ -887,7 +971,7 @@ let test_pre_route_admission () =
        (sample_tx Transaction.Standard));
   expect_payload_error "pre route observer"
     ("read_only_observer", "observer node is read-only")
-    (Tx_view.pre_route_admission
+    (Tx_view.pre_route_check
        ~now:12.5
        ~max_timestamp_drift:1.0
        ~observer_rpc_mode:true
@@ -895,42 +979,42 @@ let test_pre_route_admission () =
        (sample_tx Transaction.Standard));
   expect_payload_error "pre route bft op"
     ("unsupported_operation", Transaction.bft_reject_reason Transaction.EncryptOp)
-    (Tx_view.pre_route_admission
+    (Tx_view.pre_route_check
        ~now:12.5
        ~max_timestamp_drift:1.0
        ~observer_rpc_mode:false
        ~bft_mode:true
        (sample_tx Transaction.EncryptOp))
 
-let test_bft_op_admission () =
+let test_bft_op_check () =
   expect_payload_ok "bft standard"
-    (Tx_view.bft_op_admission
+    (Tx_view.bft_op_check
        ~bft_mode:true
        (sample_tx Transaction.Standard));
   expect_payload_error "bft private blocked"
     ("unsupported_operation", Transaction.bft_reject_reason Transaction.StealthOp)
-    (Tx_view.bft_op_admission
+    (Tx_view.bft_op_check
        ~bft_mode:true
        (sample_tx Transaction.StealthOp));
   expect_payload_ok "single private unchanged"
-    (Tx_view.bft_op_admission
+    (Tx_view.bft_op_check
        ~bft_mode:false
        (sample_tx Transaction.StealthOp))
 
-let test_signature_admission () =
+let test_signature_check () =
   let signed_tx, pub_b64 = signed_sample_tx () in
   expect_payload_ok "signature valid"
-    (Tx_view.signature_admission ~account_public_key:None signed_tx);
+    (Tx_view.signature_check ~account_public_key:None signed_tx);
   let wire_pubkey_ignored =
     { signed_tx with Transaction.public_key = Some "not-base64"; }
   in
   expect_payload_ok "signature account pubkey priority"
-    (Tx_view.signature_admission
+    (Tx_view.signature_check
        ~account_public_key:(Some pub_b64)
        wire_pubkey_ignored);
   expect_payload_error "signature missing pubkey"
     ("invalid_signature", "no public key available")
-    (Tx_view.signature_admission
+    (Tx_view.signature_check
        ~account_public_key:None
        (sample_tx Transaction.Standard));
   let wrong_addr =
@@ -938,32 +1022,32 @@ let test_signature_admission () =
   in
   expect_payload_error "signature address mismatch"
     ("invalid_address", "address does not match public key")
-    (Tx_view.signature_admission ~account_public_key:None wrong_addr);
+    (Tx_view.signature_check ~account_public_key:None wrong_addr);
   let wrong_signature =
     { signed_tx with Transaction.signature = Base64.encode_exn (String.make 64 '\000'); }
   in
   expect_payload_error "signature invalid"
     ("invalid_signature", "signature verification failed")
-    (Tx_view.signature_admission ~account_public_key:None wrong_signature)
+    (Tx_view.signature_check ~account_public_key:None wrong_signature)
 
-let test_sender_admission () =
+let test_sender_check () =
   expect_payload_ok "sender present"
-    (Tx_view.sender_admission
+    (Tx_view.sender_check
        ~sender_exists:true
        (sample_tx Transaction.Standard));
   expect_payload_error "sender ou"
     ("malformed_transaction", "OU must be greater than zero")
-    (Tx_view.sender_admission
+    (Tx_view.sender_check
        ~sender_exists:true
        (sample_tx ~ou:Z.zero Transaction.Standard));
   expect_payload_error "sender missing"
     ("sender_not_found", "sender account does not exist")
-    (Tx_view.sender_admission
+    (Tx_view.sender_check
        ~sender_exists:false
        (sample_tx Transaction.Standard))
 
 let submit_pre_signature_ok tx =
-  Tx_view.submit_pre_signature_admission
+  Tx_view.submit_pre_signature_check
     ~now:12.5
     ~max_timestamp_drift:1.0
     ~observer_rpc_mode:false
@@ -985,7 +1069,7 @@ let test_submit_pre_signature () =
     (submit_pre_signature_ok semantic_bad);
   expect_payload_error "submit pre signature missing sender"
     ("sender_not_found", "sender account does not exist")
-    (Tx_view.submit_pre_signature_admission
+    (Tx_view.submit_pre_signature_check
        ~now:12.5
        ~max_timestamp_drift:1.0
        ~observer_rpc_mode:false
@@ -1058,7 +1142,7 @@ let test_stealth_delta_layer_limit () =
   begin
     match
       Lwt_main.run
-        (Tx_view.preverify_stealth_ranges ~math:false
+        (Tx_view.preverify_stealth_ranges ~keyed:false ~math:false
            ~strict:false
            ~pubkey_blob
            ~sender_enc:scalar
@@ -1073,9 +1157,9 @@ let test_stealth_delta_layer_limit () =
   end;
   expect_payload_error "layered stealth admission"
     ("malformed_transaction", "malformed or oversized encrypted_data")
-    (Tx_view.payload_admission ~limits:Tx_view.payload_limits layered_tx);
+    (Tx_view.payload_check ~limits:Tx_view.payload_limits layered_tx);
   expect_payload_ok "wrapped scalar stealth admission"
-    (Tx_view.payload_admission
+    (Tx_view.payload_check
        ~limits:Tx_view.payload_limits
        (sample_tx
           ~encrypted_data:(stealth_payload_with_cipher scalar)
@@ -1112,7 +1196,7 @@ let test_preverify_stealth_payload () =
     begin
       match
         Lwt_main.run
-          (Tx_view.preverify_stealth_ranges ~math:false
+          (Tx_view.preverify_stealth_ranges ~keyed:false ~math:false
            ~strict:false
              ~pubkey_blob
              ~sender_enc:cipher
@@ -1166,18 +1250,19 @@ let test_preverify_saturation () =
           sender_enc_snapshot = string_of_int value;
           strict = false;
           math = false;
+          keyed = false;
         }
       in
       if Lwt.is_sleeping completed then Lwt.wakeup resolve_completed result;
       Lwt.return (Preverify_submit.Checked result)
   in
   begin
-    match Preverify_cache.start_task cache_key compute with
+    match Preverify_cache.start_task ~keyed:false cache_key compute with
     | Preverify_submit.Started -> ()
     | _ -> fail "saturated preverify task was not admitted"
   end;
   begin
-    match Preverify_cache.state cache_key with
+    match Preverify_cache.state ~keyed:false ~math:false cache_key with
     | Preverify_cache.Pending -> ()
     | Preverify_cache.Missing -> fail "saturated preverify task is missing"
     | Preverify_cache.Ready -> fail "saturated preverify completed before capacity release"
@@ -1190,7 +1275,7 @@ let test_preverify_saturation () =
   begin
     match
       Preverify_cache.gate
-        ~state:(Preverify_cache.state cache_key)
+        ~state:(Preverify_cache.state ~keyed:false ~math:false cache_key)
         ~defer_count:0
         ~max_defer:2
     with
@@ -1212,7 +1297,7 @@ let test_preverify_saturation () =
   if result.Preverify_submit.sender_enc_snapshot <> "42" then
     fail "saturated preverify result changed";
   begin
-    match Preverify_cache.state cache_key with
+    match Preverify_cache.state ~keyed:false ~math:false cache_key with
     | Preverify_cache.Ready -> ()
     | _ -> fail "saturated preverify did not become ready"
   end;
@@ -1220,7 +1305,7 @@ let test_preverify_saturation () =
 
 let test_preverify_submit_result () =
   let ok =
-    Preverify_submit.result_of_ranges
+    Preverify_submit.result_of_ranges ~keyed:false
       ~math:false
       ~strict:false
       ~sender_enc_snapshot:"cipher-a"
@@ -1235,7 +1320,7 @@ let test_preverify_submit_result () =
     | Preverify_submit.Unavailable _ -> fail "preverify submit became unavailable"
   end;
   let bad =
-    Preverify_submit.result_of_ranges
+    Preverify_submit.result_of_ranges ~keyed:false
       ~math:false
       ~strict:false
       ~sender_enc_snapshot:"cipher-b"
@@ -1250,7 +1335,7 @@ let test_preverify_submit_result () =
     | Preverify_submit.Unavailable _ -> fail "invalid pubkey became unavailable"
   end;
   match
-    Preverify_submit.result_of_ranges
+    Preverify_submit.result_of_ranges ~keyed:false
       ~math:false
       ~strict:false
       ~sender_enc_snapshot:"cipher-c"
@@ -1269,14 +1354,15 @@ let test_preverify_tx_launch () =
   let launcher : Preverify_submit.launcher = {
     get_pvac_pubkey = (fun _ -> Lwt.return (Some "pk"));
     sender_enc = (fun addr -> "cipher:" ^ addr);
-    start_task = (fun ~math:_ hash f ->
+    start_task = (fun ~keyed:_ ~math:_ hash f ->
       incr launches;
       inserts := hash :: !inserts;
       ignore (f ());
       Preverify_submit.Started);
     strict = (fun () -> false);
     math = (fun () -> false);
-    verify_ranges = (fun ~math:_ ~strict:_ ~pubkey_blob:_ ~sender_enc ptd ->
+    keyed = (fun () -> false);
+    verify_ranges = (fun ~keyed:_ ~math:_ ~strict:_ ~pubkey_blob:_ ~sender_enc ptd ->
       sender_snapshots := sender_enc :: !sender_snapshots;
       Lwt.return (Ok (ptd.Octra_core.Crypto.PrivateTransferV4.version = 5, false)));
     now = (fun () -> 1.0);
@@ -1307,7 +1393,7 @@ let test_preverify_tx_launch () =
   if !sender_snapshots <> ["cipher:octfrom"] then fail "stealth preverify sender snapshot mismatch";
   let busy_launcher = {
     launcher with
-    Preverify_submit.start_task = (fun ~math:_ _ _ -> Preverify_submit.Busy);
+    Preverify_submit.start_task = (fun ~keyed:_ ~math:_ _ _ -> Preverify_submit.Busy);
   } in
   match
     Preverify_submit.launch_for_tx
@@ -1373,7 +1459,7 @@ let test_preverify_cache_plans () =
   if none.Preverify_submit.hard_cap_drop <> [] then fail "preverify hard cap unexpected drop"
 
 let post_signature_ok tx =
-  Tx_view.post_signature_admission
+  Tx_view.post_signature_check
     ~preverify_has_capacity:true
     ~preverify_pending:0
     ~preverify_pending_max:2
@@ -1382,7 +1468,7 @@ let post_signature_ok tx =
     ~bft_window:32
     tx
 
-let test_post_signature_admission () =
+let test_post_signature_check () =
   expect_payload_ok "post signature standard"
     (post_signature_ok (sample_tx Transaction.Standard));
   expect_payload_error "post signature recrypt payload"
@@ -1390,7 +1476,7 @@ let test_post_signature_admission () =
     (post_signature_ok (sample_tx Transaction.RecryptOp));
   expect_payload_error "post signature stealth busy"
     ("pre_verify_busy", "stealth pre-verify busy (2/2), retry shortly")
-    (Tx_view.post_signature_admission
+    (Tx_view.post_signature_check
        ~preverify_has_capacity:false
        ~preverify_pending:2
        ~preverify_pending_max:2
@@ -1400,7 +1486,7 @@ let test_post_signature_admission () =
        (sample_tx ~encrypted_data:"payload" Transaction.StealthOp));
   expect_payload_error "post signature bft nonce"
     ("nonce_too_far", "nonce too far ahead for BFT admission window (confirmed=7 window=2)")
-    (Tx_view.post_signature_admission
+    (Tx_view.post_signature_check
        ~preverify_has_capacity:true
        ~preverify_pending:0
        ~preverify_pending_max:2
@@ -1410,7 +1496,7 @@ let test_post_signature_admission () =
        (sample_tx ~nonce:10 Transaction.Standard))
 
 let submit_signature_ok ?account_public_key tx =
-  Tx_view.submit_signature_admission
+  Tx_view.submit_signature_check
     ~account_public_key
     ~preverify_has_capacity:true
     ~preverify_pending:0
@@ -1420,7 +1506,7 @@ let submit_signature_ok ?account_public_key tx =
     ~bft_window:32
     tx
 
-let test_submit_signature_admission () =
+let test_submit_signature_check () =
   let signed_tx, pub_b64 = signed_sample_tx () in
   expect_payload_ok "submit signature valid"
     (submit_signature_ok signed_tx);
@@ -1436,8 +1522,31 @@ let test_submit_signature_admission () =
   if Octra_core.Pvac_verify_policy.proof_allowed (String.make (proof_limit + 1) 'a') then
     fail "proof size limit missing"
 
+let test_runtime_profiles () =
+  let module P = Octra_node_runtime.Consensus_profile in
+  let module S = Octra_node_runtime.Status_read_rpc in
+  let chain_id = "octra-devnet-9871-cluster" in
+  List.iter (fun epoch ->
+    let hash = P.hash ~chain_id ~epoch Sys.getenv_opt in
+    let result = Lwt_main.run (S.runtime_version ~chain_id ~epoch
+      ~validator_address:"validator" ~program_trust_hash:None
+      ~runtime_profile_hash:(Some hash)
+      ~validator_set_ref:(ref (Octra_consensus.C_types.make_validator_set []))
+      ~scheduled_validator_set_ref:(ref None)) in
+    let json = match result with Ok json -> json | Error _ -> fail "runtime profile read failed" in
+    if int_field "profile_epoch" json <> epoch then fail "runtime epoch differs";
+    let rows = list_field "runtime_profiles" json in
+    let selected = List.fold_left (fun selected row ->
+      if int_field "from_epoch" row <= epoch then Some (string_field "hash" row) else selected)
+      None rows in
+    if selected <> Some (Octra_node_runtime.Text.raw_to_hex hash) then fail "runtime schedule differs")
+    [1_614_499; 1_614_500; 1_654_002; 1_662_999; 1_663_000; 1_688_733; 1_688_734]
+
 let () =
+  test_runtime_profiles ();
   test_circle_tx_code ();
+  test_public_calls ();
+  test_private_views ();
   test_masking ();
   test_tx_fields ();
   test_staging_error ();
@@ -1446,20 +1555,20 @@ let () =
   test_transaction_lookup_response ();
   test_staging_json ();
   test_staging_submit_effects ();
-  test_route_admission ();
-  test_admission_semantics ();
+  test_route_check ();
+  test_check_semantics ();
   test_staging_remove_auth ();
   test_pubkey_registration_auth ();
   test_encrypted_balance_auth ();
   test_standard_fields ();
-  test_encrypted_payload_admission ();
-  test_call_params_admission ();
-  test_payload_admission ();
+  test_encrypted_payload_check ();
+  test_call_params_check ();
+  test_payload_check ();
   test_deep_message ();
-  test_pre_route_admission ();
-  test_bft_op_admission ();
-  test_signature_admission ();
-  test_sender_admission ();
+  test_pre_route_check ();
+  test_bft_op_check ();
+  test_signature_check ();
+  test_sender_check ();
   test_submit_pre_signature ();
   test_stealth_delta_layer_limit ();
   test_preverify_stealth_payload ();
@@ -1467,6 +1576,6 @@ let () =
   test_preverify_submit_result ();
   test_preverify_tx_launch ();
   test_preverify_cache_plans ();
-  test_post_signature_admission ();
-  test_submit_signature_admission ();
+  test_post_signature_check ();
+  test_submit_signature_check ();
   print_endline "status = pass test = tx_view"

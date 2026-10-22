@@ -102,6 +102,26 @@ let recent store epoch state =
   | Some root when root.epoch = epoch && root.state = state -> Ok root
   | _ -> Error "compute input origin not retained"
 
+let retained store epoch =
+  let+ saved = load store (root_path epoch) in
+  Option.bind saved (fun root -> if root.epoch = epoch then Some root else None)
+
+let retained_set ?snapshot store epoch =
+  let+ raw = Store.read ?snapshot store (root_path epoch @ ["meta"]) in
+  Option.bind raw (fun raw ->
+    let chain_id, saved, validators = Wire.decode (fun cursor ->
+      let chain_id = Wire.get_string_bounded ~max:128 cursor in
+      let saved = Wire.get_u64 cursor in
+      ignore (Wire.get_hash32 cursor);
+      let validators = Wire.get_string_bounded ~max:1_000_000 cursor
+        |> Codec.decode_validator_set in
+      ignore (Wire.get_string_bounded ~max:128 cursor);
+      chain_id, saved, validators) raw in
+    if chain_id = "" || saved < 0L || validators.n = 0 then
+      failwith "compute input state corrupt"
+    else if saved <> epoch then None
+    else Some (saved, chain_id, validators))
+
 let pin_fee bytes entries = Z.of_int (10_000 + (bytes + 15) / 16 + 32 * entries)
 
 let prepare store ~max_fee ~(header : Protocol.header) =

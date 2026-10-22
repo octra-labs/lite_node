@@ -18,6 +18,7 @@ val part_max : int
 type encoded
 val encode : Yojson.Safe.t -> (encoded, string) result
 val digest : encoded -> string option
+val size : encoded -> int
 val render : ?index:int -> encoded -> (string, string) result
 val reply : ?index:int -> Yojson.Safe.t -> (Yojson.Safe.t, string) result
 val view : Yojson.Safe.t -> (view, string) result

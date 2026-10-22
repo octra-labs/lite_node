@@ -235,6 +235,7 @@ type exec_ctx = {
   int_work : Int_work.mode;
   fhe_work : Octra_core.Rule_graph.mode;
   proof_exec : Octra_core.Rule_graph.mode;
+  proof_key : Octra_core.Rule_graph.mode;
   wasm_float : Octra_core.Rule_graph.mode;
   fhe_memory : Fhe_memory.t option;
   byte_work : Byte_work.t option;
@@ -268,6 +269,7 @@ let default_ctx = {
   int_work = Int_work.Prior;
   fhe_work = Octra_core.Rule_graph.Prior;
   proof_exec = Octra_core.Rule_graph.Prior;
+  proof_key = Octra_core.Rule_graph.Prior;
   wasm_float = Octra_core.Rule_graph.Prior;
   fhe_memory = None;
   byte_work = None;
@@ -893,7 +895,9 @@ let finish_fhe_verification st rd = function
 
 let verify_proof st rd request =
   if st.ctx.async_exec then raise (Suspend (Proof_wait (rd, request)));
-  Octra_core.Pvac_verify_worker.try_classified_result_sync ~math:st.ctx.math request
+  Octra_core.Pvac_verify_worker.try_classified_result_sync
+    ~keyed:(st.ctx.proof_key = Octra_core.Rule_graph.Active)
+    ~math:st.ctx.math request
   |> fhe_verification_of_worker_result
 
 let is_numeric = numeric_value
@@ -4021,7 +4025,9 @@ let proof_host run =
     | Stack_overflow -> Lwt.fail (Octra_core.Exec_resource.Unavailable Stack)
     | _ -> Lwt.fail (Octra_core.Exec_resource.Unavailable Host))
 
-let run_async ?(running = fun () -> true) state program =
+let run_async ?(running = fun () -> true) ?(view_seconds = 10.) state program =
+  if not (Float.is_finite view_seconds) || view_seconds <= 0. then
+    invalid_arg "view duration must be finite and positive";
   let ( let* ) work next = Lwt.bind work (Octra_core.Exec_resource.protect next) in
   let valid () =
     if not (running ()) then raise (Octra_core.Exec_resource.Unavailable Host)
@@ -4029,7 +4035,7 @@ let run_async ?(running = fun () -> true) state program =
   let rec resume = function
     | Fhe_wait (rd, reason, request) ->
       let pc = state.pc in
-      let seconds = if state.is_view then 10. else Octra_core.Pvac_verify_worker.timeout_seconds () in
+      let seconds = if state.is_view then view_seconds else Octra_core.Pvac_verify_worker.timeout_seconds () in
       let now = Mtime_clock.elapsed_ns () in
       let deadline = Int64.add now (Int64.of_float (seconds *. 1_000_000_000.)) in
       if deadline <= now then raise (Octra_core.Exec_resource.Unavailable Host);
@@ -4060,8 +4066,10 @@ let run_async ?(running = fun () -> true) state program =
           waiting := fst (Proof_wait.delta !waiting Proof_wait.Cancel);
           Lwt.return_unit)
     | Proof_wait (rd, request) ->
+      let request = if state.ctx.proof_key = Octra_core.Rule_graph.Active then
+        Octra_core.Pvac_verify_protocol.Proof_key request else request in
       let pc = state.pc in
-      let seconds = if state.is_view then 10. else Octra_core.Pvac_verify_worker.timeout_seconds () in
+      let seconds = if state.is_view then view_seconds else Octra_core.Pvac_verify_worker.timeout_seconds () in
       let now = Mtime_clock.elapsed_ns () in
       let deadline = Int64.add now (Int64.of_float (seconds *. 1_000_000_000.)) in
       if deadline <= now then raise (Octra_core.Exec_resource.Unavailable Host);

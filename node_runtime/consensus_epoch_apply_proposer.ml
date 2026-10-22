@@ -123,8 +123,8 @@ let missing_line ~epoch_id = function
       "proposer source = none epoch = %d reason = missing_fallback_validator action = exit"
       epoch_id
 
-let first_valid candidates =
-  candidates
+let first_valid entries =
+  entries
   |> List.find_map (fun (source, proposer) ->
     match valid_option proposer with
     | Some proposer -> Some { source; proposer }
@@ -151,7 +151,7 @@ let choose (request : request) =
   match env_proposer with
   | Some proposer -> Ok { source = Env; proposer }
   | None ->
-    let consensus_candidates =
+    let consensus_entries =
       if request.consensus_mode then
         [
           Pending, request.pending_proposer;
@@ -161,7 +161,7 @@ let choose (request : request) =
       else
         []
     in
-    match first_valid ((Override, request.override_proposer) :: consensus_candidates) with
+    match first_valid ((Override, request.override_proposer) :: consensus_entries) with
     | Some selected -> Ok selected
     | None when request.consensus_mode -> Error Missing_consensus_proposer
     | None -> fallback request

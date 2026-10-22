@@ -211,6 +211,23 @@ let write_new target raw =
         (try Unix.unlink staged with _ -> ());
         Error (Printexc.to_string exn)
 
+let replace ~chain target prior need =
+  match open_staged target 0 with
+  | Error _ as error -> error
+  | Ok (staged, fd) ->
+    try
+      Fun.protect ~finally:(fun () -> Unix.close fd) (fun () ->
+        write_all fd (Yojson.Safe.to_string (json chain need) ^ "\n") 0;
+        Unix.fsync fd);
+      let current = read_path ~chain target in
+      if current <> Ready prior then failwith "recovery marker changed before replacement";
+      Unix.rename staged target;
+      fsync_dir (Filename.dirname target);
+      Ok Stored
+    with exn ->
+      (try Unix.unlink staged with _ -> ());
+      Error (Printexc.to_string exn)
+
 let write ~data_dir ~chain need =
   let target =
     if need.Sync_need.cause = Sync_need.Conflict then conflict_path data_dir
@@ -223,7 +240,10 @@ let write ~data_dir ~chain need =
   if not (Sync_need.valid need) then
     Error "recovery plan is invalid"
   else match prior () with
-  | Ready prior -> Ok (Present prior)
+  | Ready prior ->
+    let next = Sync_need.carry prior need in
+    if Sync_need.covers prior next then replace ~chain target prior next
+    else Ok (Present prior)
   | Invalid reason -> Error reason
   | Missing ->
       begin
@@ -327,12 +347,19 @@ let finish_journal ~data_dir ~chain ~verified_head expected =
   | Ok true ->
     Result.map (fun () -> true) (consume ~data_dir ~chain expected)
 
-let consume_root ~data_dir ~chain ~verified_head expected =
+let consume_root ~data_dir ~chain ~verified_head ~limit expected =
   if expected.Sync_need.cause <> Sync_need.Root then
     Error "only a root recovery marker can be consumed"
   else if not (Sync_need.valid expected) then
     Error "root recovery plan is invalid"
-  else if verified_head < expected.epoch || verified_head = max_int then
+  else if not (Sync_need.snapshot_ready ~head:verified_head ~limit expected) then
     Error "verified root head is below recovery epoch"
   else
     consume ~data_dir ~chain expected
+
+let consume_range ~data_dir ~chain ~verified_head ~limit expected =
+  if expected.Sync_need.cause <> Sync_need.Range then
+    Error "only a range recovery marker can be consumed"
+  else if not (Sync_need.range_ready ~head:verified_head ~limit expected) then
+    Error "verified range head is outside recovery window"
+  else consume ~data_dir ~chain expected

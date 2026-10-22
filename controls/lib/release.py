@@ -83,9 +83,9 @@ def validate(value, fresh=True, now=None):
         raise ValidatorError("release marker key id is invalid")
     if value["chain_id"] != CHAIN:
         raise ValidatorError("release marker chain is invalid")
-    if value["action"] not in ACTIONS:
+    if not isinstance(value["action"], str) or value["action"] not in ACTIONS:
         raise ValidatorError("release marker action is invalid")
-    if value["notice_code"] not in NOTICES:
+    if not isinstance(value["notice_code"], str) or value["notice_code"] not in NOTICES:
         raise ValidatorError("release marker notice code is invalid")
     sequence = value["sequence"]
     if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 1:
@@ -141,13 +141,19 @@ def decode(raw, fresh=True, now=None):
     return value
 
 def cache_path(root):
-    result = subprocess.run(
-        ["git", "rev-parse", "--git-path", "octra-release-v2.json"],
-        cwd=root,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-path", "octra-release-v2.json"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as error:
+        root = Path(root).resolve()
+        if any((parent / ".git").exists() for parent in (root, *root.parents)):
+            raise ValidatorError("cannot locate signed release cache in Git repository") from error
+        return Path(root) / "runtime_data/release/latest.json"
     path = Path(result.stdout.strip())
     return path if path.is_absolute() else (root / path).resolve()
 
@@ -226,9 +232,20 @@ def fetch(url=URL):
         raise OriginError("release marker origin is unavailable") from error
     return decode(raw)
 
-def trusted(root):
+def trusted(root, repair=False):
     path = cache_path(root)
-    prior = read(path, fresh=False)
+    try:
+        prior = read(path, fresh=False)
+    except ValidatorError as error:
+        if not repair:
+            raise ValidatorError(f"cached marker cannot be verified: {error}; review the current sequence before --repair-cache") from error
+        value = fetch()
+        descriptor, saved = open_stage(path.with_name(path.name + ".invalid"))
+        os.close(descriptor)
+        os.replace(path, saved)
+        sync_dir(path.parent)
+        write(path, value)
+        return value, "origin_recovered"
     try:
         value = fetch()
         source = "origin"
@@ -240,7 +257,8 @@ def trusted(root):
         source = "cache"
     if prior is not None:
         if value["sequence"] < prior["sequence"]:
-            raise ValidatorError("release marker sequence would roll back")
+            validate(prior, fresh=True)
+            return prior, "cache"
         if value["sequence"] == prior["sequence"] and value != prior:
             raise ValidatorError("release marker sequence was reused")
     if prior != value:

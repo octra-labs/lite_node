@@ -599,15 +599,24 @@ let inspect_fields mode fields =
   | Rule_graph.Prior -> fields
   | Rule_graph.Active -> ("inspect_policy", `Bool true) :: fields
 
+let table_fields ?code_mode mode fields =
+  let fields = match Option.value code_mode ~default:mode with
+    | Rule_graph.Prior -> fields
+    | Rule_graph.Active -> ("code_limit", `Bool true) :: fields in
+  match mode with
+  | Rule_graph.Prior -> fields
+  | Rule_graph.Active ->
+    ("table_limit", `Bool true) :: ("stable_errors", `Bool true) :: fields
+
 let validate ?(optional = false) ?(execution_profile = Standard) ?(float_mode = Rule_graph.Prior)
-    ?(inspect_mode = Rule_graph.Prior) code_b64 =
+    ?(inspect_mode = Rule_graph.Prior) ~table_mode code_b64 =
   let payload =
-    `Assoc (inspect_fields inspect_mode ((if optional then ["is_view", `Bool true] else []) @ [
+    `Assoc (table_fields table_mode (inspect_fields inspect_mode ((if optional then ["is_view", `Bool true] else []) @ [
       "action", `String "validate";
       "float_mode", `Bool (float_enabled float_mode);
       "code_b64", `String code_b64;
       "execution_profile", `String (profile_name execution_profile);
-    ])) in
+    ]))) in
   let* json_result = read_process_json ~optional payload in
   match json_result with
   | Error _ as e ->
@@ -616,14 +625,14 @@ let validate ?(optional = false) ?(execution_profile = Standard) ?(float_mode = 
     Lwt.return (Result.map_error (fun e -> Rejected e) (descriptor_of_yojson json))
 
 let describe ?(optional = false) ?(execution_profile = Standard) ?(float_mode = Rule_graph.Prior)
-    ?(inspect_mode = Rule_graph.Prior) code_b64 =
+    ?(inspect_mode = Rule_graph.Prior) ~table_mode code_b64 =
   let payload =
-    `Assoc (inspect_fields inspect_mode ((if optional then ["is_view", `Bool true] else []) @ [
+    `Assoc (table_fields table_mode (inspect_fields inspect_mode ((if optional then ["is_view", `Bool true] else []) @ [
       "action", `String "describe";
       "float_mode", `Bool (float_enabled float_mode);
       "code_b64", `String code_b64;
       "execution_profile", `String (profile_name execution_profile);
-    ])) in
+    ]))) in
   let* json_result = read_process_json ~optional payload in
   match json_result with
   | Error _ as e ->
@@ -646,6 +655,8 @@ let input_receipt_bytes =
   |> String.length
 
 let rec execute_with_profile
+    ~table_mode
+    ~code_mode
     ~memory_bytes
     ~guest_bytes
     ~inspect_mode
@@ -664,6 +675,7 @@ let rec execute_with_profile
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~keyed
     ~math
     ~float_mode
     ~hfhe_mode
@@ -716,9 +728,10 @@ let rec execute_with_profile
       | None -> fields | Some bytes -> ("memory_bytes", `Int bytes) :: fields in
     let fields = match guest_bytes with
       | None -> fields | Some bytes -> ("guest_bytes", `Int bytes) :: fields in
-    `Assoc (inspect_fields inspect_mode (match proof_mode with
+    let fields = if keyed then ("proof_key", `Bool true) :: fields else fields in
+    `Assoc (table_fields ~code_mode table_mode (inspect_fields inspect_mode (match proof_mode with
       | Rule_graph.Prior -> fields
-      | Rule_graph.Active -> ("hfhe_pairs", `Bool true) :: fields)) in
+      | Rule_graph.Active -> ("hfhe_pairs", `Bool true) :: fields))) in
   let input_check = match proof_mode with
     | Rule_graph.Prior -> Ok ()
     | Rule_graph.Active ->
@@ -799,10 +812,12 @@ let rec execute_with_profile
       dispatch ~allow_cache_only:false ~allow_code_cache_only
     | Error _ as e ->
       Lwt.return e
-    | Ok _ as ok ->
+    | Ok json as ok ->
       begin
-        if not use_code_cache_only then
-          mark_code_seeded code_key;
+        (if not is_view then match json with
+         | `Assoc fields when List.assoc_opt "code_retained" fields = Some (`Bool true) ->
+           mark_code_seeded code_key
+         | _ -> Hashtbl.remove code_seed_cache code_key);
         match storage_entry with
         | Some entry when not use_cache_only ->
           entry.seeded_in_native <- true
@@ -947,7 +962,7 @@ type replay_step = {
   guest : int;
 }
 
-let replay_compute ~code_b64 ~cache_key ~root ~entries ~bytes ~scope ~caller ~address steps =
+let replay_compute ~code_mode ~table_mode ~code_b64 ~cache_key ~root ~entries ~bytes ~scope ~caller ~address steps =
   let refused reason = Lwt.return_error (Rejected reason) in
   if steps = [] || List.length steps > 64 then refused "compute replay step count"
   else if List.exists (fun step -> step.fuel <= 0 || step.epoch < 0) steps then
@@ -957,7 +972,7 @@ let replay_compute ~code_b64 ~cache_key ~root ~entries ~bytes ~scope ~caller ~ad
       | Some sum when step.fuel <= 10_000_000 - sum -> Some (sum + step.fuel)
       | _ -> None) (Some 0) steps in
     if Option.is_none fuel then refused "compute replay fuel limit" else
-      let fields step = `Assoc [
+      let fields step = `Assoc (table_fields ~code_mode:(code_mode step.epoch) table_mode [
         "action", `String "execute";
         "code_b64", `String code_b64;
         "code_cache_key", `String (code_cache_key code_b64);
@@ -979,7 +994,7 @@ let replay_compute ~code_b64 ~cache_key ~root ~entries ~bytes ~scope ~caller ~ad
         "fuel_limit", `Int step.fuel;
         "memory_bytes", `Int step.memory;
         "guest_bytes", `Int step.guest;
-      ] in
+      ]) in
       let payloads = List.map fields steps in
       let size = List.fold_left (fun total value -> match total with
         | None -> None
@@ -1005,6 +1020,7 @@ let replay_compute ~code_b64 ~cache_key ~root ~entries ~bytes ~scope ~caller ~ad
         | Ok _ -> Lwt.return_error (Unavailable "compute replay response differs")
 
 let execute
+    ~table_mode
     ~inspect_mode
     ~proof_mode
     ~call
@@ -1021,6 +1037,7 @@ let execute
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~keyed
     ~math
     ~float_mode
     ~hfhe_mode
@@ -1029,6 +1046,8 @@ let execute
     ~is_view
     ~update_policy =
   execute_with_profile
+    ~table_mode
+    ~code_mode:table_mode
     ~memory_bytes:None
     ~guest_bytes:None
     ~inspect_mode
@@ -1047,6 +1066,7 @@ let execute
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~keyed
     ~math
     ~float_mode
     ~hfhe_mode
@@ -1059,6 +1079,8 @@ let execute
     ~update_policy
 
 let execute_compute_with_storage_inner
+    ~table_mode
+    ~code_mode
     ~memory_bytes
     ~guest_bytes
     ~compute_session_scope
@@ -1076,12 +1098,15 @@ let execute_compute_with_storage_inner
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~keyed
     ~math
     ~float_mode
     ~hfhe_mode
     ~public_reads
     ~fuel_limit =
   execute_with_profile
+    ~table_mode
+    ~code_mode
     ~memory_bytes
     ~guest_bytes
     ~inspect_mode:Rule_graph.Prior
@@ -1100,6 +1125,7 @@ let execute_compute_with_storage_inner
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~keyed
     ~math
     ~float_mode
     ~hfhe_mode
@@ -1112,6 +1138,7 @@ let execute_compute_with_storage_inner
     ~update_policy:false
 
 let execute_compute_with_storage
+    ~table_mode
     ~compute_storage_cache_key
     ~code_b64
     ~export_name
@@ -1126,12 +1153,15 @@ let execute_compute_with_storage
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~keyed
     ~math
     ~float_mode
     ~hfhe_mode
     ~public_reads
     ~fuel_limit =
   execute_compute_with_storage_inner
+    ~table_mode
+    ~code_mode:table_mode
     ~memory_bytes:None
     ~guest_bytes:None
     ~compute_session_scope:None
@@ -1149,6 +1179,7 @@ let execute_compute_with_storage
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~keyed
     ~math
     ~float_mode
     ~hfhe_mode
@@ -1156,6 +1187,8 @@ let execute_compute_with_storage
     ~fuel_limit
 
 let execute_compute_isolated_with_storage
+    ~table_mode
+    ~code_mode
     ~memory_bytes
     ~guest_bytes
     ~compute_session_scope
@@ -1173,12 +1206,15 @@ let execute_compute_isolated_with_storage
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~keyed
     ~math
     ~float_mode
     ~hfhe_mode
     ~public_reads
     ~fuel_limit =
   execute_compute_with_storage_inner
+    ~table_mode
+    ~code_mode
     ~memory_bytes:(Some memory_bytes)
     ~guest_bytes:(Some guest_bytes)
     ~compute_session_scope:(Some compute_session_scope)
@@ -1196,6 +1232,7 @@ let execute_compute_isolated_with_storage
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~keyed
     ~math
     ~float_mode
     ~hfhe_mode
@@ -1203,6 +1240,7 @@ let execute_compute_isolated_with_storage
     ~fuel_limit
 
 let execute_compute
+    ~table_mode
     ~code_b64
     ~export_name
     ~request_bytes
@@ -1216,12 +1254,14 @@ let execute_compute
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~keyed
     ~math
     ~float_mode
     ~hfhe_mode
     ~public_reads
     ~fuel_limit =
   execute_compute_with_storage
+    ~table_mode
     ~compute_storage_cache_key:None
     ~code_b64
     ~export_name
@@ -1236,6 +1276,7 @@ let execute_compute
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~keyed
     ~math
     ~float_mode
     ~hfhe_mode

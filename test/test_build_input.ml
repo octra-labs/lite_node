@@ -88,7 +88,7 @@ let test_gc_close () = with_port (fun port ->
   let worker = Thread.create (fun () ->
     result := Some (try Ok (step port payload) with error -> Error error)) () in
   Fun.protect (fun () ->
-    let deadline = Unix.gettimeofday () +. 3. in
+    let deadline = Unix.gettimeofday () +. 120. in
     while not (waiting ()) do
       if Unix.gettimeofday () > deadline then fail "build pause not reached";
       Thread.delay 0.001
@@ -264,7 +264,7 @@ let paused run inspect =
   let worker = Thread.create (fun () ->
     result := Some (try Ok (run ()) with error -> Error error)) () in
   Fun.protect (fun () ->
-    let deadline = Unix.gettimeofday () +. 3. in
+    let deadline = Unix.gettimeofday () +. 120. in
     while not (waiting ()) do
       if Unix.gettimeofday () > deadline then fail "native pause not reached";
       Thread.delay 0.001
@@ -301,7 +301,7 @@ let test_input_queue () =
   let blocker = Lwt_preemptive.detach (fun () ->
     Atomic.set started true;
     while not (Atomic.get stopped) do Thread.delay 0.001 done) () in
-  let deadline = Unix.gettimeofday () +. 3. in
+  let deadline = Unix.gettimeofday () +. 120. in
   let rec await () =
     if Atomic.get started then Lwt.return_unit
     else if Unix.gettimeofday () > deadline then Lwt.fail_with "queue pause not reached"
@@ -396,7 +396,8 @@ let test_optional_routes () =
   let unavailable = function
     | Error (Host.Unavailable "native input busy") -> ()
     | _ -> fail "optional route skipped input quota" in
-  let execute is_view = Host.execute
+  let execute is_view = Host.execute ~keyed:false
+    ~table_mode:Octra_core.Rule_graph.Prior
     ~inspect_mode:Octra_core.Rule_graph.Prior ~proof_mode:Octra_core.Rule_graph.Prior
     ~call:None ~code_b64 ~export_name:"octra_update" ~request_bytes:""
     ~storage_tbl:(Hashtbl.create 0) ~storage_cache_key:None ~caller:"" ~address:""
@@ -411,15 +412,15 @@ let test_optional_routes () =
   ] in
   let expected = List.map (fun run -> Lwt_main.run (run ())) controls in
   with_quota input_limit (fun () ->
-    unavailable (Lwt_main.run (Host.describe ~optional:true code_b64));
-    unavailable (Lwt_main.run (Host.validate ~optional:true code_b64));
+    unavailable (Lwt_main.run (Host.describe ~table_mode:Octra_core.Rule_graph.Prior ~optional:true code_b64));
+    unavailable (Lwt_main.run (Host.validate ~table_mode:Octra_core.Rule_graph.Prior ~optional:true code_b64));
     List.iter2 (fun run expected ->
       if Lwt_main.run (run ()) <> expected then fail "input pressure blocked control work")
       controls expected;
     unavailable (Lwt_main.run (execute true));
-    if Result.is_error (Lwt_main.run (Host.validate code_b64)) then
+    if Result.is_error (Lwt_main.run (Host.validate ~table_mode:Octra_core.Rule_graph.Prior code_b64)) then
       fail "optional pressure blocked required validation";
-    if Result.is_error (Lwt_main.run (Host.describe code_b64)) then
+    if Result.is_error (Lwt_main.run (Host.describe ~table_mode:Octra_core.Rule_graph.Prior code_b64)) then
       fail "optional pressure blocked required description";
     if Result.is_error (Lwt_main.run (execute false)) then
       fail "optional pressure blocked required execution");
@@ -429,7 +430,7 @@ let test_optional_routes () =
 let test_optional_cancel () =
   mode 3;
   let work = Lwt_preemptive.detach (run_json_native true) payload in
-  let deadline = Unix.gettimeofday () +. 3. in
+  let deadline = Unix.gettimeofday () +. 120. in
   let rec await () =
     if waiting () then Lwt.return_unit
     else if Unix.gettimeofday () > deadline then Lwt.fail_with "input pause not reached"

@@ -20,6 +20,7 @@ type key = {
   blob : string;
   hash : string;
   math : bool;
+  keyed : bool;
 }
 
 type checked = {
@@ -141,21 +142,21 @@ let amount ~op entry (key : key) =
   let* proof = text values "zero_proof" in
   let* blinding = text values "blinding" in
   let* pubkey = key_blob key in
-  let* () = V.result_sync ~math:key.math (P.Encrypt {
+  let* () = V.result_sync ~keyed:key.keyed ~math:key.math (P.Encrypt {
     pubkey; cipher; amount = tx.amount; proof; commitment; blinding; strict = true;
   }) in
   Ok tx.amount
 
 let cell (key : key) ~cipher ~ciphertext_commitment ~proof ~amount_commitment =
   let* pubkey = key_blob key in
-  V.verify_circle_cell_sync ~math:key.math ~strict:true ~pubkey ~cipher
+  V.verify_circle_cell_sync ~keyed:key.keyed ~math:key.math ~strict:true ~pubkey ~cipher
     ~ciphertext_commitment ~proof_kind:P.Circle_bound_zero ~proof ~amount_commitment
 
 let send_proof sender_key (transfer : PT.t) =
   let* () = cell sender_key ~cipher:transfer.delta_cipher
     ~ciphertext_commitment:transfer.commitment ~proof:transfer.send_zero_proof
     ~amount_commitment:transfer.amount_commitment in
-  V.verify_range_sync ~math:sender_key.math ~strict:true
+  V.verify_range_sync ~keyed:sender_key.keyed ~math:sender_key.math ~strict:true
     ~pubkey:sender_key.blob ~cipher:transfer.delta_cipher
     ~proof:transfer.range_proof_delta
 

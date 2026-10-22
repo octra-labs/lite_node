@@ -402,6 +402,7 @@ let run_process ?control ?pipe ?deadline worker request =
       begin match process_response expected_hash stdout stderr status with
       | Completed response when not response.accepted
           && List.mem response.reason ["op_invalid"; "schema_invalid"; "math_invalid";
+            "proof_key_invalid";
             "request_invalid"; "request_json_invalid"; "request_too_large"] ->
         Unavailable ("worker_protocol_" ^ response.reason)
       | outcome -> outcome
@@ -559,27 +560,31 @@ let outcome_result outcome =
   classified_outcome_result outcome
   |> Result.map_error verification_failure_message
 
-let classified_result ?(math = false) ?(priority = Required) request =
+let with_rules ~keyed ~math request =
+  let request = if math then P.Math request else request in
+  if keyed then P.Proof_key request else request
+
+let classified_result ?(math = false) ~keyed ?(priority = Required) request =
   let open Lwt.Syntax in
-  let* outcome = run ~priority (if math then P.Math request else request) in
+  let* outcome = run ~priority (with_rules ~keyed ~math request) in
   Lwt.return (classified_outcome_result outcome)
 
-let result ?(math = false) ?(priority = Required) request =
+let result ?(math = false) ~keyed ?(priority = Required) request =
   let open Lwt.Syntax in
-  let* outcome = run ~priority (if math then P.Math request else request) in
+  let* outcome = run ~priority (with_rules ~keyed ~math request) in
   Lwt.return (outcome_result outcome)
 
-let result_sync ?(math = false) ?(priority = Required) request =
-  run_sync ~priority (if math then P.Math request else request) |> outcome_result
+let result_sync ?(math = false) ~keyed ?(priority = Required) request =
+  run_sync ~priority (with_rules ~keyed ~math request) |> outcome_result
 
-let classified_result_sync ?(math = false) ?(priority = Required) request =
-  run_sync ~priority (if math then P.Math request else request) |> classified_outcome_result
+let classified_result_sync ?(math = false) ~keyed ?(priority = Required) request =
+  run_sync ~priority (with_rules ~keyed ~math request) |> classified_outcome_result
 
-let try_classified_result_sync ?(math = false) ?(priority = Speculative) request =
-  try_run_sync ~priority (if math then P.Math request else request) |> classified_outcome_result
+let try_classified_result_sync ?(math = false) ~keyed ?(priority = Speculative) request =
+  try_run_sync ~priority (with_rules ~keyed ~math request) |> classified_outcome_result
 
-let try_result_sync ?(math = false) ?(priority = Speculative) request =
-  try_classified_result_sync ~math ~priority request
+let try_result_sync ?(math = false) ~keyed ?(priority = Speculative) request =
+  try_classified_result_sync ~keyed ~math ~priority request
   |> Result.map_error verification_failure_message
 
 let session_ready () =
@@ -601,12 +606,17 @@ let session_ready () =
     with _ -> Error "worker_session_unavailable"
 
 let ready_sync () =
-  Result.bind (result_sync P.Ping) session_ready
+  Result.bind (result_sync ~keyed:false P.Ping) (fun () ->
+    Result.bind (result_sync ~keyed:true ~math:true P.Ping) session_ready)
 
 let ready () =
-  result P.Ping
+  let open Lwt.Syntax in
+  let* prior = result ~keyed:false P.Ping in
+  match prior with
+  | Error _ -> Lwt.return prior
+  | Ok () -> result ~keyed:true ~math:true P.Ping
 
-let verify_encrypt_with_priority ~math
+let verify_encrypt_with_priority ~keyed ~math
     priority
     ~strict
     ~pubkey
@@ -615,7 +625,7 @@ let verify_encrypt_with_priority ~math
     ~proof
     ~commitment
     ~blinding =
-  result ~math ~priority
+  result ~keyed ~math ~priority
     (P.Encrypt {
        pubkey;
        cipher;
@@ -626,7 +636,7 @@ let verify_encrypt_with_priority ~math
        strict;
      })
 
-let verify_encrypt_classified_with_priority ~math
+let verify_encrypt_classified_with_priority ~keyed ~math
     priority
     ~strict
     ~pubkey
@@ -635,7 +645,7 @@ let verify_encrypt_classified_with_priority ~math
     ~proof
     ~commitment
     ~blinding =
-  classified_result ~math ~priority
+  classified_result ~keyed ~math ~priority
     (P.Encrypt {
        pubkey;
        cipher;
@@ -646,7 +656,7 @@ let verify_encrypt_classified_with_priority ~math
        strict;
      })
 
-let verify_encrypt ~math
+let verify_encrypt ~keyed ~math
     ~strict
     ~pubkey
     ~cipher
@@ -654,7 +664,7 @@ let verify_encrypt ~math
     ~proof
     ~commitment
     ~blinding =
-  verify_encrypt_with_priority ~math
+  verify_encrypt_with_priority ~keyed ~math
     Required
     ~strict
     ~pubkey
@@ -664,17 +674,17 @@ let verify_encrypt ~math
     ~commitment
     ~blinding
 
-let verify_claim_with_priority ~math
+let verify_claim_with_priority ~keyed ~math
     priority
     ~strict
     ~pubkey
     ~cipher
     ~proof
     ~commitment =
-  result ~math ~priority (P.Claim { pubkey; cipher; proof; commitment; strict })
+  result ~keyed ~math ~priority (P.Claim { pubkey; cipher; proof; commitment; strict })
 
-let verify_claim ~math ~strict ~pubkey ~cipher ~proof ~commitment =
-  verify_claim_with_priority ~math
+let verify_claim ~keyed ~math ~strict ~pubkey ~cipher ~proof ~commitment =
+  verify_claim_with_priority ~keyed ~math
     Required
     ~strict
     ~pubkey
@@ -682,18 +692,18 @@ let verify_claim ~math ~strict ~pubkey ~cipher ~proof ~commitment =
     ~proof
     ~commitment
 
-let verify_claim_classified_with_priority ~math
+let verify_claim_classified_with_priority ~keyed ~math
     priority
     ~strict
     ~pubkey
     ~cipher
     ~proof
     ~commitment =
-  classified_result ~math ~priority
+  classified_result ~keyed ~math ~priority
     (P.Claim { pubkey; cipher; proof; commitment; strict })
 
-let verify_claim_classified ~math ~strict ~pubkey ~cipher ~proof ~commitment =
-  verify_claim_classified_with_priority ~math
+let verify_claim_classified ~keyed ~math ~strict ~pubkey ~cipher ~proof ~commitment =
+  verify_claim_classified_with_priority ~keyed ~math
     Required
     ~strict
     ~pubkey
@@ -701,18 +711,18 @@ let verify_claim_classified ~math ~strict ~pubkey ~cipher ~proof ~commitment =
     ~proof
     ~commitment
 
-let verify_key_switch_claim_with_priority ~math
+let verify_key_switch_claim_with_priority ~keyed ~math
     priority
     ~strict
     ~pubkey
     ~cipher
     ~proof
     ~commitment =
-  result ~math ~priority
+  result ~keyed ~math ~priority
     (P.Key_switch_claim { pubkey; cipher; proof; commitment; strict })
 
-let verify_key_switch_claim ~math ~strict ~pubkey ~cipher ~proof ~commitment =
-  verify_key_switch_claim_with_priority ~math
+let verify_key_switch_claim ~keyed ~math ~strict ~pubkey ~cipher ~proof ~commitment =
+  verify_key_switch_claim_with_priority ~keyed ~math
     Required
     ~strict
     ~pubkey
@@ -720,23 +730,23 @@ let verify_key_switch_claim ~math ~strict ~pubkey ~cipher ~proof ~commitment =
     ~proof
     ~commitment
 
-let verify_key_switch_claim_classified_with_priority ~math
+let verify_key_switch_claim_classified_with_priority ~keyed ~math
     priority
     ~strict
     ~pubkey
     ~cipher
     ~proof
     ~commitment =
-  classified_result ~math ~priority
+  classified_result ~keyed ~math ~priority
     (P.Key_switch_claim { pubkey; cipher; proof; commitment; strict })
 
-let verify_key_switch_claim_classified ~math
+let verify_key_switch_claim_classified ~keyed ~math
     ~strict
     ~pubkey
     ~cipher
     ~proof
     ~commitment =
-  verify_key_switch_claim_classified_with_priority ~math
+  verify_key_switch_claim_classified_with_priority ~keyed ~math
     Required
     ~strict
     ~pubkey
@@ -744,14 +754,14 @@ let verify_key_switch_claim_classified ~math
     ~proof
     ~commitment
 
-let verify_historical_migration_claim_with_priority ~math
+let verify_historical_migration_claim_with_priority ~keyed ~math
     priority
     ~strict
     ~pubkey
     ~cipher
     ~proof
     ~commitment =
-  result ~math ~priority
+  result ~keyed ~math ~priority
     (P.Historical_migration_claim {
        pubkey;
        cipher;
@@ -760,13 +770,13 @@ let verify_historical_migration_claim_with_priority ~math
        strict;
      })
 
-let verify_historical_migration_claim ~math
+let verify_historical_migration_claim ~keyed ~math
     ~strict
     ~pubkey
     ~cipher
     ~proof
     ~commitment =
-  verify_historical_migration_claim_with_priority ~math
+  verify_historical_migration_claim_with_priority ~keyed ~math
     Required
     ~strict
     ~pubkey
@@ -774,14 +784,14 @@ let verify_historical_migration_claim ~math
     ~proof
     ~commitment
 
-let verify_historical_migration_claim_classified_with_priority ~math
+let verify_historical_migration_claim_classified_with_priority ~keyed ~math
     priority
     ~strict
     ~pubkey
     ~cipher
     ~proof
     ~commitment =
-  classified_result ~math ~priority
+  classified_result ~keyed ~math ~priority
     (P.Historical_migration_claim {
        pubkey;
        cipher;
@@ -790,13 +800,13 @@ let verify_historical_migration_claim_classified_with_priority ~math
        strict;
      })
 
-let verify_historical_migration_claim_classified ~math
+let verify_historical_migration_claim_classified ~keyed ~math
     ~strict
     ~pubkey
     ~cipher
     ~proof
     ~commitment =
-  verify_historical_migration_claim_classified_with_priority ~math
+  verify_historical_migration_claim_classified_with_priority ~keyed ~math
     Required
     ~strict
     ~pubkey
@@ -804,72 +814,72 @@ let verify_historical_migration_claim_classified ~math
     ~proof
     ~commitment
 
-let verify_range_with_priority ~math priority ~strict ~pubkey ~cipher ~proof =
-  result ~math ~priority (P.Range { pubkey; cipher; proof; strict })
+let verify_range_with_priority ~keyed ~math priority ~strict ~pubkey ~cipher ~proof =
+  result ~keyed ~math ~priority (P.Range { pubkey; cipher; proof; strict })
 
-let verify_range_classified_with_priority ~math priority ~strict ~pubkey ~cipher ~proof =
-  classified_result ~math ~priority (P.Range { pubkey; cipher; proof; strict })
+let verify_range_classified_with_priority ~keyed ~math priority ~strict ~pubkey ~cipher ~proof =
+  classified_result ~keyed ~math ~priority (P.Range { pubkey; cipher; proof; strict })
 
-let verify_range ~math ~strict ~pubkey ~cipher ~proof =
-  verify_range_with_priority ~math Required ~strict ~pubkey ~cipher ~proof
+let verify_range ~keyed ~math ~strict ~pubkey ~cipher ~proof =
+  verify_range_with_priority ~keyed ~math Required ~strict ~pubkey ~cipher ~proof
 
-let verify_zero_sync ~math ~pubkey ~cipher ~proof =
-  result_sync ~math (P.Zero { pubkey; cipher; proof })
+let verify_zero_sync ~keyed ~math ~pubkey ~cipher ~proof =
+  result_sync ~keyed ~math (P.Zero { pubkey; cipher; proof })
 
-let verify_zero_sync_classified ~math ~pubkey ~cipher ~proof =
-  classified_result_sync ~math (P.Zero { pubkey; cipher; proof })
+let verify_zero_sync_classified ~keyed ~math ~pubkey ~cipher ~proof =
+  classified_result_sync ~keyed ~math (P.Zero { pubkey; cipher; proof })
 
-let verify_claim_sync ~math ~strict ~pubkey ~cipher ~proof ~commitment =
-  result_sync ~math (P.Claim { pubkey; cipher; proof; commitment; strict })
+let verify_claim_sync ~keyed ~math ~strict ~pubkey ~cipher ~proof ~commitment =
+  result_sync ~keyed ~math (P.Claim { pubkey; cipher; proof; commitment; strict })
 
-let verify_claim_sync_classified ~math ~strict ~pubkey ~cipher ~proof ~commitment =
-  classified_result_sync ~math
+let verify_claim_sync_classified ~keyed ~math ~strict ~pubkey ~cipher ~proof ~commitment =
+  classified_result_sync ~keyed ~math
     (P.Claim { pubkey; cipher; proof; commitment; strict })
 
-let verify_range_sync ~math ~strict ~pubkey ~cipher ~proof =
-  result_sync ~math (P.Range { pubkey; cipher; proof; strict })
+let verify_range_sync ~keyed ~math ~strict ~pubkey ~cipher ~proof =
+  result_sync ~keyed ~math (P.Range { pubkey; cipher; proof; strict })
 
-let verify_range_bound_sync ~math ~strict ~pubkey ~cipher ~proof ~commitment =
-  result_sync ~math (P.Range_bound { pubkey; cipher; proof; commitment; strict })
+let verify_range_bound_sync ~keyed ~math ~strict ~pubkey ~cipher ~proof ~commitment =
+  result_sync ~keyed ~math (P.Range_bound { pubkey; cipher; proof; commitment; strict })
 
-let verify_range_bound_sync_classified ~math
+let verify_range_bound_sync_classified ~keyed ~math
     ~strict
     ~pubkey
     ~cipher
     ~proof
     ~commitment =
-  classified_result_sync ~math
+  classified_result_sync ~keyed ~math
     (P.Range_bound { pubkey; cipher; proof; commitment; strict })
 
-let try_verify_range_bound_sync_classified ~math
+let try_verify_range_bound_sync_classified ~keyed ~math
     ~strict
     ~pubkey
     ~cipher
     ~proof
     ~commitment =
-  try_classified_result_sync ~math
+  try_classified_result_sync ~keyed ~math
     (P.Range_bound { pubkey; cipher; proof; commitment; strict })
 
-let try_verify_zero_sync ~math ~pubkey ~cipher ~proof =
-  try_result_sync ~math (P.Zero { pubkey; cipher; proof })
+let try_verify_zero_sync ~keyed ~math ~pubkey ~cipher ~proof =
+  try_result_sync ~keyed ~math (P.Zero { pubkey; cipher; proof })
 
-let try_verify_zero_sync_classified ~math ~pubkey ~cipher ~proof =
-  try_classified_result_sync ~math (P.Zero { pubkey; cipher; proof })
+let try_verify_zero_sync_classified ~keyed ~math ~pubkey ~cipher ~proof =
+  try_classified_result_sync ~keyed ~math (P.Zero { pubkey; cipher; proof })
 
-let try_verify_claim_sync ~math ~strict ~pubkey ~cipher ~proof ~commitment =
-  try_result_sync ~math (P.Claim { pubkey; cipher; proof; commitment; strict })
+let try_verify_claim_sync ~keyed ~math ~strict ~pubkey ~cipher ~proof ~commitment =
+  try_result_sync ~keyed ~math (P.Claim { pubkey; cipher; proof; commitment; strict })
 
-let try_verify_claim_sync_classified ~math ~strict ~pubkey ~cipher ~proof ~commitment =
-  try_classified_result_sync ~math
+let try_verify_claim_sync_classified ~keyed ~math ~strict ~pubkey ~cipher ~proof ~commitment =
+  try_classified_result_sync ~keyed ~math
     (P.Claim { pubkey; cipher; proof; commitment; strict })
 
-let try_verify_range_sync ~math ~strict ~pubkey ~cipher ~proof =
-  try_result_sync ~math (P.Range { pubkey; cipher; proof; strict })
+let try_verify_range_sync ~keyed ~math ~strict ~pubkey ~cipher ~proof =
+  try_result_sync ~keyed ~math (P.Range { pubkey; cipher; proof; strict })
 
-let try_verify_range_sync_classified ~math ~strict ~pubkey ~cipher ~proof =
-  try_classified_result_sync ~math (P.Range { pubkey; cipher; proof; strict })
+let try_verify_range_sync_classified ~keyed ~math ~strict ~pubkey ~cipher ~proof =
+  try_classified_result_sync ~keyed ~math (P.Range { pubkey; cipher; proof; strict })
 
-let verify_circle_cell_with_priority ~math
+let verify_circle_cell_with_priority ~keyed ~math
     priority
     ~strict
     ~pubkey
@@ -878,7 +888,7 @@ let verify_circle_cell_with_priority ~math
     ~proof_kind
     ~proof
     ~amount_commitment =
-  result ~math ~priority
+  result ~keyed ~math ~priority
     (P.Circle_cell {
        pubkey;
        cipher;
@@ -889,7 +899,7 @@ let verify_circle_cell_with_priority ~math
        strict;
      })
 
-let verify_circle_cell ~math
+let verify_circle_cell ~keyed ~math
     ~strict
     ~pubkey
     ~cipher
@@ -897,7 +907,7 @@ let verify_circle_cell ~math
     ~proof_kind
     ~proof
     ~amount_commitment =
-  verify_circle_cell_with_priority ~math
+  verify_circle_cell_with_priority ~keyed ~math
     Required
     ~strict
     ~pubkey
@@ -907,7 +917,7 @@ let verify_circle_cell ~math
     ~proof
     ~amount_commitment
 
-let verify_circle_cell_sync ~math
+let verify_circle_cell_sync ~keyed ~math
     ~strict
     ~pubkey
     ~cipher
@@ -915,7 +925,7 @@ let verify_circle_cell_sync ~math
     ~proof_kind
     ~proof
     ~amount_commitment =
-  result_sync ~math
+  result_sync ~keyed ~math
     (P.Circle_cell {
        pubkey;
        cipher;

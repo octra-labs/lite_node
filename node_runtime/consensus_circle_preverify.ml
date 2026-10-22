@@ -59,6 +59,9 @@ let run runtime ~pre_state_hash ~pre_state_root tx =
     | Error fault ->
       Lwt.return_error (`Unavailable (Rule_graph.fault_message fault))
     | Ok proof_mode ->
+    match Rule_graph.proof_key runtime.rules ~epoch:env.epoch_id with
+    | Error fault -> Lwt.return_error (`Unavailable (Rule_graph.fault_message fault))
+    | Ok proof_key ->
     match Rule_graph.math runtime.rules ~epoch:env.epoch_id with
     | Error fault ->
       Lwt.return_error (`Unavailable (Rule_graph.fault_message fault))
@@ -86,7 +89,7 @@ let run runtime ~pre_state_hash ~pre_state_root tx =
             ~fold:(fun epoch ->
               Result.map
                 (fun ctx -> { ctx with Epoch_exec.account_mode;
-                  fhe_work; wasm_float; proof_exec; vm_bytes })
+                  fhe_work; wasm_float; proof_exec; proof_key; vm_bytes })
                 (Epoch_exec.prior_fold epoch))
             ~epoch_id:env.epoch_id
             ~proposal_id

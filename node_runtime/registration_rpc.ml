@@ -52,7 +52,7 @@ let pvac_pubkey ~existing ~kat_mismatch params =
       | Error e ->
         err_lwt (Rpc.malformed_tx e)
       | Ok incoming ->
-        match Pvac_registry.kat_admission (Rpc.param_string params 4) with
+        match Pvac_registry.kat_check (Rpc.param_string params 4) with
         | Pvac_registry.Kat_mismatch { got; expected } ->
           kat_mismatch ~addr ~got ~expected;
           err_lwt (Rpc.err (-32000)

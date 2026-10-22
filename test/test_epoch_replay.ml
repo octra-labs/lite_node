@@ -291,9 +291,9 @@ let () =
   expect "different rejections" (not (R.equal trace { trace with rejections = [] }));
   expect "different roots" (not (R.equal trace { trace with ledger_root = first }));
   expect "different input fees"
-    (not (R.equal trace { trace with candidate_fees = Z.zero }));
+    (not (R.equal trace { trace with entry_fees = Z.zero }));
   expect "different input roots"
-    (not (R.equal trace { trace with candidate_root = first }));
+    (not (R.equal trace { trace with entry_root = first }));
   begin match execute ~txs:[] ~rejections:[] "" with
   | Ok empty, 1 -> expect "empty epoch" (empty.confirmed = [] && empty.rejections = [])
   | _ -> failwith "empty epoch rejected"

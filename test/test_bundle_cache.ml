@@ -646,14 +646,13 @@ let test_bundle_join () =
   let module F = Octra_node_runtime.Consensus_bundle_fetch in
   let cache = C.create ~cap:2 in
   let runtime = C.node_runtime cache in
-  let query, resolve = Lwt.task () in
+  let query, _ = Lwt.task () in
   let pending = F.join ~ready:(runtime.wait_bundle ~proposal_id:"a") query in
   expect "join waits without data" (Lwt.is_sleeping pending);
   runtime.store_empty_proposal ~proposal_id:"a";
   expect "local result wins" (Lwt_main.run pending = None);
-  expect "network job is retained" (Lwt.is_sleeping query);
-  Lwt.wakeup_later resolve (Some "peer");
-  expect "network cleanup can finish" (Lwt_main.run query = Some "peer");
+  expect "unused network job is cancelled"
+    (match Lwt.state query with Lwt.Fail Lwt.Canceled -> true | _ -> false);
   let ready = runtime.wait_bundle ~proposal_id:"b" in
   let query, resolve = Lwt.task () in
   let pending = F.join ~ready query in
@@ -666,7 +665,7 @@ let test_finalized_wake () =
   let module F = Octra_node_runtime.Consensus_bundle_fetch in
   let cache = C.create ~cap:2 in
   let runtime = C.node_runtime cache in
-  let query, resolve = Lwt.task () in
+  let query, _ = Lwt.task () in
   let deps = F.{
     cached_bundle = (fun () -> Option.is_some (runtime.cached_bundle "a"));
     header_has_empty_bundle = (fun () -> false);
@@ -684,23 +683,21 @@ let test_finalized_wake () =
   runtime.store_empty_proposal ~proposal_id:"a";
   expect "finalized uses local bundle"
     (Lwt_main.run pending = F.Finalized_ready);
-  expect "finalized leaves query cleanup" (Lwt.is_sleeping query);
-  Lwt.wakeup_later resolve None;
-  ignore (Lwt_main.run query)
+  expect "finalized cancels network job"
+    (match Lwt.state query with Lwt.Fail Lwt.Canceled -> true | _ -> false)
 
 let test_bundle_cancel () =
   let module F = Octra_node_runtime.Consensus_bundle_fetch in
   let cache = C.create ~cap:2 in
   let runtime = C.node_runtime cache in
   let ready = runtime.wait_bundle ~proposal_id:"a" in
-  let query, resolve = Lwt.task () in
+  let query, _ = Lwt.task () in
   let pending = F.join ~ready query in
   Lwt.cancel pending;
-  expect "cancel keeps network owner" (Lwt.is_sleeping query);
+  expect "cancel releases network job"
+    (match Lwt.state query with Lwt.Fail Lwt.Canceled -> true | _ -> false);
   expect "cancel releases cache waiter"
     (match Lwt.state ready with Lwt.Fail Lwt.Canceled -> true | _ -> false);
-  Lwt.wakeup_later resolve None;
-  ignore (Lwt_main.run query);
   let ready = runtime.wait_bundle ~proposal_id:"b" in
   let result = F.join ~ready (Lwt.fail (Failure "query failed")) in
   expect "query failure is retained"

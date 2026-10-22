@@ -60,6 +60,8 @@ for line in lines:
     path = Path(name)
     if path.is_absolute() or ".." in path.parts:
         refuse("manifest_invalid", manifest)
+    if path.suffix.lower() == ".md":
+        refuse("manifest_document", path)
     digest = hashlib.sha256()
     try:
         with path.open("rb") as source:

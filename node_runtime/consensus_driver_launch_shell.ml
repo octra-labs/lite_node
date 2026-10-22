@@ -31,6 +31,7 @@ type runtime = {
   health : Consensus_health_wiring.node_driver_health_runtime;
   pending : Consensus_pending_commit_recovery.node_driver_runtime;
   recovery_pending : unit -> bool;
+  replay_pending : unit -> unit;
   poll_interval : float;
   pending_delay : float;
   role_label : string;
@@ -43,14 +44,17 @@ type health_runtime_input = {
   health : Consensus_health_wiring.node_driver_health_runtime;
   pending : Consensus_pending_commit_recovery.node_driver_runtime;
   recovery_pending : unit -> bool;
+  replay_pending : unit -> unit;
   poll_interval : float;
   pending_delay : float;
   role_label : string;
 }
 
-let recover_before_start ~recover_pending ~replay_stashed ~recovery_pending =
+let recover_before_start ~recover_pending ~replay_stashed ~replay_pending
+    ~recovery_pending =
   let open Lwt.Syntax in
   let* () = replay_stashed ~source:"startup_finality" in
+  if recovery_pending () then replay_pending ();
   if recovery_pending () then
     Lwt.return_false
   else
@@ -67,6 +71,7 @@ let health_runtime (input : health_runtime_input) =
         ~recover_pending:(fun () ->
           Consensus_pending_commit_recovery.run_with_driver pending driver)
         ~replay_stashed:input.replay_stashed
+        ~replay_pending:input.replay_pending
         ~recovery_pending:input.recovery_pending in
     if not ready then Lwt.return_false
     else
@@ -76,7 +81,8 @@ let health_runtime (input : health_runtime_input) =
         Octra_log.error "consensus"
           "event = pending_commit_recovery action = hold reason = relief_proof error = %s"
           reason;
-        Lwt.return_false
+        Lwt.fail (Consensus_pending_commit_recovery.Store_fault
+          ("relief proof invalid: " ^ reason))
       | Ok () -> Lwt.return_true
   in
   let validator_set = input.validator_set in
@@ -145,12 +151,12 @@ let prepare_votes runtime driver =
     Octra_log.error "consensus"
       "event = pending_vote_restore action = hold reason = store_unreadable error = %s"
       error;
-    false
+    raise (Consensus_pending_commit_recovery.Store_fault error)
   | Error (Record_invalid error) ->
     Octra_log.error "consensus"
       "event = pending_vote_restore action = hold reason = record_invalid error = %s"
       error;
-    false
+    raise (Consensus_pending_commit_recovery.Store_fault error)
   | Ok wires ->
     (match Octra_consensus.C_driver.prepare_vote_log driver (Ok wires) with
      | Ok () -> true
@@ -171,7 +177,7 @@ let prepare_votes runtime driver =
          Octra_log.error "consensus"
            "event = pending_vote_restore action = hold reason = vote_restore_invalid error = %s"
            error;
-         false)
+         raise (Consensus_pending_commit_recovery.Store_fault error))
 
 let health_runtime_of_node (runtime : runtime) =
   let base =
@@ -183,6 +189,7 @@ let health_runtime_of_node (runtime : runtime) =
         health = runtime.health;
         pending = runtime.pending;
         recovery_pending = runtime.recovery_pending;
+        replay_pending = runtime.replay_pending;
         poll_interval = runtime.poll_interval;
         pending_delay = runtime.pending_delay;
         role_label = runtime.role_label;
@@ -215,7 +222,7 @@ let publish slot on_driver driver =
   slot := Some driver;
   on_driver driver
 
-let run runtime =
+let run ?resolve runtime =
   let driver = create_driver runtime in
   Octra_consensus.C_driver.set_validator_set_activation_handler
     driver
@@ -224,6 +231,7 @@ let run runtime =
     driver
     runtime.activate_validator_set_relief;
   Octra_consensus.C_driver.set_finality_proof_handler
+    ?resolve
     driver
     ~needed:runtime.finality_proof_needed
     ~check:runtime.check_finality_proof

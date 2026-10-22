@@ -144,6 +144,7 @@ let node_backend
                     ~epoch_id
                     ~owner_migration_mode
                     ~cipher_mode
+                    ~keyed:(fold_ctx.proof_key = Core.Rule_graph.Active)
                     ~proof_mode:fold_ctx.Octra_core.Epoch_exec.standard_mode
                     ~math:fold_ctx.math
                     ~field_policy:

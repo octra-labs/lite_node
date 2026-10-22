@@ -41,6 +41,50 @@ let publication ~run ~validators (deps : Publish.deps) certificate =
     check "published image has no certificate"
       (Manifest.load_certificate (Sync.snapshot_certificate_path target) |> get = published))
 
+let failures ~run (deps : Publish.deps) certificate =
+  let module Archive = Octra_bootstrap.Sync_archive in
+  Test_workspace.with_dir "sync_failed_capture" (fun root ->
+    let path = Filename.concat root "certificate.json" in
+    let archive = Sync.snapshot_root root in
+    let target = Sync.snapshot_dir root certificate.Manifest.manifest.snapshot_id in
+    let stage = target ^ ".next" in
+    let partial = Filename.concat archive "partial.next" in
+    let signed = Filename.concat archive "signed.next" in
+    let unknown = Filename.concat archive "unknown.next" in
+    let outside = Filename.concat root "outside" in
+    let linked = Filename.concat archive "linked.next" in
+    write path "preserve";
+    get (Archive.run archive (fun owner ->
+      List.iter (fun (id, dir) ->
+        Unix.mkdir dir 0o750;
+        Archive.mark_stage owner id;
+        write (Filename.concat dir "ledger.dat") "preserve")
+        ["partial", partial; "signed", signed];
+      write (Sync.snapshot_certificate_path signed) "{";
+      Unix.mkdir unknown 0o750;
+      write (Filename.concat unknown "ledger.dat") "preserve";
+      Unix.mkdir outside 0o750;
+      write (Filename.concat outside ".writer") "octra-sync-archive-1\n";
+      write (Filename.concat outside "ledger.dat") "preserve";
+      Unix.symlink outside linked));
+    let deps = Publish.{ deps with
+      data_dir = root;
+      certificate_path = (fun () -> path);
+      exporter_set = (fun () ->
+        if Sys.file_exists (Filename.concat stage "ledger.dat") then
+          Error "publisher permission changed"
+        else deps.exporter_set ());
+    } in
+    for _ = 1 to 3 do
+      run deps;
+      check "failed capture retained unsigned image" (not (Sys.file_exists stage));
+      check "failed capture retained old unsigned image" (not (Sys.file_exists partial));
+      check "failed capture changed visible certificate" (read path = "preserve");
+      check "failed capture removed signed retry" (read (Sync.snapshot_certificate_path signed) = "{");
+      check "failed capture removed unknown stage" (read (Filename.concat unknown "ledger.dat") = "preserve");
+      check "failed capture followed directory link" (read (Filename.concat outside "ledger.dat") = "preserve")
+    done)
+
 let stages ~run (deps : Publish.deps) certificate =
   let module Archive = Octra_bootstrap.Sync_archive in
   List.iter (fun mode ->

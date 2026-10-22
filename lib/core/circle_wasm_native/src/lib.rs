@@ -19,8 +19,16 @@ use wasmi::errors::{MemoryError, TableError};
 
 mod deterministic_tensor;
 mod float_ops;
+mod wasm_error;
+mod code_cache;
+mod code_shape;
+use code_cache::*;
 #[cfg(test)]
 mod float_cases;
+#[cfg(test)]
+mod code_cases;
+#[cfg(test)]
+mod shape_cases;
 mod native_bytes;
 mod parse_memory;
 mod reply;
@@ -103,6 +111,7 @@ const HFHE_INVOKE_FUEL: u64 = 2_000_000;
 const PAGE_BYTES: usize = 65536;
 const MAX_INITIAL_PAGES: usize = 512;
 const COMPUTE_MAX_INITIAL_PAGES: usize = 1024;
+const MAX_TABLE_ELEMENTS: u32 = 65_536;
 const SESSION_CACHE_LIMIT: usize = 128;
 const LOCAL_SESSION_BYTES: usize = 128 * 1024 * 1024;
 const SESSION_CACHE_TTL_SECS: f64 = 300.0;
@@ -113,6 +122,7 @@ const Q24_FUEL_SCALE: usize = 64;
 const Q24_CALL_LIMIT: usize = 250_000;
 const Q24_WALL_LIMIT_SECS: u64 = 30;
 const MODULE_CACHE_LIMIT: usize = 32;
+const MODULE_CACHE_BYTES: usize = 48 * 1024 * 1024;
 const MODULE_CACHE_TTL_SECS: f64 = 300.0;
 const STORAGE_CACHE_LIMIT: usize = 16;
 const STORAGE_CACHE_TTL_SECS: f64 = 300.0;
@@ -278,47 +288,220 @@ impl ExecutionProfile {
     }
 }
 
-#[derive(Debug, Deserialize)]
+mod payload {
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    pub(super) struct Payload<'a> {
+        pub(super) action: Option<String>,
+        #[serde(borrow)]
+        pub(super) code_b64: Option<TextRef<'a>>,
+        pub(super) code_cache_key: Option<String>,
+        pub(super) export_name: Option<String>,
+        #[serde(borrow)]
+        pub(super) request_b64: Option<TextRef<'a>>,
+        pub(super) storage_cache_key: Option<String>,
+        pub(super) storage_pairs: Option<Vec<StoragePairJson>>,
+        pub(super) caller: Option<String>,
+        pub(super) address: Option<String>,
+        pub(super) tx_hash: Option<String>,
+        pub(super) current_epoch: Option<i64>,
+        pub(super) hfhe_caps: Option<Vec<String>>,
+        pub(super) hfhe_pubkeys: Option<Vec<HfhePubkeyJson>>,
+        pub(super) hfhe_active_key: Option<HfheActiveKey>,
+        pub(super) hfhe_strict: Option<bool>,
+        pub(super) hfhe_pairs: Option<bool>,
+        pub(super) math: Option<bool>,
+        pub(super) float_mode: Option<bool>,
+        pub(super) hfhe_receipt_mode: Option<String>,
+        pub(super) hfhe_receipt_entries: Option<Vec<HfheReceiptEntryJson>>,
+        pub(super) public_reads: Option<Vec<PublicReadJson>>,
+        pub(super) is_view: Option<bool>,
+        pub(super) update_policy: Option<bool>,
+        pub(super) inspect_policy: Option<bool>,
+        pub(super) fuel_limit: Option<u64>,
+        pub(super) guest_bytes: Option<usize>,
+        pub(super) execution_profile: Option<String>,
+        pub(super) compute_storage_cache_key: Option<String>,
+        pub(super) compute_storage_key: Option<String>,
+        #[serde(borrow)]
+        pub(super) compute_storage_value_b64: Option<TextRef<'a>>,
+        pub(super) compute_storage_root: Option<String>,
+        pub(super) compute_storage_entries: Option<usize>,
+        pub(super) compute_storage_bytes: Option<usize>,
+        pub(super) compute_session_scope: Option<String>,
+        #[serde(default)]
+        pub(super) memory_bytes: Option<usize>,
+    }
+}
+
+use payload::Payload as WirePayload;
+
+#[derive(Debug)]
 struct Payload<'a> {
-    action: Option<String>,
-    #[serde(borrow)]
-    code_b64: Option<TextRef<'a>>,
-    code_cache_key: Option<String>,
-    export_name: Option<String>,
-    #[serde(borrow)]
-    request_b64: Option<TextRef<'a>>,
-    storage_cache_key: Option<String>,
-    storage_pairs: Option<Vec<StoragePairJson>>,
-    caller: Option<String>,
-    address: Option<String>,
-    tx_hash: Option<String>,
-    current_epoch: Option<i64>,
-    hfhe_caps: Option<Vec<String>>,
-    hfhe_pubkeys: Option<Vec<HfhePubkeyJson>>,
-    hfhe_active_key: Option<HfheActiveKey>,
-    hfhe_strict: Option<bool>,
-    hfhe_pairs: Option<bool>,
-    math: Option<bool>,
-    float_mode: Option<bool>,
-    hfhe_receipt_mode: Option<String>,
-    hfhe_receipt_entries: Option<Vec<HfheReceiptEntryJson>>,
-    public_reads: Option<Vec<PublicReadJson>>,
-    is_view: Option<bool>,
-    update_policy: Option<bool>,
-    inspect_policy: Option<bool>,
-    fuel_limit: Option<u64>,
-    guest_bytes: Option<usize>,
-    execution_profile: Option<String>,
-    compute_storage_cache_key: Option<String>,
-    compute_storage_key: Option<String>,
-    #[serde(borrow)]
-    compute_storage_value_b64: Option<TextRef<'a>>,
-    compute_storage_root: Option<String>,
-    compute_storage_entries: Option<usize>,
-    compute_storage_bytes: Option<usize>,
-    compute_session_scope: Option<String>,
-    #[serde(default)]
-    memory_bytes: Option<usize>,
+    wire: WirePayload<'a>,
+    proof_key: Option<bool>,
+    table_limit: Option<bool>,
+    stable_errors: Option<bool>,
+    code_limit: Option<bool>,
+}
+
+impl<'a> std::ops::Deref for Payload<'a> {
+    type Target = WirePayload<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.wire
+    }
+}
+
+impl std::ops::DerefMut for Payload<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.wire
+    }
+}
+
+impl<'de: 'a, 'a> Deserialize<'de> for Payload<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(input: D) -> Result<Self, D::Error> {
+        enum LocalField {
+            ProofKey,
+            TableLimit,
+            StableErrors,
+            CodeLimit,
+        }
+
+        struct Name<'s, S>(&'s mut Option<S>, &'s mut Option<LocalField>);
+
+        impl<'de, S: serde::de::DeserializeSeed<'de>> serde::de::DeserializeSeed<'de> for Name<'_, S> {
+            type Value = Option<S::Value>;
+
+            fn deserialize<D: serde::Deserializer<'de>>(self, input: D)
+                -> Result<Self::Value, D::Error> {
+                input.deserialize_identifier(self)
+            }
+        }
+
+        impl<'de, S: serde::de::DeserializeSeed<'de>> serde::de::Visitor<'de> for Name<'_, S> {
+            type Value = Option<S::Value>;
+
+            fn expecting(&self, out: &mut std::fmt::Formatter) -> std::fmt::Result {
+                out.write_str("field identifier")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, name: &str) -> Result<Self::Value, E> {
+                use serde::de::IntoDeserializer;
+                match name {
+                    "proof_key" => {
+                        *self.1 = Some(LocalField::ProofKey);
+                        Ok(None)
+                    }
+                    "table_limit" => {
+                        *self.1 = Some(LocalField::TableLimit);
+                        Ok(None)
+                    }
+                    "stable_errors" => {
+                        *self.1 = Some(LocalField::StableErrors);
+                        Ok(None)
+                    }
+                    "code_limit" => {
+                        *self.1 = Some(LocalField::CodeLimit);
+                        Ok(None)
+                    }
+                    _ => self.0.take().ok_or_else(|| E::custom("field already decoded"))?
+                        .deserialize(name.into_deserializer()).map(Some),
+                }
+            }
+        }
+
+        struct Fields<'m, M> {
+            map: M,
+            proof: &'m mut Option<Option<bool>>,
+            table: &'m mut Option<Option<bool>>,
+            errors: &'m mut Option<Option<bool>>,
+            code: &'m mut Option<Option<bool>>,
+        }
+
+        impl<'de, M: serde::de::MapAccess<'de>> serde::de::MapAccess<'de> for Fields<'_, M> {
+            type Error = M::Error;
+
+            fn next_key_seed<K: serde::de::DeserializeSeed<'de>>(
+                &mut self, seed: K,
+            ) -> Result<Option<K::Value>, Self::Error> {
+                use serde::de::Error;
+                let mut seed = Some(seed);
+                let mut local = None;
+                while let Some(field) = self.map.next_key_seed(Name(&mut seed, &mut local))? {
+                    if let Some(field) = field {
+                        return Ok(Some(field));
+                    }
+                    match local.take() {
+                        Some(LocalField::ProofKey) => {
+                            if self.proof.is_some() {
+                                return Err(Self::Error::duplicate_field("proof_key"));
+                            }
+                            *self.proof = Some(self.map.next_value()?);
+                        }
+                        Some(LocalField::TableLimit) => {
+                            if self.table.is_some() {
+                                return Err(Self::Error::duplicate_field("table_limit"));
+                            }
+                            *self.table = Some(self.map.next_value()?);
+                        }
+                        Some(LocalField::StableErrors) => {
+                            if self.errors.is_some() {
+                                return Err(Self::Error::duplicate_field("stable_errors"));
+                            }
+                            *self.errors = Some(self.map.next_value()?);
+                        }
+                        Some(LocalField::CodeLimit) => {
+                            if self.code.is_some() {
+                                return Err(Self::Error::duplicate_field("code_limit"));
+                            }
+                            *self.code = Some(self.map.next_value()?);
+                        }
+                        None => return Err(Self::Error::custom("field not decoded")),
+                    }
+                }
+                Ok(None)
+            }
+
+            fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(
+                &mut self, seed: V,
+            ) -> Result<V::Value, Self::Error> {
+                self.map.next_value_seed(seed)
+            }
+        }
+
+        struct Input;
+
+        impl<'de> serde::de::Visitor<'de> for Input {
+            type Value = Payload<'de>;
+
+            fn expecting(&self, out: &mut std::fmt::Formatter) -> std::fmt::Result {
+                out.write_str("struct Payload")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(self, map: M)
+                -> Result<Self::Value, M::Error> {
+                let mut proof = None;
+                let mut table = None;
+                let mut errors = None;
+                let mut code = None;
+                let wire = WirePayload::deserialize(serde::de::value::MapAccessDeserializer::new(
+                    Fields { map, proof: &mut proof, table: &mut table, errors: &mut errors, code: &mut code },
+                ))?;
+                Ok(Payload { wire, proof_key: proof.flatten(), table_limit: table.flatten(),
+                    stable_errors: errors.flatten(), code_limit: code.flatten() })
+            }
+
+            fn visit_seq<S: serde::de::SeqAccess<'de>>(self, seq: S)
+                -> Result<Self::Value, S::Error> {
+                let wire = WirePayload::deserialize(serde::de::value::SeqAccessDeserializer::new(seq))?;
+                Ok(Payload { wire, proof_key: None, table_limit: None, stable_errors: None, code_limit: None })
+            }
+        }
+
+        input.deserialize_any(Input)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -440,6 +623,7 @@ struct HostState {
     hfhe_active_key: Option<HfheActiveKey>,
     hfhe_strict: bool,
     hfhe_pairs: bool,
+    proof_key: bool,
     math: bool,
     hfhe_receipt_mode: String,
     hfhe_receipt_expected: Vec<HfheReceiptEntryJson>,
@@ -627,6 +811,7 @@ struct ModuleCacheEntry {
     exports: Vec<ExportInfoJson>,
     has_update_disabled_imports: bool,
     has_compute_imports: bool,
+    weight: usize,
     updated_at: f64,
 }
 
@@ -1164,13 +1349,13 @@ pub unsafe extern "C" fn octra_compute_lease_hold(
         let payload: Payload = serde_json::from_slice(input)
             .map_err(|_| "compute storage hold input refused".to_owned())?;
         let key = compute_storage_key(&payload)?.to_owned();
-        let root = payload.compute_storage_root
-            .ok_or_else(|| "missing compute storage root".to_owned())?;
-        normalize_hex64(&root, "compute storage root")?;
         let entries = payload.compute_storage_entries
             .ok_or_else(|| "missing compute storage entries".to_owned())?;
         let bytes = payload.compute_storage_bytes
             .ok_or_else(|| "missing compute storage bytes".to_owned())?;
+        let root = payload.wire.compute_storage_root
+            .ok_or_else(|| "missing compute storage root".to_owned())?;
+        normalize_hex64(&root, "compute storage root")?;
         match compute_cache_call(CacheMessage::Hold { key, root, entries, bytes })? {
             CacheReply::Held(id) => {
                 (*port).id = Some(id);
@@ -1336,6 +1521,7 @@ fn session_store(local: bool) -> &'static Mutex<HashMap<String, SessionCacheEntr
 #[derive(Debug)]
 struct SessionOwner {
     modules: Mutex<HashMap<String, ModuleCacheEntry>>,
+    module_build: CodeBuild,
     values: Mutex<HashMap<String, SessionCacheEntry>>,
     tensors: Mutex<HashMap<String, TensorSessionEntry>>,
     fixed: Mutex<HashMap<String, FixedTensorSessionEntry>>,
@@ -1344,7 +1530,8 @@ struct SessionOwner {
 
 impl Default for SessionOwner {
     fn default() -> Self {
-        Self { modules: Mutex::new(HashMap::new()), values: Mutex::new(HashMap::new()), tensors: Mutex::new(HashMap::new()),
+        Self { modules: Mutex::new(HashMap::new()), module_build: Mutex::new(HashMap::new()),
+            values: Mutex::new(HashMap::new()), tensors: Mutex::new(HashMap::new()),
             fixed: Mutex::new(HashMap::new()), pool: compute_memory().child(LOCAL_SESSION_BYTES) }
     }
 }
@@ -1422,13 +1609,11 @@ fn tensor_hold(quota: Option<&Arc<native_bytes::Budget>>, lease: Option<&native_
         .map_err(|reason| HostFailure::Unavailable(reason.to_owned()))
 }
 
-fn shared_engine() -> &'static Engine {
-    static SHARED_ENGINE: OnceLock<Engine> = OnceLock::new();
-    SHARED_ENGINE.get_or_init(|| {
-        let mut config = Config::default();
-        config.consume_fuel(true);
-        Engine::new(&config)
-    })
+fn new_engine() -> Engine {
+    let mut config = Config::default();
+    config.consume_fuel(true);
+    config.set_cached_stacks(0);
+    Engine::new(&config)
 }
 
 fn module_cache() -> &'static Mutex<HashMap<String, ModuleCacheEntry>> {
@@ -1452,6 +1637,7 @@ struct Runtime {
     has_update_disabled_imports: bool,
     update_policy: bool,
     has_compute_imports: bool,
+    code_retained: bool,
 }
 
 #[derive(Debug)]
@@ -1529,6 +1715,7 @@ unsafe fn octra_circle_wasm_host_hfhe_call_json(
     err_ptr: *mut *mut u8,
     err_len: *mut usize,
 ) -> i32 {
+    code_cases::host_wait();
     if !out_ptr.is_null() {
         *out_ptr = std::ptr::null_mut();
     }
@@ -2102,6 +2289,9 @@ fn execute_output(
         "error": error,
         "unavailable": state.unavailable,
     });
+    if !state.is_view {
+        output["code_retained"] = json!(runtime.code_retained);
+    }
     if state.compute_trace.is_some() {
         output["compute_exit"] = json!(code);
         output["compute_fault"] = json!(state.compute_fault);
@@ -2222,58 +2412,15 @@ impl Runtime {
         } else {
             format!("float_prior:{module_key}")
         };
-        let (module, exports, has_update_disabled_imports, has_compute_imports) = {
-            let modules = owner.as_ref().map_or_else(|| module_cache(), |owner| &owner.modules);
-            let mut guard = cache_guard(modules);
-            if owner.is_none() { prune_module_cache_locked(&mut guard); }
-            if let Some(entry) = guard.get_mut(&cache_key) {
-                entry.updated_at = now_secs();
-                (
-                    entry.module.clone(),
-                    entry.exports.clone(),
-                    entry.has_update_disabled_imports,
-                    entry.has_compute_imports,
-                )
-            } else {
-                let code_b64 = code_b64_opt
-                    .ok_or_else(|| format!("missing wasm module cache: {module_key}"))?;
-                let wasm_bytes = decode_b64("code_b64", code_b64)?;
-                let wasm_bytes = if float_mode {
-                    float_ops::prepare(shared_engine(), &wasm_bytes)?
-                } else {
-                    wasm_bytes
-                };
-                let module = Arc::new(
-                    Module::new(shared_engine(), &mut &wasm_bytes[..])
-                        .map_err(|e| format!("wasm compile failed: {e}"))?,
-                );
-                validate_imports(&module)?;
-                let exports = collect_exports(&module);
-                validate_exports(&exports)?;
-                let has_update_disabled_imports = module
-                    .imports()
-                    .any(|entry| UPDATE_DISABLED_IMPORTS.contains(&entry.name()));
-                let has_compute_imports = module
-                    .imports()
-                    .any(|entry| COMPUTE_IMPORTS.contains(&entry.name()));
-                guard.insert(
-                    cache_key,
-                    ModuleCacheEntry {
-                        module: module.clone(),
-                        exports: exports.clone(),
-                        has_update_disabled_imports,
-                        has_compute_imports,
-                        updated_at: now_secs(),
-                    },
-                );
-                (
-                    module,
-                    exports,
-                    has_update_disabled_imports,
-                    has_compute_imports,
-                )
-            }
-        };
+        let cache_key = if payload.code_limit == Some(true) { format!("shape:{cache_key}") } else { cache_key };
+        let modules = owner.as_ref().map_or_else(|| module_cache(), |owner| &owner.modules);
+        let build = owner.as_ref().map_or_else(|| module_build(), |owner| &owner.module_build);
+        let entry = module_entry(modules, build, &cache_key, &module_key, code_b64_opt, float_mode,
+            payload.code_limit == Some(true))?;
+        let module = &entry.module;
+        let exports = entry.exports.clone();
+        let has_update_disabled_imports = entry.has_update_disabled_imports;
+        let has_compute_imports = entry.has_compute_imports;
 
         if calls && (has_update_disabled_imports || has_compute_imports) {
             return Err(HostFailure::Rejected("circle update imports invalid".to_owned()));
@@ -2303,12 +2450,12 @@ impl Runtime {
         }
 
         let mut state = HostState::from_quota(payload, description_only, budget)?;
-        state.session_owner = owner;
+        state.session_owner = owner.clone();
         if state.local_sessions {
             state.guest = Some(compute_memory().take_in(0, state.budget.as_ref())
                 .map_err(|reason| HostFailure::Unavailable(reason.to_owned()))?);
         }
-        let mut store = Store::new(shared_engine(), state);
+        let mut store = Store::new(module.engine(), state);
         if profile == ExecutionProfile::Compute {
             if let Some(scope) = payload.compute_session_scope.as_deref() {
                 normalize_hex64(scope, "compute session scope")?;
@@ -2334,7 +2481,7 @@ impl Runtime {
         }
 
         let prepared: Result<Instance, HostFailure> = (|| {
-            let mut linker = Linker::new(shared_engine());
+            let mut linker = Linker::new(module.engine());
             define_imports(&mut store, &mut linker)?;
             if description_only && payload.inspect_policy.unwrap_or(false) {
                 seal_imports(&module, &mut store, &mut linker)?;
@@ -2342,7 +2489,8 @@ impl Runtime {
             let started = match linker.instantiate(&mut store, &module) {
                 Ok(instance) => instance.start(&mut store)
                     .map_err(|e| format!("wasm start failed: {e}")),
-                Err(error) => Err(format!("wasm instantiate failed: {error}")),
+                Err(error) => Err(format!("wasm instantiate failed: {}",
+                    wasm_error::text(&error, payload.stable_errors == Some(true)))),
             };
             if let Some(reason) = store.data().inspect_error.as_ref() {
                 return Err(HostFailure::Rejected(reason.clone()));
@@ -2377,6 +2525,7 @@ impl Runtime {
                 return Err(error);
             }
         };
+        let code_retained = keep_module(modules, cache_key, (*entry).clone());
         Ok(Self {
             store,
             instance,
@@ -2385,6 +2534,7 @@ impl Runtime {
             has_update_disabled_imports,
             update_policy: payload.update_policy.unwrap_or(false),
             has_compute_imports,
+            code_retained,
         })
     }
 
@@ -2567,14 +2717,17 @@ impl HostState {
             .unwrap_or_else(|| "direct".to_owned());
         let hfhe_receipt_expected = payload.hfhe_receipt_entries.clone().unwrap_or_default();
         validate_hfhe_receipt_input(&hfhe_receipt_mode, &hfhe_receipt_expected)?;
+        let mut limits = StoreLimitsBuilder::new()
+            .memory_size(guest_bytes)
+            .memories(1)
+            .tables(1)
+            .instances(1)
+            .trap_on_grow_failure(true);
+        if payload.table_limit == Some(true) {
+            limits = limits.table_elements(MAX_TABLE_ELEMENTS);
+        }
         Ok(Self {
-            limits: StoreLimitsBuilder::new()
-                .memory_size(guest_bytes)
-                .memories(1)
-                .tables(1)
-                .instances(1)
-                .trap_on_grow_failure(true)
-                .build(),
+            limits: limits.build(),
             guest: None,
             guest_prior: 0,
             execution_profile,
@@ -2588,6 +2741,7 @@ impl HostState {
             hfhe_active_key: payload.hfhe_active_key.clone(),
             hfhe_strict,
             hfhe_pairs: payload.hfhe_pairs.unwrap_or(false),
+            proof_key: payload.proof_key.unwrap_or(false),
             math: payload.math.unwrap_or(false),
             hfhe_receipt_mode,
             hfhe_receipt_expected,
@@ -4545,8 +4699,11 @@ fn prune_fixed_tensor_session_cache_locked(cache: &mut HashMap<String, FixedTens
 fn prune_module_cache_locked(cache: &mut HashMap<String, ModuleCacheEntry>) {
     let now = now_secs();
     cache.retain(|_, entry| now - entry.updated_at <= MODULE_CACHE_TTL_SECS);
-    if cache.len() > MODULE_CACHE_LIMIT {
-        cache.clear();
+    while cache.len() > MODULE_CACHE_LIMIT || module_weight(cache) > MODULE_CACHE_BYTES {
+        let oldest = cache.iter().min_by(|(left_key, left), (right_key, right)|
+            left.updated_at.total_cmp(&right.updated_at).then(left_key.cmp(right_key)))
+            .map(|(key, _)| key.clone());
+        if let Some(key) = oldest { cache.remove(&key); } else { break; }
     }
 }
 
@@ -7642,8 +7799,10 @@ fn hfhe_receipt_hash(domain: &[u8], value: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn hfhe_request_domain(strict: bool) -> &'static [u8] {
-    if strict {
+fn hfhe_request_domain(strict: bool, keyed: bool) -> &'static [u8] {
+    if keyed {
+        b"octra:circle_hfhe_request:proof_key"
+    } else if strict {
         b"octra:circle_hfhe_request:standard:v1"
     } else {
         b"octra:circle_hfhe_request:v1"
@@ -7670,6 +7829,7 @@ fn hfhe_response_bool(response: &[u8]) -> Option<bool> {
 
 fn hfhe_receipt_entry(
     strict: bool,
+    keyed: bool,
     method: &str,
     request: &[u8],
     response: &[u8],
@@ -7684,7 +7844,7 @@ fn hfhe_receipt_entry(
     };
     Ok(HfheReceiptEntryJson {
         method: method.to_owned(),
-        request_hash: hfhe_receipt_hash(hfhe_request_domain(strict), request),
+        request_hash: hfhe_receipt_hash(hfhe_request_domain(strict, keyed), request),
         response_hash: hfhe_receipt_hash(hfhe_response_domain(strict), response),
         result,
     })
@@ -7754,6 +7914,7 @@ fn execute_hfhe_invoke(
     let method = request.method.clone();
     let mode = caller.data().hfhe_receipt_mode.clone();
     let strict = caller.data().hfhe_strict;
+    let keyed = caller.data().proof_key;
     let is_verify = is_hfhe_verify_method(&method);
     let pair = caller.data().hfhe_pairs && matches!(method.as_str(), "fhe_add" | "fhe_sub");
     if (mode == "capture" || (mode == "consume" && pair))
@@ -7779,7 +7940,7 @@ fn execute_hfhe_invoke(
     }
     if mode == "consume" {
         let expected = rejected(expected_hfhe_receipt_entry(caller))?;
-        let request_hash = hfhe_receipt_hash(hfhe_request_domain(strict), req_bytes);
+        let request_hash = hfhe_receipt_hash(hfhe_request_domain(strict, keyed), req_bytes);
         rejected(match_hfhe_receipt_request(
             &expected,
             &method,
@@ -7792,7 +7953,7 @@ fn execute_hfhe_invoke(
                     .ok_or_else(|| "hfhe verifier result missing".to_owned()),
             )?;
             let response = frame_bool(result);
-            let entry = rejected(hfhe_receipt_entry(strict, &method, req_bytes, &response))?;
+            let entry = rejected(hfhe_receipt_entry(strict, keyed, &method, req_bytes, &response))?;
             rejected(consume_hfhe_receipt_entry(caller, entry))?;
             return Ok(response);
         }
@@ -7812,7 +7973,7 @@ fn execute_hfhe_invoke(
         }
         Err(_) => return result,
     };
-    let entry = rejected(hfhe_receipt_entry(strict, &method, req_bytes, response))?;
+    let entry = rejected(hfhe_receipt_entry(strict, keyed, &method, req_bytes, response))?;
     match mode.as_str() {
         "capture" => caller.data_mut().hfhe_receipt_entries.push(entry),
         "consume" => rejected(consume_hfhe_receipt_entry(caller, entry))?,
@@ -8031,6 +8192,7 @@ fn execute_hfhe_direct(
             let proof = rejected(parse_string_param(&params, 2, "proof"))?;
             let value = call_hfhe_backend(json!({
                 "action": "verify_zero",
+                "proof_key": caller.data().proof_key,
                 "pubkey_b64": pubkey_b64,
                 "ciphertext": ciphertext,
                 "proof": proof,
@@ -8046,6 +8208,7 @@ fn execute_hfhe_direct(
             let amount_commitment = rejected(parse_string_param(&params, 3, "amount_commitment"))?;
             let value = call_hfhe_backend(json!({
                 "action": "verify_range",
+                "proof_key": caller.data().proof_key,
                 "pubkey_b64": pubkey_b64,
                 "ciphertext": ciphertext,
                 "proof": proof,
@@ -8063,6 +8226,7 @@ fn execute_hfhe_direct(
             let amount_commitment = rejected(parse_string_param(&params, 3, "amount_commitment"))?;
             let value = call_hfhe_backend(json!({
                 "action": "verify_bound",
+                "proof_key": caller.data().proof_key,
                 "pubkey_b64": pubkey_b64,
                 "ciphertext": ciphertext,
                 "proof": proof,
@@ -8294,13 +8458,101 @@ mod tests {
     use wasm_encoder::{
         BlockType, CodeSection, ConstExpr, DataSection, EntityType, ExportKind,
         ExportSection, Function, FunctionSection, GlobalSection, GlobalType,
-        ImportSection, Instruction as I, MemorySection, MemoryType,
-        Module as WasmModule, StartSection, TypeSection, ValType,
+        HeapType, ImportSection, Instruction as I, MemorySection, MemoryType,
+        Module as WasmModule, RefType, StartSection, TableSection, TableType,
+        TypeSection, ValType,
     };
 
     static INPUT_TEST: Mutex<()> = Mutex::new(());
 
-    fn response_input(local: bool, compute: bool) -> Payload<'static> {
+    pub(super) fn table_input(elements: u64, profile: &str, limit: bool) -> Payload<'static> {
+        table_payload(elements, profile, limit, None)
+    }
+
+    pub(super) fn table_payload(elements: u64, profile: &str, limit: bool,
+        offset: Option<u32>) -> Payload<'static> {
+        let mut module = WasmModule::new();
+        let mut types = TypeSection::new();
+        types.ty().function([ValType::I32], [ValType::I32]);
+        types.ty().function([ValType::I32, ValType::I32], [ValType::I32]);
+        types.ty().function([], [ValType::I32]);
+        module.section(&types);
+        let mut functions = FunctionSection::new();
+        functions.function(0).function(1).function(2);
+        module.section(&functions);
+        let mut tables = TableSection::new();
+        tables.table(TableType {
+            element_type: RefType::FUNCREF,
+            minimum: elements,
+            maximum: None,
+            table64: false,
+            shared: false,
+        });
+        module.section(&tables);
+        let mut memory = MemorySection::new();
+        memory.memory(MemoryType {
+            minimum: 1, maximum: Some(1), memory64: false,
+            shared: false, page_size_log2: None,
+        });
+        module.section(&memory);
+        let mut exports = ExportSection::new();
+        exports.export("memory", ExportKind::Memory, 0);
+        exports.export("octra_alloc", ExportKind::Func, 0);
+        exports.export("octra_query", ExportKind::Func, 1);
+        exports.export("grow", ExportKind::Func, 2);
+        module.section(&exports);
+        if let Some(offset) = offset {
+            let mut section = wasm_encoder::ElementSection::new();
+            section.active(None, &ConstExpr::i32_const(offset as i32),
+                wasm_encoder::Elements::Functions(std::borrow::Cow::Borrowed(&[0])));
+            module.section(&section);
+        }
+        let mut code = CodeSection::new();
+        for _ in 0..2 {
+            let mut function = Function::new([]);
+            function.instruction(&I::I32Const(0)).instruction(&I::End);
+            code.function(&function);
+        }
+        let mut grow = Function::new([]);
+        grow.instruction(&I::RefNull(HeapType::FUNC))
+            .instruction(&I::I32Const(1))
+            .instruction(&I::TableGrow(0))
+            .instruction(&I::End);
+        code.function(&grow);
+        module.section(&code);
+        Payload::deserialize(json!({
+            "code_b64": encode_b64(&module.finish()),
+            "execution_profile": profile,
+            "is_view": true,
+            "hfhe_strict": false,
+            "fuel_limit": 100_000,
+            "table_limit": limit,
+            "stable_errors": limit,
+        })).unwrap()
+    }
+
+    #[test]
+    fn table_create_cap() {
+        let _guard = cache_test();
+        for profile in ["standard", "manifest", "compute"] {
+            assert!(run_describe(&table_input(16_384, profile, true)).is_ok());
+            assert!(run_describe(&table_input(65_536, profile, true)).is_ok());
+            assert!(run_describe(&table_input(65_537, profile, true)).is_err());
+            assert!(run_describe(&table_input(u32::MAX as u64, profile, true)).is_err());
+            assert!(run_describe(&table_input(65_537, profile, false)).is_ok());
+        }
+    }
+
+    #[test]
+    fn table_grow_cap() {
+        let _guard = cache_test();
+        let mut runtime = Runtime::instantiate(&table_input(65_535, "standard", true), false).unwrap();
+        let grow = runtime.instance.get_typed_func::<(), i32>(&runtime.store, "grow").unwrap();
+        assert_eq!(grow.call(&mut runtime.store, ()).unwrap(), 65_535);
+        assert!(grow.call(&mut runtime.store, ()).is_err());
+    }
+
+    pub(super) fn response_input(local: bool, compute: bool) -> Payload<'static> {
         let mut module = WasmModule::new();
         let mut types = TypeSection::new();
         types.ty().function([ValType::I32, ValType::I32], [ValType::I32]);
@@ -9262,6 +9514,9 @@ mod tests {
         for input in &inputs {
             let parsed = serde_json::from_str::<Payload>(input)
                 .map(|_| "ok".to_owned()).unwrap_or_else(|error| error.to_string());
+            let prior = serde_json::from_str::<WirePayload>(input)
+                .map(|_| "ok".to_owned()).unwrap_or_else(|error| error.to_string());
+            assert_eq!(parsed, prior, "input = {input}");
             let json = run_json(input.as_ptr(), input.len()).unwrap_err().to_string();
             let (built, held, called) = unsafe {
                 let mut output = std::ptr::null_mut();
@@ -9412,6 +9667,7 @@ mod tests {
         let key = "6".repeat(64);
         let port = octra_compute_build_new();
         unsafe { assert_eq!(octra_compute_build_begin(port, key.as_ptr(), key.len()), 0); }
+        let token = unsafe { (*port).token().unwrap() };
         for escaped in [false, true] {
             let text = if escaped { "\\u0061".repeat(8193) } else { "a".repeat(8193) };
             let input = format!(r#"{{"action":"unknown","address":"{text}"}}"#);
@@ -9425,6 +9681,7 @@ mod tests {
             assert_eq!(compute_memory().used(), baseline);
         }
         unsafe { octra_compute_build_close(port); octra_compute_build_release(port); }
+        build_released(&token);
         assert_eq!(compute_memory().used(), baseline);
     }
 
@@ -9435,6 +9692,7 @@ mod tests {
         let key = "6".repeat(64);
         let port = octra_compute_build_new();
         unsafe { assert_eq!(octra_compute_build_begin(port, key.as_ptr(), key.len()), 0); }
+        let token = unsafe { (*port).token().unwrap() };
         for input in ["{", r#"{"address":"\uD800"}"#, r#"{"hfhe_caps":["a",false]}"#] {
             assert_eq!(build_parse(port as usize, input),
                 (1, "compute storage input refused".to_owned()));
@@ -9452,6 +9710,7 @@ mod tests {
             octra_compute_build_close(port);
             octra_compute_build_release(port);
         }
+        build_released(&token);
         assert_eq!(compute_memory().used(), baseline);
     }
 
@@ -9471,11 +9730,11 @@ mod tests {
             let input = fields.to_string();
             let memory = payload_memory(input.as_bytes()).unwrap();
             let parsed: Payload = serde_json::from_str(&input).unwrap();
-            let bytes = parsed.storage_pairs.unwrap().capacity() * std::mem::size_of::<StoragePairJson>()
-                + parsed.hfhe_caps.unwrap().capacity() * std::mem::size_of::<String>()
-                + parsed.hfhe_pubkeys.unwrap().capacity() * std::mem::size_of::<HfhePubkeyJson>()
-                + parsed.hfhe_receipt_entries.unwrap().capacity() * std::mem::size_of::<HfheReceiptEntryJson>()
-                + parsed.public_reads.unwrap().capacity() * std::mem::size_of::<PublicReadJson>();
+            let bytes = parsed.storage_pairs.as_ref().unwrap().capacity() * std::mem::size_of::<StoragePairJson>()
+                + parsed.hfhe_caps.as_ref().unwrap().capacity() * std::mem::size_of::<String>()
+                + parsed.hfhe_pubkeys.as_ref().unwrap().capacity() * std::mem::size_of::<HfhePubkeyJson>()
+                + parsed.hfhe_receipt_entries.as_ref().unwrap().capacity() * std::mem::size_of::<HfheReceiptEntryJson>()
+                + parsed.public_reads.as_ref().unwrap().capacity() * std::mem::size_of::<PublicReadJson>();
             assert!(memory.size() >= bytes + input.len() * 4);
         }
     }
@@ -9560,6 +9819,9 @@ mod tests {
         for input in &inputs {
             let parsed = serde_json::from_str::<Payload>(input)
                 .map(|_| "ok".to_owned()).unwrap_or_else(|error| error.to_string());
+            let prior = serde_json::from_str::<WirePayload>(input)
+                .map(|_| "ok".to_owned()).unwrap_or_else(|error| error.to_string());
+            assert_eq!(parsed, prior, "input = {input}");
             let ordinary = run_json(input.as_ptr(), input.len()).unwrap_err().to_string();
             let session = unsafe {
                 let port = call_step::octra_circle_call_new();
@@ -10150,7 +10412,7 @@ mod tests {
     #[test]
     fn storage_ffi_modes() {
         let _guard = cache_test();
-        let code = read_module("standard", true, false, false).code_b64.unwrap();
+        let code = read_module("standard", true, false, false).wire.code_b64.unwrap();
         let resident = compute_memory().used();
         let held = compute_memory().take(COMPUTE_STORAGE_RESIDENT_LIMIT - resident).unwrap();
         for action in ["validate", "describe", "execute"] {
@@ -14166,12 +14428,13 @@ mod tests {
     #[test]
     fn invoke_read_receipts() {
         let _guard = cache_test();
-        for mode in ["capture", "consume"] {
+        for (mode, keyed) in [("capture", false), ("capture", true), ("consume", false), ("consume", true)] {
             let (mut input, request) = invoke_input(true, "standard", false, true, "abcd");
             let other = state_request("fhe_load_pk", &["owner", "extra"]);
             let expected = frame_string("abcd");
-            let entry = hfhe_receipt_entry(false, "fhe_load_pk", &request, &expected).unwrap();
-            let changed = hfhe_receipt_entry(false, "fhe_load_pk", &other, &expected).unwrap();
+            let entry = hfhe_receipt_entry(false, keyed, "fhe_load_pk", &request, &expected).unwrap();
+            let changed = hfhe_receipt_entry(false, keyed, "fhe_load_pk", &other, &expected).unwrap();
+            input.proof_key = Some(keyed);
             input.hfhe_receipt_mode = Some(mode.to_owned());
             if mode == "consume" {
                 input.hfhe_receipt_entries = Some(vec![entry.clone(), entry.clone(), changed.clone(), entry.clone()]);
@@ -15572,11 +15835,12 @@ mod tests {
         let _guard = cache_test();
         let input: Payload =
             Payload::deserialize(session_module(InspectStage::Unused)).unwrap();
+        let engine = new_engine();
         let mut store = Store::new(
-            shared_engine(),
+            &engine,
             HostState::from_payload(&input, true).unwrap(),
         );
-        let mut linker = Linker::new(shared_engine());
+        let mut linker = Linker::new(&engine);
         define_imports(&mut store, &mut linker).unwrap();
         let names: BTreeSet<_> = ALLOWED_IMPORTS.iter().copied()
             .filter(|name| inspect_import(name))
@@ -15599,7 +15863,7 @@ mod tests {
         }
         module.section(&types).section(&imports);
         let bytes = module.finish();
-        let module = Module::new(shared_engine(), &mut bytes.as_slice()).unwrap();
+        let module = Module::new(&engine, &mut bytes.as_slice()).unwrap();
         seal_imports(&module, &mut store, &mut linker).unwrap();
         for name in names {
             store.data_mut().inspect_error = None;
@@ -15775,6 +16039,54 @@ mod tests {
     }
 
     #[test]
+    fn proof_field_memory() {
+        let _guard = cache_test();
+        for name in ["a".repeat(2 * 1024 * 1024), "\\u0061".repeat(512 * 1024)] {
+            let input = format!("{{\"{name}\":null,\"proof_key\":true}}");
+            let (_, prior) = native_bytes::tests::large_allocs(1024 * 1024,
+                || serde_json::from_str::<WirePayload>(&input).unwrap());
+            let (payload, current) = native_bytes::tests::large_allocs(1024 * 1024,
+                || serde_json::from_str::<Payload>(&input).unwrap());
+            assert_eq!(current, prior);
+            assert_eq!(payload.proof_key, Some(true));
+        }
+    }
+
+    #[test]
+    fn proof_mode() {
+        for (field, mode) in [("", None), (",\"proof_key\":null", None),
+            (",\"proof_key\":false", Some(false)), (",\"proof_key\":true", Some(true)),
+            (",\"proof_\\u006bey\":true", Some(true))] {
+            let text = format!("{{\"is_view\":true,\"hfhe_strict\":true{field}}}");
+            let payload: Payload = serde_json::from_str(&text).unwrap();
+            assert_eq!(payload.proof_key, mode);
+            assert_eq!(HostState::from_payload(&payload, false).unwrap().proof_key,
+                mode.unwrap_or(false));
+        }
+        for field in ["1", "\"true\"", "[]", "{}"] {
+            let text = format!("{{\"proof_key\":{field}}}");
+            assert!(serde_json::from_str::<Payload>(&text).is_err());
+        }
+        for text in [r#"{"proof_key":true,"proof_key":false}"#,
+            r#"{"proof_key":null,"proof_\u006bey":true}"#] {
+            assert!(serde_json::from_str::<Payload>(text).unwrap_err().to_string()
+                .contains("duplicate field `proof_key`"));
+        }
+        let text = r#"{"proof_key":true,"code_b64":"YWJj","request_b64":"ZGVm"}"#;
+        let payload: Payload = serde_json::from_str(text).unwrap();
+        assert!(matches!(&payload.code_b64.as_ref().unwrap().0, Cow::Borrowed(_)));
+        assert!(matches!(&payload.request_b64.as_ref().unwrap().0, Cow::Borrowed(_)));
+        assert_eq!(payload.proof_key, Some(true));
+        let value = json!({"proof_key": true, "is_view": true});
+        assert!(Payload::deserialize(value).unwrap().proof_key.unwrap());
+        for len in [34, 35] {
+            let payload = Payload::deserialize(JsonValue::Array(vec![JsonValue::Null; len])).unwrap();
+            assert_eq!(payload.proof_key, None);
+        }
+        assert!(Payload::deserialize(JsonValue::Array(vec![JsonValue::Null; 36])).is_err());
+    }
+
+    #[test]
     fn math_mode() {
         for math in [false, true] {
             let payload: Payload = Payload::deserialize(json!({
@@ -15912,15 +16224,19 @@ mod tests {
 
     #[test]
     fn receipt_mode_domains() {
-        let prior = hfhe_receipt_entry(false, "fhe_verify_bound", &[1], &frame_bool(true))
+        let prior = hfhe_receipt_entry(false, false, "fhe_verify_bound", &[1], &frame_bool(true))
             .expect("prior receipt failed");
-        let active = hfhe_receipt_entry(true, "fhe_verify_bound", &[1], &frame_bool(true))
+        let active = hfhe_receipt_entry(true, false, "fhe_verify_bound", &[1], &frame_bool(true))
             .expect("active receipt failed");
         assert_eq!(
             prior.request_hash,
             "a8624ddf6ccf2769976891fdf5102bdf43a6d8c6aff2f6140804d7a40168f213"
         );
         assert_ne!(prior.request_hash, active.request_hash);
+        let keyed = hfhe_receipt_entry(true, true, "fhe_verify_bound", &[1], &frame_bool(true))
+            .expect("keyed receipt failed");
+        assert_ne!(active.request_hash, keyed.request_hash);
+        assert!(match_hfhe_receipt_request(&active, "fhe_verify_bound", &keyed.request_hash).is_err());
         assert_ne!(prior.response_hash, active.response_hash);
         assert!(
             match_hfhe_receipt_request(&prior, "fhe_verify_bound", &active.request_hash).is_err()

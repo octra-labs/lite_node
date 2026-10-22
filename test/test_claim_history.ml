@@ -19,7 +19,7 @@ module Anchor = Octra_bootstrap.Sync_anchor
 module F = Octra_consensus.C_types
 module Hash = Octra_consensus.C_hash
 module Sum = Octra_core.Claim_sum
-module Admission = Octra_core.Pvac_migration_admission
+module Records = Octra_core.Pvac_migration_check
 module Replay = Octra_core.Pvac_legacy_public_replay
 
 let check name valid =
@@ -48,7 +48,7 @@ let set name value = function
 
 let key pk =
   let blob = Bytes.to_string (P.serialize_pubkey pk) in
-  H.{blob; hash = Octra_core.Pvac_registry.full_key_hash blob; math = false}
+  H.{blob; hash = Octra_core.Pvac_registry.full_key_hash blob; math = false; keyed = false}
 
 let identity seed =
   let secret = Bytes.to_string (bytes seed) in
@@ -74,9 +74,14 @@ let chain_id = "octra-devnet-9871-cluster"
 let digest value = Digestif.SHA256.(digest_string value |> to_hex)
 let raw value = Digestif.SHA256.(of_hex value |> to_raw_string)
 
-let members ?(encoded = false) (wallet : Octra_core.Crypto.Wallet.t) =
-  let pubkey = if encoded then wallet.pub else Base64.decode_exn wallet.pub in
-  F.make_validator_set [F.{address = wallet.address; pubkey}]
+let members ?(encoded = false) ?(weighted = false) (wallet : Octra_core.Crypto.Wallet.t) =
+  if weighted then
+    let member = F.{address = wallet.address; pubkey = Base64.decode_exn wallet.pub} in
+    let set = F.make_weighted_validator_set [member, Z.of_int 1_000_000] |> unwrap in
+    if encoded then Anchor.encoded_validator_set set |> unwrap else set
+  else
+    let pubkey = if encoded then wallet.pub else Base64.decode_exn wallet.pub in
+    F.make_validator_set [F.{address = wallet.address; pubkey}]
 
 let finalized ?(version = F.proto_version_current) ?(txs = []) ?(receipts = [])
     wallet parent (pin : R.pin) =
@@ -100,12 +105,13 @@ let finalized ?(version = F.proto_version_current) ?(txs = []) ?(receipts = [])
   F.{chain_id; epoch_id = header.epoch_id; commit_round = 0; header;
     proposal_id; precommits = [vote]; parent_commit = parent}
 
-let parent wallet finalize = F.{
-  certificate = F.certificate_of_finalize finalize; validator_set = members wallet;
+let parent ?(weighted = false) wallet finalize = F.{
+  certificate = F.certificate_of_finalize finalize; validator_set = members ~weighted wallet;
 }
 
-let certificate ?(config_hash = digest "claim-history-config") wallet finalize ledger_root index_root =
-  let set = members wallet in
+let certificate ?(config_hash = digest "claim-history-config") ?(weighted = false)
+    wallet finalize ledger_root index_root =
+  let set = members ~weighted wallet in
   let checkpoint = CP.{
     chain_id; epoch = finalize.F.epoch_id;
     state_root = CP.raw_to_hex finalize.header.proposed_state_root;
@@ -132,10 +138,32 @@ let certificate ?(config_hash = digest "claim-history-config") wallet finalize l
     authority = Finalized (Anchor.make ~steps:[] ~finalize ~validator_set:set |> Anchor.encode)}
 
 let chain_read ?(first_epoch = 0) ?(max_epochs = 2)
-    ?(config_hash = digest "claim-history-config") wallet certificate read_finality =
+    ?(config_hash = digest "claim-history-config") ?(weighted = false)
+    wallet certificate read_finality =
   Chain.read ~chain_id ~config_hash
-    ~validator_set:(members ~encoded:true wallet) ~exporter_set:(members ~encoded:true wallet)
+    ~validator_set:(members ~encoded:true ~weighted wallet)
+    ~exporter_set:(members ~encoded:true ~weighted wallet)
     ~certificate ~first_epoch ~max_epochs ~read_finality
+
+let test_read_budget () =
+  let ledger_root = String.make 128 'a' in
+  let index_root = E.genesis_root in
+  let state_root = E.folded_state_root ~ledger_state_root:ledger_root ~epoch_index_root:index_root in
+  let pin = R.{epoch = 0; state_root; index_root; next_txid = 1L} in
+  let initial = finalized sender_wallet None pin in
+  let head = finalized receiver_wallet (Some (parent sender_wallet initial))
+    {pin with epoch = 2_004_440} in
+  let reads = ref 0 in
+  let read _ = incr reads; Error "archive read reached" in
+  let check_budget weighted =
+    let cert = certificate ~weighted receiver_wallet head ledger_root pin.index_root in
+    chain_read ~first_epoch:1_504_440 ~max_epochs:500_001 ~weighted
+      receiver_wallet cert read in
+  rejected "history requires stake weights" "finality qc quorum" (check_budget false);
+  check "invalid certificate read archive" (!reads = 0);
+  rejected "history budget is explicit" "archive read reached" (check_budget true);
+  check "history budget reached archive once" (!reads = 1);
+  Printf.printf "event = claim_history phase = read_budget status = pass\n%!"
 
 let journal_case () =
   let module Journal = Octra_node_runtime.Consensus_finality_journal in
@@ -153,10 +181,10 @@ let journal_case () =
        | Journal.Valid item -> item.finalize = record
        | _ -> false))
 
-let chain_rules () =
+let chain_rules plan policy ~weighted =
   let rules = Octra_core.Rule_graph.create ~chain_id
     ~root_at:(fun _ -> Octra_core.Rule_graph.Missing) in
-  let plan = Octra_core.Rule_graph.math_activation rules |> Option.get in
+  let plan : Octra_core.Rule_graph.activation = plan rules |> Option.get in
   let first_epoch = plan.anchor_epoch in
   let count = plan.activation_epoch - first_epoch + 2 in
   let ledger = String.make 128 'a' in
@@ -169,24 +197,25 @@ let chain_rules () =
     for offset = 1 to count - 1 do
       let prior_wallet = if offset = 1 then sender_wallet else receiver_wallet in
       records.(offset) <- finalized receiver_wallet
-        (Some (parent prior_wallet records.(offset - 1)))
+        (Some (parent ~weighted prior_wallet records.(offset - 1)))
         R.{epoch = first_epoch + offset; state_root; index_root = index; next_txid = 1L}
     done;
-    let cert = certificate receiver_wallet records.(count - 1) ledger index in
-    chain_read ~first_epoch ~max_epochs:count receiver_wallet cert (fun epoch ->
+    let cert = certificate ~weighted receiver_wallet records.(count - 1) ledger index in
+    chain_read ~weighted ~first_epoch ~max_epochs:count receiver_wallet cert (fun epoch ->
       let offset = Int64.to_int epoch - first_epoch in
       if offset < 0 || offset >= count then Error "history gap"
       else Ok records.(offset)) |> unwrap
   in
   let chain = build plan.anchor_state_root in
-  check "math before activation"
-    (Chain.math chain ~epoch:(plan.activation_epoch - 1) = Ok false);
-  check "math at activation"
-    (Chain.math chain ~epoch:plan.activation_epoch = Ok true);
-  check "math after activation"
-    (Chain.math chain ~epoch:(plan.activation_epoch + 1) = Ok true);
+  check "history rule before activation"
+    (policy chain ~epoch:(plan.activation_epoch - 1) = Ok false);
+  check "history rule at activation"
+    (policy chain ~epoch:plan.activation_epoch = Ok true);
+  check "history rule after activation"
+    (policy chain ~epoch:(plan.activation_epoch + 1) = Ok true);
+  refused "history epoch not authenticated" (policy chain ~epoch:(first_epoch - 1));
   let altered = build (digest "different-anchor") in
-  refused "math anchor differs" (Chain.math altered ~epoch:plan.activation_epoch);
+  refused "history rule anchor differs" (policy altered ~epoch:plan.activation_epoch);
   Printf.printf "event = claim_history phase = chain_rules status = pass\n%!"
 
 let tx ?(nonce = 1) ?(amount = Z.zero) from to_ op_type payload =
@@ -230,9 +259,9 @@ let material () =
     delta_cipher = FB.encode_cipher delta;
     commitment = b64 (P.commit_ct pk delta);
     range_proof_delta = FB.encode_bound_range_proof
-      (P.make_zero_proof_bound_range pk sk delta 7L (bytes '\007'));
+      (P.make_zero_proof_bound_range ~keyed:false pk sk delta 7L (bytes '\007'));
     range_proof_balance = FB.encode_bound_range_proof
-      (P.make_zero_proof_bound_range pk sk balance 93L (bytes '\015'));
+      (P.make_zero_proof_bound_range ~keyed:false pk sk balance 93L (bytes '\015'));
     eph_pub = b64 (bytes '\010');
     stealth_tag = String.make 32 'a';
     enc_amount = b64 (Bytes.make 68 '\011');
@@ -240,7 +269,7 @@ let material () =
       (SA.compute_claim_pub (Bytes.to_string secret) receiver);
     amount_commitment = b64 (P.pedersen_commit_amount 7L blind);
     send_zero_proof = FB.encode_zero_proof
-      (P.make_zero_proof_bound pk sk delta 7L blind);
+      (P.make_zero_proof_bound ~keyed:false pk sk delta 7L blind);
   } in
   let receipt = SC.{
     version = 5;
@@ -249,7 +278,7 @@ let material () =
     commitment = b64 (P.commit_ct rpk cipher);
     claim_secret = hex secret;
     zero_proof = FB.encode_zero_proof
-      (P.make_zero_proof_bound rpk rsk cipher 7L blind);
+      (P.make_zero_proof_bound ~keyed:false rpk rsk cipher 7L blind);
   } in
   let public pk sk amount seed =
     let cipher = P.enc_value_seeded pk sk amount (bytes seed) in
@@ -258,14 +287,14 @@ let material () =
       "cipher", `String (FB.encode_cipher cipher);
       "amount_commitment", `String (b64 (P.pedersen_commit_amount amount blinding));
       "zero_proof", `String (FB.encode_zero_proof
-        (P.make_zero_proof_bound pk sk cipher amount blinding));
+        (P.make_zero_proof_bound ~keyed:false pk sk cipher amount blinding));
       "blinding", `String (b64 blinding);
     ] in
   let _, deposit = public pk sk 100L '\022' in
   let delta, withdraw = public rpk rsk 4L '\023' in
   let remaining = P.ct_sub rpk cipher delta in
   let withdraw = set "range_proof_balance" (`String (FB.encode_bound_range_proof
-    (P.make_zero_proof_bound_range rpk rsk remaining 3L (bytes '\025')))) withdraw in
+    (P.make_zero_proof_bound_range ~keyed:false rpk rsk remaining 3L (bytes '\025')))) withdraw in
   key pk, key rpk, transfer, receipt, deposit, withdraw
 
 let amount_case sender_key receiver_key deposit withdraw =
@@ -460,13 +489,7 @@ let chain_case store archive before after transfer =
   let cert = certificate receiver_wallet head view.state_root after.index_root in
   let chain = chain_read ~first_epoch:late.epoch ~max_epochs:1 receiver_wallet cert
     (fun _ -> failwith "unexpected read") |> unwrap in
-  refused "math anchor missing" (Chain.math chain ~epoch:late.epoch);
-  let later = {after with epoch = 2_004_440} in
-  let head = finalized receiver_wallet (Some (parent sender_wallet initial)) later in
-  let cert = certificate receiver_wallet head view.state_root after.index_root in
-  let probe = chain_read ~first_epoch:1_504_440 ~max_epochs:500_001
-    receiver_wallet cert (fun _ -> Error "archive read reached") in
-  check "history budget is explicit" (probe = Error "archive read reached")
+  refused "math anchor missing" (Chain.math chain ~epoch:late.epoch)
 
 let archive_case mode sender_key receiver_key transfer receipt =
   Test_workspace.with_dir "claim_history" (fun dir ->
@@ -483,24 +506,24 @@ let archive_case mode sender_key receiver_key transfer receipt =
       else
       let epoch = unwrap (read ()) in
       if mode = Bad_key then
-        refused "key endpoint differs" (R.key epoch ~address:sender ~index:1L ~math:false)
+        refused "key endpoint differs" (R.key epoch ~keyed:false ~address:sender ~index:1L ~math:false)
       else if mode = Prior_output then
         rejected "pre-existing output id" "history output existed before creation epoch"
           (R.verify ~send:epoch ~claim:epoch ~send_index:1L ~claim_index:4L
-            ~sender_math:false ~receiver_math:false)
+            ~sender_keyed:false ~receiver_keyed:false ~sender_math:false ~receiver_math:false)
       else begin
       check "current key differs from send"
         (Lwt_main.run (S.get_pvac_pubkey store sender) = Some receiver_key.H.blob);
-      let at address index = unwrap (R.key epoch ~address ~index ~math:false) in
+      let at address index = unwrap (R.key epoch ~keyed:false ~address ~index ~math:false) in
       check "send key before rotation" ((at sender 0L).hash = receiver_key.H.hash);
       check "send key at operation" ((at sender 1L).hash = sender_key.H.hash);
       check "send key restored" ((at sender 3L).hash = receiver_key.hash);
       check "receiver key at operation" ((at receiver 4L).hash = receiver_key.hash);
       check "receiver key before switch" ((at receiver 3L).hash = sender_key.hash);
-      refused "index outside epoch" (R.key epoch ~address:sender ~index:6L ~math:false);
-      refused "missing registration" (R.key epoch ~address:"octMissing" ~index:1L ~math:false);
+      refused "index outside epoch" (R.key epoch ~keyed:false ~address:sender ~index:6L ~math:false);
+      refused "missing registration" (R.key epoch ~keyed:false ~address:"octMissing" ~index:1L ~math:false);
       let result = R.verify ~send:epoch ~claim:epoch ~send_index:1L ~claim_index:4L
-        ~sender_math:false ~receiver_math:false |> unwrap in
+        ~sender_keyed:false ~receiver_keyed:false ~sender_math:false ~receiver_math:false |> unwrap in
       check "disk receipt point" (result.commitment = transfer.PT.amount_commitment);
       chain_case store archive before after transfer;
       refused "history cap" (read ~max_txs:5 ());
@@ -516,11 +539,11 @@ let archive_case mode sender_key receiver_key transfer receipt =
       Fun.protect ~finally:(fun () ->
         if Sys.file_exists path then Unix.unlink path;
         Unix.rename held path) (fun () ->
-          refused "missing key blob" (R.key epoch ~address:sender ~index:1L ~math:false);
+          refused "missing key blob" (R.key epoch ~keyed:false ~address:sender ~index:1L ~math:false);
           let channel = open_out_bin path in
           Fun.protect ~finally:(fun () -> close_out_noerr channel)
             (fun () -> output_string channel "PVAC altered key");
-          refused "corrupt key blob" (R.key epoch ~address:sender ~index:1L ~math:false));
+          refused "corrupt key blob" (R.key epoch ~keyed:false ~address:sender ~index:1L ~math:false));
       check "key read recovery" ((at sender 1L).hash = sender_key.hash)
       end
     ))
@@ -653,55 +676,55 @@ let interval_write dir mode sender_key receiver_key transfer receipt deposit wit
     let last = save third 4 [] (fun () -> ()) in
     [initial; first; second; third; last], final_cipher)
 
-let admission_case chain result cipher =
-  let artifact = Chain.admission chain ~activation_epoch:5 [result] |> unwrap in
-  check "admission snapshot" (Admission.snapshot_epoch artifact = Some result.Chain.last_epoch);
-  check "admission state root" (Admission.state_root artifact = Some result.state_root);
-  let decision = Admission.decision artifact ~epoch:5 ~address:receiver ~cipher in
+let check_case chain result cipher =
+  let artifact = Chain.check chain ~activation_epoch:5 [result] |> unwrap in
+  check "record snapshot" (Records.snapshot_epoch artifact = Some result.Chain.last_epoch);
+  check "record state root" (Records.state_root artifact = Some result.state_root);
+  let decision = Records.decision artifact ~epoch:5 ~address:receiver ~cipher in
   check "incoming receipt admitted"
     (decision.audit_class = Replay.Hidden_witness
      && decision.commitment_net = Some result.sum.commitment);
-  check "no public entitlement"
+  check "no public migration record"
     (not decision.can_public_migrate && decision.public_net = None);
-  let entry = Admission.lookup artifact ~epoch:5 ~address:receiver ~cipher in
+  let entry = Records.lookup artifact ~epoch:5 ~address:receiver ~cipher in
   check "account record count" (match entry with Ok item -> item.total = 2 | _ -> false);
   check "activation required"
-    (Admission.lookup artifact ~epoch:4 ~address:receiver ~cipher = Error Admission.Not_active);
+    (Records.lookup artifact ~epoch:4 ~address:receiver ~cipher = Error Records.Not_active);
   check "source cipher required"
-    (Admission.lookup artifact ~epoch:5 ~address:receiver ~cipher:"other"
-     = Error Admission.Cipher_mismatch);
-  refused "admission duplicate address"
-    (Chain.admission chain ~activation_epoch:5 [result; result]);
-  refused "admission precedes snapshot"
-    (Chain.admission chain ~activation_epoch:result.last_epoch [result]);
-  rejected "admission empty" "history admission has no accounts"
-    (Chain.admission chain ~activation_epoch:5 []);
-  Test_workspace.with_dir "claim_admission" (fun dir ->
-    let path = Admission.state_path dir in
+    (Records.lookup artifact ~epoch:5 ~address:receiver ~cipher:"other"
+     = Error Records.Cipher_mismatch);
+  refused "record duplicate address"
+    (Chain.check chain ~activation_epoch:5 [result; result]);
+  refused "record precedes snapshot"
+    (Chain.check chain ~activation_epoch:result.last_epoch [result]);
+  rejected "record empty" "history admission has no accounts"
+    (Chain.check chain ~activation_epoch:5 []);
+  Test_workspace.with_dir "claim_records" (fun dir ->
+    let path = Records.state_path dir in
     Unix.mkdir (Filename.dirname path) 0o700;
-    let json = Admission.to_yojson artifact |> unwrap in
+    let json = Records.to_yojson artifact |> unwrap in
     check "receipt classifier" (Yojson.Safe.Util.member "classifier" json = `String "receipt_v1");
     let channel = open_out_bin path in
     Fun.protect ~finally:(fun () -> close_out channel)
       (fun () -> output_string channel (Yojson.Safe.to_string json));
-    let load root = Admission.load_env ~chain_id ~data_dir:dir
+    let load root = Records.load_env ~chain_id ~data_dir:dir
       ~getenv:(function "OCTRA_PVAC_MIGRATION_ROOT" -> Some root | _ -> None) in
-    let restored = load (Option.get (Admission.root artifact)) |> unwrap in
-    check "admission reload" (Admission.decision restored ~epoch:5 ~address:receiver ~cipher = decision);
-    refused "admission unpinned root" (load (digest "other-root"));
-    refused "admission wrong snapshot"
-      (Admission.bind_snapshot restored (fun _ -> Ok (digest "other-state")));
-    ignore (Admission.bind_snapshot restored (fun _ -> Ok result.state_root) |> unwrap));
+    let restored = load (Option.get (Records.root artifact)) |> unwrap in
+    check "record reload" (Records.decision restored ~epoch:5 ~address:receiver ~cipher = decision);
+    refused "record unpinned root" (load (digest "other-root"));
+    refused "record wrong snapshot"
+      (Records.bind_snapshot restored (fun _ -> Ok (digest "other-state")));
+    ignore (Records.bind_snapshot restored (fun _ -> Ok result.state_root) |> unwrap));
   decision
 
-let admission_proof result receiver_key =
+let check_proof result receiver_key =
   let pk, sk = P.keygen_from_seed (P.default_params ()) (bytes '\002') in
   let pk_blob = Bytes.to_string (P.serialize_pubkey pk) in
   check "proof key" (pk_blob = receiver_key.H.blob);
   let verify amount commitment =
     let cipher = P.enc_value_seeded pk sk amount (bytes '\029') in
-    let proof = P.make_zero_proof_bound pk sk cipher amount (bytes '\003') in
-    Octra_core.Pvac_verify_worker.verify_claim_sync ~math:false ~strict:true
+    let proof = P.make_zero_proof_bound ~keyed:false pk sk cipher amount (bytes '\003') in
+    Octra_core.Pvac_verify_worker.verify_claim_sync ~keyed:false ~math:false ~strict:true
       ~pubkey:pk_blob ~cipher:(FB.encode_cipher cipher)
       ~proof:(FB.encode_zero_proof proof) ~commitment in
   let commitment = Option.get result.Replay.commitment_net in
@@ -759,30 +782,30 @@ let interval_case mode sender_key receiver_key transfer receipt deposit withdraw
       let rows = R.fold current ~init:[] ~f:(fun rows item _ ->
         Ok (Yojson.Safe.from_string item.H.json :: rows)) |> unwrap |> List.rev in
       let raw = Replay.replay_history ~addr:receiver rows in
-      check "raw negative subtotal is not entitlement"
+      check "raw negative subtotal has no migration record"
         (raw.audit_class = Replay.Poisoned && raw.commitment_net = None);
-      let audit = admission_case chain result cipher in
-      admission_proof audit receiver_key;
+      let audit = check_case chain result cipher in
+      check_proof audit receiver_key;
       persist_journal dir records;
       check "interval amount point"
         (result.sum.commitment = b64 (P.pedersen_commit_amount 3L (bytes '\003')));
       check "interval rejected records excluded"
         (result.sum.records = 4 && result.sum.changes = 2 && result.sum.received = 1);
       check "interval final cipher"
-        (result.source_cipher_hash = Octra_core.Pvac_migration_admission.source_cipher_hash cipher);
+        (result.source_cipher_hash = Octra_core.Pvac_migration_check.source_cipher_hash cipher);
       let suffix = total ~first_epoch:1 ~max_records:2 () |> unwrap in
       check "source before empty starting state"
         (suffix.sum.commitment = result.sum.commitment && suffix.sum.records = 2);
       let sender_total = total ~address:sender ~last_epoch:1 ~max_records:2 () |> unwrap in
-      rejected "admission mixes epochs" "history admission checkpoint differs"
-        (Chain.admission chain ~activation_epoch:5 [result; sender_total]);
+      rejected "record mixes epochs" "history admission checkpoint differs"
+        (Chain.check chain ~activation_epoch:5 [result; sender_total]);
       let config_hash = digest "other-config" in
       let other_cert = certificate ~config_hash sender_wallet records.(4) view.state_root
         (List.nth pins 4).R.index_root in
       let other_chain = chain_read ~max_epochs:5 ~config_hash sender_wallet other_cert
         (fun epoch -> Ok records.(Int64.to_int epoch)) |> unwrap in
-      rejected "admission mixes networks" "history admission network differs"
-        (Chain.admission other_chain ~activation_epoch:5 [result]);
+      rejected "record mixes networks" "history admission network differs"
+        (Chain.check other_chain ~activation_epoch:5 [result]);
       let index_root = digest "other-index" in
       let state_root = E.folded_state_root ~ledger_state_root:view.state_root ~epoch_index_root:index_root in
       let changed = {(List.nth pins 2) with R.state_root; index_root} in
@@ -791,8 +814,8 @@ let interval_case mode sender_key receiver_key transfer receipt deposit withdraw
       let cert = certificate sender_wallet final view.state_root index_root in
       let other = chain_read ~max_epochs:3 sender_wallet cert
         (fun epoch -> Ok records.(Int64.to_int epoch)) |> unwrap in
-      rejected "admission mixes roots" "history admission checkpoint differs"
-        (Chain.admission other ~activation_epoch:5 [result]);
+      rejected "record mixes roots" "history admission checkpoint differs"
+        (Chain.check other ~activation_epoch:5 [result]);
       check "interval unclaimed sender debit" (sender_total.sum.commitment =
         b64 (P.pedersen_sub (P.pedersen_commit_amount 100L (bytes '\000'))
           (Bytes.of_string (Base64.decode_exn transfer.PT.amount_commitment))));
@@ -875,18 +898,18 @@ let execution_case sender_key receiver_key transfer receipt deposit withdraw =
           ~validator_policy:(Octra_core.Validator_policy.of_env_exn (fun _ -> None))
           store ledger in
         let checked = List.map (fun tx ->
-          match run (W.run ~math:false ~field_policy:Octra_core.Private_ledger.Unique_fields
+          match run (W.run ~keyed:false ~math:false ~field_policy:Octra_core.Private_ledger.Unique_fields
             ~strict:true ~ledger tx) with
           | W.Ready receipt -> receipt
           | W.Defer reason | W.Skip reason -> failwith reason) txs.(epoch) in
         receipts.(epoch) <- W.json_of_receipts checked;
         let preverify = Octra_core.Preverify_commit.create checked in
-        let transition = Private.create ~math:false ~preverify:(Some preverify) ~ledger
+        let transition = Private.create ~keyed:false ~math:false ~preverify:(Some preverify) ~ledger
           ~epoch_id:epoch ~owner_migration_mode:G.Prior ~proof_mode:G.Active
           ~cipher_mode:G.Prior
           ~field_policy:Octra_core.Private_ledger.Unique_fields
           ~result_policy:Octra_core.Private_result_policy.Recoverable
-          ~legacy_replay:(Admission.decision (Admission.disabled ~chain_id))
+          ~legacy_replay:(Records.decision (Records.disabled ~chain_id))
           ~limits:Private.{max_fhe = 1; max_stealth = 1} in
         let env : X.env = {chain_id; epoch_id = epoch; proposer_addr = sender;
           validator_addrs = [sender]; validator_pubkeys = [];
@@ -946,20 +969,26 @@ let execution_case sender_key receiver_key transfer receipt deposit withdraw =
         exporter_set = members ~encoded:true sender_wallet; first_epoch = 0;
         activation_epoch = 5; addresses = [receiver]; max_epochs = 5; max_txs = 1; max_records = 4} in
       let artifact = Build.read request |> unwrap in
-      let decision = Admission.decision artifact ~epoch:5 ~address:receiver ~cipher in
-      check "execution admission point" (decision.commitment_net = Some expected);
-      check "execution admission no public mint"
+      let decision = Records.decision artifact ~epoch:5 ~address:receiver ~cipher in
+      check "execution record point" (decision.commitment_net = Some expected);
+      check "execution record no public mint"
         (decision.public_net = None && not decision.can_public_migrate);
-      admission_proof decision receiver_key;
+      check_proof decision receiver_key;
       Array.iteri (fun index record ->
         match Journal.read_committed_epoch ~chain_id ~epoch:(Int64.of_int index) dir with
         | Journal.Valid item -> check "execution journal" (item.finalize = record)
         | _ -> failwith "execution journal missing") records));
   Printf.printf "event = claim_history phase = execution status = pass\n%!"
 
+let check_rules () =
+  chain_rules Octra_core.Rule_graph.math_activation Chain.math ~weighted:false;
+  chain_rules (fun _ -> Octra_core.Rule_graph.proof_key_activation_for_chain chain_id)
+    Chain.proof_key ~weighted:true
+
 let run () =
+  test_read_budget ();
   journal_case ();
-  chain_rules ();
+  check_rules ();
   let sender_key, receiver_key, transfer, receipt, deposit, withdraw = material () in
   execution_case sender_key receiver_key transfer receipt deposit withdraw;
   amount_case sender_key receiver_key deposit withdraw;
@@ -1078,4 +1107,8 @@ let run () =
     [Valid; Prior_output; Bad_amount];
   Printf.printf "status = pass test = claim_history\n%!"
 
-let () = run ()
+let () = match Sys.argv with
+  | [|_; "--budget"|] -> test_read_budget ()
+  | [|_; "--rules"|] -> check_rules ()
+  | [|_|] -> run ()
+  | _ -> failwith "unexpected arguments"

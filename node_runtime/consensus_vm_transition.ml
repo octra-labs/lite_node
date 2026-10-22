@@ -38,11 +38,25 @@ let inspect_mode backend env =
   | Ok fold -> fold.vm_bytes
   | Error reason -> raise (Policy_unavailable reason)
 
+let tree_hash root =
+  match String.length root with
+  | 32 -> root
+  | 64 | 128 ->
+    if not (String.for_all (function
+      | '0'..'9' | 'a'..'f' | 'A'..'F' -> true
+      | _ -> false) root) then
+      raise (Policy_unavailable "previous state root is invalid");
+    begin match Digestif.SHA256.of_hex_opt (String.sub root 0 64) with
+    | Some hash -> Digestif.SHA256.to_raw_string hash
+    | None -> raise (Policy_unavailable "previous state root is invalid")
+    end
+  | _ -> raise (Policy_unavailable "previous state root is invalid")
+
 let context ~program_trust ~object_cost backend env
     (tx : Transaction.t) effects tx_hash =
-  let fhe_work, wasm_float, proof_exec, vm_bytes =
+  let fhe_work, wasm_float, proof_exec, proof_key, vm_bytes =
     match backend.Epoch_exec.fold env.Epoch_exec.epoch_id with
-    | Ok fold -> fold.fhe_work, fold.wasm_float, fold.proof_exec, fold.vm_bytes
+    | Ok fold -> fold.fhe_work, fold.wasm_float, fold.proof_exec, fold.proof_key, fold.vm_bytes
     | Error reason -> raise (Policy_unavailable reason) in
   Vm.make_live_contract_ctx
     {
@@ -54,6 +68,7 @@ let context ~program_trust ~object_cost backend env
       proof_mode = backend.proof_mode;
       fhe_work;
       proof_exec;
+      proof_key;
       vm_bytes;
       wasm_float;
       math = backend.math;
@@ -63,12 +78,12 @@ let context ~program_trust ~object_cost backend env
         (match Octra_consensus.Epoch_time.of_seconds env.epoch_ts with
          | Ok value -> value
          | Error _ -> 0L);
-      tree_hash = env.prev_state_root;
+      tree_hash = tree_hash env.prev_state_root;
       node_id = tx.Transaction.to_;
       tx_hash;
     }
 
-let wasm_admission_profile = function
+let wasm_check_profile = function
   | Rule_graph.Prior -> Octra_core.Circle_wasm_host.Standard
   | Rule_graph.Active -> Octra_core.Circle_wasm_host.Manifest
 
@@ -216,12 +231,18 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
         | Error reason -> Lwt.fail (Policy_unavailable reason)
         | Ok fold ->
           Vm.prepare_program_package
+            ~records:fold.program_records
             ~proof_exec:fold.proof_exec
             ~preview:fold.fhe_work
             ~overlap:fold.program_overlap
             ~program_mode:fold.program_mode
             ~point_ops:(backend.proof_mode = Rule_graph.Active)
             current);
+      program_record = (fun current package ->
+        match backend.fold env.Epoch_exec.epoch_id with
+        | Error reason -> raise (Policy_unavailable reason)
+        | Ok fold -> Vm.stage_program_record ~mode:fold.program_records
+          ~journal:(Tx_effects.program effects) current package);
       ensure_account = (fun address ->
         match Tx_effects.ensure_account effects address with
         | Ok () -> ()
@@ -283,10 +304,14 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
           ~method_name:call.Call_plan.method_name
           result.Circle_exec.receipt);
       circle_commit = (fun current result ->
+        let table_mode = match backend.fold env.Epoch_exec.epoch_id with
+          | Ok fold -> fold.proof_key
+          | Error reason -> raise (Policy_unavailable reason) in
         Circle_exec.commit_call_result
           ~inspect_mode:(inspect_mode backend env)
-          ~deployment_profile:(wasm_admission_profile wasm_compute_mode)
+          ~deployment_profile:(wasm_check_profile wasm_compute_mode)
           ~float_mode:(float_mode backend env)
+          ~table_mode
           ~proof_mode:backend.proof_mode
           backend.store
           current.to_
@@ -342,7 +367,11 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
         let* () =
           match tx.op_type with
           | Transaction.ContractUpgrade ->
+            let records = match backend.fold env.epoch_id with
+              | Ok fold -> fold.program_records
+              | Error reason -> raise (Policy_unavailable reason) in
             Vm.run_program_upgrade_tx
+              ~records
               runtime
               ~trusted_program_keys:program_trust
               ~program_journal:(Tx_effects.program effects)
@@ -534,7 +563,7 @@ let process_tx ?preverify ?save_receipt_raw ~backend
   | Transaction.CircleDeploy ->
     let open Lwt.Syntax in
     let* admitted =
-      Consensus_circle_code_admission.admit
+      Consensus_circle_code_check.admit
         ~resource_errors:((Epoch_exec.fold_at backend env.epoch_id).proof_exec = Rule_graph.Active)
         ~store:backend.Epoch_exec.store
         ~program_trust
@@ -547,11 +576,12 @@ let process_tx ?preverify ?save_receipt_raw ~backend
       | Ok () ->
         let* result =
           Epoch_exec.process_circle_deploy_tx
+            ~table_mode:(Epoch_exec.fold_at backend env.epoch_id).proof_key
             ~inspect_mode:(inspect_mode backend env)
             ~calls:(match backend.fold env.Epoch_exec.epoch_id with
               | Ok fold -> fold.proof_exec = Rule_graph.Active
               | Error reason -> raise (Policy_unavailable reason))
-            ~wasm_profile:(wasm_admission_profile wasm_compute_mode)
+            ~wasm_profile:(wasm_check_profile wasm_compute_mode)
             ~float_mode:(float_mode backend env)
             ~backend
             tx in
@@ -561,7 +591,7 @@ let process_tx ?preverify ?save_receipt_raw ~backend
   | Transaction.CircleProgramUpdate ->
     let open Lwt.Syntax in
     let* admitted =
-      Consensus_circle_code_admission.admit
+      Consensus_circle_code_check.admit
         ~resource_errors:((Epoch_exec.fold_at backend env.epoch_id).proof_exec = Rule_graph.Active)
         ~store:backend.Epoch_exec.store
         ~program_trust
@@ -574,11 +604,12 @@ let process_tx ?preverify ?save_receipt_raw ~backend
       | Ok () ->
         let* result =
           Epoch_exec.process_circle_program_update_tx
+            ~table_mode:(Epoch_exec.fold_at backend env.epoch_id).proof_key
             ~inspect_mode:(inspect_mode backend env)
             ~calls:(match backend.fold env.Epoch_exec.epoch_id with
               | Ok fold -> fold.proof_exec = Rule_graph.Active
               | Error reason -> raise (Policy_unavailable reason))
-            ~wasm_profile:(wasm_admission_profile wasm_compute_mode)
+            ~wasm_profile:(wasm_check_profile wasm_compute_mode)
             ~float_mode:(float_mode backend env)
             ~backend
             tx in
@@ -591,7 +622,7 @@ let process_tx ?preverify ?save_receipt_raw ~backend
     let open Lwt.Syntax in
     let* result =
       Epoch_exec.process_standard_tx_with_wasm_profile
-        ~wasm_profile:(wasm_admission_profile wasm_compute_mode)
+        ~wasm_profile:(wasm_check_profile wasm_compute_mode)
         ~backend
         ~env
         tx in

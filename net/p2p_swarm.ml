@@ -62,9 +62,14 @@ type t = {
   mutable generation : unit ref;
   mutable listener : unit Lwt.t option;
   mutable pending : (unit ref * unit Lwt.t) list;
+  mutable accepting : P2p_accept.slot list;
+  mutable resolved : (string * string list * float) list;
+  bootstrap : P2p_endpoint.t list;
+  eviction_key : string;
 }
 
 let max_observer_peers = 8
+let max_accepts = P2p_accept.limit
 let max_record_dials = 4
 let record_retry_s = 30.0
 let connect_wait_s = 10.0
@@ -101,6 +106,10 @@ let create config =
     generation = ref ();
     listener = None;
     pending = [];
+    accepting = [];
+    resolved = [];
+    bootstrap = P2p_endpoint.bootstrap config.bootstrap_peers;
+    eviction_key = Mirage_crypto_rng_unix.getrandom 32;
   }
 
 let config_hash t = t.active_hash
@@ -138,7 +147,7 @@ let peer_ids t =
   |> List.sort String.compare
 
 let peer_scores t =
-  P2p_peer_guard.snapshot t.peer_guard
+  P2p_peer_guard.snapshot ~now:(Unix.gettimeofday ()) t.peer_guard
 
 let relayed_record_stats t =
   let rejections =
@@ -186,6 +195,42 @@ let local_accepts_observers t =
   Option.is_some t.validator_pubkeys
   && local_is_validator t
 
+let record_keys t =
+  Option.value ~default:t.config.allowed_pubkeys t.validator_pubkeys
+
+let handshake_keys t =
+  let observers = Hashtbl.fold (fun id conn count ->
+    if P2p_conn.is_connected conn && peer_role t id = Observer then count + 1
+    else count) t.peers 0 in
+  if local_accepts_observers t && observers < max_observer_peers then []
+  else record_keys t
+
+let dial_keys t =
+  if not (local_accepts_observers t) then record_keys t
+  else match t.config.allowed_pubkeys with
+    | [] -> []
+    | keys -> List.sort_uniq String.compare (keys @ record_keys t)
+
+let peer_capacity ~max_peers ~validator_count ~observer_count = function
+  | Validator -> validator_count < max_peers
+  | Observer -> observer_count < max_observer_peers
+
+let peer_plan rows =
+  let kept, removed = List.partition (fun (_, _, live) -> live) rows in
+  List.map (fun (id, role, _) -> id, role) kept,
+  List.map (fun (id, _, _) -> id) removed
+
+let peer_replace ~node ~full ~role rows =
+  if not full || role <> Validator then None
+  else
+    let rank id = Digestif.SHA256.(to_raw_string (digest_string (node ^ id))) in
+    rows
+    |> List.filter (fun (_, kind, live) -> kind = Observer && live)
+    |> List.sort (fun (a, _, _) (b, _, _) ->
+      let order = String.compare (rank a) (rank b) in
+      if order = 0 then String.compare a b else order)
+    |> function (id, _, _) :: _ -> Some id | [] -> None
+
 let set_validator_pubkeys t pubkeys =
   if pubkeys = [] then
     Error "active validator public keys are empty"
@@ -197,10 +242,16 @@ let set_validator_pubkeys t pubkeys =
     Ok ()
   else begin
     t.validator_pubkeys <- Some pubkeys;
-    Hashtbl.iter
-      (fun peer_id conn ->
-        P2p_conn.set_peer_class conn (frame_peer_class (peer_role t peer_id)))
-      t.peers;
+    let rows = Hashtbl.fold (fun id conn rows ->
+      (id, peer_role t id, P2p_conn.is_connected conn) :: rows) t.peers [] in
+    let kept, removed = peer_plan rows in
+    List.iter (fun (id, role) ->
+      P2p_conn.set_peer_class (Hashtbl.find t.peers id) (frame_peer_class role)) kept;
+    List.iter (fun id ->
+      let conn = Hashtbl.find t.peers id in
+      Hashtbl.remove t.peers id;
+      Hashtbl.remove t.profiles id;
+      Lwt.async (fun () -> P2p_conn.close conn)) removed;
     P2p_peer_registry.clear t.registry;
     Hashtbl.clear t.record_due;
     Ok ()
@@ -219,10 +270,6 @@ let role_count t role =
 let validator_count t = role_count t Validator
 
 let observer_count t = role_count t Observer
-
-let peer_capacity ~max_peers ~validator_count ~observer_count = function
-  | Validator -> validator_count < max_peers
-  | Observer -> observer_count < max_observer_peers
 
 let has_role_capacity t role =
   peer_capacity
@@ -351,37 +398,43 @@ let add_peer t ~generation (conn : P2p_conn.t) hello =
     Lwt.async (fun () -> P2p_conn.close conn);
     false
   end
-  else match Hashtbl.find_opt t.peers peer_id with
+  else
+    let role = peer_role t peer_id in
+    let existing = Hashtbl.find_opt t.peers peer_id in
+    let live = Option.fold ~none:false ~some:P2p_conn.is_connected existing in
+    let full = connected_count t >= t.config.max_peers + max_observer_peers in
+    let replaced = if live then None else peer_replace ~node:t.eviction_key ~full ~role
+      (Hashtbl.fold (fun id peer rows ->
+        (id, peer_role t id, P2p_conn.is_connected peer) :: rows) t.peers []) in
+    if (role = Observer && not (local_accepts_observers t))
+        || (not live && (not (has_role_capacity t role)
+            || (full && replaced = None))) then begin
+      Lwt.async (fun () -> P2p_conn.close conn);
+      false
+    end else match existing with
     | Some existing when P2p_conn.is_connected existing ->
       if is_preferred t existing || not (is_preferred t conn) then begin
         Lwt.async (fun () -> P2p_conn.close conn);
         false
       end else begin
         Lwt.async (fun () -> P2p_conn.close existing);
+        P2p_conn.set_peer_class conn (frame_peer_class role);
         Hashtbl.replace t.peers peer_id conn;
         set_profile t hello;
         note_peer t conn;
         true
       end
-    | Some _dead ->
+    | Some _ | None ->
+      Option.iter (fun id ->
+        let prior = Hashtbl.find t.peers id in
+        Hashtbl.remove t.peers id;
+        Hashtbl.remove t.profiles id;
+        Lwt.async (fun () -> P2p_conn.close prior)) replaced;
+      P2p_conn.set_peer_class conn (frame_peer_class role);
       Hashtbl.replace t.peers peer_id conn;
       set_profile t hello;
       note_peer t conn;
       true
-    | None ->
-      let role = peer_role t peer_id in
-      if role = Observer && not (local_accepts_observers t) then begin
-        Lwt.async (fun () -> P2p_conn.close conn);
-        false
-      end else if not (has_role_capacity t role) then begin
-        Lwt.async (fun () -> P2p_conn.close conn);
-        false
-      end else begin
-        Hashtbl.replace t.peers peer_id conn;
-        set_profile t hello;
-        note_peer t conn;
-        true
-      end
 
 let remove_peer t peer_id =
   (match Hashtbl.find_opt t.peers peer_id with
@@ -534,7 +587,7 @@ let accept_record t r =
     ?binary_hash
     ~chain_id:t.config.chain_id
     ~config_hash:t.active_hash
-    ~allowed_pubkeys:t.config.allowed_pubkeys
+    ~allowed_pubkeys:(record_keys t)
     r
   with
   | P2p_peer_record.Invalid reason -> Error reason
@@ -562,6 +615,47 @@ let track t run =
     t.pending <- (token, Lwt.map (fun _ -> ()) task) :: t.pending;
   task
 
+let bootstrap_endpoints t =
+  t.bootstrap
+
+let known_name t host =
+  List.exists (fun (endpoint : P2p_endpoint.t) -> endpoint.host = host)
+    (bootstrap_endpoints t)
+  || (try ignore (Unix.inet_addr_of_string host);
+       Option.is_some (P2p_peer_registry.host_key ~now:(Unix.gettimeofday ())
+         ~host ~keys:(record_keys t) t.registry)
+      with Failure _ -> false)
+
+let resolve t host port =
+  let open Lwt.Syntax in
+  let generation = t.generation in
+  let* addrs = Lwt_unix.with_timeout connect_wait_s (fun () ->
+    Lwt_unix.getaddrinfo host (string_of_int port)
+      [Unix.AI_FAMILY Unix.PF_INET; Unix.AI_SOCKTYPE Unix.SOCK_STREAM]) in
+  if t.running && generation == t.generation && known_name t host then begin
+    let now = Unix.gettimeofday () in
+    let ips = List.filter_map (fun ai -> match ai.Unix.ai_addr with
+      | Unix.ADDR_INET (ip, _) -> Some (Unix.string_of_inet_addr ip)
+      | _ -> None) addrs |> List.sort_uniq String.compare
+      |> List.filteri (fun index _ -> index < 16) in
+    let retained = List.filter (fun (name, _, until) ->
+      name <> host && until > now && known_name t name) t.resolved
+      |> List.filteri (fun index _ -> index < 127) in
+    t.resolved <- (host, ips, now +. 60.) :: retained
+  end;
+  Lwt.return addrs
+
+let host_grant t host =
+  let now = Unix.gettimeofday () in
+  let boot = List.find_opt (fun (endpoint : P2p_endpoint.t) ->
+    endpoint.host = host || List.exists (fun (name, ips, until) ->
+      List.mem host ips && until > now && name = endpoint.host) t.resolved) t.bootstrap in
+  match P2p_peer_registry.host_key ~now ~host ~keys:(record_keys t) t.registry with
+  | Some id -> Some ("peer:" ^ id)
+  | None -> Option.map (fun (endpoint : P2p_endpoint.t) -> "boot:" ^ endpoint.host) boot
+
+let known_host t host = Option.is_some (host_grant t host)
+
 let dial t host port = track t (fun () ->
   let open Lwt.Syntax in
   let generation = t.generation in
@@ -572,8 +666,7 @@ let dial t host port = track t (fun () ->
   let fd_ref = ref None in
   Lwt.catch
     (fun () ->
-      let* addrs = Lwt_unix.getaddrinfo host (string_of_int port)
-        [Unix.AI_FAMILY Unix.PF_INET; Unix.AI_SOCKTYPE Unix.SOCK_STREAM] in
+      let* addrs = resolve t host port in
       match addrs with
       | [] ->
         Lwt.return_none
@@ -586,7 +679,7 @@ let dial t host port = track t (fun () ->
         in
         let my_hello = make_my_hello t in
         let* hs_result = P2p_handshake.dial_handshake fd ~my_hello
-          ~allowed_pubkeys:t.config.allowed_pubkeys ~sign_fn:t.config.sign_fn in
+          ~allowed_pubkeys:(dial_keys t) ~sign_fn:t.config.sign_fn in
         match hs_result with
         | P2p_handshake.Error reason ->
           err_node t.config.node_addr
@@ -756,44 +849,57 @@ let handle_frame t user_handler conn frame =
   else
     user_handler conn frame
 
-let bootstrap_endpoints t =
-  P2p_endpoint.bootstrap t.config.bootstrap_peers
-
-let accept t fd addr =
+let accept ?(clock = P2p_conn.monotonic_seconds) t fd addr =
   let open Lwt.Syntax in
+  let key, net = P2p_accept.address addr in
+  let grant = host_grant t key in
+  let known = Option.is_some grant in
+  let started = Unix.gettimeofday () in
+  let began = clock () in
+  let grant = match grant with
+    | Some value when P2p_peer_guard.holding t.peer_guard ~now:started ~key:("grant:" ^ value) -> None
+    | value -> value in
+  let grant = P2p_accept.select grant t.accepting in
+  let verdict = if not t.running then P2p_peer_guard.Drop "stopped" else
+    match P2p_peer_guard.admit_conn ~known t.peer_guard ~now:started ~key with
+    | P2p_peer_guard.Drop _ as verdict -> verdict
+    | Accept ->
+      if not (has_inbound_capacity t) then Drop "peer_capacity"
+      else if not (P2p_accept.room ~grant ~host:key ~net t.accepting) then Drop "handshake_capacity"
+      else Accept in
+  if verdict <> P2p_peer_guard.Accept then begin
+    (match verdict with
+     | Drop reason when known && t.running ->
+       Option.iter (fun count -> err_node t.config.node_addr
+         "event = handshake_refused host = %s reason = %s count = %d" key reason count)
+         (P2p_peer_guard.note_drop t.peer_guard ~now:started ~key ~reason)
+     | _ -> ());
+    Lwt.async (fun () -> close_socket fd)
+  end
+  else begin
+  let slot = ref () in
+  t.accepting <- P2p_accept.{ token = slot; host = key; net; grant } :: t.accepting;
   let generation = t.generation in
   let owned = ref true in
   Lwt.async (fun () -> track t (fun () -> Lwt.finalize
     (fun () -> Lwt.catch
       (fun () ->
-        let key = P2p_peer_guard.unix_key addr in
-        match P2p_peer_guard.admit_conn t.peer_guard
-          ~now:(Unix.gettimeofday ()) ~key with
-        | P2p_peer_guard.Drop reason ->
-          err_node t.config.node_addr
-            "event = inbound_peer_rejected key = %s reason = %s"
-            key reason;
-          (try Lwt_unix.close fd |> ignore; Lwt.return_unit with _ -> Lwt.return_unit)
-        | P2p_peer_guard.Accept ->
-        if not (has_inbound_capacity t) then begin
-          err_node t.config.node_addr
-            "event = inbound_peer_rejected key = %s reason = peer_capacity"
-            key;
-          (try Lwt_unix.close fd |> ignore; Lwt.return_unit with _ -> Lwt.return_unit)
-        end else
         let my_hello = make_my_hello t in
-        let allowed_pubkeys =
-          if local_accepts_observers t then [] else t.config.allowed_pubkeys
-        in
-        let* hs_result = P2p_handshake.accept_handshake fd ~my_hello
-          ~allowed_pubkeys ~sign_fn:t.config.sign_fn in
+        let* hs_result = Lwt.catch
+          (fun () -> Lwt_unix.with_timeout P2p_accept.wait_s (fun () ->
+            P2p_handshake.accept_handshake fd ~my_hello
+              ~allowed_pubkeys:(handshake_keys t) ~sign_fn:t.config.sign_fn))
+          (function
+            | Lwt_unix.Timeout -> Lwt.return (P2p_handshake.Error "handshake timeout")
+            | error -> Lwt.fail error) in
         match hs_result with
         | P2p_handshake.Error reason ->
           (match P2p_peer_guard.handshake_penalty reason with
            | None -> ()
-           | Some penalty ->
+           | Some penalty when t.running && generation == t.generation ->
              ignore (P2p_peer_guard.report_bad t.peer_guard
-               ~now:(Unix.gettimeofday ()) ~key ~reason:penalty));
+               ~now:(Unix.gettimeofday ()) ~key ~reason:penalty)
+           | Some _ -> ());
           (try Lwt_unix.close fd |> ignore; Lwt.return_unit with _ -> Lwt.return_unit)
         | P2p_handshake.Ok peer_hello ->
           let peer_id = peer_hello.node_id in
@@ -824,7 +930,17 @@ let accept t fd addr =
           end)
       (fun _exn ->
         Lwt.return_unit))
-    (fun () -> if !owned then close_socket fd else Lwt.return_unit)))
+    (fun () ->
+      if t.running && generation == t.generation then begin
+        let now = Unix.gettimeofday () in
+        let held_s = clock () -. began in
+        P2p_peer_guard.report_hold t.peer_guard ~now ~key ~held_s;
+        Option.iter (fun grant ->
+          P2p_peer_guard.report_hold t.peer_guard ~now ~key:("grant:" ^ grant) ~held_s) grant
+      end;
+      t.accepting <- P2p_accept.release slot t.accepting;
+      if !owned then close_socket fd else Lwt.return_unit)))
+  end
 
 let listen ?(take = fun fd -> Lwt_unix.accept ~cloexec:true fd)
     ?(sleep = Lwt_unix.sleep) ?socket t =
@@ -887,6 +1003,7 @@ let stop t =
   let open Lwt.Syntax in
   t.running <- false;
   t.generation <- ref ();
+  t.resolved <- [];
   let listener = t.listener in
   t.listener <- None;
   let* () = match listener with

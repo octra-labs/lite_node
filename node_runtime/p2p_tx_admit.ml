@@ -30,7 +30,7 @@ let admit ?(duty = None) ?(bft_mode = false) ~now ~max_drift ~sender_pk tx =
   if not (addr_valid tx) then Invalid_address
   else
     match
-      Tx_view.payload_size_admission
+      Tx_view.payload_size_check
         ~limits:Tx_view.payload_limits
         tx
     with
@@ -42,6 +42,6 @@ let admit ?(duty = None) ?(bft_mode = false) ~now ~max_drift ~sender_pk tx =
         Timestamp_drift drift
       else if not (sig_valid tx sender_pk) then Invalid_signature
       else
-        match Tx_view.payload_admission ~limits:Tx_view.payload_limits tx with
+        match Tx_view.payload_check ~limits:Tx_view.payload_limits tx with
         | Error _ -> Invalid_payload
         | Ok () -> Accept

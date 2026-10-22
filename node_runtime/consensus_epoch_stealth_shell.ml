@@ -10,6 +10,7 @@ type deps = {
   nonce : int;
   strict : bool;
   math : bool;
+  keyed : bool;
   stealth_count : int;
   max_stealth_per_epoch : int;
   max_stealth_defer : int;
@@ -20,7 +21,7 @@ type deps = {
   defer_count : string -> int;
   set_defer_count : string -> int -> unit;
   clear_defer_count : string -> unit;
-  preverify_state : string -> Preverify_cache.state;
+  preverify_state : keyed:bool -> math:bool -> string -> Preverify_cache.state;
   preverify_remove : string -> unit;
   preverify_ready :
     string ->
@@ -55,6 +56,7 @@ type deps = {
 type tx_deps = {
   strict : bool;
   math : bool;
+  keyed : bool;
   stealth_count : int;
   max_stealth_per_epoch : int;
   max_stealth_defer : int;
@@ -64,7 +66,7 @@ type tx_deps = {
   defer_count : string -> int;
   set_defer_count : string -> int -> unit;
   clear_defer_count : string -> unit;
-  preverify_state : string -> Preverify_cache.state;
+  preverify_state : keyed:bool -> math:bool -> string -> Preverify_cache.state;
   preverify_remove : string -> unit;
   preverify_ready :
     string ->
@@ -117,6 +119,7 @@ type gate_deps = {
 type live_tx_args = {
   strict : bool;
   math : bool;
+  keyed : bool;
   stealth_count : int;
   max_stealth_per_epoch : int;
   max_stealth_defer : int;
@@ -164,6 +167,7 @@ type live_ledger_tx_args = {
   field_policy : Private_ledger.field_policy;
   strict : bool;
   math : bool;
+  keyed : bool;
   current_epoch : unit -> int;
   private_result_policy :
     int ->
@@ -262,6 +266,7 @@ let live_tx_deps (args : live_tx_args) : tx_deps =
   {
     strict = args.strict;
     math = args.math;
+    keyed = args.keyed;
     stealth_count = args.stealth_count;
     max_stealth_per_epoch = args.max_stealth_per_epoch;
     max_stealth_defer = args.max_stealth_defer;
@@ -273,7 +278,7 @@ let live_tx_deps (args : live_tx_args) : tx_deps =
     clear_defer_count = args.clear_defer_count;
     preverify_state = Preverify_cache.state;
     preverify_remove = Preverify_cache.remove;
-    preverify_ready = Preverify_cache.ready_result ~math:args.math;
+    preverify_ready = Preverify_cache.ready_result ~keyed:args.keyed ~math:args.math;
     log_cap_defer;
     log_defer;
     log_cache_hit;
@@ -301,6 +306,7 @@ let live_ledger_tx_deps (args : live_ledger_tx_args) : tx_deps =
   live_tx_deps {
     strict = args.strict;
     math = args.math;
+    keyed = args.keyed;
     stealth_count = args.stealth_count;
     max_stealth_per_epoch = args.max_stealth_per_epoch;
     max_stealth_defer = args.max_stealth_defer;
@@ -327,12 +333,12 @@ let live_ledger_tx_deps (args : live_ledger_tx_args) : tx_deps =
         tx);
     trace_cipher = args.trace_cipher;
     inline_range =
-      Octra_core.Private_ledger.stealth_inline_range ~math:args.math
+      Octra_core.Private_ledger.stealth_inline_range ~keyed:args.keyed ~math:args.math
         ~strict:args.strict
         args.ledger;
     accept_range = Octra_core.Private_ledger.stealth_accept_range;
     binding =
-      Octra_core.Private_ledger.stealth_binding ~math:args.math
+      Octra_core.Private_ledger.stealth_binding ~keyed:args.keyed ~math:args.math
         ~field_policy:args.field_policy
         ~strict:args.strict
         args.ledger;
@@ -441,7 +447,7 @@ let run (deps : deps) =
       let defer_count = deps.defer_count tx_hash in
       match
         Preverify_cache.gate
-          ~state:(deps.preverify_state tx_hash)
+          ~state:(deps.preverify_state ~keyed:deps.keyed ~math:deps.math tx_hash)
           ~defer_count
           ~max_defer:deps.max_stealth_defer
       with
@@ -483,6 +489,7 @@ let run_tx (deps : tx_deps) tx =
     nonce = tx.nonce;
     strict = deps.strict;
     math = deps.math;
+    keyed = deps.keyed;
     stealth_count = deps.stealth_count;
     max_stealth_per_epoch = deps.max_stealth_per_epoch;
     max_stealth_defer = deps.max_stealth_defer;

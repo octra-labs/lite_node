@@ -6,6 +6,7 @@ type result = Preverify_submit.result = {
   balance_ok : bool;
   strict : bool;
   math : bool;
+  keyed : bool;
   sender_enc_snapshot : string;
 }
 
@@ -33,7 +34,8 @@ type gate =
     status : string;
   }
 
-type entry = { math : bool; task : task_result Lwt.t }
+type entry = { math : bool;
+  keyed : bool; task : task_result Lwt.t }
 
 let cache : (string, entry) Hashtbl.t = Hashtbl.create 100
 
@@ -151,7 +153,7 @@ let prune ?(ttl = -1.0) ?(max_entries = -1) () =
       ttl
       (Hashtbl.length cache)
 
-let insert_with_cap ?(math=false) hash result_promise =
+let insert_with_cap ~keyed ?(math=false) hash result_promise =
   let now = now () in
   let max_entries = configured_max_entries () in
   let plan =
@@ -167,11 +169,11 @@ let insert_with_cap ?(math=false) hash result_promise =
       plan.hard_cap_requested_drop
       (Hashtbl.length cache_ts)
   end;
-  Hashtbl.replace cache hash { math; task = result_promise };
+  Hashtbl.replace cache hash { math; keyed; task = result_promise };
   Hashtbl.replace cache_ts hash now
 
-let start_task ?(math=false) hash f =
-  if Option.fold ~none:false ~some:(fun entry -> entry.math = math)
+let start_task ~keyed ?(math=false) hash f =
+  if Option.fold ~none:false ~some:(fun entry -> entry.math = math && entry.keyed = keyed)
       (Hashtbl.find_opt cache hash) then
     Preverify_submit.Existing
   else if not (has_capacity ()) then
@@ -188,17 +190,20 @@ let start_task ?(math=false) hash f =
           if gc_on_finish () then Gc.major ();
           Lwt.return_unit)
     in
-    insert_with_cap ~math hash task;
+    insert_with_cap ~keyed ~math hash task;
     Preverify_submit.Started
   end
 
-let state hash =
-  match find hash with
-  | Some task ->
+let state ~keyed ~math hash =
+  match Hashtbl.find_opt cache hash with
+  | Some entry when entry.math = math && entry.keyed = keyed ->
     begin
-      match Lwt.state task with
-      | Lwt.Return (Checked _) ->
+      match Lwt.state entry.task with
+      | Lwt.Return (Checked result)
+        when result.math = math && result.keyed = keyed ->
         Ready
+      | Lwt.Return (Checked _) ->
+        Missing
       | Lwt.Return (Unavailable reason) ->
         Unavailable_state reason
       | Lwt.Fail exn ->
@@ -206,7 +211,7 @@ let state hash =
       | Lwt.Sleep ->
         Pending
     end
-  | None ->
+  | Some _ | None ->
     Missing
 
 let gate ~state ~defer_count ~max_defer =
@@ -234,13 +239,13 @@ let gate ~state ~defer_count ~max_defer =
       | Pending -> Defer_gate { next_count; status = "pending" }
       | Ready | Failed _ -> Defer_gate { next_count; status = "unexpected" }
 
-let ready_result ?(math=false) hash ~strict ~sender_enc_snapshot =
+let ready_result ~keyed ?(math=false) hash ~strict ~sender_enc_snapshot =
   match find hash with
   | Some task ->
     begin
       match Lwt.state task with
       | Lwt.Return (Checked result)
-        when Bool.equal result.math math && Bool.equal result.strict strict
+        when Bool.equal result.math math && Bool.equal result.keyed keyed && Bool.equal result.strict strict
           && String.equal result.sender_enc_snapshot sender_enc_snapshot ->
         Some result
       | _ ->

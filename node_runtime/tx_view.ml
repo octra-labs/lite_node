@@ -34,6 +34,11 @@ let display_from tx =
 let display_to tx =
   display_to_op tx.Transaction.op_type tx.Transaction.to_
 
+let public_nonce op nonce =
+  match op with
+  | Transaction.StealthOp | Transaction.ClaimOp -> `Null
+  | _ -> `Int nonce
+
 let mask_stealth_row row =
   match row with
   | `Assoc fields ->
@@ -49,6 +54,7 @@ let mask_stealth_row row =
           (fun (k, v) ->
             match k with
             | "from" -> k, `String anon
+            | "nonce" | "waiting_for_nonce" | "confirmed_nonce" -> k, `Null
             | ("to" | "to_") when mask_to -> k, `String anon
             | _ -> k, v)
           fields)
@@ -64,7 +70,7 @@ let tx_fields ~decode_message tx =
     "to", `String (display_to tx);
     "amount", `String (Denomination.format_balance tx.Transaction.amount);
     "amount_raw", `String (Z.to_string tx.Transaction.amount);
-    "nonce", `Int tx.Transaction.nonce;
+    "nonce", public_nonce tx.Transaction.op_type tx.Transaction.nonce;
     "ou", `String (Z.to_string tx.Transaction.ou);
     "timestamp", `Float tx.Transaction.timestamp;
     "op_type", `String (Transaction.op_type_to_string tx.Transaction.op_type);
@@ -137,7 +143,7 @@ let rpc_rejected ~hash ~from_addr ~to_addr ~amount ~nonce ~err_type ~reason ~epo
     "from", `String from_addr;
     "to", `String to_addr;
     "amount", `String amount;
-    "nonce", `Int nonce;
+    "nonce", (if from_addr = anon then `Null else `Int nonce);
     "rejected_at", `Float rejected_at;
     "source", `String "rejected_txs";
   ]
@@ -151,7 +157,7 @@ let rpc_dropped ~hash ~reason ~detail ~dropped_at ~from_addr ~to_addr ~nonce ~ou
     "dropped_at", `Float dropped_at;
     "from", `String (display_from_op op_type from_addr);
     "to_", `String (display_to_op op_type to_addr);
-    "nonce", `Int nonce;
+    "nonce", public_nonce op_type nonce;
     "ou", `String (Z.to_string ou);
     "op_type", `String (Transaction.op_type_to_string op_type);
   ]
@@ -225,10 +231,14 @@ let transaction_lookup ~pending ~confirmed ~rejected ~dropped =
 
 let transaction_lookup_response ?queue_state ~decode_message ~hash = function
   | Lookup_pending tx ->
+    let queued = queue_fields queue_state |> fun fields ->
+      match mask_stealth_row (`Assoc (("op_type", `String (Transaction.op_type_to_string tx.op_type)) :: fields)) with
+      | `Assoc fields -> List.remove_assoc "op_type" fields
+      | _ -> assert false in
     Ok
       (rpc_pending
          ~hash
-         ~fields:(queue_fields queue_state @ tx_fields ~decode_message tx))
+         ~fields:(queued @ tx_fields ~decode_message tx))
   | Lookup_confirmed (epoch, tx_json) ->
     let fields =
       match Transaction.parse_raw_json tx_json with
@@ -296,7 +306,7 @@ let rest_rejected ~hash ~from_addr ~to_addr ~amount ~nonce ~err_type ~reason ~ep
     "from", `String from_addr;
     "to", `String to_addr;
     "amount", `String amount;
-    "nonce", `Int nonce;
+    "nonce", (if from_addr = anon then `Null else `Int nonce);
     "rejected_at", `Float rejected_at;
     "source", `String "rejected_txs";
   ]
@@ -325,7 +335,7 @@ let staging_row ~decode_message tx =
       (match tx.Transaction.op_type with
        | Transaction.PrivateOp -> `String "no data"
        | _ -> `String (Denomination.format_balance tx.Transaction.amount));
-    "nonce", `Int tx.Transaction.nonce;
+    "nonce", public_nonce tx.Transaction.op_type tx.Transaction.nonce;
     "ou", `String (Z.to_string tx.Transaction.ou);
     "timestamp", `Float tx.Transaction.timestamp;
     "op_type", `String (Transaction.op_type_to_string tx.Transaction.op_type);
@@ -431,7 +441,7 @@ let submit_batch_row tx result =
 let submit_batch_decode_error reason =
   Rpc_view.submit_batch_decode_error ~reason
 
-let admission_fee_check ~min_ou tx =
+let intake_fee_check ~min_ou tx =
   if requires_heavy_preverify tx && Z.lt tx.Transaction.ou min_ou then
     Error (Printf.sprintf "fee too low: stealth requires ou >= %s, got %s"
              (Z.to_string min_ou) (Z.to_string tx.Transaction.ou))
@@ -508,9 +518,9 @@ let semantic_check tx =
   | Transaction.Op01Burn ->
     if Z.leq tx.Transaction.amount Z.zero then Error "amount must be positive for op01_burn" else Ok ()
 
-let staging_submit_admission ~min_ou ~min_relay_fee tx =
+let staging_submit_check ~min_ou ~min_relay_fee tx =
   let required = Z.max min_relay_fee (Transaction.ou_cost tx) in
-  match admission_fee_check ~min_ou tx with
+  match intake_fee_check ~min_ou tx with
   | Error e -> Error e
   | Ok () ->
     match semantic_check tx with
@@ -520,7 +530,7 @@ let staging_submit_admission ~min_ou ~min_relay_fee tx =
         Error (Printf.sprintf "fee too low (min: %s)" (Z.to_string required))
       else Ok ()
 
-let duty_nonce_admission ~head ~confirmed_nonce tx =
+let duty_nonce_check ~head ~confirmed_nonce tx =
   match head, tx.Transaction.op_type with
   | Some head, Transaction.ValidatorReady ->
     begin
@@ -551,7 +561,7 @@ let staging_submit_effects ~relay ~peer_count ~total_txs ~total_ou ~max_ou ~tx_h
     else None in
   { total_txs; total_ou; max_ou; relay_payload }
 
-let address_route_admission tx =
+let address_route_check tx =
   let to_valid =
     match tx.Transaction.op_type with
     | Transaction.StealthOp -> String.equal tx.Transaction.to_ "stealth"
@@ -562,7 +572,7 @@ let address_route_admission tx =
     Error ("invalid_address", "malformed sender or recipient address")
   else Ok ()
 
-let self_route_admission tx =
+let self_route_check tx =
   let self = String.equal tx.Transaction.from tx.Transaction.to_ in
   match tx.Transaction.op_type, self with
   | Transaction.Standard, true ->
@@ -935,12 +945,12 @@ let max_proof_queue_waits = 40
 
 let max_proof_worker_retries = 1
 
-let preverify_range ~math ~strict ~pubkey ~cipher ~proof =
+let preverify_range ~keyed ~math ~strict ~pubkey ~cipher ~proof =
   let rec verify queue_waits worker_retries =
     let open Lwt.Syntax in
     let* result =
       Octra_core.Pvac_verify_worker.verify_range_classified_with_priority
-        ~math
+        ~keyed ~math
         Octra_core.Compute_pool.Speculative
         ~strict
         ~pubkey
@@ -972,7 +982,7 @@ let preverify_range ~math ~strict ~pubkey ~cipher ~proof =
   in
   verify 0 0
 
-let preverify_stealth_ranges ~math ~strict ~pubkey_blob ~sender_enc ptd =
+let preverify_stealth_ranges ~keyed ~math ~strict ~pubkey_blob ~sender_enc ptd =
   let open Lwt.Syntax in
   let delta_cipher = ptd.Crypto.PrivateTransferV4.delta_cipher in
   if not (stealth_delta_cipher_allowed delta_cipher) then
@@ -992,7 +1002,7 @@ let preverify_stealth_ranges ~math ~strict ~pubkey_blob ~sender_enc ptd =
     | Ok (Ok new_enc) ->
       let* delta =
         preverify_range
-          ~math
+          ~keyed ~math
           ~strict
           ~pubkey:pubkey_blob
           ~cipher:delta_cipher
@@ -1004,7 +1014,7 @@ let preverify_stealth_ranges ~math ~strict ~pubkey_blob ~sender_enc ptd =
         | Ok delta ->
           let* balance =
             preverify_range
-              ~math
+              ~keyed ~math
               ~strict
               ~pubkey:pubkey_blob
               ~cipher:new_enc
@@ -1098,7 +1108,7 @@ let circle_asset_body_too_large tx =
     String.length value > Transaction.circle_asset_max_encrypted_data_len
   | _ -> false
 
-let payload_size_admission ~limits tx =
+let payload_size_check ~limits tx =
   if circle_asset_body_too_large tx then
     Error ("malformed_transaction", "circle asset body exceeds max encoded size")
   else
@@ -1106,8 +1116,8 @@ let payload_size_admission ~limits tx =
     | Error e -> Error ("malformed_transaction", e)
     | Ok () -> Ok ()
 
-let payload_admission ~limits tx =
-  match payload_size_admission ~limits tx with
+let payload_check ~limits tx =
+  match payload_size_check ~limits tx with
   | Error _ as error -> error
   | Ok () ->
       if not (encrypted_payload_ok tx) then
@@ -1116,7 +1126,7 @@ let payload_admission ~limits tx =
         Error ("malformed_transaction", "contract call params contain invalid characters")
       else Ok ()
 
-let bft_op_admission ~bft_mode tx =
+let bft_op_check ~bft_mode tx =
   if
     bft_mode
     && not
@@ -1140,7 +1150,7 @@ let duty_retry ~now ~duty ~bft_mode tx =
         | Error _ -> false)
     | _ -> false
 
-let pre_route_admission
+let pre_route_check
     ?(duty = None)
     ~now
     ~max_timestamp_drift
@@ -1156,14 +1166,14 @@ let pre_route_admission
   else if observer_rpc_mode then
     Error ("read_only_observer", "observer node is read-only")
   else
-    bft_op_admission ~bft_mode tx
+    bft_op_check ~bft_mode tx
 
 let submission_pubkey ~account_public_key tx =
   match account_public_key, tx.Transaction.public_key with
   | Some pk, _ -> Some pk
   | None, pk -> pk
 
-let signature_admission ~account_public_key tx =
+let signature_check ~account_public_key tx =
   match submission_pubkey ~account_public_key tx with
   | None -> Error ("invalid_signature", "no public key available")
   | Some pk ->
@@ -1173,14 +1183,14 @@ let signature_admission ~account_public_key tx =
       Error ("invalid_signature", "signature verification failed")
     else Ok ()
 
-let sender_admission ~sender_exists tx =
+let sender_check ~sender_exists tx =
   if Z.leq tx.Transaction.ou Z.zero then
     Error ("malformed_transaction", "OU must be greater than zero")
   else if not sender_exists then
     Error ("sender_not_found", "sender account does not exist")
   else Ok ()
 
-let submit_pre_signature_admission
+let submit_pre_signature_check
     ?(duty = None)
     ~now
     ~max_timestamp_drift
@@ -1189,7 +1199,7 @@ let submit_pre_signature_admission
     ~limits
     ~sender_exists
     tx =
-  match pre_route_admission
+  match pre_route_check
           ~duty
           ~now
           ~max_timestamp_drift
@@ -1198,25 +1208,25 @@ let submit_pre_signature_admission
           tx with
   | Error e -> Error e
   | Ok () ->
-    match address_route_admission tx with
+    match address_route_check tx with
     | Error e -> Error e
     | Ok () ->
-      match payload_size_admission ~limits tx with
+      match payload_size_check ~limits tx with
       | Error e -> Error e
       | Ok () ->
-        match self_route_admission tx with
+        match self_route_check tx with
         | Error e -> Error e
         | Ok () ->
           match semantic_check tx with
           | Error e -> Error ("malformed_transaction", semantic_error_reason tx e)
-          | Ok () -> sender_admission ~sender_exists tx
+          | Ok () -> sender_check ~sender_exists tx
 
 let encrypted_data_missing_or_empty tx =
   match tx.Transaction.encrypted_data with
   | None -> true
   | Some value -> String.equal value ""
 
-let post_signature_admission
+let post_signature_check
     ~preverify_has_capacity
     ~preverify_pending
     ~preverify_pending_max
@@ -1244,7 +1254,7 @@ let post_signature_admission
         confirmed_nonce bft_window)
   else Ok ()
 
-let submit_signature_admission
+let submit_signature_check
     ~account_public_key
     ~preverify_has_capacity
     ~preverify_pending
@@ -1253,12 +1263,12 @@ let submit_signature_admission
     ~confirmed_nonce
     ~bft_window
     tx =
-  match signature_admission ~account_public_key tx with
+  match signature_check ~account_public_key tx with
   | Error e -> Error e
   | Ok () ->
-    match payload_admission ~limits:payload_limits tx with
+    match payload_check ~limits:payload_limits tx with
     | Error _ as error -> error
-    | Ok () -> post_signature_admission
+    | Ok () -> post_signature_check
       ~preverify_has_capacity
       ~preverify_pending
       ~preverify_pending_max

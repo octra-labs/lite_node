@@ -203,6 +203,26 @@ inline bool cipher_mul_depth(const Cipher& cipher, size_t& depth) {
     return true;
 }
 
+inline bool pubkey_powers_ok(const PubKey& pk) {
+    const auto& powers = pk.powg_B;
+    if (pk.prm.B < 3 || powers.size() != static_cast<size_t>(pk.prm.B))
+        return false;
+    if (powers[0].lo != 1 || powers[0].hi != 0)
+        return false;
+    const auto ratio = powers[1];
+    if ((ratio.lo <= 1 && ratio.hi == 0) || ratio.hi > MASK63 ||
+        (ratio.hi == MASK63 && ratio.lo == UINT64_MAX))
+        return false;
+    auto expected = ratio;
+    for (size_t i = 2; i < powers.size(); ++i) {
+        expected = fp_mul(expected, ratio);
+        if (powers[i].lo != expected.lo || powers[i].hi != expected.hi)
+            return false;
+    }
+    const auto closing = fp_mul(expected, ratio);
+    return closing.lo == 1 && closing.hi == 0;
+}
+
 inline bool is_valid_pubkey_shape(const PubKey& pk) {
     if (pk.prm.B <= 0 || pk.prm.m_bits <= 0 || pk.prm.n_bits <= 0)
         return false;

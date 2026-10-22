@@ -12,6 +12,8 @@ type add_result =
   | Refreshed
   | Rejected of string
 
+let max_records = 256
+
 let create ?(ttl_s = 300.0) ?(max_per_bucket = 4) () =
   { rows = Hashtbl.create 32; ttl_s; max_per_bucket }
 
@@ -36,9 +38,17 @@ let values ~now t =
   Hashtbl.fold (fun _ r acc -> r :: acc) t.rows []
   |> List.sort (fun a b -> String.compare a.P2p_peer_record.node_id b.P2p_peer_record.node_id)
 
+let host_key ~now ~host ~keys t =
+  Hashtbl.fold (fun _ (record : P2p_peer_record.t) found ->
+    if record.host = host && live ~now t record && List.mem record.pubkey keys then
+      Some (match found with None -> record.node_id | Some id -> min id record.node_id)
+    else found) t.rows None
+
 let add ~now t r =
   prune ~now t;
   if not (live ~now t r) then Rejected "ttl"
+  else if not (Hashtbl.mem t.rows r.P2p_peer_record.node_id)
+      && Hashtbl.length t.rows >= max_records then Rejected "record_capacity"
   else
     let records =
       Hashtbl.fold

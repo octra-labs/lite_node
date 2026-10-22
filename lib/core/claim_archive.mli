@@ -21,7 +21,7 @@ val fold :
   f:('a -> Claim_history.entry -> Transaction.t -> ('a, string) result) ->
   ('a, string) result
 
-val sent : t -> index:int64 -> math:bool -> (string, string) result
+val sent : t -> index:int64 -> keyed:bool -> math:bool -> (string, string) result
 
 val read :
   Store_irmin.t ->
@@ -35,6 +35,7 @@ val key :
   t ->
   address:string ->
   index:int64 ->
+  keyed:bool ->
   math:bool ->
   (Claim_history.key, string) result
 
@@ -43,6 +44,8 @@ val verify :
   claim:t ->
   send_index:int64 ->
   claim_index:int64 ->
+  sender_keyed:bool ->
+  receiver_keyed:bool ->
   sender_math:bool ->
   receiver_math:bool ->
   (Claim_history.checked, string) result

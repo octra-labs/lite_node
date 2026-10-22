@@ -1,14 +1,14 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-module Admission = Octra_core.Validator_admission
+module Entry = Octra_core.Validator_entry
 module Policy = Octra_core.Validator_policy
 module Status = Octra_node_runtime.Status_rpc
 
 let expect label value =
   if not value then failwith ("test_exit_status: " ^ label)
 
-let candidate = Admission.{
+let entry = Entry.{
   address = "octA";
   pubkey = String.make 32 'k';
   bond = Z.of_int 1_000_000;
@@ -18,8 +18,8 @@ let candidate = Admission.{
 }
 
 let read ?(head = 10) ?(chain_id = "octra-devnet-9871-cluster") value =
-  Status.validator_enrollment ~chain_id ~head_epoch:head ~address:candidate.address
-    ~pubkey:(Base64.encode_exn candidate.pubkey) value
+  Status.validator_enrollment ~chain_id ~head_epoch:head ~address:entry.address
+    ~pubkey:(Base64.encode_exn entry.pubkey) value
 
 let field name = function
   | Ok (`Assoc fields) -> List.assoc name fields
@@ -31,7 +31,7 @@ let check_membership () =
   let member byte =
     let pubkey = String.make 32 byte in
     let address = Octra_core.Crypto.Address.address_from_pubkey (Base64.encode_exn pubkey) in
-    Admission.{ address; pubkey; weight = Z.one }
+    Entry.{ address; pubkey; weight = Z.one }
   in
   let first = member 'a' in
   let second = member 'b' in
@@ -72,22 +72,22 @@ let check_snapshot () =
   let module Registry = Octra_core.Validator_registry in
   let module Update = Octra_core.Validator_set_update in
   let module Head = Octra_core.Head_manifest in
-  let pubkey = Base64.encode_exn candidate.pubkey in
+  let pubkey = Base64.encode_exn entry.pubkey in
   let address = Octra_core.Crypto.Address.address_from_pubkey pubkey in
-  let candidate = { candidate with address; exit_epoch = None } in
+  let entry = { entry with address; exit_epoch = None } in
   let registry = Registry.of_yojson (`Assoc [
     "standard", `String Policy.standard_name;
     "candidates", `List [`Assoc [
       "address", `String address;
       "consensus_pubkey", `String pubkey;
-      "bond", `String (Z.to_string candidate.bond);
+      "bond", `String (Z.to_string entry.bond);
       "bonded_epoch", `String "1";
       "ready_epoch", `String "2";
       "exit_epoch", `Null;
     ]];
   ]) |> Result.get_ok in
   let update = Update.make_weighted ~source_epoch:1L ~activate_epoch:2L
-    [Admission.{ address; pubkey = candidate.pubkey; weight = Z.one }]
+    [Entry.{ address; pubkey = entry.pubkey; weight = Z.one }]
     |> Result.get_ok |> Update.to_string in
   (try Unix.mkdir "runtime_data" 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ());
   let path = Filename.concat "runtime_data" ("exit_view_" ^ string_of_int (Unix.getpid ())) in
@@ -117,7 +117,7 @@ let check_snapshot () =
         ~automatic:false in
       let* snapshot = read head in
       let snapshot = Result.get_ok snapshot in
-      expect "registry comes from pinned epoch" (snapshot.candidate = Some candidate);
+      expect "registry comes from pinned epoch" (snapshot.entry = Some entry);
       expect "membership comes from the same epoch" (snapshot.sets = (Some update, None));
       let* response = R.validator_enrollment ~snapshot:(Ok snapshot)
         ~validator_address:address ~validator_pubkey:pubkey in
@@ -137,23 +137,23 @@ let check_transition () =
   let plan = Option.get (Octra_core.Rule_graph.exit_activation_for_chain chain_id) in
   let epoch = plan.activation_epoch in
   let exited = Int64.sub (Int64.of_int epoch) 9_000L in
-  let candidate = { candidate with exit_epoch = Some exited } in
+  let entry = { entry with exit_epoch = Some exited } in
   expect "prior withdrawal epoch retained"
-    (field "withdraw_epoch" (read ~head:(epoch - 1) (Some candidate))
+    (field "withdraw_epoch" (read ~head:(epoch - 1) (Some entry))
      = `String (Int64.to_string (Int64.add exited Policy.unbonding_epochs)));
   List.iter (fun head ->
     expect "existing exit matures at activation"
-      (field "withdraw_epoch" (read ~head (Some candidate)) = `String (string_of_int epoch));
+      (field "withdraw_epoch" (read ~head (Some entry)) = `String (string_of_int epoch));
     expect "existing exit has no remaining wait"
-      (field "withdraw_remaining_epochs" (read ~head (Some candidate)) = `String "0"))
+      (field "withdraw_remaining_epochs" (read ~head (Some entry)) = `String "0"))
     [epoch; epoch + 1];
-  let candidate = { candidate with exit_epoch = Some (Int64.of_int epoch) } in
+  let entry = { entry with exit_epoch = Some (Int64.of_int epoch) } in
   expect "new exit retains complete shorter wait"
-    (field "withdraw_epoch" (read ~head:epoch (Some candidate))
+    (field "withdraw_epoch" (read ~head:epoch (Some entry))
      = `String (Int64.to_string (Int64.add (Int64.of_int epoch) Policy.exit_wait)));
   List.iter (fun chain_id ->
     expect "other chain keeps original wait"
-      (field "withdraw_epoch" (read ~chain_id ~head:epoch (Some candidate))
+      (field "withdraw_epoch" (read ~chain_id ~head:epoch (Some entry))
        = `String (Int64.to_string (Int64.add (Int64.of_int epoch) Policy.unbonding_epochs))))
     ["octra-mainnet"; "other"]
 
@@ -161,19 +161,19 @@ let () =
   check_transition ();
   check_snapshot ();
   check_membership ();
-  let epoch = Admission.withdraw_epoch Policy.parameters candidate |> Result.get_ok in
+  let epoch = Entry.withdraw_epoch Policy.parameters entry |> Result.get_ok in
   expect "RPC uses protocol withdrawal epoch"
-    (field "withdraw_epoch" (read (Some candidate)) = `String (Int64.to_string epoch));
+    (field "withdraw_epoch" (read (Some entry)) = `String (Int64.to_string epoch));
   List.iter (fun (head, remaining) ->
     expect "remaining epochs use the same committed head"
-      (field "withdraw_remaining_epochs" (read ~head (Some candidate))
+      (field "withdraw_remaining_epochs" (read ~head (Some entry))
        = `String (string_of_int remaining)))
     [Int64.to_int epoch - 1, 1; Int64.to_int epoch, 0; Int64.to_int epoch + 1, 0];
-  expect "negative head is refused" (Result.is_error (read ~head:(-1) (Some candidate)));
+  expect "negative head is refused" (Result.is_error (read ~head:(-1) (Some entry)));
   expect "absent enrollment has no withdrawal epoch"
     (field "withdraw_epoch" (read None) = `Null);
   expect "ready enrollment needs exit first"
-    (field "withdraw_epoch" (read (Some { candidate with exit_epoch = None })) = `Null);
+    (field "withdraw_epoch" (read (Some { entry with exit_epoch = None })) = `Null);
   expect "overflow cannot advertise withdrawal"
-    (Result.is_error (read (Some { candidate with exit_epoch = Some Int64.max_int })));
+    (Result.is_error (read (Some { entry with exit_epoch = Some Int64.max_int })));
   Printf.printf "status = pass test = exit_status\n%!"

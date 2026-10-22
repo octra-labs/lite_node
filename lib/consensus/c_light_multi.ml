@@ -42,6 +42,7 @@ let same_validator_set a b =
   && Z.equal a.quorum_weight b.quorum_weight
   && a.weighted = b.weighted
   && a.validators = b.validators
+  && a.authors = b.authors
   && same_scheduled a.scheduled b.scheduled
 
 let first = function

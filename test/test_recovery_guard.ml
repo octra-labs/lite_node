@@ -258,7 +258,7 @@ let test_boot_guard () =
          | exception Failure reason -> reason = "planned history failure");
       expect "failed boot released guard" (Marker.recovery_required dir)
     done;
-    expect "verified boot epoch differs" (boot false = 1);
+    expect "verified boot epoch differs" (fst (boot false) = 1);
     expect "verified boot retained guard" (not (Marker.recovery_required dir));
     expect "verified boot skipped proof" (not (run dir).full_repair_skipped))
 

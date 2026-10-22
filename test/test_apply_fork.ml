@@ -30,7 +30,7 @@ let boot dir = child (fun () ->
         validators = (fun () -> []); int_value = (fun _ value -> value);
         env = (fun _ -> None); exit_fatal;
       }) with
-    | Ok epoch -> C.expect "next epoch differs" (epoch = 1)
+    | Ok (epoch, _) -> C.expect "next epoch differs" (epoch = 1)
     | Error error ->
       Printf.eprintf "event = boot_refused reason = %s\n%!" error.reason; exit Start.exit_code))
 

@@ -4,7 +4,7 @@
 module Head = Octra_core.Head_manifest
 module Irmin = Octra_core.Store_irmin
 module Image = Octra_core.Ledger_image
-module Migration = Octra_core.Pvac_migration_admission
+module Migration = Octra_core.Pvac_migration_check
 module Roots = Root_win
 module Txlog = Octra_core.Txlog
 module Epochlog = Octra_core.Epochlog
@@ -51,17 +51,6 @@ let rec mkdir_p path =
     mkdir_p (Filename.dirname path);
     Unix.mkdir path 0o750
   end
-
-let rec remove_tree path =
-  if Sys.file_exists path then
-    match (Unix.lstat path).Unix.st_kind with
-    | Unix.S_DIR ->
-        Sys.readdir path
-        |> Array.iter (fun name ->
-          if name <> "." && name <> ".." then
-            remove_tree (Filename.concat path name));
-        Unix.rmdir path
-    | _ -> Unix.unlink path
 
 let rec write_all descriptor bytes offset length =
   if length > 0 then
@@ -163,7 +152,7 @@ let snapshot_shape root =
 let remove_stage archive target =
   try
     if Sync_archive.marked_stage archive (Filename.basename target) then
-      remove_tree (target ^ ".next")
+      Sync_archive.remove_stage archive (Filename.basename target)
   with _ -> ()
 
 let format ~chain_id ~epoch =

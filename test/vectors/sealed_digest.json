@@ -1,0 +1,95 @@
+{
+  "valid": [
+    {
+      "name": "plain",
+      "circle_id": "circle",
+      "key_id": "key",
+      "passphrase": "secret",
+      "plaintext_hex": "646f63756d656e74",
+      "salt_hex": "5b226f637472613a636972636c653a7365616c65645f646967657374222c22636972636c65222c226b6579225d",
+      "digest_hex": "1683a8e481069ebb70b58784a6007aa45f63260c71561a7c9d9d533857bef692",
+      "browser_digest_hex": "1683a8e481069ebb70b58784a6007aa45f63260c71561a7c9d9d533857bef692",
+      "plaintext_hash": "43cc23fa52b87b4cc1d02b5b114154151d6adddb17c9fddc06b027fa99e24008",
+      "ciphertext_b64": "T0NSUzEAAQIDBAUGBwgJCgtxgmxswgleJ72UqfuGZO2fVlL70vgjEUWvz0Xr"
+    },
+    {
+      "name": "del",
+      "circle_id": "circle\u007f",
+      "key_id": "key\u007f",
+      "passphrase": "secret",
+      "plaintext_hex": "646f63756d656e74",
+      "salt_hex": "5b226f637472613a636972636c653a7365616c65645f646967657374222c22636972636c655c7530303766222c226b65795c7530303766225d",
+      "digest_hex": "0044162bbd0ba07528a5413173a29807ee1d3ef9c9cccaa8cfe6e06866f32ddc",
+      "browser_digest_hex": "aac489e2522510db09c54431f33321e57aa8f19a67030d14c6480396dee9929e",
+      "plaintext_hash": "43cc23fa52b87b4cc1d02b5b114154151d6adddb17c9fddc06b027fa99e24008",
+      "ciphertext_b64": "T0NSUzEAAQIDBAUGBwgJCgtYch1qZjDcCS3PzkyXpPPVby2pvToZFaME0wNp"
+    },
+    {
+      "name": "controls",
+      "circle_id": "\u0000\u0001\u0002\u0003\u0004\u0005\u0006\u0007\b\t\n\u000b\f\r\u000e\u000f\u0010\u0011\u0012\u0013\u0014\u0015\u0016\u0017\u0018\u0019\u001a\u001b\u001c\u001d\u001e\u001f",
+      "key_id": "quote\"slash\\/",
+      "passphrase": "secret",
+      "plaintext_hex": "646f63756d656e74",
+      "salt_hex": "5b226f637472613a636972636c653a7365616c65645f646967657374222c225c75303030305c75303030315c75303030325c75303030335c75303030345c75303030355c75303030365c75303030375c625c745c6e5c75303030625c665c725c75303030655c75303030665c75303031305c75303031315c75303031325c75303031335c75303031345c75303031355c75303031365c75303031375c75303031385c75303031395c75303031615c75303031625c75303031635c75303031645c75303031655c7530303166222c2271756f74655c22736c6173685c5c2f225d",
+      "digest_hex": "5f47e20985f63c49698f3cc7d30c3dd01eb80499ce8bdc2b4c1bccdb4d32ade0",
+      "browser_digest_hex": "5f47e20985f63c49698f3cc7d30c3dd01eb80499ce8bdc2b4c1bccdb4d32ade0",
+      "plaintext_hash": "43cc23fa52b87b4cc1d02b5b114154151d6adddb17c9fddc06b027fa99e24008",
+      "ciphertext_b64": "T0NSUzEAAQIDBAUGBwgJCgtjgzNGzsxADN4liX6x50z1pqAQ6sG4KKnhRSx9"
+    },
+    {
+      "name": "unicode",
+      "circle_id": "caf\u00e9\u2028",
+      "key_id": "\ud83d\udd10\u2029",
+      "passphrase": "secret",
+      "plaintext_hex": "646f63756d656e74",
+      "salt_hex": "5b226f637472613a636972636c653a7365616c65645f646967657374222c22636166c3a9e280a8222c22f09f9490e280a9225d",
+      "digest_hex": "2439df8869176074012b86bb48d3516d061bc5906fe5639e82da4f022c1e28b4",
+      "browser_digest_hex": "2439df8869176074012b86bb48d3516d061bc5906fe5639e82da4f022c1e28b4",
+      "plaintext_hash": "43cc23fa52b87b4cc1d02b5b114154151d6adddb17c9fddc06b027fa99e24008",
+      "ciphertext_b64": "T0NSUzEAAQIDBAUGBwgJCgur3Ijc/lupqVwT0oWF8VTBIeJN/GpcJ7KTlSsj"
+    },
+    {
+      "name": "colon_left",
+      "circle_id": "a:b",
+      "key_id": "c",
+      "passphrase": "secret",
+      "plaintext_hex": "646f63756d656e74",
+      "salt_hex": "5b226f637472613a636972636c653a7365616c65645f646967657374222c22613a62222c2263225d",
+      "digest_hex": "cb1c3b3ed6a791fa6dbe25602700b8de7b27d29066279d0af2693b1de45dc06e",
+      "browser_digest_hex": "cb1c3b3ed6a791fa6dbe25602700b8de7b27d29066279d0af2693b1de45dc06e",
+      "plaintext_hash": "43cc23fa52b87b4cc1d02b5b114154151d6adddb17c9fddc06b027fa99e24008",
+      "ciphertext_b64": "T0NSUzEAAQIDBAUGBwgJCgvI7iD1VTCentFGn9Pi0pUl5WJmTaKrIPqeesjG"
+    },
+    {
+      "name": "colon_right",
+      "circle_id": "a",
+      "key_id": "b:c",
+      "passphrase": "secret",
+      "plaintext_hex": "646f63756d656e74",
+      "salt_hex": "5b226f637472613a636972636c653a7365616c65645f646967657374222c2261222c22623a63225d",
+      "digest_hex": "edb470a67d289bfc4cb2de5327c7cfb2c70659e40a59522102a7a39a762f6376",
+      "browser_digest_hex": "edb470a67d289bfc4cb2de5327c7cfb2c70659e40a59522102a7a39a762f6376",
+      "plaintext_hash": "43cc23fa52b87b4cc1d02b5b114154151d6adddb17c9fddc06b027fa99e24008",
+      "ciphertext_b64": "T0NSUzEAAQIDBAUGBwgJCgvI7iD1VTCentFGn9Pi0pUl5WJmTaKrIPqeesjG"
+    },
+    {
+      "name": "empty",
+      "circle_id": "",
+      "key_id": "",
+      "passphrase": "secret",
+      "plaintext_hex": "646f63756d656e74",
+      "salt_hex": "5b226f637472613a636972636c653a7365616c65645f646967657374222c22222c22225d",
+      "digest_hex": "1aaae0f3c24f1b3db33306d5688162565c0f4782e8cb8efd78d3777dfea6a891",
+      "browser_digest_hex": "1aaae0f3c24f1b3db33306d5688162565c0f4782e8cb8efd78d3777dfea6a891",
+      "plaintext_hash": "43cc23fa52b87b4cc1d02b5b114154151d6adddb17c9fddc06b027fa99e24008",
+      "ciphertext_b64": "T0NSUzEAAQIDBAUGBwgJCgtsM6n2OWLqDVmvW7B4XGPHzjHDYT/zmZFrf3ti"
+    }
+  ],
+  "invalid": [
+    {"name": "high_surrogate", "utf8_hex": "eda080", "utf16": [55296]},
+    {"name": "low_surrogate", "utf8_hex": "edbfbf", "utf16": [57343]},
+    {"name": "split_surrogates", "utf8_hex": "eda08061edb080", "utf16": [55296, 97, 56320]},
+    {"name": "high_suffix", "utf8_hex": "61eda080", "utf16": [97, 55296]}
+  ],
+  "invalid_utf8": ["80", "c080", "c1bf", "c28080", "e08080", "e282", "f0808080", "f4908080", "f5808080", "ff"]
+}

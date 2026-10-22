@@ -133,11 +133,11 @@ let rotating_parent validator_set epoch signers =
 
 let addresses = ["octA"; "octB"; "octC"; "octD"]
 
-let candidate address =
+let entry address =
   let item, _ =
     List.find (fun (item, _) -> item.C_types.address = address) keys
   in
-  Octra_core.Validator_admission.{
+  Octra_core.Validator_entry.{
     address;
     pubkey = item.pubkey;
     bond = Z.one;
@@ -146,9 +146,9 @@ let candidate address =
     exit_epoch = None;
   }
 
-let rotating_candidate address =
+let rotating_entry address =
   let item, _ = rotating_key address in
-  Octra_core.Validator_admission.{
+  Octra_core.Validator_entry.{
     address;
     pubkey = item.pubkey;
     bond = Z.one;
@@ -157,10 +157,10 @@ let rotating_candidate address =
     exit_epoch = None;
   }
 
-let names candidates =
+let names entries =
   List.map
-    (fun (item : Octra_core.Validator_admission.candidate) -> item.address)
-    candidates
+    (fun (item : Octra_core.Validator_entry.entry) -> item.address)
+    entries
 
 let member_count state =
   match Fold.to_yojson state with
@@ -241,7 +241,7 @@ let check_window_and_proof () =
       Fold.standard
       ~start:100L
       ~source:211L
-      (List.map candidate addresses)
+      (List.map entry addresses)
       state
   in
   expect "warm window keeps set" (names warm = addresses);
@@ -250,7 +250,7 @@ let check_window_and_proof () =
       Fold.standard
       ~start:100L
       ~source:212L
-      (List.map candidate addresses)
+      (List.map entry addresses)
       state
   in
   expect "closed window shadows omitted signer"
@@ -274,7 +274,7 @@ let check_window_and_proof () =
       Fold.standard
       ~start:100L
       ~source:212L
-      (List.map candidate addresses)
+      (List.map entry addresses)
       restored
   in
   expect "omitted vote restores signer" (names allowed = addresses);
@@ -395,9 +395,9 @@ let check_rejoin_and_delay () =
     (Fold.to_string decoded = Fold.to_string delayed)
 
 let check_scale () =
-  let candidates =
+  let entries =
     List.init 200 (fun index ->
-      Octra_core.Validator_admission.{
+      Octra_core.Validator_entry.{
         address = Printf.sprintf "oct%03d" index;
         pubkey = String.make 32 (Char.chr (index land 255));
         bond = Z.one;
@@ -406,13 +406,13 @@ let check_scale () =
         exit_epoch = None;
       })
   in
-  let active = names candidates in
+  let active = names entries in
   let state =
     Fold.note_set Fold.standard ~epoch:0L ~active Fold.empty
     |> Result.get_ok
   in
   let allowed, counts =
-    Fold.filter Fold.standard ~start:0L ~source:1L candidates state
+    Fold.filter Fold.standard ~start:0L ~source:1L entries state
   in
   expect "two hundred members retained" (List.length allowed = 200);
   expect "scale count retained" (counts.Fold.allowed = 200)
@@ -831,7 +831,7 @@ let check_participation_profile () =
       cfg
       ~start:100L
       ~source:147L
-      (List.map candidate addresses)
+      (List.map entry addresses)
       fifteen
   in
   expect "profile warmup retains every incumbent" (names warm = addresses);
@@ -840,7 +840,7 @@ let check_participation_profile () =
       cfg
       ~start:100L
       ~source:148L
-      (List.map candidate addresses)
+      (List.map entry addresses)
       fifteen
   in
   expect "fifteen of thirty two is excluded"
@@ -851,7 +851,7 @@ let check_participation_profile () =
       cfg
       ~start:100L
       ~source:148L
-      (List.map candidate addresses)
+      (List.map entry addresses)
       sixteen
   in
   expect "sixteen of thirty two is admitted" (names admitted = addresses);
@@ -879,7 +879,7 @@ let check_participation_profile () =
       cfg
       ~start:100L
       ~source:148L
-      (List.map candidate addresses)
+      (List.map entry addresses)
       restored
   in
   expect "omitted signed vote satisfies participation" (names appealed = addresses)
@@ -920,7 +920,7 @@ let check_slow_signer_cutoff () =
               cfg
               ~start:100L
               ~source:at
-              (List.map candidate addresses)
+              (List.map entry addresses)
               state
           in
           expect "slow finalized signer remains selected"
@@ -967,7 +967,7 @@ let check_removal_no_ratchet () =
       cfg
       ~start:100L
       ~source:148L
-      (List.map rotating_candidate rotating_addresses)
+      (List.map rotating_entry rotating_addresses)
       state
   in
   expect "one inactive validator is removed"
@@ -1018,7 +1018,7 @@ let check_removal_no_ratchet () =
               cfg
               ~start:100L
               ~source:at
-              (List.map rotating_candidate survivors)
+              (List.map rotating_entry survivors)
               state
           in
           expect "rotating finalized cutoff does not shrink survivors"

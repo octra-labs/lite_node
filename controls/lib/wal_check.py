@@ -74,6 +74,8 @@ def inspect(data_dir):
             if kind == "pending" and meta.st_size > 128 * 1024 * 1024:
                 raise ValueError("pending record exceeds size limit")
             validate(path.name, json.loads(path.read_text(encoding = "utf-8")))
+        except FileNotFoundError:
+            continue
         except (OSError, UnicodeError, ValueError) as error:
             faults.append((kind + "_store_unreadable", path, str(error)))
     return faults

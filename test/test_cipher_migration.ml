@@ -28,7 +28,7 @@ let point amount blind =
   P.pedersen_commit_amount amount blind |> Bytes.to_string |> Base64.encode_exn
 
 let verify math request =
-  Lwt_main.run (W.classified_result ~math ~priority:W.Required request)
+  Lwt_main.run (W.classified_result ~keyed:false ~math ~priority:W.Required request)
 
 let rejected name = function
   | Error (W.Proof_rejected _) -> ()
@@ -94,13 +94,13 @@ let state_check math old_key source new_key target old_proof new_proof commitmen
         [T.EncryptOp; T.DecryptOp; T.StealthOp; T.ClaimOp];
       let blocked () =
         List.iter (fun (cipher_mode, strict) ->
-          let pool = K.create ~math:(fun () -> math)
+          let pool = K.create ~keyed:(fun () -> false) ~math:(fun () -> math)
             ~field_policy:(fun () -> PL.Unique_fields) ~strict:(fun () -> strict)
             ~cipher_mode:(fun () -> cipher_mode) ledger in
           check "inactive pool does not queue proof"
             (K.admit pool (tx fields) = Octra_core.Preverify_availability.Unmanaged);
           check "inactive pool has no work" ((K.stats pool).pending = 0);
-          let result = run (PL.preverify_key_switch_artifact ~math ~cipher_mode
+          let result = run (PL.preverify_key_switch_artifact ~keyed:false ~math ~cipher_mode
             ~field_policy:PL.Unique_fields ~strict ledger (tx fields)) in
           check "inactive proof refused" (match result with
             | Error failure -> failure.PL.reason = "unknown key_switch migration_mode = cipher_proof"
@@ -115,7 +115,7 @@ let state_check math old_key source new_key target old_proof new_proof commitmen
         let backend = if interrupt then
           {backend with E.flush_dirty = (fun () -> Lwt.fail_with "migration write interrupted")}
           else backend in
-        let transition = A.create ~math ~preverify:None ~ledger ~epoch_id:1
+        let transition = A.create ~keyed:false ~math ~preverify:None ~ledger ~epoch_id:1
           ~owner_migration_mode:G.Active ~cipher_mode ~proof_mode:G.Active
           ~field_policy:Octra_core.Private_ledger.Unique_fields
           ~result_policy:Octra_core.Private_result_policy.Recoverable
@@ -158,9 +158,9 @@ let state_check math old_key source new_key target old_proof new_proof commitmen
       check "cached proof cannot bypass activation" (inactive.artifacts.confirmed = []);
       check "cached refusal preserves state" (capture () = before);
       blocked ();
-      let prepared = run (PL.key_switch_plan ~math ~cipher_mode:G.Active
+      let prepared = run (PL.key_switch_plan ~keyed:false ~math ~cipher_mode:G.Active
         ~field_policy:PL.Unique_fields ~strict:true ledger (tx fields)) |> Result.get_ok in
-      let blocked_batch = run (Octra_core.Preverify_worker.run_many ~math
+      let blocked_batch = run (Octra_core.Preverify_worker.run_many ~keyed:false ~math
         ~field_policy:PL.Unique_fields ~strict:true ~ledger
         ~prepared:(fun _ -> Lwt.return (Octra_core.Preverify_availability.Ready
           (PL.Prepared_key_switch prepared))) [tx fields]) in
@@ -175,7 +175,7 @@ let state_check math old_key source new_key target old_proof new_proof commitmen
             let counted = ref 0 in
             let open Lwt.Syntax in
             let* () = Octra_node_runtime.Consensus_epoch_key_switch_shell.run_live_ledger_tx
-              {ledger = fork; field_policy = PL.Unique_fields; strict = true; math;
+              {ledger = fork; field_policy = PL.Unique_fields; strict = true; math; keyed = false;
                 cipher_mode = mode; legacy_replay = (fun _ -> failwith "unexpected history read");
                 gate = (fun () -> None);
                 reject_gate = (fun _ -> failwith "unexpected transaction gate");
@@ -242,10 +242,10 @@ let test_pair ?(deep = false) math =
   let blind = seed '\055' in
   let commitment = point 3L blind in
   let old_proof = timed "old_proof" (fun () ->
-    P.make_zero_proof_bound_historical_migration
+    P.make_zero_proof_bound_historical_migration ~keyed:false
       ~math old_pk old_sk old_ct 3L blind |> F.encode_zero_proof) in
   let new_proof = timed "new_proof" (fun () ->
-    P.make_zero_proof_bound_range
+    P.make_zero_proof_bound_range ~keyed:false
       ~math new_pk new_sk new_ct 3L blind |> F.encode_bound_range_proof) in
   Printf.printf "event = cipher_migration old_bytes = %d new_bytes = %d\n%!"
     (String.length old_proof) (String.length new_proof);
@@ -264,7 +264,7 @@ let test_pair ?(deep = false) math =
     (verify math (old_request ~cipher:(F.encode_cipher other_ct) ()));
   rejected "old key replacement" (verify math (old_request ~pubkey:(key new_pk) ()));
   rejected "new key replacement" (verify math (new_request ~pubkey:(key old_pk) ()));
-  let plain = P.make_zero_proof_bound ~math new_pk new_sk new_ct 3L blind in
+  let plain = P.make_zero_proof_bound ~keyed:false ~math new_pk new_sk new_ct 3L blind in
   rejected "missing range proof"
     (verify math (new_request ~proof:(F.encode_zero_proof plain) ()));
   if math then timed "state" (fun () -> state_check math (key old_pk) (F.encode_cipher old_ct)
@@ -272,7 +272,7 @@ let test_pair ?(deep = false) math =
   Printf.printf "event = cipher_migration math = %b bases = %d status = pass\n%!"
     math (P.cipher_shape old_ct).P.base_layers
 
-let wallet_server path =
+let wallet_server ~keyed path =
   let output = Unix.dup Unix.stdout |> Unix.out_channel_of_descr in
   Unix.dup2 Unix.stderr Unix.stdout;
   let json = Yojson.Safe.from_file path in
@@ -300,8 +300,9 @@ let wallet_server path =
       run (L.flush_dirty_lwt ledger);
       run (S.set_meta store "total_supply" "1000003");
       run (S.set_meta store "emission_remaining" "0");
-      let epoch = ref (Option.get
-        (Octra_core.Rule_graph.cipher_activation_for_chain "octra-devnet-9871-cluster")).activation_epoch in
+      let rule = if keyed then Octra_core.Rule_graph.proof_key_activation_for_chain
+        else Octra_core.Rule_graph.cipher_activation_for_chain in
+      let epoch = ref (Option.get (rule chain_id)).activation_epoch in
       let cipher () = (L.find_opt ledger address |> Option.get).encrypted_balance
         |> Option.value ~default:"0" in
       let response method_ params =
@@ -317,15 +318,16 @@ let wallet_server path =
         | "octra_pvacMigrationStatus" ->
           let status = Octra_core.Pvac_migration.status_of_state ~cap:true
             ~cipher:(cipher ()) ~pubkey:(run (L.get_pvac_pubkey ledger address)) in
-          Octra_node_runtime.Rpc_view.pvac_migration_status ~addr:address
+          Octra_node_runtime.Rpc_view.pvac_migration_status ~keyed ~addr:address
             ~cipher:(cipher ()) ~epoch:!epoch ~math:true ~owner_migration_mode:G.Active
             ~cipher_mode:G.Active ~proof_mode:G.Active status
-            (Octra_core.Pvac_migration_admission.disabled ~chain_id)
+            (Octra_core.Pvac_migration_check.disabled ~chain_id)
         | "inspect" ->
-          let registered = run (L.get_pvac_pubkey ledger address) |> Option.get
-            |> Bytes.of_string |> P.deserialize_pubkey in
+          let wire = run (L.get_pvac_pubkey ledger address) |> Option.get in
+          let registered = wire |> Bytes.of_string |> P.deserialize_pubkey in
           let amount = F.get_balance registered sk (cipher ()) |> Result.get_ok in
           `Assoc ["amount", `String (Z.to_string amount);
+            "key_hash", `String Digestif.SHA256.(digest_string wire |> to_hex);
             "balance", `String (Z.to_string account.balance); "nonce", `Int account.nonce;
             "supply", `String (run (S.get_meta store "total_supply") |> Option.get)]
         | "octra_submit" ->
@@ -339,7 +341,7 @@ let wallet_server path =
             ~emission_policy:Octra_core.Emission_policy.Guard
             ~emission_schedule:(Octra_core.Emission_schedule.of_env_exn (fun _ -> None))
             ~validator_policy:(Octra_core.Validator_policy.of_env_exn (fun _ -> None)) store ledger in
-          let transition = A.create ~math:true ~preverify:None ~ledger ~epoch_id:!epoch
+          let transition = A.create ~keyed ~math:true ~preverify:None ~ledger ~epoch_id:!epoch
             ~owner_migration_mode:G.Active ~cipher_mode:G.Active ~proof_mode:G.Active
             ~field_policy:PL.Unique_fields ~result_policy:Octra_core.Private_result_policy.Recoverable
             ~legacy_replay:(fun ~epoch:_ ~address:_ ~cipher:_ -> failwith "unexpected history read")
@@ -376,7 +378,8 @@ let wallet_server path =
 let () =
   Mirage_crypto_rng_unix.use_default ();
   match Array.to_list Sys.argv with
-  | [_; "--serve-wallet"; path] -> wallet_server path
+  | [_; "--serve-wallet"; path] -> wallet_server ~keyed:false path
+  | [_; "--serve-keyed-wallet"; path] -> wallet_server ~keyed:true path
   | [_; "--wallet"; path] ->
     let input = open_in_bin path in
     let text = Fun.protect ~finally:(fun () -> close_in_noerr input) (fun () ->

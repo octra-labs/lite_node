@@ -8,6 +8,7 @@
 #include <cassert>
 #include "transcript.hpp"
 #include "generators.hpp"
+#include "prover_msm.hpp"
 #include "../ristretto255.hpp"
 
 namespace pvac {
@@ -147,7 +148,7 @@ inline InnerProductProof ipp_prove(
             scalars.push_back(c_L);
             points.push_back(Q);
 
-            proof.L[k] = multi_scalar_mul(scalars, points);
+            proof.L[k] = prover_msm(scalars, points);
         }
 
         {
@@ -167,7 +168,7 @@ inline InnerProductProof ipp_prove(
             scalars.push_back(c_R);
             points.push_back(Q);
 
-            proof.R[k] = multi_scalar_mul(scalars, points);
+            proof.R[k] = prover_msm(scalars, points);
         }
 
         transcript.append_point("L", proof.L[k]);
@@ -184,12 +185,12 @@ inline InnerProductProof ipp_prove(
             a_new[i] = sc_add(ops.mul(a[i], u_k), ops.mul(a[half + i], u_k_inv));
             b_new[i] = sc_add(ops.mul(b[i], u_k_inv), ops.mul(b[half + i], u_k));
 
-            G_new[i] = multi_scalar_mul(
+            G_new[i] = prover_msm(
                 {u_k_inv, u_k},
                 {G_vec[i], G_vec[half + i]}
             );
 
-            H_new[i] = multi_scalar_mul(
+            H_new[i] = prover_msm(
                 {u_k, u_k_inv},
                 {H_vec[i], H_vec[half + i]}
             );

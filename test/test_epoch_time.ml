@@ -18,7 +18,7 @@ let test_conversion () =
   | Error _ -> failwith "millisecond conversion rejected"
 
 let test_check_accepts () =
-  match T.check ~now:1_700_000_000.0 ~previous:None ~candidate:1_700_000_001.0 with
+  match T.check ~now:1_700_000_000.0 ~previous:None ~entry:1_700_000_001.0 with
   | Ok value -> expect "accepted timestamp" (value = 1_700_000_001_000L)
   | Error _ -> failwith "accepted timestamp rejected"
 
@@ -27,7 +27,7 @@ let test_protocol_interval () =
     T.check
       ~now:1_700_000_010.0
       ~previous:(Some 1_700_000_000_000L)
-      ~candidate:1_700_000_010.0
+      ~entry:1_700_000_010.0
   with
   | Ok value ->
     expect "protocol interval timestamp" (value = 1_700_000_010_000L)
@@ -38,7 +38,7 @@ let test_check_accepts_schedule_debt () =
     T.check
       ~now:1_700_000_100.0
       ~previous:(Some 1_700_000_000_000L)
-      ~candidate:1_700_000_010.0
+      ~entry:1_700_000_010.0
   with
   | Ok value ->
     expect "schedule debt timestamp" (value = 1_700_000_010_000L)
@@ -61,44 +61,44 @@ let test_next_delay_after_boundary () =
 
 let test_check_rejects_drift () =
   expect_error "drift accepted"
-    (T.check ~now:1_700_000_000.0 ~previous:None ~candidate:1_700_030_001.0)
+    (T.check ~now:1_700_000_000.0 ~previous:None ~entry:1_700_030_001.0)
 
 let test_short_interval () =
   expect_error "short protocol interval accepted"
     (T.check
        ~now:1_700_000_009.0
        ~previous:(Some 1_700_000_000_000L)
-       ~candidate:1_700_000_009.999)
+       ~entry:1_700_000_009.999)
 
 let test_check_rejects_future_time () =
   expect_error "future epoch time accepted"
     (T.check
        ~now:1_700_000_010.0
        ~previous:(Some 1_700_000_005_001L)
-       ~candidate:1_700_000_015.001)
+       ~entry:1_700_000_015.001)
 
 let test_check_rejects_backwards () =
   expect_error "backwards timestamp accepted"
     (T.check
        ~now:1_700_000_000.0
        ~previous:(Some 1_700_000_001_000L)
-       ~candidate:1_700_000_000.0)
+       ~entry:1_700_000_000.0)
 
 let test_check_rejects_non_finite () =
   expect_error "nan timestamp accepted"
-    (T.check ~now:(0. /. 0.) ~previous:None ~candidate:1.0);
+    (T.check ~now:(0. /. 0.) ~previous:None ~entry:1.0);
   expect_error "infinite timestamp accepted"
-    (T.check ~now:1.0 ~previous:None ~candidate:(1. /. 0.))
+    (T.check ~now:1.0 ~previous:None ~entry:(1. /. 0.))
 
 let test_check_rejects_range () =
   expect_error "negative timestamp accepted"
-    (T.check ~now:1.0 ~previous:None ~candidate:(-1.0))
+    (T.check ~now:1.0 ~previous:None ~entry:(-1.0))
 
 let test_reproposal_monotonic () =
   match
     T.check_reproposal
       ~previous:(Some 1_700_000_000_000L)
-      ~candidate:1_700_000_010.0
+      ~entry:1_700_000_010.0
   with
   | Ok value ->
     expect "reproposal timestamp" (value = 1_700_000_010_000L)
@@ -108,13 +108,13 @@ let test_reproposal_short () =
   expect_error "short reproposal interval accepted"
     (T.check_reproposal
        ~previous:(Some 1_700_000_000_000L)
-       ~candidate:1_700_000_009.999)
+       ~entry:1_700_000_009.999)
 
 let test_reproposal_backwards () =
   expect_error "backwards reproposal timestamp accepted"
     (T.check_reproposal
        ~previous:(Some 1_700_000_001_000L)
-       ~candidate:1_700_000_000.0)
+       ~entry:1_700_000_000.0)
 
 let future_ts = 1_700_000_100.0
 
@@ -127,7 +127,7 @@ let test_historical_time_rule () =
       ~kind:T.Reproposal
       ~now:1_700_000_010.0
       ~previous:prior_time
-      ~candidate:future_ts
+      ~entry:future_ts
   with
   | Ok _ -> ()
   | Error _ -> failwith "historical reproposal rule changed"
@@ -139,7 +139,7 @@ let test_historical_future_time () =
        ~kind:T.Fresh
        ~now:1_700_000_010.0
        ~previous:prior_time
-       ~candidate:future_ts)
+       ~entry:future_ts)
 
 let test_uniform_future_time () =
   expect_error "uniform reproposal accepted future time"
@@ -148,7 +148,7 @@ let test_uniform_future_time () =
        ~kind:T.Reproposal
        ~now:1_700_000_010.0
        ~previous:prior_time
-       ~candidate:future_ts)
+       ~entry:future_ts)
 
 let test_uniform_observed_time () =
   match
@@ -157,7 +157,7 @@ let test_uniform_observed_time () =
       ~kind:T.Reproposal
       ~now:1_700_000_010.0
       ~previous:prior_time
-      ~candidate:1_700_000_010.0
+      ~entry:1_700_000_010.0
   with
   | Ok _ -> ()
   | Error _ -> failwith "uniform reproposal rejected observed time"
@@ -169,7 +169,7 @@ let test_uniform_clock_drift () =
       ~kind:T.Reproposal
       ~now:1_700_000_002.0
       ~previous:(Some 1_699_999_990_000L)
-      ~candidate:1_700_000_004.0
+      ~entry:1_700_000_004.0
   with
   | Ok _ -> ()
   | Error _ -> failwith "uniform early reproposal rejected reduced drift"
@@ -207,37 +207,37 @@ let test_finite_recovery () =
   let now = 1_700_000_000.0 in
   let parent = now +. 86_400.0 in
   let previous = Some (T.of_seconds parent |> Result.get_ok) in
-  let candidate = parent +. T.interval_seconds in
+  let entry = parent +. T.interval_seconds in
   List.iter (fun rule ->
     expect_error "fresh proposal accepted before recovery"
       (T.check_proposal ~rule ~kind:T.Fresh ~now:(parent +. 4.0)
-         ~previous ~candidate);
+         ~previous ~entry);
     expect "fresh proposal accepted at future limit"
       (Result.is_ok (T.check_proposal ~rule ~kind:T.Fresh
-        ~now:(parent +. 5.0) ~previous ~candidate))) [T.Historical; T.Uniform];
+        ~now:(parent +. 5.0) ~previous ~entry))) [T.Historical; T.Uniform];
   expect "finite future parent retains a finite delay"
     (T.next_delay_ms ~now ~previous:parent = 86_410_000L);
   expect "recovery admission still precedes cadence"
     (T.next_delay_ms ~now:(parent +. 5.0) ~previous:parent = 5_000L);
   expect "cadence resumes at parent plus interval"
-    (T.next_delay_ms ~now:candidate ~previous:parent = 0L);
+    (T.next_delay_ms ~now:entry ~previous:parent = 0L);
   expect "cadence remains open after recovery"
-    (T.next_delay_ms ~now:(candidate +. 1.0) ~previous:parent = 0L)
+    (T.next_delay_ms ~now:(entry +. 1.0) ~previous:parent = 0L)
 
 let test_live_time_policy () =
   let chain_id = "octra-devnet-9871-cluster" in
   let now = 1_700_000_000.0 in
   let previous = Some (T.of_seconds (now -. 10.0) |> Result.get_ok) in
-  let candidate = now +. 86_400.0 in
+  let entry = now +. 86_400.0 in
   List.iter (fun epoch_id ->
     let rule = Policy.rule_for_epoch ~chain_id ~epoch_id in
     List.iter (fun kind ->
       expect_error "active devnet accepted day-ahead proposal"
-        (T.check_proposal ~rule ~kind ~now ~previous ~candidate))
+        (T.check_proposal ~rule ~kind ~now ~previous ~entry))
       [T.Fresh; T.Reproposal]) [1_320_000L; 1_523_218L];
   expect "historical replay rule preserved"
     (Result.is_ok (T.check_proposal ~rule:T.Historical ~kind:T.Reproposal
-      ~now ~previous ~candidate))
+      ~now ~previous ~entry))
 
 let () =
   test_finite_recovery ();

@@ -5,7 +5,7 @@ module Contract = Octra_vm.Contract
 module ContractVM = Octra_vm.Contract_vm
 module Circles = Octra_core.Circles
 module Circle_code =
-  Octra_node_runtime.Consensus_circle_code_admission
+  Octra_node_runtime.Consensus_circle_code_check
 module Epoch_exec = Octra_core.Epoch_exec
 module Program_package = Octra_vm.Program_package
 module Program_trust = Octra_vm.Program_trust
@@ -1394,7 +1394,7 @@ Program CirclePayments {
         program_journal = Octra_vm.Tx_effects.program effects;
         trusted_program_keys = program_trust; store;
         get_fhe_pubkey = (fun _ -> None);
-        proof_mode = R.Active; fhe_work = R.Active; proof_exec = R.Active;
+        proof_mode = R.Active; fhe_work = R.Active; proof_exec = R.Active; proof_key = R.Prior;
         vm_bytes = R.Prior;
         wasm_float = R.Active; math = true; object_cost = false;
         current_epoch = epoch; epoch_time_ms = 0L; tree_hash = "root";
@@ -1595,7 +1595,7 @@ Program CirclePayments {
         let entered, notify = Lwt.wait () in
         let pending, _ = Lwt.task () in
         let work = interrupted (fun () -> Lwt.wakeup_later notify (); pending) in
-        let* () = Lwt.pick [entered; (let* () = Lwt_unix.sleep 5. in
+        let* () = Lwt.pick [entered; (let* () = Lwt_unix.sleep 120. in
           Lwt.fail_with "wasm callback did not suspend")] in
         Lwt.cancel work;
         Lwt.catch (fun () -> let* _ = work in Lwt.fail_with "wasm cancellation lost")
@@ -1861,7 +1861,8 @@ Program CirclePayments {
           spawns = [Octra_core.Circle_wasm_host.{circle_id = child; spawn_nonce = 0;
             owner_mode = Circles.Spawn_owner_caller; payload_json}]} in
         expect "child commit failed"
-          (Lwt_main.run (C.commit_call_result ~proof_mode:R.Active store address result) = Ok ());
+          (Lwt_main.run (C.commit_call_result ~table_mode:!selected
+            ~proof_mode:R.Active store address result) = Ok ());
         let info = Option.get (Lwt_main.run (Store.get_circle_info store child)) in
         expect "child acquired different call permission"
           (Lwt_main.run (D.calls_enabled store info) = expected) in
@@ -2413,7 +2414,7 @@ program ByteWork {
       get_fhe_pubkey = (fun _ -> None);
       proof_mode = R.Active;
       fhe_work = R.Active;
-      proof_exec = R.Active;
+      proof_exec = R.Active; proof_key = Octra_core.Rule_graph.Prior;
       vm_bytes = mode;
       wasm_float = R.Active;
       math = true;

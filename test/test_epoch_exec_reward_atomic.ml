@@ -109,7 +109,10 @@ let fold standard_mode =
     program_overlap = false;
     fhe_work = Octra_core.Rule_graph.Prior;
     proof_exec = Octra_core.Rule_graph.Prior;
+    proof_key = Octra_core.Rule_graph.Prior;
     vm_bytes = Octra_core.Rule_graph.Prior;
+    program_records = Octra_core.Rule_graph.Prior;
+    duty_marks = Octra_core.Rule_graph.Prior;
     wasm_float = Octra_core.Rule_graph.Prior;
     math = false;
     cap_mode = Octra_core.Set_fold.Prune;
@@ -379,7 +382,7 @@ let test_validator_unbond () =
   in
   let parameters = {
     Octra_core.Validator_policy.parameters with
-    Octra_core.Validator_admission.unbonding_epochs = 8L;
+    Octra_core.Validator_entry.unbonding_epochs = 8L;
   } in
   expect "early validator withdrawal rejected"
     (Result.is_error
@@ -499,6 +502,7 @@ let test_integer_work_gate () =
           proof_mode;
           fhe_work = Octra_core.Rule_graph.Prior;
           proof_exec = Octra_core.Rule_graph.Prior;
+          proof_key = Octra_core.Rule_graph.Prior;
           vm_bytes = Octra_core.Rule_graph.Prior;
           wasm_float = Octra_core.Rule_graph.Prior;
           math = false;

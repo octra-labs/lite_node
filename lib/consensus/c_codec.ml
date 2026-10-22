@@ -187,7 +187,15 @@ let encode_validator_set validator_set =
         | Some weight -> O.put_string buf (Z.to_string weight)
         | None -> failwith "consensus codec: validator weight missing")
       buf
-      validator_set.validators)
+      validator_set.validators;
+    Option.iter (fun (height, entries) ->
+      O.put_string buf "octra:relief_authors";
+      O.put_u64 buf height;
+      O.put_list (fun buf (member, weight) ->
+        O.put_string buf member.address;
+        O.put_bytes buf member.pubkey;
+        O.put_string buf (Z.to_string weight)) buf entries)
+      validator_set.authors)
 
 let decode_validator_set payload =
   let validator_set =
@@ -207,7 +215,7 @@ let decode_validator_set payload =
               { address; pubkey }, weight)
             c
         in
-        match make_weighted_validator_set entries with
+        let validators = match make_weighted_validator_set entries with
         | Error error -> failwith ("consensus codec: " ^ error)
         | Ok validator_set when weighted -> validator_set
         | Ok validator_set ->
@@ -218,7 +226,27 @@ let decode_validator_set payload =
           then
             failwith "consensus codec: unweighted validator has non-unit weight"
           else
-            make_validator_set validator_set.validators)
+            make_validator_set validator_set.validators in
+        if O.remaining c = 0 then validators else
+        if O.get_string c <> "octra:relief_authors" then
+          failwith "consensus codec: author tag differs"
+        else
+          let height = O.get_u64 c in
+          let authors = O.get_list_bounded ~max:max_validators (fun c ->
+            let address = get_string max_addr_bytes c in
+            let pubkey = get_exact_bytes 32 c in
+            let weight = get_string 256 c |> Z.of_string in
+            {address; pubkey}, weight) c in
+          match make_weighted_validator_set authors with
+          | Error reason -> failwith ("consensus codec: author " ^ reason)
+          | Ok checked ->
+            if height < 0L || not weighted
+              || List.exists (fun (member, _) ->
+                is_validator validators member.address
+                || List.exists (fun voter -> voter.pubkey = member.pubkey)
+                     validators.validators) authors then
+              failwith "consensus codec: author context differs";
+            {validators with authors = Some (height, weights_of_set checked)})
       payload
   in
   if encode_validator_set validator_set <> payload then

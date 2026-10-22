@@ -7,6 +7,7 @@ module Bundle_fetch = Consensus_bundle_fetch
 
 type deps = {
   check_finality : C_types.finalize -> unit;
+  finish_applied : C_types.finalize -> bool;
   write_finality : C_types.finalize -> unit;
   persist_finality_certificate :
     validator_set:C_types.validator_set ->
@@ -35,14 +36,15 @@ type deps = {
     Bundle_fetch.accepted ->
     unit;
   sleep : float -> unit Lwt.t;
+  range_bundle : C_types.epoch_header -> timeout:float -> Bundle_fetch.accepted option Lwt.t;
   bundle_wait_timeout_seconds : float;
   bundle_wait_expired : epoch_id:int64 -> unit;
-  bundle_wait_recovered : epoch_id:int64 -> unit;
-  post_finalize : epoch_id:int64 -> proposed_root:string -> unit Lwt.t;
+  post_finalize : epoch_id:int64 -> proposed_root:string -> Consensus_post_finalize.result Lwt.t;
 }
 
 type node_deps = {
   check_finality : C_types.finalize -> unit;
+  finish_applied : C_types.finalize -> bool;
   write_finality : C_types.finalize -> unit;
   persist_finality_certificate :
     validator_set:C_types.validator_set ->
@@ -73,16 +75,19 @@ type node_deps = {
   sleep : float -> unit Lwt.t;
   bundle_wait_timeout_seconds : float;
   bundle_wait_expired : epoch_id:int64 -> unit;
-  bundle_wait_recovered : epoch_id:int64 -> unit;
-  post_finalize : epoch_id:int64 -> proposed_root:string -> unit Lwt.t;
+  post_finalize : epoch_id:int64 -> proposed_root:string -> Consensus_post_finalize.result Lwt.t;
 }
 
 val node_deps :
   node_deps ->
   deps
 
+val range_payload :
+  header:C_types.epoch_header -> C_driver.catchup_range_response_record ->
+  Bundle_fetch.accepted option
+
 val run :
   deps ->
   validator_set:C_types.validator_set ->
   C_types.finalize ->
-  unit Lwt.t
+  Consensus_post_finalize.result Lwt.t

@@ -867,6 +867,179 @@ void cipher_math_cases() {
 #endif
 }
 
+void key_field_cases(const pvac::PubKey& key) {
+    using namespace pvac;
+    const auto expected = proof_key_digest(key);
+    std::cout << "event = proof_key_digest hash = " << hex(expected.data(), expected.size()) << "\n";
+    const auto different = [&](const auto& change) {
+        auto copy = key;
+        change(copy);
+        check(proof_key_digest(copy) != expected, "key field omitted");
+    };
+    for (auto member : {&Params::B, &Params::m_bits, &Params::n_bits,
+        &Params::h_col_wt, &Params::x_col_wt, &Params::err_wt,
+        &Params::lpn_n, &Params::lpn_t, &Params::lpn_tau_num,
+        &Params::lpn_tau_den, &Params::recrypt_rounds}) {
+        different([&](auto& copy) { ++(copy.prm.*member); });
+    }
+    for (auto member : {&Params::noise_entropy_bits, &Params::tuple2_fraction,
+        &Params::depth_slope_bits, &Params::recrypt_lo, &Params::recrypt_hi}) {
+        different([&](auto& copy) { copy.prm.*member += 0.125; });
+    }
+    different([](auto& copy) { ++copy.prm.edge_budget; });
+    different([](auto& copy) { ++copy.canon_tag; });
+    different([](auto& copy) { copy.H.pop_back(); });
+    different([](auto& copy) { ++copy.H.front().nbits; });
+    different([](auto& copy) { copy.H.front().w.front() ^= 1; });
+    different([](auto& copy) { copy.H.front().w.push_back(0); });
+    different([](auto& copy) { ++copy.ubk.perm.front(); });
+    different([](auto& copy) { ++copy.ubk.inv.front(); });
+    different([](auto& copy) { copy.ubk.perm.push_back(0); });
+    different([](auto& copy) { copy.H_digest.front() ^= 1; });
+    different([](auto& copy) { copy.omega_B.lo ^= 1; });
+    different([](auto& copy) { copy.omega_B.hi ^= 1; });
+    different([](auto& copy) { copy.powg_B.front().lo ^= 1; });
+    different([](auto& copy) { copy.powg_B.front().hi ^= 1; });
+    different([](auto& copy) { copy.powg_B.push_back({}); });
+    different([](auto& copy) { copy.circuit_prf_key_commit.front() ^= 1; });
+    different([](auto& copy) {
+        copy.circuit_prf_profile = copy.circuit_prf_profile == CircuitPrfProfile::MIMC_X5_V7
+            ? CircuitPrfProfile::MIMC_X3_V6 : CircuitPrfProfile::MIMC_X5_V7;
+    });
+    const auto group = [](std::string_view domain, const auto&... values) {
+        KeyHash hash;
+        hash.group(domain, values...);
+        return hash.finish();
+    };
+    check(group("key", 1) != group("proof", 1), "key domain omitted");
+    check(group("key", 1) != group("key", uint64_t{1}), "key type omitted");
+    check(group("key", 1) != group("key", 1, 0), "key field count omitted");
+    check(group("key", std::vector<int>{1, 2}, std::vector<int>{3})
+        != group("key", std::vector<int>{1}, std::vector<int>{2, 3}),
+        "key list lengths omitted");
+}
+
+void key_sample(const std::string& path) {
+    using namespace pvac;
+    Params params;
+    params.m_bits = 256;
+    params.n_bits = 512;
+    params.h_col_wt = 32;
+    params.x_col_wt = 32;
+    params.err_wt = 32;
+    PubKey key;
+    SecKey secret;
+    const uint8_t seed[32] = {89};
+    keygen_from_seed(params, key, secret, seed);
+    auto rng = make_seeded_rng(seed);
+    const auto encrypted = enc_fp_depth_seeded(key, secret,
+        {fp_neg(fp_from_u64(1))}, 0, rng);
+    const auto cipher = ct_add_const(key, encrypted, uint64_t{1}, true);
+    check(field_eq(dec_value(key, secret, cipher), fp_from_u64(0)), "key sample value differs");
+    auto changed = key;
+    std::vector<bool> used(key.powg_B.size(), false);
+    for (const auto& edge : cipher.E) used[edge.idx] = true;
+    const auto free = std::find(used.begin(), used.end(), false);
+    check(free != used.end(), "key sample entry missing");
+    const auto pos = std::distance(used.begin(), free);
+    changed.powg_B[pos] = fp_add(changed.powg_B[pos], fp_from_u64(1));
+    auto metadata = key;
+    ++metadata.prm.recrypt_rounds;
+    const auto blind = bp::sc_from_u64(19);
+    const auto point = pedersen_commit(bp::sc_from_u64(0), blind);
+    std::ofstream output(path, std::ios::binary);
+    const auto write = [&](const auto& bytes) {
+        check(bytes.size() <= UINT32_MAX, "key sample too large");
+        const auto size = static_cast<uint32_t>(bytes.size());
+        for (int shift : {24, 16, 8, 0}) output.put(static_cast<char>(size >> shift));
+        output.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    };
+    for (const auto& item : {key, changed, metadata}) write(pvac_ser::serialize_pubkey(item));
+    write(pvac_ser::serialize_cipher(cipher));
+    write(point);
+    for (bool keyed : {false, true}) {
+        for (const auto& item : {key, changed}) {
+            const auto zero = make_zero_proof(item, secret, cipher, ScalarRule::Wide, keyed);
+            const auto amount = make_zero_proof_bound(item, secret, cipher, 0, blind, ScalarRule::Wide, keyed);
+            const auto range = make_zero_proof_bound_range(item, secret, cipher, 0, blind, ScalarRule::Wide, keyed);
+            check(verify_zero(item, cipher, zero, ScalarRule::Wide, keyed), "key sample zero refused");
+            check(verify_zero_bound(item, cipher, amount, point, ScalarRule::Wide, keyed), "key sample amount refused");
+            check(verify_zero_bound_range(item, cipher, range, ScalarRule::Wide, keyed), "key sample range refused");
+            pvac_ser::Writer zero_bytes;
+            pvac_ser::write_zero_proof_raw(zero_bytes, zero);
+            write(zero_bytes.buf);
+            pvac_ser::Writer amount_bytes;
+            pvac_ser::write_zero_proof_raw(amount_bytes, amount);
+            write(amount_bytes.buf);
+            write(pvac_ser::serialize_bound_range_proof(range));
+        }
+    }
+    output.close();
+    check(output.good(), "key sample write failed");
+}
+
+void proof_key_cases() {
+    using namespace pvac;
+    Params params;
+    params.m_bits = 256;
+    params.n_bits = 512;
+    params.h_col_wt = 32;
+    params.x_col_wt = 32;
+    params.err_wt = 32;
+    PubKey key;
+    SecKey secret;
+    const uint8_t seed[32] = {73};
+    keygen_from_seed(params, key, secret, seed);
+    key_field_cases(key);
+    auto cipher = enc_value_seeded(key, secret, 1, seed);
+    check(!cipher.E.empty(), "key context edge missing");
+    auto changed = key;
+    const auto index = cipher.E.front().idx;
+    changed.powg_B[index] = fp_add(changed.powg_B[index], fp_from_u64(1));
+    check(is_cipher_compatible_with_pubkey(changed, cipher), "key context shape control");
+    const auto left = compute_layer_coeffs(key, cipher);
+    const auto right = compute_layer_coeffs(changed, cipher);
+    check(!field_eq(left[cipher.E.front().layer_id][0], right[cipher.E.front().layer_id][0]), "key context relation control");
+    check(commit_ct(key, cipher) == commit_ct(changed, cipher), "prior commitment changed");
+    const auto challenge = [&](const PubKey& value, bool keyed) {
+        bp::Transcript transcript("pvac.verify_zero.key_bound", ScalarRule::Wide);
+        detail::append_key_bound_transcript_context(transcript, value, cipher, "zero", nullptr, keyed);
+        const auto scalar = transcript.challenge_scalar("key_context");
+        std::array<uint8_t, 32> bytes;
+        sc_tobytes(bytes.data(), scalar);
+        return bytes;
+    };
+    check(challenge(key, false) == challenge(changed, false), "prior proof context changed");
+    check(challenge(key, true) != challenge(changed, true), "public key missing from proof context");
+    const auto encoded = pvac_ser::serialize_pubkey(key);
+    const auto decoded = pvac_ser::deserialize_pubkey(encoded.data(), encoded.size());
+    check(proof_key_digest(key) == proof_key_digest(decoded), "key encoding differs");
+    auto unused = key;
+    std::vector<bool> used(key.powg_B.size(), false);
+    for (const auto& edge : cipher.E) used[edge.idx] = true;
+    const auto free = std::find(used.begin(), used.end(), false);
+    check(free != used.end(), "unused key entry missing");
+    unused.powg_B[std::distance(used.begin(), free)] = fp_from_u64(9);
+    const auto blind = bp::sc_from_u64(17);
+    const auto point = pedersen_commit(bp::sc_from_u64(1), blind);
+    for (bool keyed : {false, true}) {
+        const auto proof = make_zero_proof_bound(key, secret, cipher, 1, blind, ScalarRule::Wide, keyed);
+        check(verify_zero_bound(key, cipher, proof, point, ScalarRule::Wide, keyed), "amount proof rejected");
+        check(!verify_zero_bound(key, cipher, proof, point, ScalarRule::Wide, !keyed), "proof policy confused");
+        check(verify_zero_bound(unused, cipher, proof, point, ScalarRule::Wide, keyed) == !keyed,
+            "unused key entry not authenticated");
+        check(!verify_zero_bound(changed, cipher, proof, point, ScalarRule::Wide, keyed), "changed relation accepted");
+        check(verify_zero_bound_key_switch(key, cipher, proof, point, ScalarRule::Wide, keyed),
+            "key switch proof rejected");
+        check(!verify_zero_bound_key_switch(key, cipher, proof, point, ScalarRule::Wide, !keyed),
+            "key switch proof policy confused");
+        check(verify_zero_bound_key_switch(unused, cipher, proof, point, ScalarRule::Wide, keyed) == !keyed,
+            "key switch entry not authenticated");
+        check(!verify_zero_bound_key_switch(changed, cipher, proof, point, ScalarRule::Wide, keyed),
+            "key switch relation accepted");
+    }
+}
+
 #ifdef PVAC_C_API
 void api_proof_cases() {
     using namespace pvac;
@@ -909,6 +1082,11 @@ int main(int argc, char** argv) {
         const std::string mode = argc > 1 ? argv[1] : "all";
         if (mode == "vector") { std::cout << "vector = " << vector_digest() << "\n"; return 0; }
         if (mode == "wire") { product_case(true); return 0; }
+        if (mode == "key-sample") {
+            check(argc == 3, "key sample path missing");
+            key_sample(argv[2]);
+            return 0;
+        }
         if (mode == "peak-write" || mode == "peak-read") {
             check(argc == 3, "proof file missing");
             proof_peak_cases(mode, argv[2]);
@@ -928,6 +1106,7 @@ int main(int argc, char** argv) {
         if (mode == "all" || mode == "circuit") circuit_cases();
         if (mode == "all" || mode == "cipher") cipher_math_cases();
         if (mode == "all" || mode == "recrypt") recrypt_cases();
+        if (mode == "all" || mode == "key-context") proof_key_cases();
 #ifdef PVAC_C_API
         if (mode == "all" || mode == "api") api_proof_cases();
 #endif

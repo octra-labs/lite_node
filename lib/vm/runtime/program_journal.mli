@@ -7,7 +7,7 @@ type deploy = {
   bytecode_b64 : string;
   owner : string;
   ctype : string;
-  admission : string;
+  check : string;
   version : string;
   storage : (string, string) Hashtbl.t;
 }
@@ -19,7 +19,7 @@ type upgrade = {
   bytecode_b64 : string;
   owner : string;
   ctype : string;
-  admission : string;
+  check : string;
   version : string;
 }
 
@@ -47,6 +47,8 @@ val checkout_storage :
   (string, string) Hashtbl.t
 val deploys : t -> deploy list
 val upgrades : t -> upgrade list
+val add_record : t -> string -> Octra_core.Store_chaindata.program_record -> unit
+val records : t -> (string * Octra_core.Store_chaindata.program_record) list
 val storage_entries : t -> (string * (string, string) Hashtbl.t) list
 val circle_storage :
   t -> string -> (string, string) Hashtbl.t -> (string, string) Hashtbl.t

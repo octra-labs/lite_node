@@ -41,19 +41,30 @@ let short_hex8 s =
        (min 8 (String.length s))
        (fun i -> Printf.sprintf "%02x" (Char.code s.[i])))
 
-let rec drain (deps : deps) =
+let drain (deps : deps) =
   let open Lwt.Syntax in
-  let head = deps.committed_head_epoch () in
-  let epoch = head + 1 in
-  match deps.find_finalized epoch with
-  | Some (finalize, validator_set) ->
-    Log.info "consensus" "replaying stashed finalized epoch = %d reason = drain" epoch;
-    let* () = deps.apply_finalized ~validator_set finalize in
-    if deps.committed_head_epoch () <= head then
-      Lwt.fail_with "finalized replay did not advance committed head"
-    else
-      drain deps
-  | None -> Lwt.return_unit
+  let rec ceiling head =
+    if head = max_int then head else
+    match deps.find_finalized (head + 1) with
+    | Some _ -> ceiling (head + 1)
+    | None -> head in
+  let through = ceiling (deps.committed_head_epoch ()) in
+  let rec loop () =
+    let head = deps.committed_head_epoch () in
+    if head >= through then Lwt.return_unit else
+    let epoch = head + 1 in
+    match deps.find_finalized epoch with
+    | Some (finalize, validator_set) ->
+      Log.info "consensus" "replaying stashed finalized epoch = %d reason = drain" epoch;
+      let* () = deps.apply_finalized ~validator_set finalize in
+      if deps.committed_head_epoch () <= head then begin
+        Log.warn "consensus"
+          "event = stashed_replay_no_progress epoch = %d head = %d source = drain"
+          epoch (deps.committed_head_epoch ());
+        Lwt.return_unit
+      end else loop ()
+    | None -> Lwt.return_unit in
+  loop ()
 
 let rec replay_while_safe (deps : deps) ~source =
   let open Lwt.Syntax in
@@ -67,20 +78,29 @@ let rec replay_while_safe (deps : deps) ~source =
     | Some (finalize, validator_set) ->
       let header = finalize.C_types.header in
       let* local_root = deps.read_local_root_raw () in
-      if header.prev_state_root <> local_root then begin
+      if deps.catchup_active () || deps.committed_head_epoch () <> head then
+        Lwt.return_unit
+      else if header.prev_state_root <> local_root then begin
         if deps.quarantine_active () then
           Log.info "consensus"
             "quarantine replay paused source = %s epoch = %d local_root = %s prev_root = %s"
             source epoch (short_hex8 local_root) (short_hex8 header.prev_state_root);
         Lwt.return_unit
       end else begin
-        Log.warn "consensus"
-          "quarantine replay applying stashed finalized epoch = %d source = %s"
-          epoch source;
-        let* () = deps.apply_finalized ~validator_set finalize in
-        if deps.committed_head_epoch () <= head then
-          Lwt.fail_with "finalized replay did not advance committed head"
+        if deps.quarantine_active () then
+          Log.warn "consensus"
+            "quarantine replay applying stashed finalized epoch = %d source = %s"
+            epoch source
         else
+          Log.info "consensus"
+            "event = stashed_replay_apply epoch = %d source = %s" epoch source;
+        let* () = deps.apply_finalized ~validator_set finalize in
+        if deps.committed_head_epoch () <= head then begin
+          Log.warn "consensus"
+            "event = stashed_replay_no_progress epoch = %d head = %d source = %s"
+            epoch (deps.committed_head_epoch ()) source;
+          Lwt.return_unit
+        end else
           replay_while_safe deps ~source
       end
 

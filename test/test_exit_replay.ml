@@ -106,9 +106,9 @@ let check_fee_balance () =
   count 1 (run path [step (mature + 1) [withdraw]] |> List.hd)
 
 let check_epoch_limit () =
-  let module A = Octra_core.Validator_admission in
+  let module A = Octra_core.Validator_entry in
   let last_exit = Int64.sub Int64.max_int P.unbonding_epochs in
-  let candidate = A.{
+  let entry = A.{
     address = owner.address;
     pubkey = owner.public;
     bond = P.min_bond;
@@ -117,13 +117,13 @@ let check_epoch_limit () =
     exit_epoch = Some last_exit;
   } in
   expect "last representable maturity"
-    (A.withdraw_epoch P.parameters candidate = Ok Int64.max_int);
+    (A.withdraw_epoch P.parameters entry = Ok Int64.max_int);
   expect "maturity before last epoch"
     (A.can_withdraw P.parameters ~current_epoch:(Int64.pred Int64.max_int)
-       candidate = Ok false);
+       entry = Ok false);
   expect "maturity at last epoch"
-    (A.can_withdraw P.parameters ~current_epoch:Int64.max_int candidate = Ok true);
-  let overflow = { candidate with exit_epoch = Some (Int64.succ last_exit) } in
+    (A.can_withdraw P.parameters ~current_epoch:Int64.max_int entry = Ok true);
+  let overflow = { entry with exit_epoch = Some (Int64.succ last_exit) } in
   expect "maturity overflow refused"
     (A.withdraw_epoch P.parameters overflow = Error "epoch arithmetic overflow")
 

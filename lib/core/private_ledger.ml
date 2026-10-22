@@ -78,6 +78,7 @@ type key_switch_source = {
   source_fields : field_policy;
   source_strict : bool;
   source_math : bool;
+  source_keyed : bool;
   source_mode : Rule_graph.mode;
 }
 
@@ -97,6 +98,7 @@ type key_switch_artifact =
       artifact_fields : field_policy;
       artifact_strict : bool;
       artifact_math : bool;
+      artifact_keyed : bool;
       artifact_mode : Rule_graph.mode;
       artifact_plan : key_switch_plan;
       artifact_snapshot : key_switch_snapshot;
@@ -133,6 +135,7 @@ type private_source = {
   source_fields : field_policy;
   source_strict : bool;
   source_math : bool;
+  source_keyed : bool;
   source_verifier : string;
 }
 
@@ -141,7 +144,7 @@ let key_switch_cache_cap = 32
 let key_switch_cache : (string, key_switch_entry) Hashtbl.t =
   Hashtbl.create key_switch_cache_cap
 
-let key_switch_cache_key ?(math = false) ?(cipher_mode = Rule_graph.Prior)
+let key_switch_cache_key ~keyed ?(math = false) ?(cipher_mode = Rule_graph.Prior)
     field_policy strict ledger tx =
   let open Lwt.Syntax in
   let* root = Ledger.hash ledger in
@@ -154,6 +157,7 @@ let key_switch_cache_key ?(math = false) ?(cipher_mode = Rule_graph.Prior)
      ^ ":"
      ^ string_of_bool strict
      ^ (if math then ":math" else "")
+     ^ (if keyed then ":proof_key" else "")
      ^ (match cipher_mode with Rule_graph.Prior -> "" | Rule_graph.Active -> ":cipher"))
 
 let remember_key_switch_plan ?source key plan =
@@ -266,6 +270,8 @@ type key_switch_migration =
 type key_switch_payload = {
   new_pubkey_b64 : string;
   aes_kat : string;
+  owner_cipher : string option;
+  owner_proof : string option;
   old_bound_pubkey_b64 : string option;
   old_bound_cipher : string option;
   source_cipher_hash : string option;
@@ -560,7 +566,7 @@ let parse_decrypt field_policy raw =
         ("decrypt: cannot parse encrypted_data: " ^ e)
         ~user_reason:"decrypt: malformed encrypted_data"
 
-let parse_key_switch field_policy raw =
+let parse_key_switch ~keyed field_policy raw =
   match json_payload "key_switch" raw with
   | Error e ->
     error "key_switch_rejected" e.reason ~user_reason:"encrypted_data must be JSON with new_pubkey and aes_kat"
@@ -569,6 +575,10 @@ let parse_key_switch field_policy raw =
     let decoded =
       let* new_pubkey_b64 = required_string_field field_policy json "new_pubkey" in
       let* aes_kat = required_string_field field_policy json "aes_kat" in
+      let owner name =
+        if keyed then optional_string_field field_policy json name else Ok None in
+      let* owner_cipher = owner "owner_cipher" in
+      let* owner_proof = owner "owner_proof" in
       let* migration = parse_key_switch_migration field_policy json in
       let* old_bound_pubkey_b64 =
         optional_string_field field_policy json "old_bound_pubkey"
@@ -587,6 +597,8 @@ let parse_key_switch field_policy raw =
       Ok {
         new_pubkey_b64;
         aes_kat;
+        owner_cipher;
+        owner_proof;
         old_bound_pubkey_b64;
         old_bound_cipher;
         source_cipher_hash;
@@ -610,14 +622,14 @@ let parse_key_switch field_policy raw =
 let key_switch_requests_legacy_public_migration
     ~field_policy
     tx =
-  match parse_key_switch field_policy tx.T.encrypted_data with
+  match parse_key_switch ~keyed:false field_policy tx.T.encrypted_data with
   | Ok payload -> payload.migration = Public_history
   | Error _ -> false
 
 let key_switch_requests_historical_owner_proof
     ~field_policy
     tx =
-  match parse_key_switch field_policy tx.T.encrypted_data with
+  match parse_key_switch ~keyed:false field_policy tx.T.encrypted_data with
   | Ok payload -> payload.migration = Historical_owner_proof
   | Error _ -> false
 
@@ -641,7 +653,7 @@ let key_switch_requests_legacy_audit
     ?(cipher_mode = Rule_graph.Prior)
     ~field_policy
     tx =
-  match parse_key_switch field_policy tx.T.encrypted_data with
+  match parse_key_switch ~keyed:false field_policy tx.T.encrypted_data with
   | Ok payload ->
     begin
       match payload.migration with
@@ -744,7 +756,7 @@ let private_claim_source field_policy ledger tx =
     end
   | _ -> Lwt.return Private_claim_none
 
-let private_source ?(math = false) ~field_policy ~strict ~result_policy ledger tx =
+let private_source ~keyed ?(math = false) ~field_policy ~strict ~result_policy ledger tx =
   let open Lwt.Syntax in
   match private_op tx with
   | None ->
@@ -766,6 +778,7 @@ let private_source ?(math = false) ~field_policy ~strict ~result_policy ledger t
       source_fields = field_policy;
       source_strict = strict;
       source_math = math;
+      source_keyed = keyed;
       source_verifier = private_verifier;
     }
 
@@ -779,6 +792,7 @@ let private_source_equal left right =
   && left.source_fields = right.source_fields
   && Bool.equal left.source_strict right.source_strict
   && Bool.equal left.source_math right.source_math
+  && Bool.equal left.source_keyed right.source_keyed
   && String.equal left.source_verifier right.source_verifier
 
 let kat_state ledger addr =
@@ -873,7 +887,7 @@ let encrypt_balance_plan
         | Error e -> error "encrypt_balance_failed" e
         | Ok next_cipher -> Ok { current_cipher = current; next_cipher })
 
-let verify_encrypt ?(math = false)
+let verify_encrypt ~keyed ?(math = false)
     ~strict
     worker_priority
     result_policy
@@ -886,7 +900,7 @@ let verify_encrypt ?(math = false)
   | Error e -> Lwt.return (Error e)
   | Ok () ->
     let* verified =
-      VW.verify_encrypt_classified_with_priority ~math
+      VW.verify_encrypt_classified_with_priority ~keyed ~math
         worker_priority
         ~strict
         ~pubkey:blob
@@ -936,7 +950,7 @@ let prepare_encrypt_plan
         | Error e -> Lwt.return (Error e)
         | Ok () -> encrypt_balance_plan ~cap result_policy blob current payload
 
-let encrypt_plan ?(math = false)
+let encrypt_plan ~keyed ?(math = false)
     ~field_policy
     ~strict
     ?(worker_priority = Compute_pool.Required)
@@ -954,7 +968,7 @@ let encrypt_plan ?(math = false)
       match current_cipher ledger tx.T.from "encrypt_balance_failed" with
       | Error e -> Lwt.return (Error e)
       | Ok current ->
-        verify_encrypt ~math
+        verify_encrypt ~keyed ~math
           ~strict
           worker_priority
           result_policy
@@ -996,7 +1010,7 @@ let decrypt_balance_plan
         | Ok next_cipher ->
           Ok { current_cipher = current; next_cipher })
 
-let verify_decrypt ?(math = false)
+let verify_decrypt ~keyed ?(math = false)
     ~strict
     worker_priority
     result_policy
@@ -1017,7 +1031,7 @@ let verify_decrypt ?(math = false)
             ~user_reason:"decrypt: range_proof_balance required: proves remaining encrypted balance >= 0")
       | Some range_proof ->
         let* verified =
-          VW.verify_encrypt_classified_with_priority ~math
+          VW.verify_encrypt_classified_with_priority ~keyed ~math
             worker_priority
             ~strict
             ~pubkey:blob
@@ -1051,7 +1065,7 @@ let verify_decrypt ?(math = false)
               | Error _ as e -> Lwt.return e
               | Ok plan ->
                 let* range =
-                  VW.verify_range_classified_with_priority ~math
+                  VW.verify_range_classified_with_priority ~keyed ~math
                     worker_priority
                     ~strict
                     ~pubkey:blob
@@ -1106,7 +1120,7 @@ let prepare_decrypt_plan
           | Error e -> Lwt.return (Error e)
           | Ok () -> decrypt_balance_plan ~cap result_policy blob current payload
 
-let decrypt_plan ?(math = false)
+let decrypt_plan ~keyed ?(math = false)
     ~field_policy
     ~strict
     ?(worker_priority = Compute_pool.Required)
@@ -1131,7 +1145,7 @@ let decrypt_plan ?(math = false)
         match current_cipher ledger tx.T.from "decrypt_cipher_failed" with
         | Error e -> Lwt.return (Error e)
         | Ok current ->
-          verify_decrypt ~math
+          verify_decrypt ~keyed ~math
             ~strict
             worker_priority
             result_policy
@@ -1158,14 +1172,14 @@ let apply_encrypt_plan ledger tx plan =
         | Ok () -> Lwt.return (Ok plan)
         | Error e -> failwith (Printf.sprintf "encrypt update_enc_balance: %s" e))
 
-let apply_encrypt ?(math = false)
+let apply_encrypt ~keyed ?(math = false)
     ~field_policy
     ~strict
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
   let open Lwt.Syntax in
-  let* plan = encrypt_plan ~math ~field_policy ~strict ~result_policy ledger tx in
+  let* plan = encrypt_plan ~keyed ~math ~field_policy ~strict ~result_policy ledger tx in
   match plan with
   | Error e -> Lwt.return (Error e)
   | Ok plan -> apply_encrypt_plan ledger tx plan
@@ -1184,14 +1198,14 @@ let apply_decrypt_plan ledger tx plan =
           | Ok () -> Lwt.return (Ok plan)
           | Error e -> failwith (Printf.sprintf "decrypt update_enc_balance: %s" e))
 
-let apply_decrypt ?(math = false)
+let apply_decrypt ~keyed ?(math = false)
     ~field_policy
     ~strict
     ?(result_policy = Private_result_policy.Recoverable)
     ledger
     tx =
   let open Lwt.Syntax in
-  let* plan = decrypt_plan ~math ~field_policy ~strict ~result_policy ledger tx in
+  let* plan = decrypt_plan ~keyed ~math ~field_policy ~strict ~result_policy ledger tx in
   match plan with
   | Error e -> Lwt.return (Error e)
   | Ok plan -> apply_decrypt_plan ledger tx plan
@@ -1213,13 +1227,13 @@ let legacy_audit_commitment = function
     | _, None -> Error "legacy commitment migration requires reconstructable commitment history")
   | None -> Error "legacy commitment migration requires node history audit"
 
-let verify_legacy_public_migration ?(math = false) ~worker_priority ~strict new_pubkey amount payload =
+let verify_legacy_public_migration ~keyed ?(math = false) ~worker_priority ~strict new_pubkey amount payload =
   match payload.new_cipher, payload.new_zero_proof, payload.amount_commitment, payload.amount_blinding with
   | Some new_cipher, Some new_zero_proof, Some amount_commitment, Some amount_blinding ->
     begin
       match PM.classify_cipher ~cap:strict new_cipher with
     | PM.V3 ->
-      VW.verify_encrypt_classified_with_priority ~math worker_priority
+      VW.verify_encrypt_classified_with_priority ~keyed ~math worker_priority
         ~strict
         ~pubkey:new_pubkey
         ~cipher:new_cipher
@@ -1234,7 +1248,7 @@ let verify_legacy_public_migration ?(math = false) ~worker_priority ~strict new_
     Lwt.return_error (VW.Proof_rejected
       "legacy public migration requires new_cipher, new_zero_proof, amount_commitment and amount_blinding")
 
-let verify_legacy_commitment_migration ?(math = false) ~worker_priority ~strict new_pubkey commitment payload =
+let verify_legacy_commitment_migration ~keyed ?(math = false) ~worker_priority ~strict new_pubkey commitment payload =
   match payload.new_cipher, payload.new_zero_proof with
   | Some new_cipher, Some new_zero_proof ->
     if not (FB.cipher_is_wrapped_scalar ~cap:strict new_cipher) then
@@ -1244,7 +1258,7 @@ let verify_legacy_commitment_migration ?(math = false) ~worker_priority ~strict 
       begin
         match PM.classify_cipher ~cap:strict new_cipher with
       | PM.V3 ->
-        VW.verify_claim_classified_with_priority ~math worker_priority
+        VW.verify_claim_classified_with_priority ~keyed ~math worker_priority
           ~strict
           ~pubkey:new_pubkey
           ~cipher:new_cipher
@@ -1258,7 +1272,7 @@ let verify_legacy_commitment_migration ?(math = false) ~worker_priority ~strict 
     Lwt.return_error (VW.Proof_rejected
       "legacy commitment migration requires new_cipher and new_zero_proof")
 
-let verify_legacy_zero_reset ?(math = false) ~worker_priority ~strict new_pubkey payload =
+let verify_legacy_zero_reset ~keyed ?(math = false) ~worker_priority ~strict new_pubkey payload =
   match payload.old_bound_pubkey_b64, payload.old_bound_cipher, payload.old_zero_proof with
   | Some _, _, _
   | _, Some _, _
@@ -1271,7 +1285,7 @@ let verify_legacy_zero_reset ?(math = false) ~worker_priority ~strict new_pubkey
       begin
         match PM.classify_cipher ~cap:strict new_cipher with
       | PM.V3 ->
-        VW.verify_encrypt_classified_with_priority ~math worker_priority
+        VW.verify_encrypt_classified_with_priority ~keyed ~math worker_priority
           ~strict
           ~pubkey:new_pubkey
           ~cipher:new_cipher
@@ -1300,6 +1314,31 @@ let verify_new_key new_pubkey label verify =
     Lwt.return (key_switch_worker_error label e)
   | Ok () ->
     Lwt.return_ok ()
+
+let owner_fields payload =
+  match payload.owner_cipher, payload.owner_proof with
+  | Some cipher, Some proof -> Ok (cipher, proof)
+  | _ -> error "key_switch_rejected" "key ownership proof is required"
+
+let verify_key_owner ~keyed ~math ~worker_priority ~address ~pubkey payload =
+  let open Lwt.Syntax in
+  if not keyed then Lwt.return_ok ()
+  else
+    match owner_fields payload with
+    | Error failure -> Lwt.return_error failure
+    | Ok (cipher, proof) ->
+      let blind = PR.owner_blinding address in
+      let commitment = Pvac_ffi.pedersen_commit_amount 0L blind in
+      let* checked =
+        VW.verify_encrypt_classified_with_priority ~keyed ~math
+          worker_priority ~strict:true ~pubkey ~cipher ~amount:Z.zero
+          ~proof ~commitment:(Base64.encode_exn (Bytes.to_string commitment))
+          ~blinding:(Base64.encode_exn (Bytes.to_string blind))
+      in
+      match checked with
+      | Ok () -> Lwt.return_ok ()
+      | Error failure ->
+        Lwt.return (key_switch_worker_error "key ownership proof failed: " failure)
 
 let prepared_legacy_zero_reset ~cap payload =
   match
@@ -1463,7 +1502,7 @@ let prepared_historical_owner ~cap current_cipher payload =
           end
     end
 
-let verify_historical_owner ?(math = false)
+let verify_historical_owner ~keyed ?(math = false)
     ~strict
     ~worker_priority
     ~legacy_public_replay
@@ -1484,7 +1523,7 @@ let verify_historical_owner ?(math = false)
              "historical owner commitment differs from finalized history")
       | Ok _ ->
         let* new_checked =
-          VW.verify_claim_classified_with_priority ~math
+          VW.verify_claim_classified_with_priority ~keyed ~math
             worker_priority
             ~strict
             ~pubkey:new_pubkey
@@ -1527,20 +1566,20 @@ let prepared_cipher_proof ~cap current_cipher payload =
         | _ -> error "key_switch_rejected"
           "cipher migration requires scalar new_cipher, old_zero_proof, new_range_proof and amount_commitment"
 
-let verify_cipher_proof ~math ~worker_priority ~current_cipher ~old_key ~new_key payload =
+let verify_cipher_proof ~keyed ~math ~worker_priority ~current_cipher ~old_key ~new_key payload =
   let open Lwt.Syntax in
   match prepared_cipher_proof ~cap:true current_cipher payload with
   | Error failure -> Lwt.return_error failure
   | Ok (cipher, old_proof, new_proof, commitment) ->
     let* old_checked =
-      VW.verify_historical_migration_claim_classified_with_priority ~math
+      VW.verify_historical_migration_claim_classified_with_priority ~keyed ~math
         worker_priority ~strict:true ~pubkey:old_key ~cipher:current_cipher
         ~proof:old_proof ~commitment in
     match old_checked with
     | Error failure -> Lwt.return (key_switch_worker_error
         "old encrypted balance proof failed: " failure)
     | Ok () ->
-      let* new_checked = VW.classified_result ~math ~priority:worker_priority
+      let* new_checked = VW.classified_result ~keyed ~math ~priority:worker_priority
         (Pvac_verify_protocol.Range_bound {
           pubkey = new_key; cipher; proof = new_proof; commitment; strict = true;
         }) in
@@ -1549,7 +1588,7 @@ let verify_cipher_proof ~math ~worker_priority ~current_cipher ~old_key ~new_key
           "new encrypted balance range proof failed: " failure)
       | Ok () -> Lwt.return_ok cipher
 
-let verify_key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
+let verify_key_switch_plan ~keyed ?(math = false) ?(cipher_mode = Rule_graph.Prior)
     ~field_policy
     ~strict
     ?legacy_public_replay
@@ -1558,7 +1597,7 @@ let verify_key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
     ledger
     tx =
   let open Lwt.Syntax in
-  match parse_key_switch field_policy tx.T.encrypted_data with
+  match parse_key_switch ~keyed field_policy tx.T.encrypted_data with
   | Error e -> Lwt.return (Error e)
   | Ok payload ->
     if payload.aes_kat <> PR.expected_kat () then
@@ -1569,11 +1608,16 @@ let verify_key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
         Proof_pool.run ~priority:worker_priority (fun () ->
           match PR.decode_b64 payload.new_pubkey_b64 with
           | Error e -> Error e
-          | Ok raw -> PR.canonicalize_blob raw)
+          | Ok raw -> PR.key_blob ~keyed raw)
       in
       match new_pubkey_result with
       | Error e -> Lwt.return (error "key_switch_rejected" e)
       | Ok new_pubkey ->
+          let* owner = verify_key_owner ~keyed ~math ~worker_priority
+            ~address:tx.T.from ~pubkey:new_pubkey payload in
+          match owner with
+          | Error failure -> Lwt.return_error failure
+          | Ok () ->
           let* old_pk =
             match snapshot with
             | Some value -> Lwt.return value.snapshot_pubkey
@@ -1608,7 +1652,7 @@ let verify_key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
               begin
                 match migration_status.cipher_class, migration_status.key_class, old_pk with
                 | PM.V3, PM.Historical, Some old_key ->
-                  let* checked = verify_cipher_proof ~math ~worker_priority
+                  let* checked = verify_cipher_proof ~keyed ~math ~worker_priority
                     ~current_cipher ~old_key ~new_key:new_pubkey payload in
                   Lwt.return (Result.bind checked (fun new_cipher ->
                     key_switch_value ~old_pubkey:old_pk ~new_key_hash ~new_pubkey
@@ -1637,7 +1681,7 @@ let verify_key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
               if payload.migration = Verified_zero_reset then
                   let* checked =
                     verify_new_key new_pubkey "legacy zero reset failed: "
-                    (fun pubkey -> verify_legacy_zero_reset ~math ~worker_priority ~strict pubkey payload)
+                    (fun pubkey -> verify_legacy_zero_reset ~keyed ~math ~worker_priority ~strict pubkey payload)
                 in
                 (match checked, payload.new_cipher with
                 | Error e, _ -> Lwt.return (Error e)
@@ -1658,7 +1702,7 @@ let verify_key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
                        "historical owner proof requires a key-bound balance and historical registered key")
                 else
                   let* checked =
-                    verify_historical_owner ~math
+                    verify_historical_owner ~keyed ~math
                       ~strict
                       ~worker_priority
                       ~legacy_public_replay
@@ -1685,7 +1729,7 @@ let verify_key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
                   let* checked =
                     verify_new_key new_pubkey "legacy commitment migration failed: "
                       (fun pubkey ->
-                        verify_legacy_commitment_migration ~math ~worker_priority
+                        verify_legacy_commitment_migration ~keyed ~math ~worker_priority
                           ~strict
                           pubkey
                           commitment
@@ -1710,7 +1754,7 @@ let verify_key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
                   let* checked =
                     verify_new_key new_pubkey "legacy public migration failed: "
                       (fun pubkey ->
-                        verify_legacy_public_migration ~math ~worker_priority
+                        verify_legacy_public_migration ~keyed ~math ~worker_priority
                           ~strict
                           pubkey
                           amount
@@ -1754,14 +1798,24 @@ let verify_key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
                       (error "key_switch_rejected"
                         "new encrypted balance must be a wrapped scalar")
                   else
+                    let old_request =
+                      if keyed then Pvac_verify_protocol.Stored_key_claim {
+                        pubkey = old_blob;
+                        cipher = current_cipher;
+                        proof = old_zero_proof;
+                        commitment = amount_commitment;
+                        strict;
+                      } else Pvac_verify_protocol.Key_switch_claim {
+                        pubkey = old_blob;
+                        cipher = current_cipher;
+                        proof = old_zero_proof;
+                        commitment = amount_commitment;
+                        strict;
+                      }
+                    in
                     let* old_checked =
-                      VW.verify_key_switch_claim_classified_with_priority ~math
-                        worker_priority
-                        ~strict
-                        ~pubkey:old_blob
-                        ~cipher:current_cipher
-                        ~proof:old_zero_proof
-                        ~commitment:amount_commitment
+                      VW.classified_result ~keyed ~math
+                        ~priority:worker_priority old_request
                     in
                     let* checked =
                       match old_checked with
@@ -1772,7 +1826,7 @@ let verify_key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
                              worker_failure)
                       | Ok () ->
                         let* new_checked =
-                          VW.verify_claim_classified_with_priority ~math
+                          VW.verify_claim_classified_with_priority ~keyed ~math
                             worker_priority
                             ~strict
                             ~pubkey:new_pubkey
@@ -1805,9 +1859,9 @@ let verify_key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
             Lwt.return (Result.map (fun plan -> plan, source) result)
     end
 
-let prepare_key_switch_plan_uncached ~cipher_mode ~cap field_policy ledger tx =
+let prepare_key_switch_plan_uncached ~keyed ~cipher_mode ~cap field_policy ledger tx =
   let open Lwt.Syntax in
-  match parse_key_switch field_policy tx.T.encrypted_data with
+  match parse_key_switch ~keyed field_policy tx.T.encrypted_data with
   | Error e -> Lwt.return (Error e)
   | Ok payload when payload.aes_kat <> PR.expected_kat () ->
     Lwt.return
@@ -1817,12 +1871,18 @@ let prepare_key_switch_plan_uncached ~cipher_mode ~cap field_policy ledger tx =
       Proof_pool.run (fun () ->
         match PR.decode_b64 payload.new_pubkey_b64 with
         | Error e -> Error e
-        | Ok raw -> PR.canonicalize_blob raw)
+        | Ok raw -> PR.key_blob ~keyed raw)
     in
     begin
       match new_pubkey_result with
       | Error e -> Lwt.return (error "key_switch_rejected" e)
       | Ok new_pubkey ->
+        let owner =
+          if keyed then Result.map (fun _ -> ()) (owner_fields payload)
+          else Ok () in
+        match owner with
+        | Error failure -> Lwt.return_error failure
+        | Ok () ->
         let* old_pk = Ledger.get_pvac_pubkey ledger tx.T.from in
         let old_key_hash =
           match old_pk with
@@ -1905,21 +1965,21 @@ let prepare_key_switch_plan_uncached ~cipher_mode ~cap field_policy ledger tx =
                prepared)
     end
 
-let prepare_key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
+let prepare_key_switch_plan ~keyed ?(math = false) ?(cipher_mode = Rule_graph.Prior)
     ~field_policy
     ?(cap = true)
     ledger
     tx =
   let open Lwt.Syntax in
   if key_switch_requests_legacy_audit ~cipher_mode ~field_policy tx then
-    prepare_key_switch_plan_uncached ~cipher_mode ~cap field_policy ledger tx
+    prepare_key_switch_plan_uncached ~keyed ~cipher_mode ~cap field_policy ledger tx
   else
-    let* key = key_switch_cache_key ~math ~cipher_mode field_policy cap ledger tx in
+    let* key = key_switch_cache_key ~keyed ~math ~cipher_mode field_policy cap ledger tx in
     match Hashtbl.find_opt key_switch_cache key with
     | Some entry -> Lwt.return_ok entry.plan
-    | None -> prepare_key_switch_plan_uncached ~cipher_mode ~cap field_policy ledger tx
+    | None -> prepare_key_switch_plan_uncached ~keyed ~cipher_mode ~cap field_policy ledger tx
 
-let key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
+let key_switch_plan ~keyed ?(math = false) ?(cipher_mode = Rule_graph.Prior)
     ~field_policy
     ~strict
     ?legacy_public_replay
@@ -1933,7 +1993,7 @@ let key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
   let* cache_key =
     if legacy then Lwt.return_none
     else
-      let* key = key_switch_cache_key ~math ~cipher_mode field_policy strict ledger tx in
+      let* key = key_switch_cache_key ~keyed ~math ~cipher_mode field_policy strict ledger tx in
       Lwt.return_some key
   in
   let* cached =
@@ -1955,7 +2015,7 @@ let key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
   | Some plan -> Lwt.return_ok plan
   | None ->
     let* result =
-      verify_key_switch_plan ~math ~cipher_mode
+      verify_key_switch_plan ~keyed ~math ~cipher_mode
         ~field_policy
         ~strict
         ?legacy_public_replay
@@ -1969,7 +2029,7 @@ let key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
         match cache_key with
         | None -> Lwt.return_unit
         | Some key ->
-          let* current = key_switch_cache_key ~math ~cipher_mode field_policy strict ledger tx in
+          let* current = key_switch_cache_key ~keyed ~math ~cipher_mode field_policy strict ledger tx in
           if not (String.equal key current) then Lwt.return_unit
           else begin
             let source = if strict then Some source else None in
@@ -1979,7 +2039,7 @@ let key_switch_plan ?(math = false) ?(cipher_mode = Rule_graph.Prior)
       in
       Lwt.return_ok plan
 
-let preverify_key_switch_artifact ?(math = false) ?(cipher_mode = Rule_graph.Prior)
+let preverify_key_switch_artifact ~keyed ?(math = false) ?(cipher_mode = Rule_graph.Prior)
     ~field_policy
     ~strict
     ?(worker_priority = Compute_pool.Speculative)
@@ -2004,11 +2064,12 @@ let preverify_key_switch_artifact ?(math = false) ?(cipher_mode = Rule_graph.Pri
         source_fields = field_policy;
         source_strict = strict;
         source_math = math;
+      source_keyed = keyed;
         source_mode = cipher_mode;
       } in
       let artifact_tx_hash = T.hash tx in
       let* result =
-        verify_key_switch_plan ~math ~cipher_mode
+        verify_key_switch_plan ~keyed ~math ~cipher_mode
           ~field_policy
           ~strict
           ~snapshot
@@ -2025,6 +2086,7 @@ let preverify_key_switch_artifact ?(math = false) ?(cipher_mode = Rule_graph.Pri
                artifact_fields = field_policy;
                artifact_strict = strict;
                artifact_math = math;
+               artifact_keyed = keyed;
                artifact_mode = cipher_mode;
                artifact_plan;
                artifact_snapshot;
@@ -2041,7 +2103,7 @@ let preverify_key_switch_artifact ?(math = false) ?(cipher_mode = Rule_graph.Pri
              })
       end
 
-let bind_key_switch_artifact ?(math = false) ?(cipher_mode = Rule_graph.Prior)
+let bind_key_switch_artifact ~keyed ?(math = false) ?(cipher_mode = Rule_graph.Prior)
     ~field_policy
     ~strict
     ledger
@@ -2074,6 +2136,7 @@ let bind_key_switch_artifact ?(math = false) ?(cipher_mode = Rule_graph.Prior)
             verified.artifact_fields = field_policy
             && Bool.equal verified.artifact_strict strict
             && Bool.equal verified.artifact_math math
+            && Bool.equal verified.artifact_keyed keyed
             && verified.artifact_mode = cipher_mode
             && String.equal current_cipher plan.source_cipher
             && key_source_equal snapshot verified.artifact_snapshot
@@ -2081,7 +2144,7 @@ let bind_key_switch_artifact ?(math = false) ?(cipher_mode = Rule_graph.Prior)
             let* () =
               if strict then Lwt.return_unit
               else
-                let* key = key_switch_cache_key ~math ~cipher_mode field_policy strict ledger tx in
+                let* key = key_switch_cache_key ~keyed ~math ~cipher_mode field_policy strict ledger tx in
                 remember_key_switch_plan key plan;
                 Lwt.return_unit
             in
@@ -2094,6 +2157,7 @@ let bind_key_switch_artifact ?(math = false) ?(cipher_mode = Rule_graph.Prior)
             rejected.artifact_source.source_fields = field_policy
             && Bool.equal rejected.artifact_source.source_strict strict
             && Bool.equal rejected.artifact_source.source_math math
+            && Bool.equal rejected.artifact_source.source_keyed keyed
             && rejected.artifact_source.source_mode = cipher_mode
             && String.equal current_cipher rejected.artifact_source.source_cipher
             && Option.equal String.equal
@@ -2106,22 +2170,22 @@ let bind_key_switch_artifact ?(math = false) ?(cipher_mode = Rule_graph.Prior)
             Lwt.return Key_switch_source_changed
       end
 
-let key_switch_plan_for_apply ?(math = false) ?(cipher_mode = Rule_graph.Prior)
+let key_switch_plan_for_apply ~keyed ?(math = false) ?(cipher_mode = Rule_graph.Prior)
     ~field_policy
     ~strict
     ?legacy_public_replay
     ledger
     tx =
   let open Lwt.Syntax in
-  if strict || key_switch_requests_legacy_audit ~cipher_mode ~field_policy tx
+  if keyed || strict || key_switch_requests_legacy_audit ~cipher_mode ~field_policy tx
      || key_switch_requests_cipher_proof ~field_policy tx then
-    key_switch_plan ~math ~cipher_mode ~field_policy ~strict ?legacy_public_replay ledger tx
+    key_switch_plan ~keyed ~math ~cipher_mode ~field_policy ~strict ?legacy_public_replay ledger tx
   else
-    let* key = key_switch_cache_key ~math ~cipher_mode field_policy strict ledger tx in
+    let* key = key_switch_cache_key ~keyed ~math ~cipher_mode field_policy strict ledger tx in
     match Hashtbl.find_opt key_switch_cache key with
     | Some entry -> Lwt.return_ok entry.plan
     | None ->
-      key_switch_plan ~math ~cipher_mode ~field_policy ~strict ?legacy_public_replay ledger tx
+      key_switch_plan ~keyed ~math ~cipher_mode ~field_policy ~strict ?legacy_public_replay ledger tx
 
 let apply_key_switch_plan ledger tx (plan : key_switch_plan) =
   let open Lwt.Syntax in
@@ -2158,7 +2222,7 @@ let apply_key_switch_plan ledger tx (plan : key_switch_plan) =
             migrated_cipher;
           })
 
-let apply_key_switch ?(math = false) ?(cipher_mode = Rule_graph.Prior)
+let apply_key_switch ~keyed ?(math = false) ?(cipher_mode = Rule_graph.Prior)
     ~field_policy
     ~strict
     ?legacy_public_replay
@@ -2166,7 +2230,7 @@ let apply_key_switch ?(math = false) ?(cipher_mode = Rule_graph.Prior)
     tx =
   let open Lwt.Syntax in
   let* plan =
-    key_switch_plan_for_apply ~math ~cipher_mode
+    key_switch_plan_for_apply ~keyed ~math ~cipher_mode
       ~field_policy
       ~strict
       ?legacy_public_replay
@@ -2304,7 +2368,7 @@ let range_status prefix = function
       prefix
       worker_failure
 
-let stealth_inline_range ?(math = false)
+let stealth_inline_range ~keyed ?(math = false)
     ~strict
     ?(worker_priority = Compute_pool.Required)
     ledger
@@ -2320,7 +2384,7 @@ let stealth_inline_range ?(math = false)
   | Error e -> Lwt.return (Error e)
   | Ok blob ->
     let* delta =
-      VW.verify_range_classified_with_priority ~math
+      VW.verify_range_classified_with_priority ~keyed ~math
         worker_priority
         ~strict
         ~pubkey:blob
@@ -2332,7 +2396,7 @@ let stealth_inline_range ?(math = false)
       | Error failure -> Lwt.return_error failure
       | Ok delta_ok ->
         let* balance =
-          VW.verify_range_classified_with_priority ~math
+          VW.verify_range_classified_with_priority ~keyed ~math
             worker_priority
             ~strict
             ~pubkey:blob
@@ -2354,7 +2418,7 @@ let stealth_accept_range range =
   else
     Ok ()
 
-let stealth_binding ?(math = false)
+let stealth_binding ~keyed ?(math = false)
     ~field_policy
     ~strict
     ?(worker_priority = Compute_pool.Required)
@@ -2379,7 +2443,7 @@ let stealth_binding ?(math = false)
         | Error e -> Lwt.return (Error e)
         | Ok blob ->
           let* verified =
-            VW.verify_claim_classified_with_priority ~math
+            VW.verify_claim_classified_with_priority ~keyed ~math
               worker_priority
               ~strict
               ~pubkey:blob
@@ -2434,7 +2498,7 @@ let prepare_claim_plan
             claim_cipher = claim.SC.claim_cipher;
           }
 
-let claim_plan ?(math = false)
+let claim_plan ~keyed ?(math = false)
     ~field_policy
     ~strict
     ?(worker_priority = Compute_pool.Required)
@@ -2486,7 +2550,7 @@ let claim_plan ?(math = false)
                 | Error _ as result -> Lwt.return result
                 | Ok () ->
                   let* verified =
-                    VW.verify_claim_classified_with_priority ~math
+                    VW.verify_claim_classified_with_priority ~keyed ~math
                       worker_priority
                       ~strict
                       ~pubkey:blob
@@ -2555,7 +2619,7 @@ let claim_balance_plan
               | Ok next_cipher ->
                 Ok { current_cipher = current; next_cipher }))
 
-let verify_private ?(math = false)
+let verify_private ~keyed ?(math = false)
     ~field_policy
     ~strict
     ?(worker_priority = Compute_pool.Required)
@@ -2566,7 +2630,7 @@ let verify_private ?(math = false)
   match tx.T.op_type with
   | T.EncryptOp ->
     let* result =
-      encrypt_plan ~math
+      encrypt_plan ~keyed ~math
         ~field_policy
         ~strict
         ~worker_priority
@@ -2580,7 +2644,7 @@ let verify_private ?(math = false)
        |> Result.map_error private_reject)
   | T.DecryptOp ->
     let* result =
-      decrypt_plan ~math
+      decrypt_plan ~keyed ~math
         ~field_policy
         ~strict
         ~worker_priority
@@ -2607,7 +2671,7 @@ let verify_private ?(math = false)
       | Error failure -> Lwt.return_error (private_reject failure)
       | Ok plan ->
         let* range =
-          stealth_inline_range ~math ~strict ~worker_priority ledger tx plan
+          stealth_inline_range ~keyed ~math ~strict ~worker_priority ledger tx plan
         in
         begin
           match range with
@@ -2618,7 +2682,7 @@ let verify_private ?(math = false)
               | Error failure -> Lwt.return_error (private_reject failure)
               | Ok () ->
                 let* binding =
-                  stealth_binding ~math
+                  stealth_binding ~keyed ~math
                     ~field_policy
                     ~strict
                     ~worker_priority
@@ -2635,7 +2699,7 @@ let verify_private ?(math = false)
     end
   | T.ClaimOp ->
     let* claim =
-      claim_plan ~math ~field_policy ~strict ~worker_priority ledger tx
+      claim_plan ~keyed ~math ~field_policy ~strict ~worker_priority ledger tx
     in
     begin
       match claim with
@@ -2665,7 +2729,7 @@ let verify_private ?(math = false)
     } in
     Lwt.return_error (private_reject private_error)
 
-let preverify_private_artifact ?(math = false)
+let preverify_private_artifact ~keyed ?(math = false)
     ~field_policy
     ~strict
     ?(worker_priority = Compute_pool.Speculative)
@@ -2674,13 +2738,13 @@ let preverify_private_artifact ?(math = false)
     tx =
   let open Lwt.Syntax in
   let* source =
-    private_source ~math ~field_policy ~strict ~result_policy ledger tx
+    private_source ~keyed ~math ~field_policy ~strict ~result_policy ledger tx
   in
   match source with
   | Error failure -> Lwt.return_error failure
   | Ok private_source ->
     let* result =
-      verify_private ~math
+      verify_private ~keyed ~math
         ~field_policy
         ~strict
         ~worker_priority
@@ -2701,7 +2765,7 @@ let preverify_private_artifact ?(math = false)
           (Rejected_private { private_source; private_rejection })
     end
 
-let bind_private_artifact ?(math = false)
+let bind_private_artifact ~keyed ?(math = false)
     ~field_policy
     ~strict
     ?(result_policy = Private_result_policy.Recoverable)
@@ -2715,7 +2779,7 @@ let bind_private_artifact ?(math = false)
     | Rejected_private rejected -> rejected.private_source
   in
   let* current =
-    private_source ~math ~field_policy ~strict ~result_policy ledger tx
+    private_source ~keyed ~math ~field_policy ~strict ~result_policy ledger tx
   in
   match current with
   | Error private_error ->

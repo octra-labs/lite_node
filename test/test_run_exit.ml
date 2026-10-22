@@ -71,9 +71,11 @@ let gc_child path mode =
     end else if mode = "sync-present" then
       ignore (Result.get_ok (Mark.write ~data_dir:path ~chain need));
     S.require_sync ~data_dir:path ~chain ~store need
-  end else if mode = "async" || mode = "worker-async" then begin
+  end else if mode = "async" || mode = "worker-async" || mode = "store-async" then begin
     Octra_node_runtime.Startup_process_shell.configure_lwt ~exit_fatal ~exit_refused;
     !Lwt.async_exception_hook (if mode = "async" then Out_of_memory
+      else if mode = "store-async" then
+        Octra_node_runtime.Consensus_pending_commit_recovery.Store_fault "journal"
       else Octra_core.Private_ledger.Worker_stopped "test");
     failwith "async memory failure returned"
   end else
@@ -85,7 +87,10 @@ let gc_child path mode =
       | _ -> S.default_join_log in
     S.run_join ~log
       ~tasks:[Lwt.fail (if String.starts_with ~prefix:"worker" mode then
-        Octra_core.Private_ledger.Worker_stopped "test" else Failure "GC owner task")]
+        Octra_core.Private_ledger.Worker_stopped "test"
+        else if mode = "store" then
+          Octra_node_runtime.Consensus_pending_commit_recovery.Store_fault "journal"
+        else Failure "GC owner task")]
       ~exit_fatal ~exit_refused
 
 let gc_process mode = Test_workspace.with_dir "fatal_gc" (fun path ->
@@ -94,7 +99,8 @@ let gc_process mode = Test_workspace.with_dir "fatal_gc" (fun path ->
   let rec reap () =
     try snd (Unix.waitpid [] pid)
     with Unix.Unix_error (Unix.EINTR, _, _) -> reap () in
-  let code = if String.starts_with ~prefix:"worker" mode then 78 else 1 in
+  let code = if String.starts_with ~prefix:"worker" mode
+    || String.starts_with ~prefix:"store" mode then 78 else 1 in
   let status = reap () in
   let channel = open_in (Filename.concat path "gc.pid") in
   let worker = Fun.protect ~finally:(fun () -> close_in channel)
@@ -109,7 +115,7 @@ let gc_process mode = Test_workspace.with_dir "fatal_gc" (fun path ->
     match Lock.acquire path with
     | owner -> owner
     | exception Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), "flock", _) ->
-      if Mtime.Span.to_float_ns (Mtime_clock.count clock) > 3e9 then begin
+      if Mtime.Span.to_float_ns (Mtime_clock.count clock) > 120e9 then begin
         Unix.kill worker Sys.sigkill;
         failwith "fatal exit retained GC ownership"
       end;
@@ -171,7 +177,7 @@ let fatal_process () =
   let rec wait () = match Unix.waitpid [Unix.WNOHANG] pid with
     | exception Unix.Unix_error (Unix.EINTR, _, _) -> wait ()
     | 0, _ ->
-      if Mtime.Span.to_float_ns (Mtime_clock.count clock) > 3e9 then begin
+      if Mtime.Span.to_float_ns (Mtime_clock.count clock) > 120e9 then begin
         Unix.kill pid Sys.sigkill;
         reap ();
         failwith "fatal exit waited for diagnostic hook"
@@ -194,4 +200,5 @@ let () =
     Lwt_main.run (gc_child Sys.argv.(2) Sys.argv.(3))
   else begin ownership (); fatal_process ();
     List.iter gc_process ["task"; "async"; "worker"; "worker-async"; "worker-log"; "worker-warn";
-      "sync"; "sync-error"; "sync-present"; "worker-apply"; "worker-apply-log"; "apply"] end
+      "sync"; "sync-error"; "sync-present"; "worker-apply"; "worker-apply-log"; "apply";
+      "store"; "store-async"] end

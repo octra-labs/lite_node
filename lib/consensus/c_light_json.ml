@@ -228,6 +228,14 @@ let validator_set json =
     else Ok (Z.of_int quorum)
   in
   let* validators = list "validators" (validator ~weighted) json in
+  let* authors = match json with
+    | `Assoc fields -> (match List.assoc_opt "authors" fields with
+      | None -> Ok None
+      | Some value ->
+        let* height = i64 "height" value in
+        let* entries = list "validators" (validator ~weighted:true) value in
+        Ok (Some (height, entries)))
+    | _ -> Error "object expected" in
   let* scheduled_json = field "scheduled" json in
   let* scheduled = scheduled ~weighted_proof scheduled_json in
   Ok C_light_validator_set.{
@@ -241,6 +249,7 @@ let validator_set json =
     quorum_weight;
     weighted;
     validators;
+    authors;
     scheduled;
     program_trust_hash;
     runtime_profile_hash;

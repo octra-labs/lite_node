@@ -289,8 +289,7 @@ let ensure_physical_eof_matches t =
 let read_at t ~seg_id ~offset length =
   let read fd =
     let bytes = Bytes.create length in
-    ignore (Unix.lseek fd offset Unix.SEEK_SET);
-    if not (read_exact fd bytes 0 length) then failwith "txlog: unexpected EOF";
+    if not (Disk_read.exact fd offset bytes 0 length) then failwith "txlog: unexpected EOF";
     bytes
   in
   if seg_id = t.current_seg then read t.current_fd

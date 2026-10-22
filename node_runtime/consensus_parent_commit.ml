@@ -107,8 +107,13 @@ let load source ~epoch_id =
         | Journal.Valid record ->
           Result.map Option.some (record_parent record)
 
+let proposal source ~epoch_id =
+  if epoch_id < 0L then Error "proposal epoch is invalid"
+  else if epoch_id = 0L || not (required source epoch_id) then Ok None
+  else load source ~epoch_id
+
 let verify source ~epoch_id incoming =
-  match load source ~epoch_id with
+  match proposal source ~epoch_id with
   | Error _ as error -> error
   | Ok None ->
     begin

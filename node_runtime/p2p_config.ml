@@ -223,10 +223,10 @@ let upgrade_log_message = function
       (Octra_consensus.C_config.short row.binary_hash)
       (Octra_consensus.C_config.short row.config_hash)
 
-let standard_profiles ~chain_id ?program_trust_hash getenv =
-  Octra_core.Rule_graph.profile_epochs ~chain_id
+let standard_profiles ?policy ~chain_id ?program_trust_hash getenv =
+  Consensus_profile.epochs ?policy chain_id
   |> List.map (fun epoch ->
-    let profile_hash = Consensus_profile.hash ~chain_id ~epoch getenv in
+    let profile_hash = Consensus_profile.hash ?policy ~chain_id ~epoch getenv in
     let wire_hash =
       Octra_consensus.C_config.network_hash
         ~chain_id

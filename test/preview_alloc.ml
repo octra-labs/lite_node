@@ -121,7 +121,7 @@ Program CipherWork {
       let runtime = Node.Consensus_circle_preverify.{store; ledger;
         program_trust = Octra_vm.Program_trust.empty; rules;
         env = (fun ~pre_state_root -> {env with prev_state_root = pre_state_root})} in
-      let batch_run () = Lwt_main.run (Core.Preverify_worker.run_many
+      let batch_run () = Lwt_main.run (Core.Preverify_worker.run_many ~keyed:false
         ~field_policy:Core.Private_ledger.Unique_fields ~strict:false ~ledger
         ~circle_preverify:(Node.Consensus_circle_preverify.run runtime) [transaction]) in
       let batch = batch_run () in

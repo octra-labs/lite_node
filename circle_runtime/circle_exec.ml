@@ -301,12 +301,12 @@ let preview_request_of_call method_name params =
     None
 
 let preview_cache_key ?(inspect_mode = Octra_core.Rule_graph.Prior)
-    ~scope ~trusted ~math circle_id caller prompt_csv =
+    ~scope ~trusted ~keyed ~math circle_id caller prompt_csv =
   let policy = match inspect_mode with
     | Octra_core.Rule_graph.Prior -> ""
     | Octra_core.Rule_graph.Active -> "|inspect" in
   trusted, circle_id ^ "|" ^ caller ^ "|" ^ prompt_csv
-    ^ (if math then "|math" else "") ^ policy ^ "|" ^ scope
+    ^ (if math then "|math" else "") ^ (if keyed then "|proof_key" else "") ^ policy ^ "|" ^ scope
 
 let preview_scope (ctx : ContractVM.exec_ctx) (info : Octra_core.Circles.circle_info) =
   String.concat ":" [info.code_hash; Int64.to_string info.version; info.stable_root;
@@ -408,7 +408,7 @@ let public_reads_hash snapshots =
   |> fun values -> hash_json "octra:circle_public_reads:v1" (`List values)
 
 let hfhe_context_hash ?(float_mode=Octra_core.Rule_graph.Prior)
-    ~math ~strict caps pubkeys active_key =
+    ~keyed ~math ~strict caps pubkeys active_key =
   let caps =
     caps
     |> List.sort_uniq String.compare
@@ -442,6 +442,7 @@ let hfhe_context_hash ?(float_mode=Octra_core.Rule_graph.Prior)
       "pubkeys", `List pubkeys;
       "active_key", active_key;
     ] @ (if math then ["math", `Bool true] else [])
+      @ (if keyed then ["proof_key", `Bool true] else [])
       @ (if Octra_core.Circle_wasm_host.float_enabled float_mode
          then ["wasm_float", `String Octra_core.Circle_wasm_host.float_id]
          else [])))
@@ -1144,6 +1145,7 @@ let wasm_compute_fuel_limit limit =
 let execute_wasm_view
     execution
     ~inspect_mode
+    ~table_mode
     ~proof_mode
     ~code_b64
     ~export_name
@@ -1158,6 +1160,7 @@ let execute_wasm_view
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~keyed
     ~math
     ~float_mode
     ~hfhe_mode
@@ -1167,6 +1170,8 @@ let execute_wasm_view
     | Circle_program.Standard -> Octra_core.Circle_wasm_host.Standard, wasm_fuel_limit fuel_limit
     | Circle_program.Compute -> Octra_core.Circle_wasm_host.Compute, wasm_compute_fuel_limit fuel_limit in
   Octra_core.Circle_wasm_host.execute_with_profile
+    ~table_mode
+    ~code_mode:table_mode
     ~memory_bytes:None
     ~guest_bytes:None
     ~inspect_mode
@@ -1185,6 +1190,7 @@ let execute_wasm_view
     ~hfhe_pubkeys
     ~hfhe_active_key
     ~hfhe_strict
+    ~keyed
     ~math
     ~float_mode
     ~hfhe_mode
@@ -1251,7 +1257,7 @@ let rec execute_view_call_with_execution execution ?snapshot ?running ?(trusted 
     Lwt.return receipt in
   let* loaded_result =
     Circle_program.load ?snapshot ~optional:true ~trusted ~point_ops:ctx.point_ops
-      ~float_mode:ctx.wasm_float ~inspect_mode store circle_id in
+      ~float_mode:ctx.wasm_float ~inspect_mode ~table_mode:ctx.proof_key store circle_id in
   timing_mark "load_program";
   match loaded_result with
   | Error e ->
@@ -1380,6 +1386,7 @@ let rec execute_view_call_with_execution execution ?snapshot ?running ?(trusted 
                           execute_wasm_view
                             execution
                             ~inspect_mode
+                            ~table_mode:runtime_hfhe.exec_ctx.proof_key
                             ~proof_mode:runtime_hfhe.exec_ctx.proof_exec
                             ~code_b64:wasm.code_b64
                             ~export_name:"octra_query"
@@ -1393,7 +1400,8 @@ let rec execute_view_call_with_execution execution ?snapshot ?running ?(trusted 
                             ~hfhe_caps
                             ~hfhe_pubkeys
                             ~hfhe_active_key
-                            ~math:runtime_hfhe.exec_ctx.math
+                            ~keyed:(runtime_hfhe.exec_ctx.proof_key = Octra_core.Rule_graph.Active)
+                              ~math:runtime_hfhe.exec_ctx.math
                             ~float_mode:runtime_hfhe.exec_ctx.wasm_float
                             ~hfhe_strict:true
                             ~hfhe_mode:Octra_core.Circle_hfhe_transcript.Direct
@@ -1459,7 +1467,7 @@ and maybe_prefetch_preview ~scope ~trusted ?snapshot ?running ?(ctx = ContractVM
       ()
     else
       let next_prompt_csv = append_csv prompt_csv delivered_csv in
-      let next_key = preview_cache_key ~inspect_mode ~scope ~trusted ~math:ctx.math circle_id caller next_prompt_csv in
+      let next_key = preview_cache_key ~inspect_mode ~scope ~trusted ~keyed:(ctx.proof_key = Octra_core.Rule_graph.Active) ~math:ctx.math circle_id caller next_prompt_csv in
       let prefetch_n = min preview_prefetch_tokens remaining in
       if prefetch_n <= 0 then
         ()
@@ -1517,13 +1525,14 @@ and execute_view_call ?snapshot ?running ?(trusted = []) ?(ctx = ContractVM.defa
       params
       caller
   | Some (prompt_csv, prompt_tokens, n_tokens) ->
-    let* loaded = Circle_program.load ?snapshot ~optional:true ~inspect_mode ~trusted ~point_ops:ctx.point_ops
+    let* loaded = Circle_program.load ?snapshot ~optional:true ~inspect_mode
+      ~table_mode:ctx.proof_key ~trusted ~point_ops:ctx.point_ops
       ~float_mode:ctx.wasm_float store circle_id in
     begin match loaded with
     | Error error -> Lwt.return (failed_receipt (Octra_core.Circle_wasm_host.error_message error))
     | Ok loaded ->
     let scope = preview_scope ctx loaded.info in
-    let cache_key = preview_cache_key ~inspect_mode ~scope ~trusted ~math:ctx.math circle_id caller prompt_csv in
+    let cache_key = preview_cache_key ~inspect_mode ~scope ~trusted ~keyed:(ctx.proof_key = Octra_core.Rule_graph.Active) ~math:ctx.math circle_id caller prompt_csv in
     begin
       match preview_cache_lookup cache_key n_tokens with
       | Some result_csv ->
@@ -1631,7 +1640,7 @@ let execute_call ?(trusted = []) ?journal ?(ctx = ContractVM.default_ctx) ?(dept
   let* loaded_result =
     Circle_program.load
       ~trusted ~point_ops:ctx.point_ops ~manifest_profile
-      ~float_mode:ctx.wasm_float ~inspect_mode store circle_id in
+      ~float_mode:ctx.wasm_float ~inspect_mode ~table_mode:ctx.proof_key store circle_id in
   match loaded_result with
   | Error (Octra_core.Circle_wasm_host.Rejected e) ->
     Lwt.return (failed_call_result e)
@@ -1755,7 +1764,7 @@ let execute_call ?(trusted = []) ?journal ?(ctx = ContractVM.default_ctx) ?(dept
                           circle_id
                           (public_reads_hash [])
                           (hfhe_context_hash ~float_mode:ctx.wasm_float
-                             ~math:ctx.math ~strict:hfhe_strict [] [] None)
+                             ~keyed:(ctx.proof_key = Octra_core.Rule_graph.Active) ~math:ctx.math ~strict:hfhe_strict [] [] None)
                           [];
                     }
                 end
@@ -1832,8 +1841,10 @@ let execute_call ?(trusted = []) ?journal ?(ctx = ContractVM.default_ctx) ?(dept
                           let* wasm_result =
                             Octra_core.Circle_wasm_host.execute
                               ~inspect_mode
+                              ~table_mode:runtime_hfhe.exec_ctx.proof_key
                               ~proof_mode:runtime_hfhe.exec_ctx.proof_exec
                               ~call
+                              ~keyed:(runtime_hfhe.exec_ctx.proof_key = Octra_core.Rule_graph.Active)
                               ~math:runtime_hfhe.exec_ctx.math
                               ~float_mode:runtime_hfhe.exec_ctx.wasm_float
                               ~code_b64:wasm.code_b64
@@ -1922,7 +1933,7 @@ let execute_call ?(trusted = []) ?journal ?(ctx = ContractVM.default_ctx) ?(dept
                                       loaded
                                       circle_id
                                       (public_reads_hash public_reads.snapshots)
-                                      (hfhe_context_hash ~math:ctx.math
+                                      (hfhe_context_hash ~keyed:(ctx.proof_key = Octra_core.Rule_graph.Active) ~math:ctx.math
                                          ~float_mode:ctx.wasm_float
                                          ~strict:hfhe_strict
                                          hfhe_caps
@@ -1984,6 +1995,7 @@ let commit_call_result
     ?(deployment_profile = Octra_core.Circle_wasm_host.Standard)
     ?(float_mode = Octra_core.Rule_graph.Prior)
     ?(inspect_mode = Octra_core.Rule_graph.Prior)
+    ~table_mode
     ~proof_mode
     store
     circle_id
@@ -2046,6 +2058,7 @@ let commit_call_result
                     ~execution_profile:deployment_profile
                     ~float_mode
                     ~inspect_mode
+                    ~table_mode
                     store
                     src
                     payload in

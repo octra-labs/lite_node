@@ -22,6 +22,9 @@ type callbacks = {
   remove_finalized : epoch:int -> unit;
   remove_proposer : epoch:int -> unit;
   prune_after_epoch : int -> unit;
+  defer_apply : epoch:int -> reason:string -> unit;
+  clear_apply : epoch:int -> unit;
+  apply_error : int -> string option;
 }
 
 val create : unit -> t

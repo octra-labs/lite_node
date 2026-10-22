@@ -68,10 +68,10 @@ opam exec -- "$BUILD_DIR/default/test/test_epoch_exec_reward_atomic.exe"
 opam exec -- "$BUILD_DIR/default/test/test_journal_hash.exe"
 opam exec -- "$BUILD_DIR/default/test/test_catchup_shell.exe"
 opam exec -- "$BUILD_DIR/default/test/test_fhe_memory.exe"
-opam exec -- "$BUILD_DIR/default/test/test_fhe_task.exe"
+opam exec -- sh test/fd_limit.sh "$BUILD_DIR/default/test/test_fhe_task.exe"
 opam exec -- "$BUILD_DIR/default/test/test_fhe_work.exe"
 opam exec -- "$BUILD_DIR/default/test/test_native_alloc.exe" --preview
-opam exec -- "$BUILD_DIR/default/test/test_pvac_verify_worker.exe"
+opam exec -- sh test/fd_limit.sh "$BUILD_DIR/default/test/test_pvac_verify_worker.exe"
 opam exec -- "$BUILD_DIR/default/test/test_private_transition_receipt.exe" migration_retry
 opam exec -- "$BUILD_DIR/default/test/test_proof_wait.exe"
 opam exec -- "$BUILD_DIR/default/test/test_vm_transition.exe"

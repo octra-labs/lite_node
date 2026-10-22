@@ -154,9 +154,10 @@ let pvac_status store ~addr =
           pk_opt))
 
 let pvac_migration_status
+    ~keyed
     status_actor
     store
-    admissions
+    checks
     ~epoch
     ~math
     ~owner_migration_mode
@@ -184,7 +185,7 @@ let pvac_migration_status
       (Rpc.err (-32005) "pvac migration status unavailable" None)
   | Ok status ->
     ok
-      (Rpc_view.pvac_migration_status
+      (Rpc_view.pvac_migration_status ~keyed
          ~addr
          ~cipher
          ~epoch
@@ -193,7 +194,7 @@ let pvac_migration_status
          ~cipher_mode
          ~proof_mode
          status
-         admissions)
+         checks)
 
 let encrypted_cipher ~addr ~account =
   Lwt.return (Result.map (fun cipher -> Rpc_view.encrypted_cipher ~addr ~cipher)
@@ -386,17 +387,23 @@ let account chaindata ~params ~profile_enabled ~started_at ~addr ~account =
   in
   let open Lwt.Syntax in
   let* recent_status =
-    Lwt.return
-      (Octra_core.Store_chaindata.txs_by_addr_rows_status
-         ~profile_tag:"octra_account"
+    Octra_core.Store_chaindata.public_addr_rows
          chaindata
          addr
          ~limit
-         ~offset:0)
+         ~offset:0
   in
   let t2 = Unix.gettimeofday () in
-  let rejected_txs =
-    Octra_core.Store_chaindata.get_rejected_txs_by_addr chaindata addr ~limit in
+  let recent_status, rejected_txs = match recent_status with
+    | Error _ -> recent_status, []
+    | Ok _ ->
+      begin match Octra_core.Store_chaindata.get_rejected_txs_by_addr chaindata addr ~limit with
+      | rows -> recent_status, rows
+      | exception _ -> Error "address history unavailable", []
+      end in
+  let tx_count, recent_rows = match recent_status with
+    | Ok status -> status.total, status.rows
+    | Error _ -> 0, [] in
   let t3 = Unix.gettimeofday () in
   let account_view =
     History.account_view
@@ -405,8 +412,8 @@ let account chaindata ~params ~profile_enabled ~started_at ~addr ~account =
       ~nonce:account.Ledger.nonce
       ~has_public_key:(Option.is_some account.Ledger.public_key)
       ~encrypted_balance:account.Ledger.encrypted_balance
-      ~tx_count:recent_status.total
-      ~recent_rows:recent_status.rows
+      ~tx_count
+      ~recent_rows
       ~rejected_txs
   in
   let t4 = Unix.gettimeofday () in
@@ -425,7 +432,13 @@ let account chaindata ~params ~profile_enabled ~started_at ~addr ~account =
     in
     Log.info "rpc" "%s" (History.account_profile_log_message profile)
   end;
-  ok account_view.History.account_json
+  let json = match recent_status, account_view.History.account_json with
+    | Error reason, `Assoc fields ->
+      `Assoc (("history_status", `String "unavailable")
+        :: ("history_error", `String reason)
+        :: List.map (function "tx_count", _ -> "tx_count", `Null | field -> field) fields)
+    | _, json -> json in
+  ok json
 
 let public_dispatch adapters =
   [

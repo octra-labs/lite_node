@@ -57,6 +57,7 @@ type live_ledger_tx_args = {
   field_policy : Private_ledger.field_policy;
   strict : bool;
   math : bool;
+  keyed : bool;
   cipher_mode : Octra_core.Rule_graph.mode;
   legacy_replay : string -> Octra_core.Pvac_legacy_public_replay.decision;
   gate : unit -> Private_gate.reject option;

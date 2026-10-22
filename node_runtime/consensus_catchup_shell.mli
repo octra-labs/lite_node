@@ -69,8 +69,10 @@ type query_deps = {
     max_epochs:int ->
     timeout_seconds:float ->
     validate:(Octra_consensus.C_driver.catchup_range_response_record -> bool) ->
+    prove:(Octra_consensus.C_driver.catchup_range_response_record -> bool) ->
     Octra_consensus.C_driver.catchup_range_response_record option Lwt.t;
   http_range :
+    budget:float ->
     from_epoch:int64 ->
     max_epochs:int ->
     validate:(Octra_consensus.C_driver.catchup_range_response_record -> bool) ->
@@ -284,6 +286,7 @@ type driver_runner_wiring = {
   observer : bool;
   drain_pending_finalized : unit -> unit Lwt.t;
   http_range :
+    budget:float ->
     from_epoch:int64 ->
     max_epochs:int ->
     validate:(Octra_consensus.C_driver.catchup_range_response_record -> bool) ->
@@ -318,6 +321,7 @@ type driver_runner_node_wiring = {
   observer : bool;
   drain_pending_finalized : unit -> unit Lwt.t;
   http_range :
+    budget:float ->
     from_epoch:int64 ->
     max_epochs:int ->
     validate:(Octra_consensus.C_driver.catchup_range_response_record -> bool) ->
@@ -329,6 +333,8 @@ val range_plan :
   from_epoch:int64 ->
   target_epoch:int64 ->
   range_plan
+
+val first_success : sleep:(float -> unit Lwt.t) -> 'a option Lwt.t list -> 'a option Lwt.t
 
 val response_payload_valid :
   Octra_consensus.C_codec.catchup_epoch_record list ->
@@ -350,6 +356,7 @@ val query_range :
   timeout_seconds:float ->
   reason:string ->
   validate:(Octra_consensus.C_driver.catchup_range_response_record -> bool) ->
+  prove:(Octra_consensus.C_driver.catchup_range_response_record -> bool) ->
   Octra_consensus.C_driver.catchup_range_response_record option Lwt.t
 
 val query_progress :
@@ -363,6 +370,15 @@ val query_chunk :
   from_epoch:int64 ->
   reason:string ->
   chunk_query_step Lwt.t
+
+val probe_range :
+  chunk_query_deps ->
+  now:(unit -> float) ->
+  head:int64 ->
+  current_head:(unit -> int64) ->
+  allowed:(unit -> bool) ->
+  run_catchup:(target_epoch:int64 -> reason:string -> unit Lwt.t) ->
+  unit Lwt.t
 
 val base_gate :
   target_epoch:int64 ->
@@ -438,12 +454,23 @@ val apply_chunk_gate :
   chunk_apply_step Lwt.t
 
 val run_target :
+  ?now:(unit -> float) ->
   target_deps ->
   target_epoch:int64 ->
   reason:string ->
   finish_success:(finish -> unit Lwt.t) ->
   fail_catchup:(string -> unit Lwt.t) ->
   unit Lwt.t
+
+val next_window : extended:bool -> target:int64 -> next:int64 -> count:int -> bool * bool
+
+val next_target :
+  now:float -> reason:string -> initial:int64 -> target:int64 ->
+  epoch:int64 -> epoch_ts:float -> int64
+
+val probe_target :
+  now:float -> head:int64 -> current:int64 -> allowed:bool ->
+  Octra_consensus.C_codec.catchup_epoch_record list -> int64 option
 
 val run :
   deps ->

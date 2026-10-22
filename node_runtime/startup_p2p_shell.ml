@@ -52,7 +52,7 @@ type node_request = {
   pub_b64 : string;
 }
 
-type admission_deps = {
+type check_deps = {
   getenv : string -> string option;
   activation_epoch : unit -> int64 option;
   info : string -> unit;
@@ -244,9 +244,9 @@ let request_of_runtime runtime =
     pub_b64 = runtime.pub_b64;
   }
 
-let admit_validator_startup (deps : admission_deps) ~address ~voting
+let admit_validator_startup (deps : check_deps) ~address ~voting
     ~role_label validator =
-  Validator_config.node_startup_admission
+  Validator_config.node_startup_check
     ~getenv:deps.getenv
     ~activation_epoch:deps.activation_epoch
     ~address
@@ -267,7 +267,7 @@ let load_persistent_update (deps : persistent_update_deps) =
       warn = deps.warn;
     }
 
-let admission_deps_of_runtime runtime =
+let check_deps_of_runtime runtime =
   {
     getenv = runtime.getenv;
     activation_epoch = runtime.activation_epoch;
@@ -359,23 +359,28 @@ let start_node runtime =
   | Ok view ->
     if runtime.consensus_mode then
       admit_validator_startup
-        (admission_deps_of_runtime runtime)
+        (check_deps_of_runtime runtime)
         ~address:runtime.address
         ~voting:runtime.voting
         ~role_label:runtime.role_label
         view.validator_config;
     let active = ref view.active_vs in
+    let stake = ref view.stake_vs in
     let scheduled = ref view.scheduled_validator_set_config in
     let select validator_set fingerprint =
-      let next =
+      let next, next_stake =
         match !scheduled with
         | Some config when
-            same_validator_set validator_set
+            ((Octra_consensus.C_quorum_policy.linear_weight
+                ~chain_id:runtime.chain_id ~epoch_id:(runtime.current_height ())
+              && same_validator_set validator_set config.validator_set)
+             || same_validator_set validator_set
               (Octra_consensus.C_types.validator_set_for_epoch
                  ~chain_id:runtime.chain_id ~epoch_id:config.activate_epoch
-                 config.validator_set)
-            && String.equal fingerprint config.fingerprint -> None
-        | current -> current
+                 config.validator_set))
+            && String.equal fingerprint config.fingerprint ->
+              None, config.validator_set
+        | current -> current, !stake
       in
       let light = Validator_config.light_scheduled_of_driver
         ~chain_id:runtime.chain_id next in
@@ -383,6 +388,7 @@ let start_node runtime =
       | Error _ as error -> error
       | Ok () ->
         active := validator_set;
+        stake := next_stake;
         scheduled := next;
         Ok ()
     in
@@ -416,14 +422,14 @@ let start_node runtime =
         match loaded with
         | None -> Lwt.return_none
         | Some config ->
-          let effective =
-            Octra_consensus.C_types.validator_set_for_epoch
-              ~chain_id:runtime.chain_id
-              ~epoch_id:(runtime.current_height ())
-              config.validator_set
-          in
+          let current, projected =
+            if Octra_consensus.C_quorum_policy.linear_weight
+              ~chain_id:runtime.chain_id ~epoch_id:(runtime.current_height ())
+            then !stake, config.validator_set
+            else !active, Octra_consensus.C_types.validator_set_for_epoch
+              ~chain_id:runtime.chain_id ~epoch_id:(runtime.current_height ()) config.validator_set in
           let next =
-            if same_validator_set !active effective
+            if same_validator_set current projected
                && Int64.compare config.activate_epoch (runtime.current_height ()) <= 0 then
               None
             else

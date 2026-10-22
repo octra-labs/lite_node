@@ -305,7 +305,13 @@ let session_scope (request : Provider_rpc.execute) =
     Octra_net.Oce1.put_hash32 buffer (Text.hex_to_raw32_lossy request.session_id))
   |> Text.raw_to_hex
 
-let native_run ~model ~program ~storage (request : Provider_rpc.execute) =
+let code_mode chain epoch =
+  let module Rule = Octra_core.Rule_graph in
+  match Rule.proof_key_activation_for_chain chain with
+  | Some plan when epoch >= Int64.of_int plan.activation_epoch -> Rule.Active
+  | _ -> Rule.Prior
+
+let native_run ~chain_id ~model ~program ~storage (request : Provider_rpc.execute) =
   match params_of_json request.params_json with
   | Error error -> Lwt.return_error (Octra_core.Circle_wasm_host.Rejected error)
   | Ok params ->
@@ -315,9 +321,12 @@ let native_run ~model ~program ~storage (request : Provider_rpc.execute) =
       | Ok request_bytes ->
         let* result =
           Octra_core.Circle_wasm_host.execute_compute_isolated_with_storage
+            ~table_mode:Octra_core.Rule_graph.Active
+            ~code_mode:(code_mode chain_id request.epoch_id)
             ~memory_bytes:request.memory_bytes
             ~guest_bytes:request.guest_bytes
             ~float_mode:Octra_core.Rule_graph.Prior
+            ~keyed:false
             ~math:false
             ~compute_session_scope:(session_scope request)
             ~compute_storage_cache_key:(Some model.cache_key)
@@ -360,8 +369,8 @@ let native_observation (result : Octra_core.Circle_wasm_host.exec_result) =
         trace steps operations)
   | _ -> Error "compute measurement has no payable outcome"
 
-let native_execute ~model ~program ~storage request =
-  let* result = native_run ~model ~program ~storage request in
+let native_execute ~chain_id ~model ~program ~storage request =
+  let* result = native_run ~chain_id ~model ~program ~storage request in
   Lwt.return (match result with
     | Error error -> Error (Octra_core.Circle_wasm_host.error_message error)
     | Ok result -> Result.map fst (native_observation result))
@@ -408,7 +417,7 @@ let measure ~model ~program ~storage ~call request =
   match check_measure ~model ~program ~call request with
   | Error _ as error -> Lwt.return error
   | Ok () ->
-    let* result = native_run ~model ~program ~storage request in
+    let* result = native_run ~chain_id:call.request.chain_id ~model ~program ~storage request in
     Lwt.return (match result with
     | Error error -> Error (Octra_core.Circle_wasm_host.error_message error)
     | Ok result ->
@@ -450,6 +459,8 @@ let replay ~model ~program calls =
       | Error reason -> Lwt.return_error (Host.Unavailable reason)
       | Ok lease -> Lwt.finalize (fun () ->
       let* result = Host.replay_compute ~code_b64:program.code_b64
+        ~table_mode:Octra_core.Rule_graph.Active
+        ~code_mode:(fun epoch -> code_mode call.request.chain_id (Int64.of_int epoch))
         ~cache_key:model.cache_key ~root:model.cache_root ~entries:model.entries ~bytes:model.bytes
         ~scope:(session_scope first)
         ~caller:first.caller ~address:first.circle_id steps in
@@ -468,7 +479,7 @@ let replay ~model ~program calls =
           measure [] calls results |> Result.map_error (fun reason -> Host.Rejected reason)))
         (fun () -> Native.lease_close lease; Lwt.return_unit)
 
-let native_deps ~limits ~store ~state_root_at ~index_root_at =
+let native_deps ~chain_id ~limits ~store ~state_root_at ~index_root_at =
   {
     program = native_program state_root_at index_root_at store;
     storage = (fun ~epoch_id ~state_root ~circle_id ->
@@ -502,17 +513,17 @@ let native_deps ~limits ~store ~state_root_at ~index_root_at =
     execute = (fun ~model ~program ~storage request ->
       match native_accelerator limits.accelerator with
       | Error _ as error -> Lwt.return error
-      | Ok () -> native_execute ~model ~program ~storage request);
+      | Ok () -> native_execute ~chain_id ~model ~program ~storage request);
   }
 
-let replay_deps ~(limits : Resource_compute_provider_config.limits) = {
+let replay_deps ~chain_id ~(limits : Resource_compute_provider_config.limits) = {
   program = (fun ~epoch_id:_ ~state_root:_ ~circle_id:_ -> Lwt.return_error "compute input program required");
   storage = (fun ~epoch_id:_ ~state_root:_ ~circle_id:_ -> Lwt.return_error "compute replay storage is session-owned");
   load_model = (fun ~cancel:_ _ -> Lwt.return_error "compute input model required");
   drop_model = native_drop_model;
   hold_model = Cache.native_hold;
   self_test = native_self_test ~accelerator:limits.accelerator;
-  execute = (fun ~model ~program ~storage request -> native_execute ~model ~program ~storage request);
+  execute = (fun ~model ~program ~storage request -> native_execute ~chain_id ~model ~program ~storage request);
 }
 
 let reject error (Command command) =

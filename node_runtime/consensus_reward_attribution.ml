@@ -250,6 +250,15 @@ let bind_finality ~validator_set finalize supplied =
     end
   | _ -> Error "reward finality protocol is unsupported"
 
+let prove_finality ~validator_set finalize supplied =
+  if finalize.C_types.header.proto_version = C_types.proto_version_current
+     && standard_mode ~chain_id:finalize.chain_id finalize.epoch_id
+        = Octra_core.Rule_graph.Prior
+     && Option.is_none finalize.parent_commit then
+    Error "reward proof is missing"
+  else
+    bind_finality ~validator_set finalize supplied
+
 let resolve_for_epoch ~chain_id ~epoch_id ~proposer_addr ~validator_pubkeys
     parent =
   match

@@ -34,49 +34,49 @@ let next_delay_ms ~now ~previous =
   | Error _, _ | _, Error _ ->
     interval_ms
 
-let check_candidate ~previous ~candidate =
-  match of_seconds candidate with
+let check_entry ~previous ~entry =
+  match of_seconds entry with
   | Error error -> Error error
-  | Ok candidate_ms ->
+  | Ok entry_ms ->
     match previous with
-    | Some previous_ms when candidate_ms < previous_ms ->
+    | Some previous_ms when entry_ms < previous_ms ->
       Error "epoch time is not monotonic"
     | Some previous_ms
-      when Int64.sub candidate_ms previous_ms < interval_ms ->
+      when Int64.sub entry_ms previous_ms < interval_ms ->
       Error "epoch time interval is below protocol minimum"
-    | _ -> Ok candidate_ms
+    | _ -> Ok entry_ms
 
-let check ~now ~previous ~candidate =
-  match of_seconds now, check_candidate ~previous ~candidate with
+let check ~now ~previous ~entry =
+  match of_seconds now, check_entry ~previous ~entry with
   | Error error, _ | _, Error error -> Error error
-  | Ok now_ms, Ok candidate_ms ->
+  | Ok now_ms, Ok entry_ms ->
     begin
       match previous with
       | None ->
-        let drift = Int64.abs (Int64.sub candidate_ms now_ms) in
+        let drift = Int64.abs (Int64.sub entry_ms now_ms) in
         if drift > initial_drift_ms then
           Error "initial epoch time drift exceeds limit"
         else
-          Ok candidate_ms
+          Ok entry_ms
       | Some _ ->
         let future =
-          if candidate_ms > now_ms then
-            Int64.sub candidate_ms now_ms
+          if entry_ms > now_ms then
+            Int64.sub entry_ms now_ms
           else
             0L
         in
         if future > max_future_ms then
           Error "epoch time is too far in the future"
         else
-          Ok candidate_ms
+          Ok entry_ms
     end
 
-let check_reproposal ~previous ~candidate =
-  check_candidate ~previous ~candidate
+let check_reproposal ~previous ~entry =
+  check_entry ~previous ~entry
 
-let check_proposal ~rule ~kind ~now ~previous ~candidate =
+let check_proposal ~rule ~kind ~now ~previous ~entry =
   match rule, kind with
-  | Historical, Reproposal -> check_reproposal ~previous ~candidate
+  | Historical, Reproposal -> check_reproposal ~previous ~entry
   | Historical, Fresh
   | Uniform, Fresh
-  | Uniform, Reproposal -> check ~now ~previous ~candidate
+  | Uniform, Reproposal -> check ~now ~previous ~entry

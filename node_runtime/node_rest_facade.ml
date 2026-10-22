@@ -17,6 +17,7 @@ type runtime = {
   proof_mode : unit -> Octra_core.Rule_graph.mode;
   compute_mode : unit -> Octra_core.Rule_graph.mode;
   settle_mode : unit -> Octra_core.Rule_graph.mode;
+  marks_mode : unit -> Octra_core.Rule_graph.mode;
   queue_head : unit -> int64 option;
   preverify_admit : Transaction.t -> (unit, string) result;
   save_drops : Staging.drop_record list -> unit;
@@ -74,7 +75,8 @@ let expire_duty ?sender runtime () =
   let point = runtime.duty_head () in
   let head = Option.map fst point in
   let mode = Option.fold ~none:Octra_core.Rule_graph.Prior ~some:snd point in
-  let drops = Staging.expire_duty ?sender ~mode ~head () in
+  let marks = runtime.marks_mode () = Octra_core.Rule_graph.Active in
+  let drops = Staging.expire_duty ?sender ~marks ~mode ~head () in
   if drops <> [] then begin
     runtime.save_drops drops;
     List.iter (fun drop -> Preverify_cache.remove drop.Staging.d_hash) drops;
@@ -91,18 +93,20 @@ let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
   let* () = Octra_core.Tx_envelope.check_compute ~settle:(runtime.settle_mode ())
     (runtime.compute_mode ()) [tx] in
   let* tx = prepare_tx ledger tx |> Result.map_error snd in
+  let* () = Octra_core.Tx_payload.admit tx in
   let point = runtime.duty_head () in
   let head = Option.map fst point in
   let mode = Option.fold ~none:Octra_core.Rule_graph.Prior ~some:snd point in
-  if Staging.duty_expired ~mode ~head tx then
+  let marks = runtime.marks_mode () = Octra_core.Rule_graph.Active in
+  if Staging.duty_expired ~marks ~mode ~head tx then
     Error "validator ready head has expired"
   else
-  match Tx_view.bft_op_admission ~bft_mode tx with
+  match Tx_view.bft_op_check ~bft_mode tx with
   | Error (_, reason) -> Error reason
   | Ok () ->
     let* () = if bft_mode then
       Octra_core.Resource_lanes.queue_check ~mode:(runtime.proof_mode ()) tx else Ok () in
-    match Tx_view.staging_submit_admission
+    match Tx_view.staging_submit_check
             ~min_ou:(Rest_read_rpc.stealth_floor ())
             ~min_relay_fee:(Staging.min_relay_fee tx)
             tx with
@@ -120,7 +124,7 @@ let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
         |> Option.map (fun a -> (a.Ledger.balance, a.Ledger.nonce))
       in
       let confirmed_nonce = Option.fold ~none:0 ~some:snd (lookup tx.from) in
-      match Tx_view.duty_nonce_admission
+      match Tx_view.duty_nonce_check
         ~head ~confirmed_nonce tx with
       | Error _ as error -> error
       | Ok () ->
@@ -129,13 +133,13 @@ let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
       | Ok drops ->
         runtime.save_drops drops;
         begin
-          let admission =
+          let check =
             try runtime.preverify_admit tx
             with exn ->
               Error
                 ("pre_verify_unavailable reason = " ^ Printexc.to_string exn)
           in
-          match admission with
+          match check with
           | Error reason ->
             ignore (Staging.remove_by_hash tx_hash);
             Preverify_cache.remove tx_hash;
@@ -222,7 +226,7 @@ let validate_and_submit_tx runtime ledger (tx : Transaction.t) =
     (runtime.compute_mode ()) [tx]
     |> Result.map_error (fun reason -> "malformed_transaction", reason) in
   let now = Unix.gettimeofday () in
-  match Tx_view.submit_pre_signature_admission
+  match Tx_view.submit_pre_signature_check
           ~duty:(runtime.duty_head ())
           ~now
           ~max_timestamp_drift
@@ -236,7 +240,7 @@ let validate_and_submit_tx runtime ledger (tx : Transaction.t) =
     let acc = Ledger.find ledger tx.from in
     let ( let* ) = Result.bind in
     let* tx = prepare_tx ledger tx in
-    match Tx_view.submit_signature_admission
+    match Tx_view.submit_signature_check
             ~account_public_key:acc.Ledger.public_key
             ~preverify_has_capacity:(Preverify_cache.has_capacity ())
             ~preverify_pending:(Preverify_cache.pending_count ())
@@ -264,7 +268,7 @@ let start runtime ~port ~grpc ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_
     ~consensus_config_hash_ref ~consensus_validator_set_ref
     ~scheduled_validator_set_ref
     ~current_epoch ~total_tx_count ~validator_view_sk ~validator_view_pub
-    ~program_trust ~migration_admissions ~rules ~chaindata
+    ~program_trust ~migration_checks ~rules ~chaindata
     ~consensus_driver_ref
     ~epoch_visibility ~resource_compute ~validator_enrollment =
   let deps = Node_rpc_server.{
@@ -295,7 +299,7 @@ let start runtime ~port ~grpc ~data_dir ~store ~ledger ~tree_ref ~wallet ~chain_
     validator_view_sk;
     validator_view_pub;
     program_trust;
-    migration_admissions;
+    migration_checks;
     rules;
     chaindata;
     consensus_driver_ref;
@@ -308,7 +312,7 @@ let start_task runtime ~port ~grpc ~data_dir ~store ~ledger ~tree_ref ~wallet
     ~chain_id ~consensus_config_hash_ref ~consensus_validator_set_ref
     ~scheduled_validator_set_ref ~current_epoch ~total_tx_count
     ~validator_view_sk ~validator_view_pub ~program_trust
-    ~migration_admissions ~rules ~chaindata
+    ~migration_checks ~rules ~chaindata
     ~consensus_driver_ref ~epoch_visibility ~resource_compute
     ~validator_enrollment () =
   start
@@ -329,7 +333,7 @@ let start_task runtime ~port ~grpc ~data_dir ~store ~ledger ~tree_ref ~wallet
     ~validator_view_sk
     ~validator_view_pub
     ~program_trust
-    ~migration_admissions
+    ~migration_checks
     ~rules
     ~chaindata
     ~consensus_driver_ref

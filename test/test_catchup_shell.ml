@@ -248,6 +248,13 @@ let parent_commit ~epoch ~proposer ~public_key =
     };
   }
 
+let proved_record ?(epoch = 11L) ?(prev = base_root)
+    ?(creator = "oct_creator") () =
+  let public_key = Mirage_crypto_ec.Ed25519.pub_to_octets finality_public_key in
+  let parent = parent_commit ~epoch:(Int64.pred epoch)
+    ~proposer:creator ~public_key in
+  record ~epoch ~prev ~creator ~reward_public_key:public_key ~parent ()
+
 let test_reject_stripped_parent () =
   let public_key = String.make 32 'k' in
   let parent =
@@ -421,7 +428,475 @@ let test_observer_drain_no_wake () =
   assert_true "observer drained before run" (has "drain" events);
   assert_true "wake skipped" (not (has "wake" events))
 
+let test_finish_keeps_owner () =
+  let events = ref [] in
+  let state = deps events in
+  let active = ref [] in
+  let state = { state with
+    drain_pending_finalized = (fun () ->
+      active := state.catchup_active () :: !active;
+      Lwt.return_unit);
+  } in
+  let run_one ~target_epoch:_ ~reason:_ ~finish_success ~fail_catchup:_ =
+    finish_success (unproved "done") in
+  run (S.run state ~run_one ~target_epoch:20L ~reason:"peer");
+  assert_true "drain retains catchup ownership" (!active = [true; true]);
+  assert_true "finished run releases ownership" (not (state.catchup_active ()))
+
+let test_finish_queued_during_drain () =
+  let events = ref [] in
+  let state = deps events in
+  let queued = ref None in
+  let drains = ref 0 in
+  let calls = ref [] in
+  let state = { state with
+    take_queued_after = (fun ~head:_ ->
+      let next = !queued in queued := None; next);
+    drain_pending_finalized = (fun () ->
+      incr drains;
+      if !drains = 2 then
+        queued := Some { S.target_epoch = 30L; reason = "arrived" };
+      Lwt.return_unit);
+  } in
+  let run_one ~target_epoch ~reason:_ ~finish_success ~fail_catchup:_ =
+    calls := target_epoch :: !calls;
+    finish_success (unproved "done") in
+  run (S.run state ~run_one ~target_epoch:20L ~reason:"peer");
+  assert_true "drain arrival runs before release" (!calls = [30L; 20L]);
+  assert_true "one ownership release"
+    (List.filter (( = ) "active:false") (snapshot events) = ["active:false"])
+
+let health_deps active events =
+  Octra_node_runtime.Consensus_health_wiring.{
+    sleep = (fun _ -> add events "sleep"; Lwt.return_unit);
+    catchup_active = (fun () -> !active);
+    quarantine_active = (fun () -> true);
+    replay_stashed = (fun ~source:_ -> active := true; Lwt.return_unit);
+    probe_health = (fun () -> add events "probe"; Lwt.return_unit);
+    reset_liveness = (fun ~source:_ -> add events "reset"; Lwt.return_unit);
+  }
+
+let test_wake_keeps_new_owner () =
+  List.iter (fun cancel ->
+    let events = ref [] in
+    let wake, release = Lwt.task () in
+    let next, finish = Lwt.task () in
+    let state = { (deps events) with wake_ready = (fun () -> wake) } in
+    let run_one ~target_epoch ~reason:_ ~finish_success ~fail_catchup:_ =
+      if target_epoch = 20L then finish_success (unproved "done") else next in
+    let first = S.run state ~run_one ~target_epoch:20L ~reason:"first" in
+    assert_true "first run waits for wake" (Lwt.is_sleeping first);
+    let second = S.run state ~run_one ~target_epoch:30L ~reason:"second" in
+    assert_true "second run owns catchup" (state.catchup_active ());
+    if cancel then Lwt.cancel first
+    else Lwt.wakeup_later_exn release (Failure "wake failed");
+    run (Lwt.catch (fun () -> first) (fun _ -> Lwt.return_unit));
+    assert_true "old wake cannot release new owner" (state.catchup_active ());
+    assert_true "old wake cannot quarantine new owner"
+      (not (has "mark_quarantine:catchup_failed:unexpected" (snapshot events)));
+    Lwt.wakeup_later finish ();
+    run second
+  ) [false; true]
+
+let test_finish_stashed_arrival () =
+  let module R = Octra_node_runtime.Consensus_finalized_replay in
+  let module F = Octra_node_runtime.Consensus_finalized_shell in
+  let module Q = Octra_node_runtime.Consensus_catchup_queue in
+  let events = ref [] in
+  let head = ref 10 in
+  let saved = Hashtbl.create 2 in
+  let queue = Q.create () in
+  let state = deps events in
+  let proof epoch = Option.get (record ~epoch ()).finality in
+  let store epoch item = Hashtbl.replace saved epoch
+    (item.Octra_consensus.C_codec.finalize, item.validator_set) in
+  let apply ~validator_set:_ item =
+    head := Int64.to_int item.Octra_consensus.C_types.epoch_id;
+    Hashtbl.remove saved !head;
+    Lwt.return_unit in
+  let shell = F.{
+    prune_frozen = (fun ~finalized_epoch:_ -> ());
+    store_expected_root = (fun ~epoch:_ ~root:_ -> ());
+    store_finalized = (fun ~epoch ~validator_set item ->
+      Hashtbl.replace saved epoch (item, validator_set));
+    remove_finalized = (fun ~epoch -> Hashtbl.remove saved epoch);
+    remove_proposer = (fun ~epoch:_ -> ());
+    committed_head_epoch = (fun () -> !head);
+    driver = (fun () -> Some ()); observer_mode = false;
+    catchup_active = state.catchup_active;
+    quarantine_active = (fun () -> false); state_attested = (fun () -> true);
+    current_epoch = (fun () -> !head + 1);
+    read_local_root_raw = (fun () -> Lwt.return base_root);
+    queue_catchup_target = (fun ~target_epoch ~reason ->
+      ignore (Q.queue queue ~target_epoch ~reason));
+    run_catchup_to_target = (fun () ~target_epoch:_ ~reason:_ ->
+      failwith "unexpected range query");
+    mark_quarantine = (fun _ -> failwith "unexpected quarantine");
+    clear_quarantine = (fun _ -> ());
+    apply_finalized = apply;
+    replay_stashed_while_safe = (fun ~source:_ -> failwith "unexpected replay");
+  } in
+  let replay = R.{
+    committed_head_epoch = shell.committed_head_epoch;
+    catchup_active = state.catchup_active;
+    quarantine_active = shell.quarantine_active;
+    find_finalized = (fun epoch -> Hashtbl.find_opt saved epoch);
+    read_local_root_raw = shell.read_local_root_raw;
+    apply_finalized = (fun ~validator_set item ->
+      let open Lwt.Syntax in
+      let* () = apply ~validator_set item in
+      if !head <> 11 then Lwt.return_unit else
+      let arrival = proof 12L in
+      F.handle shell ~validator_set:arrival.validator_set arrival.finalize);
+  } in
+  let state = { state with
+    committed_head_epoch = shell.committed_head_epoch;
+    take_queued_after = (fun ~head ->
+      Option.map (fun (item : Q.queued) ->
+        S.{ target_epoch = item.target_epoch; reason = item.reason })
+        (Q.take_if_after queue ~head));
+    clear_queue = (fun () -> Q.clear_all queue);
+    drain_pending_finalized = (fun () -> R.drain replay);
+  } in
+  let run_one ~target_epoch ~reason:_ ~finish_success ~fail_catchup:_ =
+    if target_epoch = 11L then store 11 (proof 11L);
+    finish_success (unproved "done") in
+  run (S.run state ~run_one ~target_epoch:11L ~reason:"peer");
+  assert_true "arrival during drain is applied without a probe" (!head = 12);
+  assert_true "arrival leaves no saved work" (Hashtbl.length saved = 0)
+
+let test_startup_delay_has_no_owner () =
+  let active = ref false in
+  let events = ref [] in
+  let state = { (health_deps active events) with
+    sleep = (fun _ ->
+      assert_true "startup delay leaves catchup free" (not !active);
+      active := true;
+      Lwt.return_unit);
+  } in
+  run (Octra_node_runtime.Consensus_health_wiring.startup_probe state);
+  assert_true "startup keeps a run begun during delay" !active;
+  assert_true "startup does not probe active run" (!events = [])
+
+let test_startup_owns_no_run () =
+  let active = ref true in
+  let events = ref [] in
+  run (Octra_node_runtime.Consensus_health_wiring.startup_probe
+    (health_deps active events));
+  assert_true "startup cannot release another run" !active;
+  assert_true "startup skips running catchup" (!events = [])
+
+let test_startup_hold_waits () =
+  let active = ref false and events = ref [] in
+  let calls = ref 0 and sleeps = ref 0 in
+  let deps = { (health_deps active events) with
+    sleep = (fun _ -> incr sleeps; Lwt.return_unit);
+  } in
+  let ready = run (Octra_node_runtime.Consensus_health_wiring.await_pending_recovery
+    deps ~delay:12.0 (fun () ->
+      incr calls;
+      Lwt.return (!calls = 77))) in
+  assert_true "startup peer wait stopped before recovery"
+    (ready && !calls = 77 && !sleeps = 76);
+  calls := 0;
+  sleeps := 0;
+  let ready = run (Octra_node_runtime.Consensus_health_wiring.await_pending_recovery
+    deps ~delay:12.0 (fun () ->
+      incr calls;
+      Lwt.return (!calls = 75))) in
+  assert_true "verified startup did not release"
+    (ready && !calls = 75 && !sleeps = 74);
+  calls := 0;
+  sleeps := 0;
+  let stopped = try
+    ignore (run (Octra_node_runtime.Consensus_health_wiring.await_pending_recovery
+      deps ~delay:12.0 (fun () ->
+        incr calls;
+        Lwt.fail (Octra_node_runtime.Consensus_pending_commit_recovery.Store_fault "disk"))));
+    false
+  with Octra_node_runtime.Consensus_pending_commit_recovery.Store_fault "disk" -> true in
+  assert_true "startup store fault retried" (stopped && !calls = 1 && !sleeps = 0)
+
+let test_poll_rechecks_owner () =
+  let active = ref false in
+  let events = ref [] in
+  run (Octra_node_runtime.Consensus_health_wiring.poll_once
+    (health_deps active events));
+  assert_true "poll skips probe after catchup starts" (!events = [])
+
+module Health = Octra_node_runtime.Consensus_health_shell
+
+let probe_config = Health.{
+    active_f = 1; validator_count = 4; state_attest_configured = 2;
+    snapshot_policy_threshold = 4096; soft_catchup_max_lag = 4;
+    quarantine_ahead_streak_threshold = 3; quarantine_ahead_grace_epochs = 2;
+    quarantine_ahead_drift_tolerance = 1;
+  }
+
+let probe_state active change = Health.{
+    normalize_next_epoch_for_head = (fun ~source:_ -> ());
+    committed_head_epoch = (fun () -> 10); current_epoch = (fun () -> 11);
+    catchup_next_target = (fun () -> None); attested_head = (fun _ -> false);
+    clear_state_attested = change; catchup_active = (fun () -> !active);
+    set_state_attested = (fun ~head:_ ~root:_ -> change ());
+    clear_quarantine = (fun _ -> change ()); mark_quarantine = (fun _ -> change ());
+    query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ -> Lwt.return []);
+    root_consensus_quorum = (fun ~epoch_id:_ ~root:_ _ -> false);
+    read_local_root_raw = (fun () -> Lwt.return base_root);
+    committed_epoch_root_raw = (fun _ -> Some base_root);
+    peer_snapshot = (fun () -> "");
+    drain_pending_finalized = (fun () -> change (); Lwt.return_unit);
+    wake_ready = (fun () -> change (); Lwt.return_unit);
+    require_sync = (fun _ -> change ());
+    run_catchup_to_target = (fun ~target_epoch:_ ~reason:_ -> change (); Lwt.return_unit);
+    quarantine_active = (fun () -> false); quarantine_reason = (fun () -> "");
+    ahead_streak = (fun () -> 0); incr_ahead_streak = change;
+  }
+
+let probe_peer head address = Octra_consensus.C_driver.{
+  responder_addr = address;
+  responder_head_epoch = head;
+  state_root = Some base_root;
+}
+
+let test_probe_keeps_owner () =
+  let active = ref false and changes = ref 0 in
+  let state = { (probe_state active (fun () -> incr changes)) with
+    query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+      Lwt.bind (Lwt.pause ()) (fun () -> active := true; Lwt.return []));
+  } in
+  run (Health.run probe_config state);
+  assert_true "probe cannot alter active catchup" (!active && !changes = 0)
+
+let test_probe_snapshot_cause () =
+  List.iter (fun gap ->
+    let active = ref false and need = ref None and starts = ref 0 in
+    let target = Int64.of_int (10 + gap) in
+    let state = { (probe_state active (fun () -> ())) with
+      query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+        Lwt.return [probe_peer target "left"; probe_peer target "right"]);
+      require_sync = (fun value -> need := Some value);
+      run_catchup_to_target = (fun ~target_epoch:_ ~reason:_ ->
+        incr starts; Lwt.return_unit);
+    } in
+    run (Health.run probe_config state);
+    let module N = Octra_node_runtime.Sync_need in
+    assert_true "snapshot cause is not missing range"
+      (if gap > 4096 then match !need with
+        | Some value -> N.valid value && value.cause = N.Range
+          && value.head = 10 && value.epoch = 11 && value.target = Some target && !starts = 0
+        | None -> false
+      else !need = None && !starts = 1)
+  ) [4096; 4097; 7529]
+
+let test_root_read_owner () =
+  List.iter (fun changed ->
+    let active = ref false and effects = ref 0 and reads = ref 0 in
+    let root, wake = Lwt.wait () in
+    let state = { (probe_state active (fun () -> incr effects)) with
+      query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+        Lwt.return [probe_peer 10L "left"; probe_peer 10L "right"]);
+      read_local_root_raw = (fun () -> incr reads; root);
+    } in
+    let work = Health.run probe_config state in
+    assert_true "probe did not await root" (!reads = 1 && Lwt.is_sleeping work);
+    active := changed;
+    Lwt.wakeup wake base_root;
+    run work;
+    assert_true "root read crossed owner change" (if changed then !effects = 0 else !effects > 0)
+  ) [false; true]
+
+let test_root_drain_owner () =
+  List.iter (fun change_owner ->
+    let active = ref false and wakes = ref 0 in
+    let state = { (probe_state active (fun () -> ())) with
+      query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+        Lwt.return [probe_peer 10L "left"; probe_peer 10L "right"]);
+      drain_pending_finalized = (fun () ->
+        Lwt.bind (Lwt.pause ()) (fun () ->
+          if change_owner then active := true;
+          Lwt.return_unit));
+      wake_ready = (fun () -> incr wakes; Lwt.return_unit);
+    } in
+    run (Health.run probe_config state);
+    assert_true "root wake respects new owner"
+      (!wakes = if change_owner then 0 else 1)
+  ) [false; true]
+
+let test_ready_drain_owner () =
+  List.iter (fun change_owner ->
+    let active = ref false and wakes = ref 0 in
+    let state = { (probe_state active (fun () -> ())) with
+      query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+        Lwt.return [probe_peer 9L "left"; probe_peer 9L "right"]);
+      drain_pending_finalized = (fun () ->
+        Lwt.bind (Lwt.pause ()) (fun () ->
+          if change_owner then active := true;
+          Lwt.return_unit));
+      wake_ready = (fun () -> incr wakes; Lwt.return_unit);
+    } in
+    run (Health.run probe_config state);
+    assert_true "ready wake respects new owner"
+      (!wakes = if change_owner then 0 else 1)
+  ) [false; true]
+
+let test_http_probe_owner () =
+  List.iter (fun change_owner ->
+    let active = ref false and starts = ref 0 in
+    let state = { (probe_state active (fun () -> ())) with
+      run_catchup_to_target = (fun ~target_epoch:_ ~reason:_ ->
+        incr starts; Lwt.return_unit);
+    } in
+    let http_target () =
+      Lwt.bind (Lwt.pause ()) (fun () ->
+        if change_owner then active := true;
+        Lwt.return_some 12L) in
+    run (Health.run ~http_target probe_config state);
+    assert_true "HTTP probe respects new owner"
+      (!starts = if change_owner then 0 else 1)
+  ) [false; true]
+
+let test_probe_saved_target () =
+  let check reason ~http ~queued expected =
+    let active = ref false and target = ref None in
+    let state = { (probe_state active (fun () -> ())) with
+      catchup_next_target = (fun () -> queued);
+      quarantine_active = (fun () -> true);
+      quarantine_reason = (fun () -> reason);
+      run_catchup_to_target = (fun ~target_epoch ~reason:_ ->
+        target := Some target_epoch; Lwt.return_unit);
+    } in
+    run (Health.run ~http_target:(fun () -> Lwt.return http)
+      probe_config state);
+    assert_true "probe did not use verified target" (!target = expected)
+  in
+  check "finalized_bundle_unavailable:12" ~http:(Some 12L)
+    ~queued:(Some 14L) (Some 14L);
+  check "rule anchor unreadable epoch = 8" ~http:None
+    ~queued:(Some 14L) (Some 14L);
+  check "operator hold" ~http:(Some 14L)
+    ~queued:(Some 15L) None
+
+let test_soft_probe_owner () =
+  List.iter (fun change_owner ->
+    let active = ref false and starts = ref 0 in
+    let state = { (probe_state active (fun () -> ())) with
+      query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+        Lwt.return [probe_peer 12L "left"; probe_peer 12L "right"]);
+      drain_pending_finalized = (fun () ->
+        Lwt.bind (Lwt.pause ()) (fun () ->
+          if change_owner then active := true;
+          Lwt.return_unit));
+      run_catchup_to_target = (fun ~target_epoch:_ ~reason:_ ->
+        incr starts; Lwt.return_unit);
+    } in
+    run (Health.run probe_config state);
+    assert_true "soft probe respects new owner"
+      (!starts = if change_owner then 0 else 1)
+  ) [false; true]
+
+let test_repair_probe_owner () =
+  List.iter (fun stop_at ->
+    let active = ref false and queries = ref 0 and repairs = ref 0 in
+    let state = { (probe_state active (fun () -> ())) with
+      query_epoch_root = (fun ~epoch_id ~timeout_seconds:_ ->
+        Lwt.bind (Lwt.pause ()) (fun () ->
+          incr queries;
+          if epoch_id = 10L && !queries = 1 then
+            let peer address = Octra_consensus.C_driver.{
+              responder_addr = address;
+              responder_head_epoch = 9L;
+              state_root = None;
+            } in
+            Lwt.return [peer "left"; peer "right"]
+          else if epoch_id = 10L then begin
+            if stop_at = "current" then active := true;
+            Lwt.return []
+          end else begin
+            if stop_at = "target" then active := true;
+            Lwt.return [probe_peer 9L "left"; probe_peer 9L "right"]
+          end));
+      root_consensus_quorum = (fun ~epoch_id ~root:_ _ -> epoch_id = 9L);
+      quarantine_active = (fun () -> true);
+    } in
+    let repair ~target_epoch:_ ~target_root:_ ~required:_
+        ~current_root_quorum:_ =
+      incr repairs;
+      Lwt.return_true in
+    run (Health.run ~repair probe_config state);
+    assert_true "repair respects new owner"
+      (!repairs = if stop_at = "none" then 1 else 0)
+  ) ["none"; "current"; "target"]
+
+let test_replay_rechecks_owner () =
+  let module R = Octra_node_runtime.Consensus_finalized_replay in
+  List.iter (fun change_head ->
+    let head = ref 10 in
+    let active = ref false in
+    let calls = ref 0 in
+    let finality = Option.get (record ()).finality in
+    let state = R.{
+      committed_head_epoch = (fun () -> !head);
+      catchup_active = (fun () -> !active);
+      quarantine_active = (fun () -> false);
+      find_finalized = (fun epoch -> if epoch = 11 then
+        Some (finality.finalize, finality.validator_set) else None);
+      read_local_root_raw = (fun () ->
+        if change_head then head := 11 else active := true;
+        Lwt.return base_root);
+      apply_finalized = (fun ~validator_set:_ _ -> incr calls; Lwt.return_unit);
+    } in
+    run (R.replay_while_safe state ~source:"test");
+    assert_true "replay rechecks owner and head after read" (!calls = 0)
+  ) [false; true]
+
+let test_drain_stops_at_seen_head () =
+  let module R = Octra_node_runtime.Consensus_finalized_replay in
+  let head = ref 10 and visible = ref 11 in
+  let state = R.{
+    committed_head_epoch = (fun () -> !head);
+    catchup_active = (fun () -> true);
+    quarantine_active = (fun () -> false);
+    find_finalized = (fun epoch ->
+      if epoch > !visible then None else
+      let saved = Option.get (record ~epoch:(Int64.of_int epoch) ()).finality in
+      Some (saved.finalize, saved.validator_set));
+    read_local_root_raw = (fun () -> Lwt.return base_root);
+    apply_finalized = (fun ~validator_set:_ saved ->
+      head := Int64.to_int saved.epoch_id;
+      visible := 12;
+      Lwt.return_unit);
+  } in
+  run (R.drain state);
+  assert_true "drain stops at initially visible head" (!head = 11);
+  run (R.drain state);
+  assert_true "next drain consumes later arrival" (!head = 12)
+
 let test_range_plan_defaults () =
+  let probe ?(current = 10L) ?(allowed = true) now records =
+    S.probe_target ~now ~head:10L ~current ~allowed records in
+  assert_true "empty probe started catchup" (probe 1000. [] = None);
+  assert_true "fresh next epoch started catchup" (probe 120. [record ()] = None);
+  assert_true "old next epoch did not start" (probe 1000. [record ()] = Some 11L);
+  assert_true "verified lag did not start"
+    (probe 120. [record (); record ~epoch:12L ()] = Some 12L);
+  assert_true "changed head started catchup"
+    (probe ~current:11L 1000. [record ()] = None);
+  assert_true "unsafe state started catchup"
+    (probe ~allowed:false 1000. [record ()] = None);
+  let next = S.next_target ~now:1000. ~initial:10L in
+  let extended, short = S.next_window ~extended:false ~target:10L ~next:26L ~count:1 in
+  assert_true "short extension not recorded" (extended && short);
+  let extended, short = S.next_window ~extended ~target:26L ~next:26L ~count:16 in
+  assert_true "full response retained short wait" (extended && not short);
+  assert_true "fixed target grew"
+    (next ~reason:"finalized_gap" ~target:10L ~epoch:10L ~epoch_ts:0. = 10L);
+  assert_true "old verified head did not grow"
+    (next ~reason:"lagging" ~target:10L ~epoch:10L ~epoch_ts:0. = 26L);
+  assert_true "target moved before it was reached"
+    (next ~reason:"lagging" ~target:26L ~epoch:20L ~epoch_ts:0. = 26L);
+  assert_true "fresh head did not finish"
+    (next ~reason:"lagging" ~target:26L ~epoch:20L ~epoch_ts:990. = 20L);
   let plan =
     S.range_plan
       ~env_timeout:None
@@ -429,9 +904,15 @@ let test_range_plan_defaults () =
       ~target_epoch:14L
   in
   assert_true "remain" (plan.remain = 5);
-  assert_true "max epochs" (plan.max_epochs = 5);
+  assert_true "max epochs"
+    (plan.max_epochs = 5);
   assert_true "timeout" (plan.timeout_seconds = 8.0);
-  assert_true "log progress" (plan.log_progress = false)
+  assert_true "log progress" (plan.log_progress = false);
+  let near =
+    S.range_plan ~env_timeout:None ~from_epoch:10L ~target_epoch:10L
+  in
+  assert_true "range stops at old target"
+    (near.max_epochs = 1)
 
 let test_query_progress_decisions () =
   assert_true "prior head awaits range"
@@ -448,11 +929,12 @@ let test_range_retry_success () =
     sleep = (fun _ ->
       incr slept;
       Lwt.return_unit);
-    query_range = (fun ~from_epoch:_ ~max_epochs:_ ~timeout_seconds:_ ~validate:_ ->
+    query_range = (fun ~from_epoch:_ ~max_epochs:_ ~timeout_seconds:_
+        ~validate:_ ~prove:_ ->
       incr attempts;
       if !attempts = 3 then Lwt.return_some (chunk ())
       else Lwt.return_none);
-    http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate:_ -> Lwt.return_none);
+http_range = (fun ~budget:_ ~from_epoch:_ ~max_epochs:_ ~validate:_ -> Lwt.return_none);
   } in
   let result =
     run
@@ -464,14 +946,15 @@ let test_range_retry_success () =
          ~max_epochs:4
          ~timeout_seconds:1.0
          ~reason:"test"
-         ~validate:(fun _ -> true))
+         ~validate:(fun _ -> true)
+         ~prove:(fun _ -> true))
   in
   assert_true "query succeeded" (Option.is_some result);
   assert_true "attempts" (!attempts = 3);
   assert_true "sleeps" (!slept = 2)
 
 let query_chunk_deps ?(local_root = base_root) ?(answer = Some (chunk ()))
-    events =
+    ?(quorum = true) events =
   S.{
     env_timeout = (fun () -> None);
     verify_http = check_qcs
@@ -486,14 +969,14 @@ let query_chunk_deps ?(local_root = base_root) ?(answer = Some (chunk ()))
         add events "query_sleep";
         Lwt.return_unit);
       query_range = (fun ~from_epoch:_ ~max_epochs:_ ~timeout_seconds:_
-          ~validate ->
+          ~validate ~prove ->
         add events "query_range";
         match answer with
-        | Some response when validate response ->
+        | Some response when validate response && (quorum || prove response) ->
           Lwt.return_some response
         | _ ->
           Lwt.return_none);
-      http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate:_ -> Lwt.return_none);
+      http_range = (fun ~budget:_ ~from_epoch:_ ~max_epochs:_ ~validate:_ -> Lwt.return_none);
     };
   }
 
@@ -516,6 +999,62 @@ let test_query_chunk_success () =
   assert_true "root read" (has "query_root" events);
   assert_true "query called" (has "query_range" events)
 
+let test_probe_moving_head () =
+  let records = [proved_record (); proved_record ~epoch:12L ~prev:next_root ();
+    proved_record ~epoch:13L ~prev:next_root ()] in
+  List.iter (fun (after, permitted, expected) ->
+    let events = ref [] and current = ref 10L and allowed = ref true in
+    let started = ref [] in
+    let query = query_chunk_deps ~quorum:false
+      ~answer:(Some (chunk ~records ())) events in
+    let read = query.S.range_query.query_range in
+    let query = { query with S.range_query = { query.range_query with
+      query_range = (fun ~from_epoch ~max_epochs ~timeout_seconds ~validate ~prove ->
+        let open Lwt.Syntax in
+        let* response = read ~from_epoch ~max_epochs ~timeout_seconds ~validate ~prove in
+        current := after;
+        allowed := permitted;
+        Lwt.return response) } } in
+    run (S.probe_range query ~now:(fun () -> 1000.) ~head:10L
+      ~current_head:(fun () -> !current) ~allowed:(fun () -> !allowed)
+      ~run_catchup:(fun ~target_epoch ~reason ->
+        assert_true "probe changed reason" (reason = "verified_lag");
+        started := target_epoch :: !started;
+        Lwt.return_unit));
+    assert_true "probe lost verified progress" (!started = expected)
+  ) [10L, true, [13L]; 11L, true, [13L]; 12L, true, [13L];
+     13L, true, []; 14L, true, []; 9L, true, []; 11L, false, []]
+
+let test_probe_rejects_range () =
+  List.iter (fun records ->
+    let events = ref [] and started = ref false in
+    let query = query_chunk_deps ~quorum:false
+      ~answer:(Some (chunk ~records ())) events in
+    run (S.probe_range query ~now:(fun () -> 1000.) ~head:10L
+      ~current_head:(fun () -> 11L) ~allowed:(fun () -> true)
+      ~run_catchup:(fun ~target_epoch:_ ~reason:_ ->
+        started := true;
+        Lwt.return_unit));
+    assert_true "unverified range started catchup" (not !started)
+  ) [[]; [{ (proved_record ()) with finality = None }];
+     [proved_record ~prev:wrong_root ()]]
+
+let test_query_peer_proof () =
+  let events = ref [] in
+  let bad = { (record ()) with finality = None } in
+  let answer = Some (chunk ~records:[bad] ()) in
+  let step =
+    run
+      (S.query_chunk
+         (query_chunk_deps ~answer ~quorum:false events)
+         ~target_epoch:12L
+         ~from_epoch:11L
+         ~reason:"proof")
+  in
+  match step with
+  | S.Query_failed _ -> ()
+  | S.Query_chunk _ -> failwith "peer range lacks finality proof"
+
 let test_query_chunk_failure () =
   let events = ref [] in
   let step =
@@ -532,17 +1071,44 @@ let test_query_chunk_failure () =
     | _ -> failwith "query chunk should fail"
   end;
   let events = snapshot events in
-  assert_true "retried sleep twice"
-    (List.length (List.filter (( = ) "query_sleep") events) = 2)
+  assert_true "retry and early HTTP waits"
+    (List.length (List.filter (( = ) "query_sleep") events) = 3)
+
+let test_http_reward () =
+  let first = record () in
+  let check = S.check_qcs
+    ~chain_id:"octra-test"
+    ~expected_validator_set_hash:(fun _ -> Ok trusted_validator_set_hash)
+    ~start_txid:4L in
+  assert_true "unproved reward rejected by single source"
+    (Result.is_error (check [first]));
+  let changed = record ~reward_creator:"oct_other" () in
+  assert_true "changed unproved reward rejected by single source"
+    (Result.is_error (check [changed]));
+  let signed = proved_record () in
+  let unproved = record ~epoch:12L ~prev:next_root () in
+  assert_true "only proved reward prefix retained"
+    (match check [signed; unproved] with
+     | Ok [value] -> value = signed
+     | _ -> false);
+  let altered = { signed with reward_source = changed.reward_source } in
+  assert_true "signed reward mismatch rejected"
+    (Result.is_error (check [altered]));
+  let module Reward = Octra_node_runtime.Consensus_reward_attribution in
+  let proof = Option.get first.finality in
+  let supplied = first.reward_source |> Option.get |> Reward.of_source |> Result.get_ok in
+  assert_true "historical apply rule unchanged"
+    (Reward.bind_finality ~validator_set:proof.validator_set proof.finalize supplied
+     = Ok supplied)
 
 let test_http_qc () =
   let check = S.check_qcs
     ~chain_id:"octra-test"
     ~expected_validator_set_hash:(fun _ -> Ok trusted_validator_set_hash)
     ~start_txid:4L in
-  let first = record () in
-  let second = record ~epoch:12L ~prev:next_root () in
-  let changed = record ~epoch:12L ~prev:next_root ~creator:"oct_other" () in
+  let first = proved_record () in
+  let second = proved_record ~epoch:12L ~prev:next_root () in
+  let changed = proved_record ~epoch:12L ~prev:next_root ~creator:"oct_other" () in
   let wrong_chain = S.check_qcs
     ~chain_id:"octra-other"
     ~expected_validator_set_hash:(fun _ -> Ok trusted_validator_set_hash)
@@ -596,13 +1162,13 @@ let test_query_chunk_http_reject () =
   let deps = query_chunk_deps events in
   let range_query = S.{ deps.range_query with
     query_range = (fun ~from_epoch:_ ~max_epochs:_ ~timeout_seconds:_
-        ~validate ->
+        ~validate ~prove:_ ->
       incr calls;
       add events "query_range";
       let response = chunk () in
       Lwt.return
         (if !calls > 1 && validate response then Some response else None));
-    http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate:_ ->
+    http_range = (fun ~budget:_ ~from_epoch:_ ~max_epochs:_ ~validate:_ ->
       add events "http";
       Lwt.return_some (chunk ~records:[{ (record ()) with finality = None }] ()));
   } in
@@ -620,17 +1186,19 @@ let test_query_chunk_http_reject () =
     | _ -> failwith "peer retry should succeed"
   end;
   assert_true "invalid http rejected" (!calls = 2);
-  assert_true "http precedes second peer"
-    (snapshot events =
-     ["query_root"; "query_range"; "http"; "query_sleep"; "query_range"])
+  let events = snapshot events in
+  assert_true ("http precedes second peer: " ^ String.concat "," events)
+    (events =
+     ["query_root"; "query_range"; "query_sleep"; "http";
+      "query_sleep"; "query_range"])
 
 let test_query_chunk_http_first () =
   let events = ref [] in
   let deps = query_chunk_deps ~answer:None events in
   let range_query = S.{ deps.range_query with
-    http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate ->
+    http_range = (fun ~budget:_ ~from_epoch:_ ~max_epochs:_ ~validate ->
       add events "http";
-      let response = chunk () in
+      let response = chunk ~records:[proved_record ()] () in
       Lwt.return (if validate response then Some response else None));
   } in
   let step =
@@ -646,17 +1214,49 @@ let test_query_chunk_http_first () =
     | S.Query_chunk _ -> ()
     | _ -> failwith "http chunk should be used"
   end;
-  assert_true "http precedes peer retry"
-    (snapshot events = ["query_root"; "query_range"; "http"])
+  let events = snapshot events in
+  assert_true ("http precedes peer retry: " ^ String.concat "," events)
+    (events = ["query_root"; "query_range"; "query_sleep"; "http"])
+
+let test_http_early () =
+  let events = ref [] in
+  let deps = query_chunk_deps ~answer:None events in
+  let range_query = S.{
+    sleep = (fun seconds ->
+      if seconds = 1.0 then Lwt.return_unit else Lwt_unix.sleep seconds);
+    query_range = (fun ~from_epoch:_ ~max_epochs:_ ~timeout_seconds:_
+        ~validate:_ ~prove:_ ->
+      add events "peer";
+      let open Lwt.Syntax in
+      let* () = Lwt_unix.sleep 0.05 in
+      add events "peer_done";
+      Lwt.return_none);
+    http_range = (fun ~budget:_ ~from_epoch:_ ~max_epochs:_ ~validate ->
+      add events "http";
+      let response = chunk ~records:[proved_record ()] () in
+      Lwt.return (if validate response then Some response else None));
+  } in
+  let step =
+    run
+      (S.query_chunk
+         { deps with range_query }
+         ~target_epoch:12L
+         ~from_epoch:11L
+         ~reason:"early")
+  in
+  assert_true "HTTP did not win the first wait"
+    (match step with S.Query_chunk _ -> true | _ -> false);
+  assert_true "HTTP waited for the peer"
+    (not (has "peer_done" (snapshot events)))
 
 let test_query_chunk_http_prefix () =
   let events = ref [] in
   let checks = ref 0 in
-  let first = record () in
-  let changed = record ~epoch:12L ~prev:next_root ~creator:"oct_other" () in
+  let first = proved_record () in
+  let changed = proved_record ~epoch:12L ~prev:next_root ~creator:"oct_other" () in
   let deps = query_chunk_deps ~answer:None events in
   let range_query = S.{ deps.range_query with
-    http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate ->
+    http_range = (fun ~budget:_ ~from_epoch:_ ~max_epochs:_ ~validate ->
       let response = chunk ~records:[first; changed] () in
       Lwt.return (if validate response then Some response else None));
   } in
@@ -692,12 +1292,12 @@ let test_query_chunk_http_read () =
   let deps = query_chunk_deps ~answer:None events in
   let range_query = S.{ deps.range_query with
     query_range = (fun ~from_epoch:_ ~max_epochs:_ ~timeout_seconds:_
-        ~validate ->
+        ~validate ~prove:_ ->
       incr calls;
       let response = chunk () in
       Lwt.return
         (if !calls > 1 && validate response then Some response else None));
-    http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate ->
+    http_range = (fun ~budget:_ ~from_epoch:_ ~max_epochs:_ ~validate ->
       let response = chunk () in
       Lwt.return (if validate response then Some response else None));
   } in
@@ -718,12 +1318,12 @@ let test_query_chunk_http_last () =
   let calls = ref 0 in
   let deps = query_chunk_deps ~answer:None events in
   let range_query = S.{ deps.range_query with
-    http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate ->
+    http_range = (fun ~budget:_ ~from_epoch:_ ~max_epochs:_ ~validate ->
       incr calls;
       let response =
         if !calls = 1 then
           chunk ~records:[{ (record ()) with finality = None }] ()
-        else chunk ()
+        else chunk ~records:[proved_record ()] ()
       in
       Lwt.return (if validate response then Some response else None));
   } in
@@ -743,7 +1343,7 @@ let test_query_chunk_http_bad_last () =
   let calls = ref 0 in
   let deps = query_chunk_deps ~answer:None events in
   let range_query = S.{ deps.range_query with
-    http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate ->
+    http_range = (fun ~budget:_ ~from_epoch:_ ~max_epochs:_ ~validate ->
       incr calls;
       let response =
         chunk ~records:[{ (record ()) with finality = None }] ()
@@ -1276,6 +1876,48 @@ let test_apply_chunk_gate_continue () =
   assert_true "local root read" (has "chunk_root" events);
   assert_true "record applied" (has "apply:11" events)
 
+let test_range_grows_head () =
+  let first = proved_record () in
+  let second = proved_record ~epoch:12L ~prev:next_root () in
+  let head = ref 10 in
+  let root = ref base_root in
+  let eic = ref "eic0" in
+  let txid = ref 4L in
+  let events = ref [] in
+  let point = apply_point ~epoch:10L ~root:base_root ~eic:"eic0" ~txid:4L () in
+  let record_apply = S.{ (apply_deps events ~head_before_record:10 ~point) with
+    head_before_record = (fun () -> !head);
+    point_source = {
+      head_epoch = (fun () -> !head);
+      read_root = (fun () -> Lwt.return !root);
+      cached_head = (fun () -> {
+        S.cached_root = !root;
+        cached_eic = Some !eic;
+      });
+      next_txid = (fun () -> !txid);
+    };
+    apply_record = (fun validated ->
+      head := Int64.to_int validated.record.epoch_id;
+      root := validated.record.state_root;
+      eic := validated.expected_eic;
+      txid := validated.expected_txid;
+      add events (Printf.sprintf "apply:%d" !head);
+      Lwt.return_unit);
+  } in
+  let deps = S.{ (chunk_apply_deps events ~head:10 ~point) with
+    current_head = (fun () -> Int64.of_int !head);
+    record_apply;
+  } in
+  let step =
+    run (S.apply_chunk_gate deps ~target_epoch:11L ~start_head:10L
+      ~from_epoch:11L ~reason:"growth" (chunk ~records:[first; second] ()))
+  in
+  assert_true "verified range did not advance beyond old target"
+    (match step with S.Chunk_continue _ -> true | _ -> false);
+  assert_true "second certified epoch was not applied"
+    (!head = 12 && !root = second.state_root &&
+     has "apply:11" (snapshot events) && has "apply:12" (snapshot events))
+
 let test_apply_chunk_gate_retry () =
   let events = ref [] in
   let step =
@@ -1575,7 +2217,7 @@ let test_local_apply_cancels_query () =
         head := 11;
         Lwt.return_unit);
       query_range = (fun ~from_epoch:_ ~max_epochs:_ ~timeout_seconds:_
-          ~validate:_ ->
+          ~validate:_ ~prove:_ ->
         add events "query_range";
         Lwt.finalize
           (fun () -> waiting)
@@ -1583,7 +2225,7 @@ let test_local_apply_cancels_query () =
             query_cancelled := true;
             add events "query_cancelled";
             Lwt.return_unit));
-      http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate:_ -> Lwt.return_none);
+      http_range = (fun ~budget:_ ~from_epoch:_ ~max_epochs:_ ~validate:_ -> Lwt.return_none);
     };
   } in
   let deps = S.{
@@ -1642,6 +2284,73 @@ let test_run_with_target_success () =
   assert_true "driver restarted" (has "start:11" events);
   assert_true "state attested" (has "attest:10:root" events);
   assert_true "driver woke" (has "wake" events)
+
+let test_catchup_ready_flow () =
+  let module Actor = Octra_node_runtime.Set_actor in
+  let module Fold = Octra_core.Set_fold in
+  let module State = Octra_node_runtime.Consensus_runtime_state in
+  List.iter (fun valid ->
+    let recd = record ~root:(String.make 32 'w') () in
+    let checked = validated_or_fail ~head_before_record:10 recd in
+    let point = apply_point ~epoch:11L
+      ~root:(if valid then recd.state_root else String.make 32 'z')
+      ~eic:checked.expected_eic ~txid:checked.expected_txid () in
+    let events = ref [] and head = ref 10 and sent = ref 0 in
+    let state = State.create () and fold = ref Fold.empty in
+    ignore (State.enter_quarantine state ~epoch:10 ~reason:"catchup_failed:lagging");
+    let actor = Actor.create Actor.{
+      sample = (fun () -> {
+        epoch = Int64.of_int (!head + 1); active = false;
+        bonded = if State.attested_head state !head && not (State.quarantine_active state)
+          then Ok true else Error "sync pending";
+      });
+      read = (fun ~epoch:_ -> Lwt.return_ok (Fold.receipt ~address:"octA" !fold));
+      peers = (fun () -> 1);
+      send = (fun ~epoch action ->
+        assert_true "rejoin sent a non-pulse" (action = Actor.Pulse);
+        incr sent;
+        fold := Fold.note_pulse Fold.standard ~epoch ~active:false ~address:"octA" !fold
+          |> Result.get_ok;
+        Lwt.return_ok ());
+      warn = (fun _ reason -> if reason <> "sync pending" then failwith reason);
+    } in
+    let settle () = run (Lwt_list.iter_s (fun _ -> Lwt.pause ()) (List.init 20 Fun.id)) in
+    let wake () = ignore (Actor.wake actor ~head:!head) in
+    wake (); settle ();
+    assert_true "unverified node sent ready" (!sent = 0);
+    let outer = S.{ (deps events) with
+      committed_head_epoch = (fun () -> !head);
+      read_local_root = (fun () -> Lwt.return recd.state_root);
+      set_state_attested = (fun ~head ~root -> State.set_state_attested state ~head ~root; wake ());
+      clear_quarantine = (fun evidence -> ignore (State.clear_quarantine state ~evidence));
+      wake_ready = (fun () -> wake (); Lwt.return_unit);
+    } in
+    let target = target_deps ~answer:(Some (chunk ~records:[recd] ())) events ~head:10 ~point in
+    let prior_apply = target.apply.record_apply.apply_record in
+    let target = S.{ target with
+      head_epoch = (fun () -> !head);
+      apply = {target.apply with
+        gap_active = (fun () -> not valid);
+        record_apply = {target.apply.record_apply with apply_record = (fun record ->
+          let open Lwt.Syntax in
+          let* () = prior_apply record in
+          head := 11;
+          Lwt.return_unit)};
+      };
+    } in
+    run (S.run_with_target outer ~target ~target_epoch:11L ~reason:"lagging");
+    settle ();
+    assert_true "ready eligibility differs from checked root" ((!sent = 1) = valid);
+    if valid then begin
+      for next = 12 to 75 do
+        head := next;
+        State.set_state_attested state ~head:next ~root:recd.state_root;
+        wake (); settle ()
+      done;
+      assert_true "automatic pulses did not restore membership eligibility"
+        (Fold.allows Fold.standard ~start:0L ~source:76L ~address:"octA" !fold)
+    end;
+    run (Actor.shutdown actor)) [false; true]
 
 let test_root_mismatch_attest_hold () =
   let recd = record ~root:(String.make 32 'w') () in
@@ -1706,6 +2415,48 @@ let test_run_wired_success () =
   assert_true "wired queried" (has "query_range" events);
   assert_true "wired applied" (has "apply:11" events);
   assert_true "wired woke" (has "wake" events)
+
+let test_anchor_recovery () =
+  let module State = Octra_node_runtime.Consensus_runtime_state in
+  let recd = record ~root:(String.make 32 'x') () in
+  let validated = validated_or_fail ~head_before_record:10 recd in
+  let point = apply_point ~epoch:11L ~root:recd.state_root
+    ~eic:validated.S.expected_eic ~txid:validated.expected_txid () in
+  let check reason expected verified =
+    let events = ref [] in
+    let state = State.create () in
+    ignore (State.enter_quarantine state ~epoch:10 ~reason);
+    assert_true "peer root cleared a read failure"
+      (State.root_recovery_evidence ~reason ~evidence:"in_sync"
+        ~consensus_proved:true = None);
+    let base = deps events in
+    let target = target_wiring ~answer:(Some (chunk ~records:[recd] ()))
+      events ~head:10 ~point in
+    let input = S.{ base with
+      committed_head_epoch = target.head_epoch;
+      set_state_attested = (fun ~head ~root ->
+        State.set_state_attested state ~head ~root);
+      clear_quarantine = (fun evidence ->
+        ignore (State.clear_quarantine state ~evidence));
+    } in
+    if verified then
+      run (S.run_wired input
+        ~target
+        ~target_epoch:11L ~reason:"checked_chain")
+    else
+      run (S.run input ~run_one:(fun ~target_epoch:_ ~reason:_
+        ~finish_success ~fail_catchup:_ -> finish_success (unproved "peer"))
+        ~target_epoch:11L ~reason:"peer");
+    assert_true "catchup changed the wrong quarantine"
+      (State.quarantine_active state <> (expected && verified)) in
+  List.iter (fun verified ->
+    check "rule anchor unreadable epoch = 1504440 reason = epoch log entry missing"
+      true verified;
+    check "finalized_bundle_unavailable:11" true verified;
+    check "finalized_bundle_unavailable:12" false verified;
+    check "finalized_bundle_unavailable:invalid" false verified;
+    check "rule anchor mismatch epoch = 1504440" false verified;
+    check "operator hold" false verified) [false; true]
 
 let test_run_driver_wired_success () =
   let recd = record ~root:(String.make 32 'y') () in
@@ -1792,7 +2543,7 @@ let test_run_driver_wired_success () =
     drain_pending_finalized = (fun () ->
       add events "drain";
       Lwt.return_unit);
-    http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate:_ -> Lwt.return_none);
+    http_range = (fun ~budget:_ ~from_epoch:_ ~max_epochs:_ ~validate:_ -> Lwt.return_none);
   } in
   run
     (S.run_driver_wired
@@ -1969,7 +2720,7 @@ let test_driver_runtime_fields () =
         mark_quarantine = ignore;
         observer = true;
         drain_pending_finalized = (fun () -> Lwt.return_unit);
-        http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate:_ -> Lwt.return_none);
+        http_range = (fun ~budget:_ ~from_epoch:_ ~max_epochs:_ ~validate:_ -> Lwt.return_none);
       }
   in
   let cached = wiring.S.cached_head () in
@@ -2086,23 +2837,48 @@ let test_response_payload_integrity () =
     (S.response_payload_valid [oversized_record])
 
 let tests = [
+  "finish keeps owner", test_finish_keeps_owner;
+  "wake keeps new owner", test_wake_keeps_new_owner;
+  "finish stashed arrival", test_finish_stashed_arrival;
+  "startup delay has no owner", test_startup_delay_has_no_owner;
+  "finish queued during drain", test_finish_queued_during_drain;
+  "startup owns no run", test_startup_owns_no_run;
+  "startup hold waits", test_startup_hold_waits;
+  "poll rechecks owner", test_poll_rechecks_owner;
+  "probe keeps owner", test_probe_keeps_owner;
+  "root read owner", test_root_read_owner;
+  "root drain owner", test_root_drain_owner;
+  "ready drain owner", test_ready_drain_owner;
+  "HTTP probe owner", test_http_probe_owner;
+  "probe saved target", test_probe_saved_target;
+  "probe snapshot cause", test_probe_snapshot_cause;
+  "soft probe owner", test_soft_probe_owner;
+  "repair probe owner", test_repair_probe_owner;
+  "replay rechecks owner", test_replay_rechecks_owner;
+  "drain stops at seen head", test_drain_stops_at_seen_head;
   "reject stripped parent", test_reject_stripped_parent;
   "active call queues only", test_active_call_queues_only;
   "success finishes and wakes", test_success_finishes_and_wakes;
   "unverified attestation hold", test_unverified_attestation_hold;
+  "anchor recovery", test_anchor_recovery;
   "continue queued target", test_continue_queued_target;
   "failure quarantine clear", test_failure_quarantine_clear;
   "throw quarantine release",
     test_throw_quarantine_release;
   "observer drain no wake", test_observer_drain_no_wake;
   "range plan defaults", test_range_plan_defaults;
+  "probe moving head", test_probe_moving_head;
+  "probe rejects range", test_probe_rejects_range;
   "query progress decisions", test_query_progress_decisions;
   "range retry success", test_range_retry_success;
   "query chunk success", test_query_chunk_success;
+  "query peer proof", test_query_peer_proof;
   "query chunk failure", test_query_chunk_failure;
+  "http reward", test_http_reward;
   "http qc", test_http_qc;
   "query chunk http reject", test_query_chunk_http_reject;
   "query chunk http first", test_query_chunk_http_first;
+  "http early", test_http_early;
   "query chunk http prefix", test_query_chunk_http_prefix;
   "query chunk http read", test_query_chunk_http_read;
   "query chunk http last", test_query_chunk_http_last;
@@ -2128,10 +2904,12 @@ let tests = [
   "apply chunk records skip", test_apply_chunk_records_skip;
   "apply chunk records retry", test_apply_chunk_records_retry;
   "apply chunk gate continue", test_apply_chunk_gate_continue;
+  "range grows head", test_range_grows_head;
   "apply chunk gate retry", test_apply_chunk_gate_retry;
   "chunk continuity fail", test_chunk_continuity_fail;
   "run target already in sync", test_run_target_already_in_sync;
   "run target continue", test_run_target_continue;
+  "catchup ready flow", test_catchup_ready_flow;
   "run target query failed", test_run_target_query_failed;
   "local apply cancels query", test_local_apply_cancels_query;
   "run with target success", test_run_with_target_success;
@@ -2149,8 +2927,12 @@ let tests = [
 ]
 
 let () =
+  let failed = ref 0 in
   List.iter (fun (name, f) ->
     try f () with exn ->
-      failwith (Printf.sprintf "%s failed: %s" name (Printexc.to_string exn))
+      incr failed;
+      Printf.eprintf "test = %s status = fail error = %s\n%!"
+        name (Printexc.to_string exn)
   ) tests;
+  if !failed > 0 then failwith (Printf.sprintf "failed tests = %d" !failed);
   print_endline "status = pass test = node_runtime_consensus_catchup_shell"

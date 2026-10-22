@@ -116,7 +116,7 @@ let enrollment () =
   Octra_node_runtime.Status_read_rpc.{
     head_epoch = 100; head_proposal_id = Some (String.make 64 'a');
     state_root = String.make 64 'b'; chain_id = "test"; config_hash = String.make 64 'c';
-    candidate = Some Octra_core.Validator_admission.{
+    entry = Some Octra_core.Validator_entry.{
       address = "sender"; pubkey = "key"; bond = Z.one; bonded_epoch = 1L;
       ready_epoch = None; exit_epoch = None;
     };
@@ -126,20 +126,20 @@ let enrollment () =
 let check_enrollment () =
   let module Control = Octra_node_runtime.Set_control in
   let snapshot = enrollment () in
-  let eligible snapshot = Control.eligible ~mode:Rule.Active ~head:100L
+  let eligible snapshot = Control.eligible ~marks:false ~mode:Rule.Active ~head:100L
     ~bonded_epoch:1L ~snapshot (transaction 100L) in
   expect "same bond cycle is eligible" (eligible (Ok snapshot) = Post.Eligible);
   expect "absent candidate retires duty"
-    (eligible (Ok { snapshot with candidate = None }) = Post.Expired);
-  let candidate = Option.get snapshot.candidate in
+    (eligible (Ok { snapshot with entry = None }) = Post.Expired);
+  let entry = Option.get snapshot.entry in
   expect "new bond cycle retires duty"
-    (eligible (Ok { snapshot with candidate = Some { candidate with bonded_epoch = 2L } })
+    (eligible (Ok { snapshot with entry = Some { entry with bonded_epoch = 2L } })
      = Post.Expired);
   expect "committed exit retires duty"
-    (eligible (Ok { snapshot with candidate = Some { candidate with exit_epoch = Some 100L } })
+    (eligible (Ok { snapshot with entry = Some { entry with exit_epoch = Some 100L } })
      = Post.Expired);
   expect "old enrollment cannot retire current duty"
-    (eligible (Ok { snapshot with head_epoch = 99; candidate = None }) = Post.Eligible);
+    (eligible (Ok { snapshot with head_epoch = 99; entry = None }) = Post.Eligible);
   expect "unavailable enrollment permits guarded refresh"
     (eligible (Error "enrollment unavailable") = Post.Eligible)
 
@@ -152,16 +152,16 @@ let check_refresh_gate () =
     let cached = ref prior in
     let refresh = ref (Lwt.return prior) in
     let retry = { retry with
-      Post.eligible = (fun tx -> Control.eligible ~mode:Rule.Active ~head:sample.head
+      Post.eligible = (fun tx -> Control.eligible ~marks:false ~mode:Rule.Active ~head:sample.head
         ~bonded_epoch:1L ~snapshot:!cached tx);
       post = (fun ~current tx ->
         let open Lwt.Syntax in
         let* fresh = !refresh in
         cached := fresh;
         match fresh with
-        | Ok { head_epoch; candidate = Some candidate; _ }
+        | Ok { head_epoch; entry = Some entry; _ }
           when Int64.of_int head_epoch = sample.head
-               && candidate.bonded_epoch = 1L && candidate.exit_epoch = None ->
+               && entry.bonded_epoch = 1L && entry.exit_epoch = None ->
           retry.post ~current tx
         | _ -> Lwt.return_error (Post.Wait "committed enrollment refresh required"));
     } in
@@ -186,7 +186,7 @@ let check_refresh_gate () =
       fire sample 60.;
       expect "fresh enrollment and guard permit exact retry"
         (sample.staged && sample.calls = [wire tx] && sample.guards = 2)))
-    [Error "enrollment unavailable"; Ok { snapshot with head_epoch = 99; candidate = None }]
+    [Error "enrollment unavailable"; Ok { snapshot with head_epoch = 99; entry = None }]
 
 let check_head_root () =
   let module C = Octra_consensus.C_types in

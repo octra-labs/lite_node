@@ -9,7 +9,8 @@ let expect reason condition = if not condition then failwith reason
 let state ?(mode = Octra_core.Rule_graph.Active) ?(proof = Octra_core.Rule_graph.Prior)
     ?(view = false) ?(limit = 10_000_000) ?memory source =
   let ctx = {VM.default_ctx with fhe_work = mode; fhe_memory = memory;
-    proof_exec = proof; get_fhe_pubkey = (fun _ -> Some source)} in
+    proof_exec = proof;
+    proof_key = Octra_core.Rule_graph.Prior; get_fhe_pubkey = (fun _ -> Some source)} in
   VM.create_state ~ctx ~is_view:view ~limit ~caller:"sender"
     ~origin:"sender" ~address:"program" ~value:Z.zero ~storage:(Hashtbl.create 1) ()
 

@@ -45,6 +45,7 @@ let runtime () =
     proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
     compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
     settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
+    marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
     queue_head = (fun () -> None);
     duty_head = (fun () -> None);
     preverify_admit = (fun _ -> Ok ());
@@ -108,6 +109,7 @@ let test_preverify () =
       proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
       compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
       settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
+      marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
       queue_head = (fun () -> None);
       duty_head = (fun () -> None);
       preverify_admit = (fun tx ->
@@ -132,6 +134,7 @@ let test_preverify () =
       proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
       compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
       settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
+      marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
       queue_head = (fun () -> None);
       duty_head = (fun () -> None);
       preverify_admit = (fun _ -> Error "pre_verify_busy pending = 6 limit = 6");
@@ -166,6 +169,7 @@ let test_eviction () =
       proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
       compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
       settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
+      marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
       queue_head = (fun () -> None);
       duty_head = (fun () -> None);
       preverify_admit = (fun _ -> Ok ());
@@ -346,7 +350,7 @@ let test_duty_window () =
   List.iter (fun (head, confirmed_nonce, nonce, op_type, accepted) ->
     let item = { base with Transaction.nonce; op_type } in
     expect "duty nonce policy"
-      (Result.is_ok (View.duty_nonce_admission ~head ~confirmed_nonce item) = accepted))
+      (Result.is_ok (View.duty_nonce_check ~head ~confirmed_nonce item) = accepted))
     cases;
   expect "duty gap is a queue error, not an execution rejection"
     (View.staging_error "validator ready requires next confirmed nonce"
@@ -425,7 +429,7 @@ let test_delivery_retry () =
   let hash = Transaction.hash item in
   let bytes = Transaction.to_yojson item in
   let submit = R.add_tx_to_staging ~relay:false ~bft_mode:true runtime ledger in
-  let timed mode tx = V.pre_route_admission ~duty:(Some (!head, mode))
+  let timed mode tx = V.pre_route_check ~duty:(Some (!head, mode))
     ~now:10_000. ~max_timestamp_drift:300. ~observer_rpc_mode:false ~bft_mode:true tx in
   Staging.clear ();
   Fun.protect ~finally:Staging.clear (fun () ->
@@ -440,8 +444,8 @@ let test_delivery_retry () =
     expect "future timestamp refused"
       (Result.is_error (timed G.Active {item with timestamp = 20_000.}));
     expect "signature remains required"
-      (V.signature_admission ~account_public_key:None item = Ok ()
-       && Result.is_error (V.signature_admission ~account_public_key:None
+      (V.signature_check ~account_public_key:None item = Ok ()
+       && Result.is_error (V.signature_check ~account_public_key:None
           {item with message = (duty 101L).message}));
     ignore (Staging.remove_by_hash hash);
     expect "pool eviction retains valid repeat" (submit item = Ok hash);
@@ -484,6 +488,7 @@ let test_compute_paths () =
   let runtime = R.{(runtime ()) with
     compute_mode = (fun () -> G.vm_bytes_at ~chain_id ~epoch:(!head + 1));
     settle_mode = (fun () -> G.settle_at ~chain_id ~epoch:(!head + 1));
+    marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
     preverify_admit = (fun _ -> incr count; Ok ())} in
   let ledger = ledger () in
   let base = standard_tx () in

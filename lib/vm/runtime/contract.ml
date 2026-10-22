@@ -60,14 +60,14 @@ let addr_from_code code deployer nonce =
 
 type loaded = {
   code : Contract_vm.instr array;
-  profile : Admission.profile;
+  profile : Code_check.profile;
 }
 
 let decode_loaded ?(trusted = []) ?(point_ops = false) raw =
   try
-    match Admission.decode_deploy ~trusted ~point_ops raw with
+    match Code_check.decode_deploy ~trusted ~point_ops raw with
     | Ok admitted ->
-      Some { code = Admission.code admitted; profile = Admission.profile admitted }
+      Some { code = Code_check.code admitted; profile = Code_check.profile admitted }
     | Error _ -> None
   with
   | (Stack_overflow | Out_of_memory) as error -> raise error
@@ -76,11 +76,11 @@ let decode_loaded ?(trusted = []) ?(point_ops = false) raw =
 let decode_mode ?(trusted = []) ?(point_ops = false) mode raw =
   if String.equal mode "source" then
     try
-      match Admission.decode_program_source ~point_ops raw with
+      match Code_check.decode_program_source ~point_ops raw with
       | Ok admitted ->
         Some {
-          code = Admission.code admitted;
-          profile = Admission.profile admitted;
+          code = Code_check.code admitted;
+          profile = Code_check.profile admitted;
         }
       | Error _ -> None
     with
@@ -94,7 +94,7 @@ let load_loaded ?snapshot ?(trusted = []) ?(point_ops = false) store contract_ad
   | Some b64 ->
     let mode =
       match run_s (Octra_core.Store_irmin.get_contract_meta ?snapshot store contract_addr) with
-      | Some meta -> meta.admission
+      | Some meta -> meta.check
       | None -> "binary"
     in
     (try
@@ -119,7 +119,7 @@ let load_async ?snapshot ~trusted ~point_ops store address =
   | None -> Lwt.return_none
   | Some encoded ->
     let* meta = Octra_core.Store_irmin.get_contract_meta ?snapshot store address in
-    let mode = match meta with Some meta -> meta.admission | None -> "binary" in
+    let mode = match meta with Some meta -> meta.check | None -> "binary" in
     let work = Octra_core.Exec_resource.detach (fun () ->
       match Base64.decode encoded with
       | Error _ -> None
@@ -273,20 +273,20 @@ let entry_kinds facts target =
 
 let runtime_params profile target params =
   match profile with
-  | Admission.Legacy -> Ok (List.rev (List.rev_map parse_param params))
-  | Admission.Program facts -> Program_input.parse (entry_kinds facts target) params
+  | Code_check.Legacy -> Ok (List.rev (List.rev_map parse_param params))
+  | Code_check.Program facts -> Program_input.parse (entry_kinds facts target) params
 
 let runtime_values profile target values =
   match profile with
-  | Admission.Legacy -> Ok values
-  | Admission.Program facts ->
+  | Code_check.Legacy -> Ok values
+  | Code_check.Program facts ->
     (match Program_input.validate (entry_kinds facts target) values with
      | Ok () -> Ok values
      | Error error -> Error error)
 
 let strict_values = function
-  | Admission.Legacy -> false
-  | Admission.Program _ -> true
+  | Code_check.Legacy -> false
+  | Code_check.Program _ -> true
 
 let storage_kind = function
   | Program_type_flow.Int -> Some Contract_vm.StorageInt
@@ -303,8 +303,8 @@ let storage_kind = function
   | Program_type_flow.Unknown -> None
 
 let storage_kinds = function
-  | Admission.Legacy -> []
-  | Admission.Program facts ->
+  | Code_check.Legacy -> []
+  | Code_check.Program facts ->
     List.filter_map
       (fun (key, kind) ->
         Option.map (fun value -> key, value) (storage_kind kind))
@@ -411,22 +411,22 @@ let deploy_with ~async_exec ~return ~bind ~run ~journal ?(trusted = []) ?admitte
     match admitted with
     | Some value ->
       Result.map (fun () -> value)
-        (Admission.check_standard ~point_ops:ctx.point_ops value)
-    | None -> Admission.decode_deploy ~trusted ~point_ops:ctx.point_ops bytecode_raw
+        (Code_check.check_standard ~point_ops:ctx.point_ops value)
+    | None -> Code_check.decode_deploy ~trusted ~point_ops:ctx.point_ops bytecode_raw
   in
   match checked with
   | Error error ->
     return (addr, { success = false; return_value = None; effort_used = 0;
-             events = []; error = Some (Admission.error_message error); storage_writes = 0 })
+             events = []; error = Some (Code_check.error_message error); storage_writes = 0 })
 | Ok admitted ->
-  let admission = if source_checked then "source" else "binary" in
+  let check = if source_checked then "source" else "binary" in
   let version =
     if source_checked then
-      Option.value (Admission.compiler_version admitted) ~default:Oct_compile.lang_version
+      Option.value (Code_check.compiler_version admitted) ~default:Oct_compile.lang_version
     else Oct_compile.lang_version
   in
-  let code = Admission.code admitted in
-  let profile = Admission.profile admitted in
+  let code = Code_check.code admitted in
+  let profile = Code_check.profile admitted in
   let strict_values = strict_values profile in
   let storage_kinds = storage_kinds profile in
   let exists = run_s (Octra_core.Store_irmin.contract_exists store addr) in
@@ -436,7 +436,7 @@ let deploy_with ~async_exec ~return ~bind ~run ~journal ?(trusted = []) ?admitte
     return (addr, { success = true; return_value = None; effort_used = 0;
              events = []; error = None; storage_writes = 0 })
   ) else
-    match runtime_params (Admission.profile admitted) 0 params with
+    match runtime_params (Code_check.profile admitted) 0 params with
     | Error error ->
       return (addr, { success = false; return_value = None; effort_used = 0;
                events = []; error = Some (Program_input.error_message error); storage_writes = 0 })
@@ -469,7 +469,7 @@ let deploy_with ~async_exec ~return ~bind ~run ~journal ?(trusted = []) ?admitte
           bytecode_b64 = Base64.encode_exn bytecode_raw;
           owner = deployer;
           ctype;
-          admission;
+          check;
           version;
           storage = storage_tbl;
         };
@@ -494,13 +494,13 @@ let deploy_async = deploy_with ~async_exec:true ~return:Lwt.return
 let spawn_with ~async_exec ~return ~bind ~run ~journal ?(trusted = []) ~(ctx : Contract_vm.exec_ctx) ~depth ?(limit = 1_000_000) ?(params = []) store ~deployer
     ~bytecode_raw ~nonce =
   let ctx = { ctx with async_exec } in
-  match Admission.decode_deploy ~trusted ~point_ops:ctx.point_ops bytecode_raw with
-  | Error (Admission.Decode_error error) -> return (Error (Printf.sprintf "bad bytecode: %s" error))
-  | Error (Admission.Verify_error _) -> return (Error "verify failed")
-  | Error (Admission.Unsafe_error error) -> return (Error error)
+  match Code_check.decode_deploy ~trusted ~point_ops:ctx.point_ops bytecode_raw with
+  | Error (Code_check.Decode_error error) -> return (Error (Printf.sprintf "bad bytecode: %s" error))
+  | Error (Code_check.Verify_error _) -> return (Error "verify failed")
+  | Error (Code_check.Unsafe_error error) -> return (Error error)
   | Ok admitted ->
-      let code = Admission.code admitted in
-      let profile = Admission.profile admitted in
+      let code = Code_check.code admitted in
+      let profile = Code_check.profile admitted in
       let strict_values = strict_values profile in
       let storage_kinds = storage_kinds profile in
       let addr = addr_from_code bytecode_raw deployer nonce in
@@ -508,7 +508,7 @@ let spawn_with ~async_exec ~return ~bind ~run ~journal ?(trusted = []) ~(ctx : C
       let already_pending = Program_journal.has_deploy journal addr in
       if exists || already_pending then return (Error (Printf.sprintf "collision: %s" addr))
       else
-        match runtime_values (Admission.profile admitted) 0 params with
+        match runtime_values (Code_check.profile admitted) 0 params with
         | Error error -> return (Error (Program_input.error_message error))
         | Ok values ->
           let hash = Digestif.SHA256.(digest_string bytecode_raw |> to_hex) in
@@ -534,7 +534,7 @@ let spawn_with ~async_exec ~return ~bind ~run ~journal ?(trusted = []) ~(ctx : C
               bytecode_b64 = Base64.encode_exn bytecode_raw;
               owner = deployer;
               ctype = "CUSTOM";
-              admission = "binary";
+              check = "binary";
               version = Oct_compile.lang_version;
               storage = storage_tbl;
             };
@@ -574,9 +574,9 @@ let upgrade ~journal ?(trusted = []) ~(ctx : Contract_vm.exec_ctx) store ~addres
       Error "program upgrade code hash mismatch"
     | Some meta ->
       begin
-        match Admission.decode_program ~trusted ~point_ops:ctx.point_ops bytecode_raw with
+        match Code_check.decode_program ~trusted ~point_ops:ctx.point_ops bytecode_raw with
         | Error error ->
-          Error (Admission.error_message error)
+          Error (Code_check.error_message error)
         | Ok _ ->
           let new_code_hash =
             Digestif.SHA256.(digest_string bytecode_raw |> to_hex) in
@@ -590,7 +590,7 @@ let upgrade ~journal ?(trusted = []) ~(ctx : Contract_vm.exec_ctx) store ~addres
               bytecode_b64 = Base64.encode_exn bytecode_raw;
               owner = meta.owner;
               ctype = meta.ctype;
-              admission = "binary";
+              check = "binary";
               version = Oct_compile.lang_version;
             };
             Ok {
@@ -612,7 +612,7 @@ let load_loaded_with_overlay ?(trusted = []) ?(point_ops = false) journal store 
        decode_mode
          ~trusted
          ~point_ops
-         upgrade.admission
+         upgrade.check
          (Base64.decode_exn upgrade.bytecode_b64)
      with
      | (Stack_overflow | Out_of_memory) as error -> raise error
@@ -624,7 +624,7 @@ let load_loaded_with_overlay ?(trusted = []) ?(point_ops = false) journal store 
          decode_mode
            ~trusted
            ~point_ops
-           deploy.admission
+           deploy.check
            (Base64.decode_exn deploy.bytecode_b64)
        with
        | (Stack_overflow | Out_of_memory) as error -> raise error

@@ -10,6 +10,37 @@ module Transaction = Octra_core.Transaction
 
 let fail msg = failwith ("test_node_runtime_history: " ^ msg)
 
+let () =
+  let root = Test_workspace.unique_dir "private_rejected" in
+  let store = SC.open_chaindata (Filename.concat root "chaindata") in
+  Fun.protect ~finally:(fun () -> SC.close store) (fun () ->
+    SC.begin_batch store;
+    List.iteri (fun i op_type ->
+      SC.save_rejected ~op_type store ~hash:(String.make 64 (Char.chr (97 + i)))
+        ~from_addr:"sender" ~to_addr:"receiver" ~amount:"0" ~nonce:i
+        ~error_type:"private_refused" ~reason:"refused" ~epoch_id:1 ~ts:1.)
+      [Transaction.StealthOp; Transaction.ClaimOp];
+    SC.commit_batch store;
+    if SC.rejected_count_by_addr store "sender" <> 0
+       || SC.rejected_count_by_addr store "receiver" <> 0 then
+      fail "private rejection created an address index";
+    List.iteri (fun i target ->
+      match SC.get_rejected_tx store (String.make 64 (Char.chr (97 + i))) with
+      | Some ("-", actual, _, 0, _, _, _, _) when actual = target -> ()
+      | _ -> fail "private rejection exposed an address or nonce") ["receiver"; "-"];
+    let rows = SC.rejected_by_epoch_rows store 1 ~limit:10 ~offset:0 in
+    if List.length rows <> 2 || List.exists (fun row ->
+      Yojson.Safe.Util.member "nonce" row <> `Int 0) rows then
+      fail "private rejection page exposed a nonce";
+    let raw op = Yojson.Safe.to_string (`Assoc [
+      "op_type", `String op; "epoch_id", `Int 1; "from_addr", `String "-";
+      "to_addr", `String "-"; "amount", `String "0"; "nonce", `Int 91;
+      "error_type", `String "refused"; "reason", `String "refused"; "ts", `Int 0]) in
+    List.iter (fun (op, nonce) -> match SC.rejected_to_row "hash" (raw op) with
+      | Some row when Yojson.Safe.Util.member "nonce" row = `Int nonce -> ()
+      | _ -> fail "rejection nonce projection differs")
+      ["stealth", 0; "claim", 0; "standard", 91])
+
 let member name = function
   | `Assoc fields ->
       (match List.assoc_opt name fields with

@@ -17,6 +17,12 @@ type entry = {
   mutable ban_until : float;
   mutable last_seen : float;
   mutable last_reason : string;
+  mutable held_start : float;
+  mutable held_s : float;
+  mutable pause_until : float;
+  mutable drop_count : int;
+  mutable drop_start : float;
+  mutable drop_reason : string;
   mutable invalid_frame_count : int;
   mutable bad_signature_count : int;
   mutable stale_root_count : int;
@@ -37,7 +43,11 @@ type score_record = {
   bad_count : int;
   conn_count : int;
   ban_until : float;
+  held_s : float;
+  pause_until : float;
   last_reason : string;
+  drop_count : int;
+  drop_reason : string;
   invalid_frame_count : int;
   bad_signature_count : int;
   stale_root_count : int;
@@ -66,6 +76,12 @@ let make_entry now = {
   ban_until = 0.0;
   last_seen = now;
   last_reason = "";
+  held_start = now;
+  held_s = 0.;
+  pause_until = 0.;
+  drop_count = 0;
+  drop_start = now;
+  drop_reason = "";
   invalid_frame_count = 0;
   bad_signature_count = 0;
   stale_root_count = 0;
@@ -154,23 +170,50 @@ let identity_key node_id =
   "node:" ^ node_id
 
 let handshake_penalty reason =
-  if contains reason "invalid Ed25519 signature" then
+  if List.exists (contains reason)
+    ["chain_id mismatch"; "p2p proto mismatch"; "consensus_config_hash mismatch";
+     "unknown validator pubkey"] then None
+  else if contains reason "invalid Ed25519 signature" then
     Some "bad_signature_handshake"
   else if contains reason "node_id does not match pubkey" then
     Some "bad_signature_handshake"
-  else if contains reason "frame_payload_limit" then
+  else if List.exists (contains reason)
+    ["frame_payload_limit"; "frame_payload_too_large"; "frame_too_large";
+     "p2p hello:"; "p2p finish:"; "Invalid_argument"; "End_of_file"] then
     Some "invalid_frame_handshake"
   else if contains reason "expected HELLO" then
     Some "invalid_frame_handshake"
   else if contains reason "handshake timeout" then
     Some "timeout_handshake"
+  else if List.exists (contains reason)
+    ["invalid listen port"; "HELLO_FINISH"; "decode"; "malformed"] then
+    Some "invalid_frame_handshake"
   else
     None
 
-let admit_conn ?(cfg=default) t ~now ~key =
+let report_hold ?(cfg = default) t ~now ~key ~held_s =
+  if held_s > 0. then begin
+    let e = entry t key now in
+    if now -. e.held_start >= cfg.conn_window_s then begin
+      e.held_start <- now;
+      e.held_s <- 0.
+    end;
+    e.held_s <- e.held_s +. min cfg.conn_window_s held_s;
+    if e.held_s > cfg.conn_window_s then
+      e.pause_until <- now +. cfg.conn_window_s
+  end
+
+let holding (t : t) ~now ~key =
+  match Hashtbl.find_opt t key with
+  | Some e -> e.pause_until > now
+  | None -> false
+
+let admit_conn ?(cfg = default) ?(known = false) t ~now ~key =
   let e = entry t key now in
-  if banned e now then
+  if banned e now && not known then
     Drop "banned"
+  else if e.pause_until > now then
+    Drop "handshake_budget"
   else begin
     if now -. e.conn_start >= cfg.conn_window_s then begin
       e.conn_start <- now;
@@ -179,14 +222,26 @@ let admit_conn ?(cfg=default) t ~now ~key =
     let next = e.conn_count + 1 in
     if next > cfg.max_conn then begin
       e.conn_count <- next;
-      e.last_reason <- "connection_budget";
-      e.ban_until <- now +. cfg.ban_s;
+      if not known then begin
+        e.last_reason <- "connection_budget";
+        e.ban_until <- now +. cfg.ban_s
+      end;
       Drop "connection_budget"
     end else begin
       e.conn_count <- next;
       Accept
     end
   end
+
+let note_drop ?(cfg = default) t ~now ~key ~reason =
+  let e = entry t key now in
+  if now -. e.drop_start >= cfg.conn_window_s || e.drop_reason <> reason then begin
+    e.drop_count <- 0;
+    e.drop_start <- now
+  end;
+  e.drop_reason <- reason;
+  e.drop_count <- min (max_int - 1) e.drop_count + 1;
+  if e.drop_count land (e.drop_count - 1) = 0 then Some e.drop_count else None
 
 let report_bad ?(cfg=default) t ~now ~key ~reason =
   let e = entry t key now in
@@ -214,14 +269,18 @@ let score (t : t) key =
   | None -> None
   | Some e -> Some (e.bad_count, e.conn_count, e.ban_until, e.last_reason)
 
-let snapshot (t : t) =
+let snapshot ?(cfg = default) ~now (t : t) =
   Hashtbl.fold
     (fun key (e : entry) acc -> {
       key;
       bad_count = e.bad_count;
-      conn_count = e.conn_count;
+      conn_count = if now -. e.conn_start >= cfg.conn_window_s then 0 else e.conn_count;
       ban_until = e.ban_until;
+      held_s = if now -. e.held_start >= cfg.conn_window_s then 0. else e.held_s;
+      pause_until = e.pause_until;
       last_reason = e.last_reason;
+      drop_count = if now -. e.drop_start >= cfg.conn_window_s then 0 else e.drop_count;
+      drop_reason = if now -. e.drop_start >= cfg.conn_window_s then "" else e.drop_reason;
       invalid_frame_count = e.invalid_frame_count;
       bad_signature_count = e.bad_signature_count;
       stale_root_count = e.stale_root_count;

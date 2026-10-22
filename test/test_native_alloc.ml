@@ -32,7 +32,7 @@ let () =
   if Array.length Sys.argv > 1 then begin
     if Array.to_list Sys.argv |> List.tl <> ["--preview"] then failwith "unknown allocation test option";
     let zero = Pvac_ffi.enc_zero_seeded pk sk (Bytes.make 32 '\007') in
-    let proof = Pvac_ffi.make_zero_proof pk sk zero
+    let proof = Pvac_ffi.make_zero_proof ~keyed:false pk sk zero
       |> Octra_core.Crypto.FheBalance.encode_zero_proof in
     Preview_alloc.run arm key (Pvac_ffi.serialize_cipher zero) proof;
     exit 0
@@ -84,14 +84,14 @@ let () =
   List.iter (fun (label, run) ->
     expect (label ^ " accepted invalid bytes") (not (run ()));
     refused label 0 run)
-    ["range_any", (fun () -> Pvac_ffi.verify_range_any pk cipher malformed true);
-     "range_commitment", (fun () -> Pvac_ffi.verify_range_bound pk cipher malformed commitment);
-     "range_prior", (fun () -> Pvac_ffi.verify_range_amount_prior pk cipher malformed commitment)];
+    ["range_any", (fun () -> Pvac_ffi.verify_range_any ~keyed:false pk cipher malformed true);
+     "range_commitment", (fun () -> Pvac_ffi.verify_range_bound ~keyed:false pk cipher malformed commitment);
+     "range_prior", (fun () -> Pvac_ffi.verify_range_amount_prior ~keyed:false pk cipher malformed commitment)];
   Gc.full_major ();
   let zero = Pvac_ffi.enc_zero_seeded pk sk seed in
-  let proof = Pvac_ffi.make_zero_proof pk sk zero in
-  expect "zero proof control failed" (Pvac_ffi.verify_zero pk zero proof);
-  refused "zero_verify" 0 (fun () -> Pvac_ffi.verify_zero pk zero proof);
+  let proof = Pvac_ffi.make_zero_proof ~keyed:false pk sk zero in
+  expect "zero proof control failed" (Pvac_ffi.verify_zero ~keyed:false pk zero proof);
+  refused "zero_verify" 0 (fun () -> Pvac_ffi.verify_zero ~keyed:false pk zero proof);
   let proof_bytes = Pvac_ffi.serialize_zero_proof proof in
   refused "zero_parse" 0 (fun () -> Pvac_ffi.deserialize_zero_proof proof_bytes);
   refused "zero_serialize" 0 (fun () -> Pvac_ffi.serialize_zero_proof proof);
@@ -100,10 +100,13 @@ let () =
   refused "encrypt_zero" 0 (fun () -> Pvac_ffi.enc_zero_seeded pk sk seed);
   refused "decrypt" 0 (fun () -> Pvac_ffi.dec_value pk sk cipher);
   refused "decrypt_vector" 0 (fun () -> Pvac_ffi.dec_values pk sk cipher);
-  refused "zero_prove" 0 (fun () -> Pvac_ffi.make_zero_proof pk sk zero);
-  refused "zero_commitment_prove" 0 (fun () -> Pvac_ffi.make_zero_proof_bound pk sk zero 0L seed);
-  refused "range_prove" 0 (fun () -> Pvac_ffi.make_range_proof pk sk cipher 7L);
-  refused "range_aggregate_prove" 0 (fun () -> Pvac_ffi.make_aggregated_range_proof pk sk cipher 7L);
+  refused "zero_prove" 0 (fun () -> Pvac_ffi.make_zero_proof ~keyed:false pk sk zero);
+  refused "zero_commitment_prove" 0 (fun () ->
+    (Pvac_ffi.make_zero_proof_bound ~keyed:false pk sk zero 0L seed : Pvac_ffi.zero_proof));
+  refused "range_prove" 0 (fun () ->
+    (Pvac_ffi.make_range_proof ~keyed:false pk sk cipher 7L : Pvac_ffi.range_proof));
+  refused "range_aggregate_prove" 0 (fun () ->
+    (Pvac_ffi.make_aggregated_range_proof ~keyed:false pk sk cipher 7L : Pvac_ffi.agg_range_proof));
   refused "evalkey" 0 (fun () -> Pvac_ffi.make_evalkey pk sk 1 1);
   let params = Pvac_ffi.default_params () in
   refused "parameters" 0 Pvac_ffi.default_params;
@@ -118,8 +121,8 @@ let () =
     cipher = FB.encode_cipher zero;
     proof = FB.encode_zero_proof proof;
   } in
-  expect "worker control failed" (Octra_core.Pvac_verify_direct.response request).accepted;
-  refused "worker_request" 0 (fun () -> Octra_core.Pvac_verify_direct.response request);
+  expect "worker control failed" (Octra_core.Pvac_verify_direct.response ~keyed:false request).accepted;
+  refused "worker_request" 0 (fun () -> Octra_core.Pvac_verify_direct.response ~keyed:false request);
   expect "cipher input changed" (encoded = Pvac_ffi.serialize_cipher cipher);
   expect "key input changed" (key = Pvac_ffi.serialize_pubkey pk);
   expect "arithmetic changed" (Pvac_ffi.dec_value pk sk (Pvac_ffi.ct_add pk cipher cipher) = 14L);

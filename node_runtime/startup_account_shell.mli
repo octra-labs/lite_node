@@ -47,4 +47,4 @@ val genesis_amounts :
 
 val run :
   deps ->
-  unit
+  bool

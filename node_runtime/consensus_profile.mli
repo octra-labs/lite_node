@@ -8,12 +8,14 @@ val compat_wire_profile : int
 val compat_wire_rules_id : string
 
 val standard_hash :
+  ?policy:Octra_consensus.C_quorum_policy.t ->
   chain_id:string ->
   epoch:int ->
   (string -> string option) ->
   string
 
 val hash :
+  ?policy:Octra_consensus.C_quorum_policy.t ->
   chain_id:string ->
   epoch:int ->
   (string -> string option) ->
@@ -23,6 +25,9 @@ val switch_after :
   chain_id:string ->
   applied_epoch:int ->
   bool
+
+val epochs : ?policy:Octra_consensus.C_quorum_policy.t -> string -> int list
+val switch_for : Octra_consensus.C_quorum_policy.t -> chain_id:string -> applied_epoch:int -> bool
 
 val activation_graph_hash : chain_id:string -> string
 

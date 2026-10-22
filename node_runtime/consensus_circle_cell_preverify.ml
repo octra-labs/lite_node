@@ -33,6 +33,10 @@ let run runtime ~pre_state_hash ~pre_state_root tx =
     | _, Error fault ->
       Lwt.return_error (Rule_graph.fault_message fault)
     | Ok account_mode, Ok proof_mode ->
+    match Rule_graph.proof_key runtime.rules ~epoch:env.epoch_id with
+    | Error fault -> Lwt.return_error (Rule_graph.fault_message fault)
+    | Ok key_mode ->
+    let keyed = key_mode = Rule_graph.Active in
     match Rule_graph.math runtime.rules ~epoch:env.epoch_id with
     | Error fault -> Lwt.return_error (Rule_graph.fault_message fault)
     | Ok math_mode ->
@@ -48,7 +52,7 @@ let run runtime ~pre_state_hash ~pre_state_root tx =
           ~math
           ~fold:(fun epoch ->
             Result.map
-              (fun ctx -> { ctx with Epoch_exec.account_mode })
+              (fun ctx -> { ctx with Epoch_exec.account_mode; proof_key = key_mode })
               (Epoch_exec.prior_fold epoch))
           ~epoch_id:env.epoch_id
           ~proposal_id
@@ -69,7 +73,7 @@ let run runtime ~pre_state_hash ~pre_state_root tx =
                 | Ok plan ->
                   let* verified =
                     Transition.verify
-                      ~math
+                      ~keyed ~math
                       ~strict:(proof_mode = Rule_graph.Active)
                       plan
                   in

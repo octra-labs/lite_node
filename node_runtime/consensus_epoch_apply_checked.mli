@@ -17,7 +17,7 @@ type deps = {
   clear_state_attested : unit -> unit;
   log_already : current_epoch:int -> head:int -> unit;
   log_defer :
-    Consensus_epoch_apply_admission.catchup ->
+    Consensus_epoch_apply_check.catchup ->
     Consensus_catchup_shell.queue_event ->
     unit;
   preflight : unit -> (unit, string) result;

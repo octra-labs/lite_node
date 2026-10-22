@@ -31,3 +31,13 @@ val range : head:int -> target:int64 -> limit:int -> t option
 val valid : t -> bool
 
 val equal : t -> t -> bool
+
+val covers : t -> t -> bool
+
+val carry : t -> t -> t
+
+val snapshot_ready : head:int -> limit:int -> t -> bool
+
+val history_limit : retained:int -> string option -> int
+
+val range_ready : head:int -> limit:int -> t -> bool

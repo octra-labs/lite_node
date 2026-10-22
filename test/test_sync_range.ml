@@ -119,7 +119,18 @@ let with_store ?(txs = List.init 2 (fun index -> transaction (index + 1))) actio
       Store.set_epoch store epoch;
       Store.commit_batch store;
       ignore (Unix.lseek store.txlog.current_fd 0 Unix.SEEK_SET);
-      action store epoch (finality epoch hashes)))
+      let prior = Head.get_cached () in
+      let head = Head.{
+        schema_version = 3; generation = 1; epoch_id = epoch.id;
+        state_root = epoch.state_root; ledger_state_root = None;
+        irmin_commit = None; txid_hi = Int64.of_int (List.length txs - 1);
+        txlog_seg = None; txlog_off = None; epochlog_off = None;
+        commit_id = "test"; ts = epoch.finalized_at; quorum_cert_hash = None;
+        epoch_index_hash = None; epoch_index_root = None;
+      } in
+      Head.set_cached head;
+      Fun.protect ~finally:(fun () -> Head.cached := prior)
+        (fun () -> action store epoch (finality epoch hashes))))
 
 let read store epoch read_finality =
   let reasons = ref [] in
@@ -209,6 +220,7 @@ let test_prefix () =
     Store.begin_batch store;
     Store.set_epoch store next;
     Store.commit_batch store;
+    Head.set_cached { (Option.get (Head.get_cached ())) with epoch_id = 13 };
     let calls = ref [] in
     let stops = ref [] in
     let reply = Sync.build_range ~chain_id ~data_dir:None ~chaindata:store
@@ -257,6 +269,7 @@ let test_async () =
       ~to_addr:address ~tx_json:(Tx.to_yojson next |> Yojson.Safe.to_string)
       ~op_type:"standard" ~encrypted_data:"" ~message:"";
     Store.commit_batch store;
+    Head.set_cached { (Option.get (Head.get_cached ())) with epoch_id = 13; txid_hi = 2L };
     require (Store.get_tx_by_txid store 2L <> None) "append after async read failed")
 
 let test_interrupt () =
@@ -328,6 +341,61 @@ let next_head = Head.{
   epochlog_off = None; commit_id = "new"; ts = 130.; quorum_cert_hash = None;
   epoch_index_hash = None; epoch_index_root = None;
 }
+
+let test_head_advance () =
+  with_store (fun store epoch proof ->
+    let prior = Head.get_cached () in
+    Fun.protect ~finally:(fun () -> Head.cached := prior) (fun () ->
+      let open Lwt.Syntax in
+      let base = Head.{ next_head with
+        generation = 0;
+        epoch_id = epoch.id;
+        state_root = epoch.state_root;
+        commit_id = "base";
+      } in
+      Head.set_cached base;
+      let pending, finish = Lwt.wait () in
+      let reached, reach = Lwt.wait () in
+      let request = Reader.read ~chaindata:store ~data_dir:None ~chain_id
+        ~read_finality:(fun _ -> Lwt.wakeup_later reach (); pending)
+        ~cancelled:(fun () -> false) (query epoch.id) in
+      Lwt_main.run (let* () = reached in
+        Head.set_cached next_head;
+        Lwt.wakeup_later finish (Some proof);
+        let* reply = request in
+        require (match reply with
+          | Ok value ->
+            let body = Yojson.Safe.from_string value.body in
+            let head = Yojson.Safe.Util.member "head_epoch" body in
+            value.status = "ok" && value.records = 1
+            && head = `Int epoch.id
+          | _ -> false) "new head stopped committed range";
+        Lwt.return_unit)))
+
+let test_head_fork () =
+  with_store (fun store epoch proof ->
+    let prior = Head.get_cached () in
+    Fun.protect ~finally:(fun () -> Head.cached := prior) (fun () ->
+      let open Lwt.Syntax in
+      let base = Head.{ next_head with
+        generation = 0;
+        epoch_id = epoch.id;
+        state_root = String.make 64 'f';
+        commit_id = "other";
+      } in
+      Head.set_cached base;
+      let pending, finish = Lwt.wait () in
+      let reached, reach = Lwt.wait () in
+      let request = Reader.read ~chaindata:store ~data_dir:None ~chain_id
+        ~read_finality:(fun _ -> Lwt.wakeup_later reach (); pending)
+        ~cancelled:(fun () -> false) (query epoch.id) in
+      Lwt_main.run (let* () = reached in
+        Head.set_cached next_head;
+        Lwt.wakeup_later finish (Some proof);
+        let* reply = request in
+        require (reply = Error Range.Changed)
+          "different saved root served range";
+        Lwt.return_unit)))
 
 let test_head_change () =
   with_store (fun store epoch proof ->
@@ -428,7 +496,40 @@ let test_large_parts () =
         Head.cached := prior;
         Range.shutdown actor)))
 
+let test_parts_share () =
+  let reads = ref 0 in
+  let actor = Range.create {
+    now = (fun () -> 0.);
+    read = (fun ~cancelled:_ query ->
+      incr reads;
+      let encoded = get (Parts.encode (`Assoc [
+        "epoch", `Intlit (Int64.to_string query.Range.from_epoch);
+        "data", `String (String.make (Parts.body_max + 1) 'a')])) in
+      Lwt.return_ok Range.{ body = get (Parts.render encoded); status = "ok";
+        records = 1; encoded = Some encoded });
+  } in
+  let open Lwt.Syntax in
+  Lwt_main.run (Lwt.finalize (fun () ->
+    let* rows = Lwt_list.map_s (fun epoch ->
+      let request = query epoch in
+      let* loaded = Range.load actor request in
+      let loaded = match loaded with Ok value -> value | Error _ -> failwith "range read failed" in
+      let hash = Option.bind loaded.encoded Parts.digest in
+      require (hash <> None) "multi range did not split";
+      Lwt.return { request with part = Some 1; hash }) [12; 13; 14; 15] in
+    let* () = Lwt_list.iter_s (fun row ->
+      let* reply = Range.load actor row in
+      require (Result.is_ok reply) "another range displaced a live part";
+      Lwt.return_unit) rows in
+    require (!reads = 4) "parts did not share four ranges";
+    let* _ = Range.load actor (query 16) in
+    let* old = Range.load actor (List.hd rows) in
+    require (old = Error Range.Missing) "fifth range did not evict oldest";
+    require (!reads = 5) "evicted part read storage";
+    Lwt.return_unit) (fun () -> Range.shutdown actor))
+
 let () =
+  test_parts_share ();
   test_valid ();
   test_bad_proof ();
   test_missing_proof ();
@@ -440,6 +541,8 @@ let () =
   test_interrupt ();
   test_async_missing ();
   test_async_bad_proof ();
+  test_head_advance ();
+  test_head_fork ();
   test_head_change ();
   test_large_parts ();
   print_endline "status = pass test = sync_range"

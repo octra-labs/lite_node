@@ -151,7 +151,7 @@ let test_seen_window () =
   let expired, fresh = Seen.step full ~now:13. "next" in
   assert_true "old entries expire" (fresh && Seen.size expired = 1)
 
-let test_repeat_admission () =
+let test_repeat_check () =
   let from, priv, pub = key () in
   let to_, _, _ = key () in
   let tx = tx ~from ~to_ ~timestamp:1000.0 |> signed ~priv in
@@ -303,7 +303,7 @@ let () =
   test_receive_broadcasts_inv ();
   test_drop_reports_and_closes ();
   test_seen_window ();
-  test_repeat_admission ();
+  test_repeat_check ();
   test_signature_identity ();
   test_inv_repeat ();
   test_duty_wire_retry ();

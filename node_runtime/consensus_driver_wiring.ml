@@ -109,7 +109,6 @@ type standard_adapters = {
   current_tx_hashes : unit -> string list;
   mark_unsynced : unit -> unit;
   write_pending : Octra_core.Wal.pending_commit -> unit;
-  set_catchup_active : bool -> unit;
 }
 
 type 'a proposal_preview_runtime = {
@@ -192,7 +191,6 @@ type deps = {
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
-  set_catchup_active : bool -> unit;
   apply_finalized :
     validator_set:Octra_consensus.C_types.validator_set ->
     Octra_consensus.C_types.finalize ->
@@ -465,6 +463,8 @@ let node_standard_adapters
           (fun tx ->
             tx.Transaction.op_type <> Transaction.ValidatorReady
             || (not (Staging.duty_expired ~mode:Octra_core.Rule_graph.Active
+                    ~marks:(Octra_core.Rule_graph.duty_marks_at
+                      ~chain_id:runtime.chain_id ~epoch:(Int64.to_int epoch) = Octra_core.Rule_graph.Active)
                     ~head:(Some (Int64.pred epoch)) tx)
                 && match Octra_core.Validator_registry.ready_payload_of_message tx.message with
                    | Ok ready ->
@@ -478,7 +478,8 @@ let node_standard_adapters
         | Some head when head.epoch_id < max_int ->
           Octra_core.Rule_graph.proof_exec_at ~chain_id:runtime.chain_id ~epoch:(head.epoch_id + 1)
         | _ -> Octra_core.Rule_graph.Prior in
-      let accept tx = accept tx
+      let accept tx = Result.is_ok (Octra_core.Tx_payload.admit tx)
+        && accept tx
         && (mode <> Octra_core.Rule_graph.Active
           || Staging.Preview.send (Ready
             (Option.map (fun head -> Int64.of_int head.Octra_core.Head_manifest.epoch_id) head,
@@ -510,8 +511,6 @@ let node_standard_adapters
     mark_unsynced = (fun () ->
       Consensus_proposal_state.mark_unsynced runtime.proposal_state);
     write_pending = runtime.write_pending;
-    set_catchup_active = (fun active ->
-      runtime.catchup_active := active);
   }
 
 let preview_with_optional_catch ~catch_exn ~warn run =
@@ -944,7 +943,6 @@ let config_with_standard ?private_slots ?prepare_at (input : config_with_standar
       observer_mode = input.observer_mode;
       queue_catchup_target = input.queue_catchup_target;
       run_catchup_to_target = input.run_catchup_to_target;
-      set_catchup_active = standard.set_catchup_active;
       apply_finalized = input.apply_finalized;
       replay_stashed_while_safe = input.replay_stashed_while_safe;
       driver_read_deps = input.driver_read_deps;

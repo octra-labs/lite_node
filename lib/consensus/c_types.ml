@@ -44,6 +44,7 @@ type validator_set = {
   total_weight : Z.t;
   quorum_weight : Z.t;
   weighted : bool;
+  authors : (int64 * (validator_info * Z.t) list) option;
 }
 
 type reward_member = {
@@ -198,6 +199,7 @@ let build_validator_set ~weighted entries =
     total_weight;
     quorum_weight;
     weighted;
+    authors = None;
   }
 
 let make_validator_set (vals : validator_info list) =
@@ -302,11 +304,19 @@ let count_capped_set (vs : validator_set) =
     let cap = count_weight_cap vs in
     build_validator_set ~weighted:true (cap_entries cap entries)
 
-let validator_set_for_epoch ~chain_id ~epoch_id vs =
-  if C_quorum_policy.count_cap_required ~chain_id ~epoch_id then
-    count_capped_set vs
-  else
-    vs
+let validator_set_for_rule rule vs =
+  match rule with
+  | C_quorum_policy.Capped -> count_capped_set vs
+  | C_quorum_policy.Prior | C_quorum_policy.Stake -> vs
+
+let validator_set_for_epoch ?policy ~chain_id ~epoch_id vs =
+  let policy = Option.value policy ~default:(C_quorum_policy.for_chain chain_id) in
+  let rule = C_quorum_policy.select policy epoch_id in
+  let vs = match vs.authors with
+    | Some (height, _) when height <> epoch_id || rule <> C_quorum_policy.Stake ->
+      {vs with authors = None}
+    | _ -> vs in
+  validator_set_for_rule rule vs
 
 let pubkey_of_addr (vs : validator_set) (addr : string) : string option =
   match List.find_opt (fun v -> v.address = addr) vs.validators with
@@ -318,6 +328,26 @@ let is_validator (vs : validator_set) (addr : string) : bool =
 
 let weight_of_addr (vs : validator_set) addr =
   List.assoc_opt addr vs.weights
+
+let author_entry ~chain_id ~epoch_id vs addr =
+  match List.find_opt (fun v -> v.address = addr) vs.validators with
+  | Some member -> Option.map (fun weight -> member, weight) (weight_of_addr vs addr)
+  | None ->
+    match vs.authors with
+    | Some (height, entries) when height = epoch_id
+      && C_quorum_policy.linear_weight ~chain_id ~epoch_id ->
+      List.find_opt (fun (member, _) -> member.address = addr) entries
+    | _ -> None
+
+let is_author ~chain_id ~epoch_id vs addr =
+  Option.is_some (author_entry ~chain_id ~epoch_id vs addr)
+
+let source_set ~chain_id ~epoch_id vs =
+  match vs.authors with
+  | Some (height, entries) when height = epoch_id
+      && C_quorum_policy.linear_weight ~chain_id ~epoch_id ->
+    make_weighted_validator_set (weights_of_set vs @ entries) |> Result.to_option
+  | _ -> None
 
 let signed_weight (vs : validator_set) validators =
   let rec loop seen total = function
@@ -359,26 +389,37 @@ let has_quorum vs validators =
       ~signer_count:(unique_signer_count validators)
       ~signed_weight:weight
 
-let has_quorum_at ~chain_id ~epoch_id vs validators =
-  let effective = validator_set_for_epoch ~chain_id ~epoch_id vs in
-  if C_quorum_policy.count_floor_required ~chain_id ~epoch_id then
-    has_quorum effective validators
-  else
-    has_weight_quorum effective validators
+let weights_valid rule vs =
+  rule <> C_quorum_policy.Stake || vs.weighted
 
-let quorum_reached_at ~chain_id ~epoch_id vs ~signer_count ~signed_weight =
+let has_quorum_for_rule rule vs validators =
+  let effective = validator_set_for_rule rule vs in
+  weights_valid rule vs &&
+  match rule with
+  | C_quorum_policy.Prior -> has_weight_quorum effective validators
+  | C_quorum_policy.Capped | C_quorum_policy.Stake -> has_quorum effective validators
+
+let has_quorum_at ?policy ~chain_id ~epoch_id vs validators =
+  let policy = Option.value policy ~default:(C_quorum_policy.for_chain chain_id) in
+  has_quorum_for_rule (C_quorum_policy.select policy epoch_id) vs validators
+
+let quorum_reached_at ?policy ~chain_id ~epoch_id vs ~signer_count ~signed_weight =
+  let policy = Option.value policy ~default:(C_quorum_policy.for_chain chain_id) in
+  weights_valid (C_quorum_policy.select policy epoch_id) vs &&
   Z.geq signed_weight vs.quorum_weight
   &&
-  (not (C_quorum_policy.count_floor_required ~chain_id ~epoch_id)
+  (C_quorum_policy.select policy epoch_id = C_quorum_policy.Prior
    || signer_count >= vs.quorum)
 
 let round_skip_weight vs =
   Z.(add (sub vs.total_weight vs.quorum_weight) one)
 
-let round_skip_reached_at ~chain_id ~epoch_id vs ~signer_count ~signed_weight =
+let round_skip_reached_at ?policy ~chain_id ~epoch_id vs ~signer_count ~signed_weight =
+  let policy = Option.value policy ~default:(C_quorum_policy.for_chain chain_id) in
+  weights_valid (C_quorum_policy.select policy epoch_id) vs &&
   Z.geq signed_weight (round_skip_weight vs)
   &&
-  (not (C_quorum_policy.count_floor_required ~chain_id ~epoch_id)
+  (C_quorum_policy.select policy epoch_id = C_quorum_policy.Prior
    || signer_count >= vs.f + 1)
 
 let weighted_leader (vs : validator_set) ~epoch_id ~round =
@@ -450,4 +491,5 @@ let proposal_is_well_formed
         ~round:proposal.round).address = proposal.proposer
   && match proposal.valid_round with
      | None -> proposal.header.creator_addr = proposal.proposer
-     | Some _ -> is_validator validator_set proposal.header.creator_addr
+     | Some _ -> is_author ~chain_id ~epoch_id:proposal.epoch_id
+         validator_set proposal.header.creator_addr

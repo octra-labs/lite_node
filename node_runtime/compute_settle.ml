@@ -154,7 +154,8 @@ let make () =
               ~model_root:request.model_root ~fetch_asset ~sink:Cache.native_sink in
             Result.bind loaded (fun loaded -> Result.map_error
               (fun reason -> Core.Circle_wasm_host.Rejected reason) (Engine.model_of_loaded request loaded)) in
-        Engine.replay_deps ~limits, program_at, load_model in
+        Engine.replay_deps ~chain_id:(List.hd records).Record.call.request.chain_id ~limits,
+          program_at, load_model in
       verify ~lookup ~engine ~epoch ~funded raw)
         (function
         | (Lwt.Canceled | Out_of_memory | Stack_overflow) as error -> Lwt.fail error

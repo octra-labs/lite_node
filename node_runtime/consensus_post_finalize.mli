@@ -1,10 +1,13 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
+type result = Applied | Deferred of string
+
 type deps = {
   deactivate_gap : unit -> unit;
   set_consensus_finalized : bool -> unit;
   committed_head_epoch : unit -> int;
+  apply_error : int -> string option;
   sleep : float -> unit Lwt.t;
   read_pre_finalize_root : unit -> string option;
   read_commit_root : unit -> string option Lwt.t;
@@ -18,8 +21,11 @@ type deps = {
 
 val short_hex8 : string -> string
 
+val stall_seconds : int -> float
+
 val run :
+  ?now:(unit -> float) ->
   deps ->
   epoch_id:int64 ->
   proposed_root:string ->
-  unit Lwt.t
+  result Lwt.t

@@ -49,7 +49,7 @@ type build_preverify = {
   skipped_sample : string;
 }
 
-type proposal_admission_result =
+type proposal_check_result =
   | Proposal_admit
   | Proposal_defer
 
@@ -128,7 +128,7 @@ type proposal_roots = {
   prev_state_root : string;
 }
 
-type tx_hash_admission =
+type tx_hash_check =
   | Tx_hash_ok of string list
   | Tx_hash_mismatch
 
@@ -347,7 +347,7 @@ type verification_deps = {
 
 type validator_pubkeys = (string * string) list
 
-type admission_plan =
+type check_plan =
   | Proceed
   | Defer_state_not_attested
   | Defer_quarantine of {
@@ -879,14 +879,15 @@ let proposal_roots ~root_to_raw32 ~ledger_head ~cached_head =
     prev_state_root;
   }
 
-let prev_root_decision ~epoch_id ~target_root ~current_root ~max_wait_tries
+let prev_root_decision ~certified_root ~epoch_id ~target_root ~current_root ~max_wait_tries
     ~tries_left ~current_streak ~quarantine_threshold =
   if target_root = current_root then
     Prev_root_match
   else
-    let streak_after = current_streak + 1 in
+    let certified = certified_root = Some target_root in
+    let streak_after = if certified then current_streak + 1 else current_streak in
     let quarantine_reason =
-      if streak_after >= quarantine_threshold then
+      if certified && streak_after >= quarantine_threshold then
         Some (
           Printf.sprintf
             "prev_state_root_mismatch_streak = %d epoch = %Ld"
@@ -1201,7 +1202,7 @@ let log_preview_result ~epoch_id final_tx_count = function
 let tx_list_hash tx_hashes =
   Octra_net.Hash_domain.hash "octra:tx_list:v1" (String.concat "" tx_hashes)
 
-let tx_hash_admission ~expected_tx_list_hash ~tx_hashes =
+let tx_hash_check ~expected_tx_list_hash ~tx_hashes =
   if expected_tx_list_hash = tx_list_hash tx_hashes then
     Tx_hash_ok tx_hashes
   else
@@ -1511,7 +1512,7 @@ let handle_before_precommit deps ~epoch_id ~round ~proposal_id
       "event = refuse_precommit reason = bundle_state";
     false
 
-let admission_plan ~epoch_id ~current_epoch ~state_attested ~quarantine_active
+let check_plan ~epoch_id ~current_epoch ~state_attested ~quarantine_active
     ~quarantine_reason =
   if not state_attested then
     Defer_state_not_attested
@@ -1526,11 +1527,11 @@ let admission_plan ~epoch_id ~current_epoch ~state_attested ~quarantine_active
     else
       Proceed
 
-let handle_proposal_admission ~start_height ~epoch_id ~current_epoch
+let handle_proposal_check ~start_height ~epoch_id ~current_epoch
     ~state_attested ~quarantine_active ~quarantine_reason =
   let open Lwt.Syntax in
   match
-    admission_plan
+    check_plan
       ~epoch_id
       ~current_epoch
       ~state_attested
@@ -1647,7 +1648,7 @@ let verify_proposal ?prepare (deps : verify_proposal_deps) ~chain_id (propose : 
           ~kind
           ~now:(deps.now ())
           ~previous
-          ~candidate:propose.header.ts
+          ~entry:propose.header.ts
     in
     match epoch_time_check with
   | Error reason ->
@@ -1676,6 +1677,9 @@ let verify_proposal ?prepare (deps : verify_proposal_deps) ~chain_id (propose : 
     let our_root = root_sample.current_root in
     match
       prev_root_decision
+        ~certified_root:(Option.map
+          (fun (parent : parent_commit) -> parent.certificate.header.proposed_state_root)
+          propose.parent_commit)
         ~epoch_id:propose.epoch_id
         ~target_root:target
         ~current_root:our_root
@@ -1723,7 +1727,7 @@ let verify_proposal ?prepare (deps : verify_proposal_deps) ~chain_id (propose : 
       end else
       let tx_hashes_hex = List.map raw32_to_hex propose.tx_hashes in
       match
-        tx_hash_admission
+        tx_hash_check
           ~expected_tx_list_hash:propose.header.tx_list_hash
           ~tx_hashes:tx_hashes_hex
       with
@@ -2085,14 +2089,6 @@ let verify_proposal ?prepare (deps : verify_proposal_deps) ~chain_id (propose : 
                 ~receipts_json;
               Lwt.return accept
             end else begin
-              let next_streak = deps.state_root_streak () + 1 in
-              deps.set_state_root_streak next_streak;
-              if next_streak >= deps.quarantine_mismatch_threshold then
-                deps.mark_quarantine
-                  (Printf.sprintf
-                     "state_root_mismatch_streak = %d epoch = %Ld"
-                     next_streak
-                     propose.epoch_id);
               Lwt.return reject
             end
 
@@ -2103,8 +2099,8 @@ let rec make_attempt ~refill ~steps ~deferred ~refusals ?prepare ?private_slots 
        = Octra_core.Rule_graph.Active then private_slots else None in
   let open Lwt.Syntax in
   if not (deps.current ()) then Lwt.return_none else
-  let* proposal_admission =
-    handle_proposal_admission
+  let* proposal_check =
+    handle_proposal_check
       ~start_height:deps.start_height
       ~epoch_id
       ~current_epoch:(deps.current_epoch ())
@@ -2113,7 +2109,7 @@ let rec make_attempt ~refill ~steps ~deferred ~refusals ?prepare ?private_slots 
       ~quarantine_reason:(deps.quarantine_reason ())
   in
   if not (deps.current ()) then Lwt.return_none else
-  match proposal_admission with
+  match proposal_check with
   | Proposal_defer ->
     Lwt.return_none
   | Proposal_admit ->
@@ -2418,7 +2414,7 @@ let rec make_attempt ~refill ~steps ~deferred ~refusals ?prepare ?private_slots 
                       inputs
                   in
                   Octra_log.info "consensus"
-                    "event = proposal_dependency_deferred epoch = %Ld count = %d candidates = %d"
+                    "event = proposal_dependency_deferred epoch = %Ld count = %d entries = %d"
                     epoch_id
                     (Hashes.cardinal deferred)
                     (List.length retained);

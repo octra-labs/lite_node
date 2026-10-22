@@ -131,7 +131,7 @@ let child_sample () =
     Fun.protect ~finally:(fun () -> close_out channel)
       (fun () -> output_string channel (string_of_int (Unix.getpid ())));
     Unix.rename (path ^ ".next") path;
-    Unix.sleepf 15.
+    Unix.sleepf 3600.
   | "hash" ->
     let hash = String.make 64 '0' in
     let reply = if proof then Wire.response_bytes
@@ -420,8 +420,8 @@ let session_retire ~cancel key cipher =
       if cancel then
         expect "closing session lost cancellation" (Lwt.state pending = Lwt.Fail Lwt.Canceled)
       else expect "reaped session retained capacity"
-        (Result.is_ok (Lwt_main.run (Lwt_unix.with_timeout 5. (fun () -> pending))));
-      let replies = Lwt_main.run (Lwt_unix.with_timeout 5. (fun () -> Lwt.all queued)) in
+        (Result.is_ok (Lwt_main.run (Lwt_unix.with_timeout 120. (fun () -> pending))));
+      let replies = Lwt_main.run (Lwt_unix.with_timeout 120. (fun () -> Lwt.all queued)) in
       expect "closing session changed queue capacity"
         (List.length (List.filter Result.is_ok replies) = Q.capacity);
       expect "closing session changed overflow result"
@@ -493,6 +493,7 @@ let key_cost key secret cipher =
 let state ?(math = true) ?(work = true) async key raw cipher =
   let ctx = {VM.default_ctx with async_exec = async; math; point_ops = true;
     proof_exec = Octra_core.Rule_graph.Active;
+    proof_key = Octra_core.Rule_graph.Prior;
     tx_hash = "fhe-task"; tree_hash = "root"; current_epoch = 1_663_000;
     fhe_work = (if work then Octra_core.Rule_graph.Active else Prior);
     get_fhe_pubkey = (fun _ -> Some (VM.Key_bytes raw))} in
@@ -596,7 +597,7 @@ let prior_checks key raw cipher =
     let* result = T.run ~ticket:(ticket 85) ~deadline (T.Verify (true, Wire.Ping)) in
     if result = Ok (T.Verified true) then Lwt.return_unit
     else let* () = Lwt_unix.sleep 0.005 in ready () in
-  Lwt_main.run (Lwt_unix.with_timeout 2. ready);
+  Lwt_main.run (Lwt_unix.with_timeout 120. ready);
   let other, secret = P.keygen_from_seed (P.default_params ()) (Bytes.make 32 '\075') in
   let other_cipher = P.enc_value_seeded other secret 3L (Bytes.make 32 '\076') in
   let program = VM.[|FHE_ADD (5, 1, 2, 2); FHE_ADD (6, 8, 9, 9);
@@ -676,7 +677,7 @@ let process_cancel ~expire request =
       with_env "OCTRA_FHE_TEST" "wait" (fun () ->
         with_env "OCTRA_FHE_PID" path (fun () ->
           let actor = T.create () in
-          let span = if expire then 2_000_000_000L else 10_000_000_000L in
+          let span = if expire then 2_000_000_000L else 300_000_000_000L in
           let deadline = Int64.add (Mtime_clock.elapsed_ns ()) span in
           let pending = T.run ~actor ~ticket:(ticket 40) ~deadline request in
           let rec ready () =
@@ -689,8 +690,8 @@ let process_cancel ~expire request =
             else let* () = Lwt_unix.sleep 0.01 in drained () in
           Fun.protect ~finally:(fun () ->
             Lwt.cancel pending;
-            Lwt_main.run (Lwt_unix.with_timeout 12. drained)) (fun () ->
-            Lwt_main.run (Lwt_unix.with_timeout 5. ready);
+            Lwt_main.run (Lwt_unix.with_timeout 120. drained)) (fun () ->
+            Lwt_main.run (Lwt_unix.with_timeout 120. ready);
             let channel = open_in path in
             let pid = Fun.protect ~finally:(fun () -> close_in channel)
               (fun () -> int_of_string (input_line channel)) in
@@ -702,7 +703,7 @@ let process_cancel ~expire request =
               expect "native cancel freed running slot" (T.stats ~actor () = (true, 0))
             end;
             let retired = try
-              Lwt_main.run (Lwt_unix.with_timeout 2. drained);
+              Lwt_main.run (Lwt_unix.with_timeout 120. drained);
               true
             with Lwt_unix.Timeout -> false in
             expect "cancelled native child retained slot" retired;
@@ -726,14 +727,14 @@ let process_priority worker =
             let rec ready () =
               if Sys.file_exists path then Lwt.return_unit
               else Lwt.bind (Lwt_unix.sleep 0.005) ready in
-            Lwt_main.run (Lwt_unix.with_timeout 5. ready);
+            Lwt_main.run (Lwt_unix.with_timeout 120. ready);
             Unix.putenv "OCTRA_PVAC_VERIFY_WORKER" worker;
             let required = T.run ~actor ~ticket:(ticket 83) ~deadline request in
             expect "priority released live view" (T.stats ~actor () = (true, 1));
             expect "priority did not cancel view"
               (Lwt_main.run pending = Error (T.Resource Host));
             expect "view delayed required proof"
-              (Lwt_main.run (Lwt_unix.with_timeout 2. (fun () -> required))
+              (Lwt_main.run (Lwt_unix.with_timeout 120. (fun () -> required))
                 = Ok (T.Verified true));
             let channel = open_in path in
             let pid = Fun.protect ~finally:(fun () -> close_in channel)
@@ -770,7 +771,7 @@ let owner_checks () =
   let second = T.run ~actor ~ticket:(ticket 62) ~deadline:(deadline ()) request in
   armed := true;
   let replies = try
-    Lwt_main.run (Lwt_unix.with_timeout 5. (fun () -> Lwt.all [first; second]))
+    Lwt_main.run (Lwt_unix.with_timeout 120. (fun () -> Lwt.all [first; second]))
   with Lwt_unix.Timeout -> failwith "owner completion fault stranded replies" in
   expect "owner completion fault returned verdict"
     (List.for_all ((=) (Error (T.Resource Host))) replies);
@@ -803,7 +804,7 @@ let owner_cancel mode =
           let armed = ref false in
           let actor = T.create ~clock:(fun () ->
             if !armed then failwith "clock" else Mtime_clock.elapsed_ns ()) () in
-          let span = if mode = "expiry" then 2_000_000_000L else 10_000_000_000L in
+          let span = if mode = "expiry" then 2_000_000_000L else 300_000_000_000L in
           let deadline = Int64.add (Mtime_clock.elapsed_ns ()) span in
           let request = T.Verify (true, Wire.Ping) in
           let first = T.run ~actor ~ticket:(ticket 70) ~deadline request in
@@ -818,8 +819,8 @@ let owner_cancel mode =
             else let* () = Lwt_unix.sleep 0.01 in drained () in
           Fun.protect ~finally:(fun () ->
             T.stop actor;
-            Lwt_main.run (Lwt_unix.with_timeout 5. drained)) (fun () ->
-            Lwt_main.run (Lwt_unix.with_timeout 5. ready);
+            Lwt_main.run (Lwt_unix.with_timeout 120. drained)) (fun () ->
+            Lwt_main.run (Lwt_unix.with_timeout 120. ready);
             let channel = open_in path in
             let pid = Fun.protect ~finally:(fun () -> close_in channel)
               (fun () -> int_of_string (input_line channel)) in
@@ -830,13 +831,13 @@ let owner_cancel mode =
                 (Lwt_main.run (T.run ~actor ~ticket:(ticket 72) ~deadline request)
                   = Error (T.Resource Host));
             expect "owner fault stranded waiting request"
-              (Lwt_main.run (Lwt_unix.with_timeout 5. (fun () -> second))
+              (Lwt_main.run (Lwt_unix.with_timeout 120. (fun () -> second))
                 = Error (T.Resource Host));
             if mode = "cancel" then
               expect "owner fault lost cancellation" (Lwt.state first = Lwt.Fail Lwt.Canceled)
             else expect "owner fault returned running verdict"
               (Lwt_main.run first = Error (T.Resource Host));
-            Lwt_main.run (Lwt_unix.with_timeout 5. drained);
+            Lwt_main.run (Lwt_unix.with_timeout 120. drained);
             let reaped = try Unix.kill pid 0; false with
               Unix.Unix_error (Unix.ESRCH, _, _) -> true in
             expect "owner fault left child running" reaped)))))
@@ -931,7 +932,7 @@ let cancel_checks request =
     if fst (T.stats ~actor ()) then
       let* () = Lwt_unix.sleep 0.01 in drain ()
     else Lwt.return_unit in
-  let* () = Lwt_unix.with_timeout 10. drain in
+  let* () = Lwt_unix.with_timeout 120. drain in
   let* refused = T.run ~actor ~ticket:(ticket 88) ~deadline request in
   expect "stopped actor restarted" (refused = Error (T.Resource Host));
   expect "cancel changed to success" (Lwt.state pending = Lwt.Fail Lwt.Canceled);

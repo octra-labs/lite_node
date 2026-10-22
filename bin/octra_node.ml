@@ -10,7 +10,7 @@ module Epochlog = Octra_core.Epochlog
 module Store_chaindata = Octra_core.Store_chaindata
 module Store_irmin = Octra_core.Store_irmin
 module Tx_drop = Octra_core.Tx_drop
-module Pvac_migration_admission = Octra_core.Pvac_migration_admission
+module Pvac_migration_check = Octra_core.Pvac_migration_check
 module Pvac_verify_worker = Octra_core.Pvac_verify_worker
 module Private_ledger = Octra_core.Private_ledger
 module Consensus_bundle_cache = Octra_node_runtime.Consensus_bundle_cache
@@ -211,9 +211,9 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         ~activation_epoch:private_result_activation_epoch
         epoch
     in
-    let migration_admissions =
+    let migration_checks =
       match
-        Pvac_migration_admission.load_env
+        Pvac_migration_check.load_env
           ~chain_id:startup_network.chain_id
           ~data_dir
           ~getenv:env_opt
@@ -221,19 +221,19 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       | Ok value -> value
       | Error reason ->
         Log.fatal "init"
-          "event = migration_admissions status = rejected reason = %s"
+          "event = migration_checks status = rejected reason = %s"
           reason;
         exit_error ()
     in
     Log.info "init"
-      "event = migration_admissions status = loaded entries = %d root = %s"
-      (Pvac_migration_admission.entry_count migration_admissions)
+      "event = migration_checks status = loaded entries = %d root = %s"
+      (Pvac_migration_check.entry_count migration_checks)
       (Option.value
          ~default:"none"
-         (Pvac_migration_admission.root migration_admissions));
+         (Pvac_migration_check.root migration_checks));
     let legacy_replay ~epoch ~address ~cipher =
-      Pvac_migration_admission.decision
-        migration_admissions
+      Pvac_migration_check.decision
+        migration_checks
         ~epoch
         ~address
         ~cipher
@@ -443,27 +443,27 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     Log.info "init" "event = chaindata_open tx_count = %d mode = lmdb_txlog_epochlog"
       !total_tx_count;
     begin
-      match Pvac_migration_admission.root migration_admissions with
+      match Pvac_migration_check.root migration_checks with
       | None ->
         Log.info "init"
           "event = migration_snapshot status = disabled"
       | Some root ->
         let binding =
-          match Pvac_migration_admission.snapshot_epoch migration_admissions with
+          match Pvac_migration_check.snapshot_epoch migration_checks with
           | None -> Error "migration snapshot epoch is missing"
           | Some epoch ->
               begin
                 match Store_chaindata.get_bound_epoch_header chaindata epoch with
                 | Ok header ->
-                    Pvac_migration_admission.bind_snapshot
-                      migration_admissions
+                    Pvac_migration_check.bind_snapshot
+                      migration_checks
                       (fun _ -> Ok header.Epochlog.state_root)
                 | Error "epoch not found" ->
                     begin
                       match history_floor, floor_config_hash with
                       | Some floor, Some config_hash ->
-                          Pvac_migration_admission.bind_floor
-                            migration_admissions
+                          Pvac_migration_check.bind_floor
+                            migration_checks
                             ~config_hash
                             ~floor_config_hash:(History_floor.config_hash floor)
                             ~floor_epoch:(History_floor.epoch floor)
@@ -477,7 +477,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         | Ok () ->
           Log.info "init"
             "event = migration_snapshot status = bound epoch = %s root = %s"
-            (Pvac_migration_admission.snapshot_epoch migration_admissions
+            (Pvac_migration_check.snapshot_epoch migration_checks
              |> Option.map string_of_int
              |> Option.value ~default:"none")
             root
@@ -488,8 +488,8 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           exit_error ()
     end;
 
-    let current_epoch =
-      ref (require_wal (Wal_start.recover ~data_dir (fun () -> Startup_node_boot_shell.run_node
+    let epoch, genesis =
+      require_wal (Wal_start.recover ~data_dir (fun () -> Startup_node_boot_shell.run_node
         Startup_node_boot_shell.{
           data_dir;
           store;
@@ -509,8 +509,9 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           int_value = env_int;
           env = env_opt;
           exit_fatal = exit_error;
-        })))
+        }))
     in
+    let current_epoch = ref epoch in
     let drop_db = Tx_drop.open_db data_dir in
     let drop_clock = Mtime_clock.counter () in
     let drop_sink = Octra_node_runtime.Drop_sink.create
@@ -540,6 +541,11 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       | Ok mode -> mode = Rule_graph.Active
       | Error fault -> failwith (Rule_graph.fault_message fault)
     in
+    let proof_key_at epoch =
+      match Rule_graph.proof_key rules ~epoch with
+      | Ok mode -> mode = Rule_graph.Active
+      | Error fault -> failwith (Rule_graph.fault_message fault)
+    in
     let cipher_at epoch =
       match Rule_graph.cipher_migration rules ~epoch with
       | Ok mode -> mode
@@ -547,6 +553,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     in
     let key_switch_preverify =
       Consensus_key_switch_preverify.create
+        ~keyed:(fun () -> proof_key_at !current_epoch)
         ~math:(fun () -> math_at !current_epoch)
         ~cipher_mode:(fun () -> cipher_at !current_epoch)
         ~field_policy:(fun () -> private_field_policy !current_epoch)
@@ -555,6 +562,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     in
     let private_preverify =
       Consensus_private_preverify.create
+        ~keyed:(fun () -> proof_key_at !current_epoch)
         ~math:(fun () -> math_at !current_epoch)
         ~field_policy:(fun () -> private_field_policy !current_epoch)
         ~strict:(fun () -> private_proof_strict !current_epoch)
@@ -653,6 +661,22 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       "object_cost"
       (Rule_graph.object_cost_activation rules)
       (fun epoch -> Rule_graph.object_cost rules ~epoch);
+    bind_rule
+      "stake"
+      (Rule_graph.stake_activation_for_chain startup_network.chain_id)
+      (fun epoch -> Rule_graph.stake rules ~epoch);
+    bind_rule
+      "proof_key"
+      (Rule_graph.proof_key_activation_for_chain startup_network.chain_id)
+      (fun epoch -> Rule_graph.proof_key rules ~epoch);
+    bind_rule
+      "program_records"
+      (Rule_graph.program_records_activation_for_chain startup_network.chain_id)
+      (fun epoch -> Rule_graph.program_records rules ~epoch);
+    bind_rule
+      "duty_marks"
+      (Rule_graph.duty_marks_activation_for_chain startup_network.chain_id)
+      (fun epoch -> Rule_graph.duty_marks rules ~epoch);
 
     let validator_ready_max_lag =
       max 0 (env_int "OCTRA_VALIDATOR_READY_MAX_LAG_EPOCHS" 64)
@@ -733,51 +757,9 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         "event = profile_switch config = %s"
         (Octra_consensus.C_config.short config_hash)
     in
-    let mark_state_attested =
-      match recovery_need with
-      | Some need when need.Sync_need.cause = Sync_need.Journal ->
-        (fun ~head ~root ->
-          set_state_attested ~head ~root;
-          match
-            Sync_mark.finish_journal
-              ~data_dir
-              ~chain:startup_network.chain_id
-              ~verified_head:head
-              need
-          with
-          | Ok false -> ()
-          | Ok true ->
-            Log.warn "init"
-              "event = sync_recovery status = consumed cause = journal head = %d action = restart"
-              head;
-            exit Sync_mark.restart_code
-          | Error reason ->
-            Log.fatal "init"
-              "event = sync_recovery status = rejected cause = journal reason = %s"
-              reason;
-            exit_error ())
-      | Some need when need.Sync_need.cause = Sync_need.Root ->
-        (fun ~head ~root ->
-          set_state_attested ~head ~root;
-          if head >= need.epoch then
-            match
-              Sync_mark.consume_root
-                ~data_dir
-                ~chain:startup_network.chain_id
-                ~verified_head:head
-                need
-            with
-            | Ok () ->
-              Log.warn "init"
-                "event = sync_recovery status = consumed cause = root head = %d action = restart"
-                head;
-              exit Sync_mark.restart_code
-            | Error reason ->
-              Log.fatal "init"
-                "event = sync_recovery status = rejected cause = root reason = %s"
-                reason;
-              exit_error ())
-      | _ -> set_state_attested
+    let mark_state_attested = Octra_node_runtime.Sync_attest.create
+      ~data_dir ~chain:startup_network.chain_id ~getenv:Sys.getenv_opt
+      ~set:set_state_attested ~exit ~exit_error recovery_need
     in
     let set_state_attested ~head ~root =
       mark_state_attested ~head ~root;
@@ -1097,6 +1079,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           ~epoch:!current_epoch
         |> Result.map (fun _ -> ()))
       ~defer:(fun reason ->
+        finality_callbacks.defer_apply ~epoch:!current_epoch ~reason;
         Log.error "finality" "event = refuse_apply reason = %s" reason;
         mark_quarantine reason;
         catchup_node_queue.queue_finalized_gap
@@ -1338,6 +1321,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       Preverify_submit.{
         strict = (fun () -> private_proof_strict !current_epoch);
         math = (fun () -> math_at !current_epoch);
+        keyed = (fun () -> proof_key_at !current_epoch);
         get_pvac_pubkey =
           (fun addr -> Ledger.get_pvac_pubkey ledger addr);
         sender_enc =
@@ -1345,11 +1329,11 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
             Option.value
               ~default:"0"
               (Ledger.find ledger addr).encrypted_balance);
-        start_task = (fun ~math -> Preverify_cache.start_task ~math);
+        start_task = (fun ~keyed ~math -> Preverify_cache.start_task ~keyed ~math);
         verify_ranges =
-          (fun ~math ~strict ~pubkey_blob ~sender_enc ptd ->
+          (fun ~keyed ~math ~strict ~pubkey_blob ~sender_enc ptd ->
             Octra_node_runtime.Tx_view.preverify_stealth_ranges
-              ~math
+              ~keyed ~math
               ~strict
               ~pubkey_blob
               ~sender_enc
@@ -1399,6 +1383,11 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           | Some head when head.epoch_id < max_int ->
             Rule_graph.settle_at ~chain_id ~epoch:(head.epoch_id + 1)
           | _ -> Rule_graph.Prior);
+        marks_mode = (fun () ->
+          match Octra_core.Head_manifest.get_cached () with
+          | Some head when head.epoch_id < max_int ->
+            Rule_graph.duty_marks_at ~chain_id ~epoch:(head.epoch_id + 1)
+          | _ -> Rule_graph.Prior);
         queue_head = (fun () -> Option.map (fun head ->
           Int64.of_int head.Octra_core.Head_manifest.epoch_id)
           (Octra_core.Head_manifest.get_cached ()));
@@ -1441,12 +1430,12 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     let validator_control = Octra_core.Validator_control.create ~data_dir in
     let duty_parent = Octra_node_runtime.Consensus_parent_commit.create
       ~chain_id ~data_dir ~chaindata Sys.getenv_opt in
-    let exit_identity (candidate : Octra_core.Validator_admission.candidate) =
+    let exit_identity (entry : Octra_core.Validator_entry.entry) =
       Octra_core.Validator_intent.{
         chain_id;
         address = wallet.address;
         pubkey = wallet.pub;
-        bonded_epoch = candidate.bonded_epoch;
+        bonded_epoch = entry.bonded_epoch;
       }
     in
     let refresh_enrollment () =
@@ -1495,22 +1484,16 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       ] in
       let fields = fields @ Option.fold ~none:[]
         ~some:(fun value -> ["head_proposal_id", `String value]) head_proposal_id in
-      let fields =
-        match action with
-        | Set_actor.Pulse -> fields
+      let open Lwt.Syntax in
+      let* added = match action with
+        | Set_actor.Pulse -> Lwt.return_ok []
         | Set_actor.Appeal proof ->
-          fields @ [
-            "duty_vote",
-              `String
-                (Base64.encode_exn
-                   (Octra_consensus.C_codec.encode_vote proof.vote));
-            "duty_commit",
-              `String
-                (Base64.encode_exn
-                   (Octra_consensus.C_parent_commit.encode proof.commit));
-          ]
-      in
-      Yojson.Safe.to_string (`Assoc fields)
+          Lwt.return_ok (Octra_node_runtime.Set_delivery.proof_fields proof)
+        | Set_actor.Appeals proofs ->
+          Octra_node_runtime.Set_delivery.mark_fields_at ~base:fields ~store
+            ~head:Octra_core.Head_manifest.get_cached ~epoch:(Int64.succ head_epoch)
+            ~state_root ~chain_id ~address:wallet.address proofs in
+      Lwt.return (Result.map (fun added -> Yojson.Safe.to_string (`Assoc (fields @ added))) added)
     in
     let read_fold_body body =
       let stream = Cohttp_lwt.Body.to_stream body in
@@ -1592,10 +1575,12 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       | None -> Set_post.Paused
       | Some head ->
         if head.epoch_id < 0 || head.epoch_id = max_int then Set_post.Paused
-        else match Rule_graph.ready_exec rules ~epoch:(head.epoch_id + 1) with
-          | Error _ -> Set_post.Paused
-          | Ok mode ->
-            Octra_node_runtime.Set_control.eligible ~mode ~head:(Int64.of_int head.epoch_id)
+        else match Rule_graph.ready_exec rules ~epoch:(head.epoch_id + 1),
+          Rule_graph.duty_marks rules ~epoch:(head.epoch_id + 1) with
+          | Error _, _ | _, Error _ -> Set_post.Paused
+          | Ok mode, Ok marks ->
+            Octra_node_runtime.Set_control.eligible ~marks:(marks = Rule_graph.Active)
+              ~mode ~head:(Int64.of_int head.epoch_id)
               ~bonded_epoch ~snapshot:!enrollment_ref tx
     in
     let fold_delivery = Octra_node_runtime.Set_delivery.{
@@ -1615,11 +1600,11 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       let wait reason = Lwt.return_error (Set_post.Wait reason) in
       match refresh_enrollment () with
       | Error reason -> wait reason
-      | Ok { candidate = Some candidate; head_epoch; _ }
-        when candidate.bonded_epoch = bonded_epoch && candidate.exit_epoch = None ->
+      | Ok { entry = Some entry; head_epoch; _ }
+        when entry.bonded_epoch = bonded_epoch && entry.exit_epoch = None ->
         begin
           match Octra_core.Validator_control.guard
-            validator_control (exit_identity candidate) (fun () ->
+            validator_control (exit_identity entry) (fun () ->
               match Octra_core.Head_manifest.get_cached (), Ledger.find_opt ledger tx.Transaction.from with
               | Some head, Some account when current () && head.epoch_id = head_epoch
                   && account.Ledger.nonce < tx.nonce
@@ -1667,7 +1652,15 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     in
     let send_fold ~epoch action =
       let send ~head_epoch ~head_proposal_id state_root =
+        let open Lwt.Syntax in
+        let* message = match state_root with
+          | None -> Lwt.return_error "validator set fold head root is unavailable"
+          | Some state_root -> fold_message action ~head_epoch ~state_root ~head_proposal_id in
         let stage () =
+          let ( let* ) = Result.bind in
+          let* message = message in
+          let* _ = Set_actor.plan ~epoch (fold_point ())
+            |> Result.map_error Set_actor.reason in
           Rest.expire_duty ~sender:wallet.address rest_runtime ();
           match state_root, Ledger.find_opt ledger wallet.address with
           | None, _ -> Error "validator set fold head root is unavailable"
@@ -1676,6 +1669,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
             match Staging.duty_nonce wallet.address account.Ledger.nonce with
             | None -> Error "validator duty nonce is pending"
             | Some nonce ->
+              let ( let* ) = Result.bind in
               let draft = Transaction.{
                 from = wallet.address;
                 to_ = wallet.address;
@@ -1685,28 +1679,27 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
                 timestamp = Unix.gettimeofday ();
                 signature = "";
                 public_key = Some wallet.pub;
-                message = Some (fold_message action ~head_epoch ~state_root ~head_proposal_id);
+                message = Some message;
                 op_type = ValidatorReady;
                 encrypted_data = None;
               } in
-              let tx = { draft with ou = Transaction.ou_cost draft } in
-              let tx = Transaction.sign_with_privkey tx wallet.priv in
+              let* tx = Octra_node_runtime.Set_delivery.sign ~key:wallet.priv draft in
               Octra_node_runtime.Set_delivery.stage ~bft_mode:consensus_mode
                 rest_runtime ledger tx
         in
         if Set_post.pending fold_post then Lwt.return_ok ()
         else match !enrollment_ref with
-        | Ok { candidate = Some candidate; head_epoch = recorded; _ }
-          when Int64.of_int recorded = head_epoch && candidate.exit_epoch = None ->
+        | Ok { entry = Some entry; head_epoch = recorded; _ }
+          when Int64.of_int recorded = head_epoch && entry.exit_epoch = None ->
           Octra_core.Validator_control.guard
-            validator_control (exit_identity candidate) (fun () -> Ok (stage ()))
+            validator_control (exit_identity entry) (fun () -> Ok (stage ()))
           |> (function
             | Error error -> Error (Set_actor.Control, error)
             | Ok result -> Result.map_error (fun error -> Set_actor.Send, error) result)
           |> Result.map (fun staged ->
             let retry = Set_post.{
-              eligible = fold_eligibility ~bonded_epoch:candidate.bonded_epoch;
-              post = retry_fold ~bonded_epoch:candidate.bonded_epoch;
+              eligible = fold_eligibility ~bonded_epoch:entry.bonded_epoch;
+              post = retry_fold ~bonded_epoch:entry.bonded_epoch;
               retain = Option.is_some head_proposal_id;
             } in
             Octra_node_runtime.Set_delivery.put ~retry fold_post staged)
@@ -1743,7 +1736,9 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
             | Ok _ -> send ~head_epoch ~head_proposal_id:None state_root
     in
     let fold_actor =
-      Set_actor.create ~observe:(fun (entry : Set_actor.observation) ->
+      Set_actor.create
+        ~batch:(fun () -> Rule_graph.duty_marks_at ~chain_id ~epoch:!current_epoch = Rule_graph.Active)
+        ~observe:(fun (entry : Set_actor.observation) ->
         let vote = entry.proof.vote in
         Log.info "validator"
           "event = set_proof stage = %s proof = %s chain = %s validator = %s vote_epoch = %Ld round = %d epoch = %Ld"
@@ -1856,7 +1851,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           (fun _ ledger ->
             let* batch =
               Octra_core.Preverify_worker.run_many
-                ~math
+                ~keyed:(proof_key_at epoch) ~math
                 ~cipher_mode:(cipher_at epoch)
                 ~field_policy:(private_field_policy epoch)
                 ~strict:(private_proof_strict epoch)
@@ -1910,7 +1905,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
            (Consensus_key_switch_preverify.await key_switch_preverify))
       |> Consensus_preverify_role.validate
     in
-    Consensus_driver_boot_shell.run
+    Consensus_driver_boot_shell.run ?genesis
       Consensus_driver_boot_shell.{
         env = env_opt;
         env_int;
@@ -2008,6 +2003,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         now = Unix.gettimeofday;
         require_sync;
         exit_error;
+        exit_refused;
       };
 
     let sync_task () =
@@ -2083,6 +2079,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         Option.map (fun history ->
         let deps =
           Resource_compute_engine.native_deps
+            ~chain_id
             ~limits
             ~store
             ~state_root_at:compute_state_root_at
@@ -2169,7 +2166,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         ~chain_id ~consensus_config_hash_ref ~consensus_validator_set_ref
         ~scheduled_validator_set_ref ~current_epoch ~total_tx_count
         ~validator_view_sk ~validator_view_pub ~program_trust ~chaindata
-        ~migration_admissions
+        ~migration_checks
         ~rules
         ~consensus_driver_ref:driver_ref
         ~epoch_visibility

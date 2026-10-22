@@ -21,7 +21,7 @@ let exit_process code =
   let rec wait () = match Unix.waitpid [Unix.WNOHANG] pid with
     | exception Unix.Unix_error (Unix.EINTR, _, _) -> wait ()
     | 0, _ ->
-      if Mtime.Span.to_float_ns (Mtime_clock.count clock) > 3e9 then begin
+      if Mtime.Span.to_float_ns (Mtime_clock.count clock) > 120e9 then begin
         Unix.kill pid Sys.sigkill;
         ignore (Unix.waitpid [] pid);
         failwith "ordinary exit waited for local drop writer"

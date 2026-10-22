@@ -60,7 +60,7 @@ const fail = (message, code = 1) => {
   process.exit(code)
 }
 
-const helperCandidates = (dir) => ([
+const helperPaths = (dir) => ([
   path.join(dir, '_build', 'default', 'bin', 'circle_hfhe_host.exe'),
   path.join(dir, '_build', 'default', 'bin', 'circle_hfhe_host'),
   path.join(dir, 'bin', 'circle_hfhe_host.exe'),
@@ -76,7 +76,7 @@ const resolveHfheHelperPath = () => {
   for (const start of starts) {
     let dir = start
     for (let depth = 0; depth < 10; depth += 1) {
-      const match = helperCandidates(dir).find((candidate) => existsSync(candidate))
+      const match = helperPaths(dir).find((file) => existsSync(file))
       if (match) {
         return match
       }

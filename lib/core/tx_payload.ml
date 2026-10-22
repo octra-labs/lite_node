@@ -82,7 +82,7 @@ let admit ?(limits=standard) tx =
   if not (size_ok ~limits tx) then
     Error "encrypted_data or message exceeds size limit"
   else
-    Bft_control_admission.validate_message
+    Bft_control_check.validate_message
       tx.Transaction.op_type
       tx.Transaction.message
 

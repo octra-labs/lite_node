@@ -66,12 +66,13 @@ let with_epoch_snapshot store read =
     else
       read snapshot (Int64.to_int snapshot.epoch_id + 1))
 
-let program_descriptor ?snapshot ?(float_mode=Octra_core.Rule_graph.Prior) store ~circle_id =
+let program_descriptor ?snapshot ?(float_mode = Octra_core.Rule_graph.Prior) ~table_mode store ~circle_id =
   let open Lwt.Syntax in
   let* described =
     Octra_circle_runtime.Circle_program.describe
       ?snapshot
-      ~inspect_mode:Octra_core.Rule_graph.Active ~float_mode store circle_id in
+      ~inspect_mode:Octra_core.Rule_graph.Active
+      ~table_mode ~float_mode store circle_id in
   match described with
   | Ok descriptor ->
     ok (Octra_circle_runtime.Circle_program.yojson_of_descriptor descriptor)
@@ -229,7 +230,7 @@ let info_auth_params store params =
     (fun _circle_id info ->
       ok (Octra_core.Circles.yojson_of_circle_info info))
 
-let program_descriptor_auth_params ?snapshot ?(float_mode=Octra_core.Rule_graph.Prior) store params =
+let program_descriptor_auth_params ?snapshot ?(float_mode = Octra_core.Rule_graph.Prior) ~table_mode store params =
   with_snapshot ?snapshot store (fun snapshot ->
     with_scope_auth
       ~snapshot
@@ -238,7 +239,7 @@ let program_descriptor_auth_params ?snapshot ?(float_mode=Octra_core.Rule_graph.
       ~gate:Circle_auth.Private_owner
       ~op:"octra_circle_program_info"
       (fun circle_id _info ->
-        program_descriptor ~snapshot ~float_mode store ~circle_id))
+        program_descriptor ~snapshot ~float_mode ~table_mode store ~circle_id))
 
 let with_owner_subject_auth ?snapshot store params ~field ~op f =
   match Rpc.require_string params 0 "circle_id", Rpc.require_string params 1 field with
@@ -359,7 +360,7 @@ let with_object_member_auth ?snapshot store params f =
         ~subject:(Circle_view.object_member_subject req)
         (fun _ -> f req.circle_id req.object_ref req.member_ref)
 
-let program_info_public ?snapshot ?(float_mode=Octra_core.Rule_graph.Prior) store ~circle_id =
+let program_info_public ?snapshot ?(float_mode = Octra_core.Rule_graph.Prior) ~table_mode store ~circle_id =
   let open Lwt.Syntax in
   let* info_opt = Octra_core.Store_irmin.get_circle_info ?snapshot store circle_id in
   match info_opt with
@@ -369,12 +370,12 @@ let program_info_public ?snapshot ?(float_mode=Octra_core.Rule_graph.Prior) stor
     if Circle_auth.private_view_required info then
       Lwt.return (Error (Rpc.err (-32000) "authenticated circle program info required" None))
     else
-      program_descriptor ?snapshot ~float_mode store ~circle_id
+      program_descriptor ?snapshot ~float_mode ~table_mode store ~circle_id
 
-let program_info_public_params ?snapshot ?(float_mode=Octra_core.Rule_graph.Prior) store params =
+let program_info_public_params ?snapshot ?(float_mode = Octra_core.Rule_graph.Prior) ~table_mode store params =
   with_snapshot ?snapshot store (fun snapshot ->
     circle_id_param params (fun circle_id ->
-      program_info_public ~snapshot ~float_mode store ~circle_id))
+      program_info_public ~snapshot ~float_mode ~table_mode store ~circle_id))
 
 let program_value ?snapshot store (info : Octra_core.Circles.circle_info) =
   let open Lwt.Syntax in
@@ -426,7 +427,8 @@ let program_rpc ~authenticated ~describe ~profile store params =
         if describe then
           let read = if authenticated then program_descriptor_auth_params
             else program_info_public_params in
-          read ~snapshot ~float_mode:profile.Octra_vm.Contract_rpc.wasm_float store params
+          read ~snapshot ~float_mode:profile.Octra_vm.Contract_rpc.wasm_float
+            ~table_mode:profile.Octra_vm.Contract_rpc.proof_key store params
         else
           let read = if authenticated then program_auth_params else program_params in
           read ~snapshot store params)

@@ -2,9 +2,27 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type t
+type polc_receipt
+
+val polc_saved : polc_receipt -> policy:C_quorum_policy.t -> chain_id:string ->
+  epoch_id:int64 -> validator_set:C_types.validator_set -> round:int -> proposal_id:string -> bool
+
+val polc_save : ?policy:C_quorum_policy.t -> ?sync:(string -> (unit, string) result) ->
+  t -> chain_id:string -> epoch_id:int64 -> validator_set:C_types.validator_set ->
+  locked_round:int -> C_types.vote list -> (polc_receipt, string) result
 
 val disk : data_dir:string -> t
 val memory : unit -> t
+
+val polc_keep : ?policy:C_quorum_policy.t -> ?sync:(string -> (unit, string) result) ->
+  t -> chain_id:string -> epoch_id:int64 ->
+  validator_set:C_types.validator_set -> locked_round:int -> C_types.vote list -> (unit, string) result
+
+val polc_ready : ?policy:C_quorum_policy.t -> chain_id:string -> epoch_id:int64 ->
+  validator_set:C_types.validator_set -> C_types.vote list -> bool
+
+val polc_load : ?policy:C_quorum_policy.t -> t -> chain_id:string -> epoch_id:int64 ->
+  validator_set:C_types.validator_set -> (C_types.vote list, string) result
 
 val floor :
   t ->

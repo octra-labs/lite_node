@@ -8,6 +8,8 @@ type key = {
 
 type error
 
+val payload : key_id:string -> string -> (string, error) result
+
 val error_message : error -> string
 val attach : key_id:string -> private_key:string -> string -> (string, error) result
 val verify : trusted:key list -> string -> (unit, error) result

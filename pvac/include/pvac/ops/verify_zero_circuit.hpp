@@ -138,7 +138,8 @@ inline void append_key_bound_transcript_context(
     const PubKey& pk,
     const Cipher& ct,
     const char* proof_kind,
-    const RistrettoPoint* amount_commitment = nullptr
+    const RistrettoPoint* amount_commitment = nullptr,
+    bool keyed = false
 ) {
     const char* proof_version = circuit_prf_proof_version(pk.circuit_prf_profile);
     transcript.append_message(
@@ -149,6 +150,10 @@ inline void append_key_bound_transcript_context(
     if (pk.circuit_prf_profile == CircuitPrfProfile::MIMC_X5_V7)
         transcript.append_u64("circuit_prf_profile", static_cast<uint64_t>(pk.circuit_prf_profile));
     transcript.append_point("registered_key_commitment", pk.circuit_prf_key_commit);
+    if (keyed) {
+        const auto digest = proof_key_digest(pk);
+        transcript.append_message("public_key", digest.data(), digest.size());
+    }
     auto ct_hash = commit_ct(pk, ct);
     transcript.append_message("commit_ct", ct_hash.data(), ct_hash.size());
     if (amount_commitment)
@@ -587,7 +592,8 @@ inline bool key_bound_key_switch_shape_ok(const PubKey& pk, const Cipher& ct) {
 
 inline ZeroProof make_zero_proof(
     const PubKey& pk, const SecKey& sk, const Cipher& ct,
-    ScalarRule rule = ScalarRule::Prior
+    ScalarRule rule = ScalarRule::Prior,
+    bool keyed = false
 ) {
     if (!key_bound_verify_shape_ok(pk, ct))
         throw std::runtime_error("pvac: key-bound proof shape rejected");
@@ -617,7 +623,7 @@ inline ZeroProof make_zero_proof(
     transcript.append_u64("nL", nL);
     transcript.append_u64("S", S);
     transcript.append_u64("nB", nB);
-    detail::append_key_bound_transcript_context(transcript, pk, ct, "zero");
+    detail::append_key_bound_transcript_context(transcript, pk, ct, "zero", nullptr, keyed);
 
     ZeroProof result;
     result.proof = prover.prove(transcript);
@@ -628,7 +634,8 @@ inline ZeroProof make_zero_proof(
 inline bool verify_zero(
     const PubKey& pk, const Cipher& ct,
     const ZeroProof& proof,
-    ScalarRule rule = ScalarRule::Prior
+    ScalarRule rule = ScalarRule::Prior,
+    bool keyed = false
 ) {
     if (!is_cipher_compatible_with_pubkey(pk, ct)) return false;
     if (!key_bound_verify_shape_ok(pk, ct)) return false;
@@ -668,7 +675,7 @@ inline bool verify_zero(
     transcript.append_u64("nL", nL);
     transcript.append_u64("S", S);
     transcript.append_u64("nB", nB);
-    detail::append_key_bound_transcript_context(transcript, pk, ct, "zero");
+    detail::append_key_bound_transcript_context(transcript, pk, ct, "zero", nullptr, keyed);
 
     return bp::r1cs_verify(transcript, cs, proof.proof);
 }
@@ -680,7 +687,8 @@ inline ZeroProof make_zero_proof_bound_checked(
     bool force_alias_rejection = false,
     const char* transcript_label = "pvac.verify_zero_bound.key_bound",
     const char* proof_kind = "bound",
-    ScalarRule rule = ScalarRule::Prior
+    ScalarRule rule = ScalarRule::Prior,
+    bool keyed = false
 ) {
     if (!key_bound_verify_shape_ok_with_limit(pk, ct, base_layer_limit))
         throw std::runtime_error("pvac: key-bound proof shape rejected");
@@ -732,7 +740,7 @@ inline ZeroProof make_zero_proof_bound_checked(
         pk,
         ct,
         proof_kind,
-        &amount_commitment);
+        &amount_commitment, keyed);
 
     ZeroProof result;
     result.proof = prover.prove(transcript, limit_profile);
@@ -743,7 +751,8 @@ inline ZeroProof make_zero_proof_bound_checked(
 inline ZeroProof make_zero_proof_bound(
     const PubKey& pk, const SecKey& sk, const Cipher& ct,
     uint64_t amount, const Scalar& amount_blinding,
-    ScalarRule rule = ScalarRule::Prior
+    ScalarRule rule = ScalarRule::Prior,
+    bool keyed = false
 ) {
     return make_zero_proof_bound_checked(
         pk,
@@ -752,13 +761,14 @@ inline ZeroProof make_zero_proof_bound(
         amount,
         amount_blinding,
         key_bound_base_layer_limit(pk.circuit_prf_profile),
-        bp::R1CSLimitProfile::Default, false, "pvac.verify_zero_bound.key_bound", "bound", rule);
+        bp::R1CSLimitProfile::Default, false, "pvac.verify_zero_bound.key_bound", "bound", rule, keyed);
 }
 
 inline ZeroProof make_zero_proof_bound_key_switch(
     const PubKey& pk, const SecKey& sk, const Cipher& ct,
     uint64_t amount, const Scalar& amount_blinding,
-    ScalarRule rule = ScalarRule::Prior
+    ScalarRule rule = ScalarRule::Prior,
+    bool keyed = false
 ) {
     return make_zero_proof_bound_checked(
         pk,
@@ -767,7 +777,7 @@ inline ZeroProof make_zero_proof_bound_key_switch(
         amount,
         amount_blinding,
         key_bound_key_switch_base_layer_limit(pk.circuit_prf_profile),
-        bp::R1CSLimitProfile::KeySwitchRefresh, false, "pvac.verify_zero_bound.key_bound", "bound", rule);
+        bp::R1CSLimitProfile::KeySwitchRefresh, false, "pvac.verify_zero_bound.key_bound", "bound", rule, keyed);
 }
 
 inline bool verify_zero_bound_checked(
@@ -778,7 +788,8 @@ inline bool verify_zero_bound_checked(
     const char* transcript_label = "pvac.verify_zero_bound.key_bound",
     const char* proof_kind = "bound",
     bool strict_amount = true,
-    ScalarRule rule = ScalarRule::Prior
+    ScalarRule rule = ScalarRule::Prior,
+    bool keyed = false
 ) {
     if (!is_cipher_compatible_with_pubkey(pk, ct)) return false;
     if (!key_bound_verify_shape_ok_with_limit(pk, ct, base_layer_limit)) return false;
@@ -839,7 +850,7 @@ inline bool verify_zero_bound_checked(
         pk,
         ct,
         proof_kind,
-        &amount_commitment);
+        &amount_commitment, keyed);
 
     return bp::r1cs_verify(transcript, cs, proof.proof, limit_profile);
 }
@@ -848,7 +859,8 @@ inline bool verify_zero_bound(
     const PubKey& pk, const Cipher& ct,
     const ZeroProof& proof,
     const RistrettoPoint& amount_commitment,
-    ScalarRule rule = ScalarRule::Prior
+    ScalarRule rule = ScalarRule::Prior,
+    bool keyed = false
 ) {
     return verify_zero_bound_checked(
         pk,
@@ -856,14 +868,15 @@ inline bool verify_zero_bound(
         proof,
         amount_commitment,
         key_bound_base_layer_limit(pk.circuit_prf_profile),
-        bp::R1CSLimitProfile::Default, false, "pvac.verify_zero_bound.key_bound", "bound", true, rule);
+        bp::R1CSLimitProfile::Default, false, "pvac.verify_zero_bound.key_bound", "bound", true, rule, keyed);
 }
 
 inline bool verify_zero_amount_prior(
     const PubKey& pk, const Cipher& ct,
     const ZeroProof& proof,
     const RistrettoPoint& amount_commitment,
-    ScalarRule rule = ScalarRule::Prior
+    ScalarRule rule = ScalarRule::Prior,
+    bool keyed = false
 ) {
     return verify_zero_bound_checked(
         pk,
@@ -875,14 +888,15 @@ inline bool verify_zero_amount_prior(
         false,
         "pvac.verify_zero_bound.key_bound",
         "bound",
-        false, rule);
+        false, rule, keyed);
 }
 
 inline bool verify_zero_bound_key_switch(
     const PubKey& pk, const Cipher& ct,
     const ZeroProof& proof,
     const RistrettoPoint& amount_commitment,
-    ScalarRule rule = ScalarRule::Prior
+    ScalarRule rule = ScalarRule::Prior,
+    bool keyed = false
 ) {
     return verify_zero_bound_checked(
         pk,
@@ -890,14 +904,15 @@ inline bool verify_zero_bound_key_switch(
         proof,
         amount_commitment,
         key_bound_key_switch_base_layer_limit(pk.circuit_prf_profile),
-        bp::R1CSLimitProfile::KeySwitchRefresh, false, "pvac.verify_zero_bound.key_bound", "bound", true, rule);
+        bp::R1CSLimitProfile::KeySwitchRefresh, false, "pvac.verify_zero_bound.key_bound", "bound", true, rule, keyed);
 }
 
 inline bool verify_zero_amount_key_switch_prior(
     const PubKey& pk, const Cipher& ct,
     const ZeroProof& proof,
     const RistrettoPoint& amount_commitment,
-    ScalarRule rule = ScalarRule::Prior
+    ScalarRule rule = ScalarRule::Prior,
+    bool keyed = false
 ) {
     return verify_zero_bound_checked(
         pk,
@@ -909,13 +924,14 @@ inline bool verify_zero_amount_key_switch_prior(
         false,
         "pvac.verify_zero_bound.key_bound",
         "bound",
-        false, rule);
+        false, rule, keyed);
 }
 
 inline ZeroProof make_zero_proof_bound_historical_migration(
     const PubKey& pk, const SecKey& sk, const Cipher& ct,
     uint64_t amount, const Scalar& amount_blinding,
-    ScalarRule rule = ScalarRule::Prior
+    ScalarRule rule = ScalarRule::Prior,
+    bool keyed = false
 ) {
     if (pk.circuit_prf_profile != CircuitPrfProfile::MIMC_X3_V6)
         throw std::runtime_error("pvac: historical migration requires historical proof profile");
@@ -929,14 +945,15 @@ inline ZeroProof make_zero_proof_bound_historical_migration(
         bp::R1CSLimitProfile::KeySwitchRefresh,
         true,
         "pvac.historical_migration.bound",
-        "historical_migration", rule);
+        "historical_migration", rule, keyed);
 }
 
 inline bool verify_zero_bound_historical_migration(
     const PubKey& pk, const Cipher& ct,
     const ZeroProof& proof,
     const RistrettoPoint& amount_commitment,
-    ScalarRule rule = ScalarRule::Prior
+    ScalarRule rule = ScalarRule::Prior,
+    bool keyed = false
 ) {
     if (pk.circuit_prf_profile != CircuitPrfProfile::MIMC_X3_V6)
         return false;
@@ -949,14 +966,15 @@ inline bool verify_zero_bound_historical_migration(
         bp::R1CSLimitProfile::KeySwitchRefresh,
         true,
         "pvac.historical_migration.bound",
-        "historical_migration", true, rule);
+        "historical_migration", true, rule, keyed);
 }
 
 inline bool verify_zero_amount_historical_prior(
     const PubKey& pk, const Cipher& ct,
     const ZeroProof& proof,
     const RistrettoPoint& amount_commitment,
-    ScalarRule rule = ScalarRule::Prior
+    ScalarRule rule = ScalarRule::Prior,
+    bool keyed = false
 ) {
     if (pk.circuit_prf_profile != CircuitPrfProfile::MIMC_X3_V6)
         return false;
@@ -970,13 +988,14 @@ inline bool verify_zero_amount_historical_prior(
         true,
         "pvac.historical_migration.bound",
         "historical_migration",
-        false, rule);
+        false, rule, keyed);
 }
 
 inline ZeroProof make_zero_proof_bound_range(
     const PubKey& pk, const SecKey& sk, const Cipher& ct,
     uint64_t amount, const Scalar& amount_blinding,
-    ScalarRule rule = ScalarRule::Prior
+    ScalarRule rule = ScalarRule::Prior,
+    bool keyed = false
 ) {
     if (!key_bound_verify_shape_ok(pk, ct))
         throw std::runtime_error("pvac: key-bound proof shape rejected");
@@ -1014,7 +1033,7 @@ inline ZeroProof make_zero_proof_bound_range(
     transcript.append_u64("nL", nL);
     transcript.append_u64("S", S);
     transcript.append_u64("nB", nB);
-    detail::append_key_bound_transcript_context(transcript, pk, ct, "bound_range", &amount_commitment);
+    detail::append_key_bound_transcript_context(transcript, pk, ct, "bound_range", &amount_commitment, keyed);
 
     ZeroProof result;
     result.proof = prover.prove(transcript);
@@ -1027,7 +1046,8 @@ inline bool verify_zero_bound_range_checked(
     const ZeroProof& proof,
     const RistrettoPoint& amount_commitment,
     bool strict_amount,
-    ScalarRule rule = ScalarRule::Prior
+    ScalarRule rule = ScalarRule::Prior,
+    bool keyed = false
 ) {
     if (!is_cipher_compatible_with_pubkey(pk, ct)) return false;
     if (!key_bound_verify_shape_ok(pk, ct)) return false;
@@ -1084,7 +1104,7 @@ inline bool verify_zero_bound_range_checked(
     transcript.append_u64("nL", nL);
     transcript.append_u64("S", S);
     transcript.append_u64("nB", nB);
-    detail::append_key_bound_transcript_context(transcript, pk, ct, "bound_range", &amount_commitment);
+    detail::append_key_bound_transcript_context(transcript, pk, ct, "bound_range", &amount_commitment, keyed);
 
     return bp::r1cs_verify(transcript, cs, proof.proof);
 }
@@ -1093,34 +1113,37 @@ inline bool verify_zero_bound_range(
     const PubKey& pk, const Cipher& ct,
     const ZeroProof& proof,
     const RistrettoPoint& amount_commitment,
-    ScalarRule rule = ScalarRule::Prior
+    ScalarRule rule = ScalarRule::Prior,
+    bool keyed = false
 ) {
     return verify_zero_bound_range_checked(
         pk,
         ct,
         proof,
         amount_commitment,
-        true, rule);
+        true, rule, keyed);
 }
 
 inline bool verify_range_amount_prior(
     const PubKey& pk, const Cipher& ct,
     const ZeroProof& proof,
     const RistrettoPoint& amount_commitment,
-    ScalarRule rule = ScalarRule::Prior
+    ScalarRule rule = ScalarRule::Prior,
+    bool keyed = false
 ) {
     return verify_zero_bound_range_checked(
         pk,
         ct,
         proof,
         amount_commitment,
-        false, rule);
+        false, rule, keyed);
 }
 
 inline bool verify_range_amount_prior(
     const PubKey& pk, const Cipher& ct,
     const ZeroProof& proof,
-    ScalarRule rule = ScalarRule::Prior
+    ScalarRule rule = ScalarRule::Prior,
+    bool keyed = false
 ) {
     if (!is_cipher_compatible_with_pubkey(pk, ct)) return false;
     if (!key_bound_verify_shape_ok(pk, ct)) return false;
@@ -1131,13 +1154,14 @@ inline bool verify_range_amount_prior(
         pk,
         ct,
         proof,
-        proof.proof.V[amount_idx], rule);
+        proof.proof.V[amount_idx], rule, keyed);
 }
 
 inline bool verify_zero_bound_range(
     const PubKey& pk, const Cipher& ct,
     const ZeroProof& proof,
-    ScalarRule rule = ScalarRule::Prior
+    ScalarRule rule = ScalarRule::Prior,
+    bool keyed = false
 ) {
     if (!is_cipher_compatible_with_pubkey(pk, ct)) return false;
     if (!key_bound_verify_shape_ok(pk, ct)) return false;
@@ -1148,7 +1172,7 @@ inline bool verify_zero_bound_range(
         pk,
         ct,
         proof,
-        proof.proof.V[amount_idx], rule);
+        proof.proof.V[amount_idx], rule, keyed);
 }
 
 }

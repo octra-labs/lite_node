@@ -39,6 +39,7 @@ val option_result :
 val program_descriptor :
   ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   ?float_mode:Octra_core.Rule_graph.mode ->
+  table_mode:Octra_core.Rule_graph.mode ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   rpc_result Lwt.t
@@ -46,6 +47,7 @@ val program_descriptor :
 val program_descriptor_auth_params :
   ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   ?float_mode:Octra_core.Rule_graph.mode ->
+  table_mode:Octra_core.Rule_graph.mode ->
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   rpc_result Lwt.t
@@ -282,6 +284,7 @@ val with_object_member_auth :
 val program_info_public :
   ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   ?float_mode:Octra_core.Rule_graph.mode ->
+  table_mode:Octra_core.Rule_graph.mode ->
   Octra_core.Store_irmin.t ->
   circle_id:string ->
   rpc_result Lwt.t
@@ -289,6 +292,7 @@ val program_info_public :
 val program_info_public_params :
   ?snapshot:Octra_core.Store_irmin.read_snapshot ->
   ?float_mode:Octra_core.Rule_graph.mode ->
+  table_mode:Octra_core.Rule_graph.mode ->
   Octra_core.Store_irmin.t ->
   Yojson.Safe.t ->
   rpc_result Lwt.t

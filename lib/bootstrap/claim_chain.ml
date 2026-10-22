@@ -9,7 +9,7 @@ module M = State_sync_manifest
 module Tx = Octra_core.Transaction
 module H = Octra_core.Claim_history
 module Sum = Octra_core.Claim_sum
-module Admission = Octra_core.Pvac_migration_admission
+module Records = Octra_core.Pvac_migration_check
 module Replay = Octra_core.Pvac_legacy_public_replay
 module Epochs = Map.Make (Int)
 
@@ -93,6 +93,13 @@ let math value ~epoch =
   | Ok mode -> Ok (mode = R.Active)
   | Error fault -> Error (R.fault_message fault)
 
+let proof_key value ~epoch =
+  let* () = require (Epochs.mem epoch value.headers)
+    "history epoch is not authenticated" in
+  match R.proof_key value.rules ~epoch with
+  | Ok mode -> Ok (mode = R.Active)
+  | Error fault -> Error (R.fault_message fault)
+
 let pin value archive epoch =
   let* header = match Epochs.find_opt epoch value.headers with
     | Some header -> Ok header
@@ -110,14 +117,16 @@ let verify value store archive ~send_epoch ~claim_epoch ~send_index ~claim_index
     let* () = require (send_epoch > 0 && claim_epoch >= send_epoch)
       "history operation epochs invalid" in
     let* sender_math = math value ~epoch:send_epoch in
+    let* sender_keyed = proof_key value ~epoch:send_epoch in
     let* receiver_math = math value ~epoch:claim_epoch in
+    let* receiver_keyed = proof_key value ~epoch:claim_epoch in
     let read epoch =
       let* before = pin value archive (epoch - 1) in
       let* after = pin value archive epoch in
       A.read store archive ~before ~after ~max_txs in
     let* send = read send_epoch in
     let* claim = if send_epoch = claim_epoch then Ok send else read claim_epoch in
-    A.verify ~send ~claim ~send_index ~claim_index ~sender_math ~receiver_math
+    A.verify ~send ~claim ~send_index ~claim_index ~sender_keyed ~receiver_keyed ~sender_math ~receiver_math
   with exn -> Error ("history receipt read failed: " ^ Printexc.to_string exn)
 
 let total value store archive ~address ~first_epoch ~last_epoch ~max_txs ~max_records =
@@ -148,21 +157,25 @@ let total value store archive ~address ~first_epoch ~last_epoch ~max_txs ~max_re
       let* source = if source_epoch = epoch then Ok current else read source_epoch max_txs in
       let* send_index = A.find source hash in
       let* sender_math = math value ~epoch:source_epoch in
+      let* sender_keyed = proof_key value ~epoch:source_epoch in
       let* receiver_math = math value ~epoch in
+      let* receiver_keyed = proof_key value ~epoch in
       A.verify ~send:source ~claim:current ~send_index ~claim_index:index
-        ~sender_math ~receiver_math in
+        ~sender_keyed ~receiver_keyed ~sender_math ~receiver_math in
     let change current epoch (entry : H.entry) (tx : Tx.t) =
       if tx.from <> address && tx.to_ <> address then Ok Sum.Keep
       else match tx.op_type with
       | Tx.EncryptOp | Tx.DecryptOp ->
         let* math = math value ~epoch in
-        let* key = A.key current ~address ~index:entry.index ~math in
+        let* keyed = proof_key value ~epoch in
+        let* key = A.key current ~address ~index:entry.index ~keyed ~math in
         let* amount = H.amount ~op:tx.op_type entry key in
         Ok (if tx.op_type = Tx.EncryptOp then Sum.Deposit amount else Sum.Withdraw amount)
       | Tx.StealthOp ->
         let* () = require (tx.from = address) "history stealth sender differs" in
         let* math = math value ~epoch in
-        let* point = A.sent current ~index:entry.index ~math in
+        let* keyed = proof_key value ~epoch in
+        let* point = A.sent current ~index:entry.index ~keyed ~math in
         Ok (Sum.Send point)
       | Tx.ClaimOp ->
         let* receipt = credit current epoch entry.index in
@@ -198,14 +211,14 @@ let total value store archive ~address ~first_epoch ~last_epoch ~max_txs ~max_re
       (Int64.of_int sum.records = Int64.sub final.next_txid initial.next_txid)
       "history interval record count differs" in
     let* cipher = A.cipher_at store final address in
-    let source_cipher_hash = Admission.source_cipher_hash
+    let source_cipher_hash = Records.source_cipher_hash
       (Option.value ~default:"0" cipher) in
     Ok {chain_id = value.chain_id; config_hash = value.config_hash;
       address; first_epoch; last_epoch; state_root = final.state_root;
       source_cipher_hash; records; sum}
   with exn -> Error ("history interval read failed: " ^ Printexc.to_string exn)
 
-let admission (value : t) ~activation_epoch totals =
+let check (value : t) ~activation_epoch totals =
   let* first = match totals with
     | [] -> Error "history admission has no accounts"
     | first :: _ -> Ok first in
@@ -231,9 +244,9 @@ let admission (value : t) ~activation_epoch totals =
         effects = [];
         reason = "authenticated history requires commitment proof";
       } in
-      let entry = Admission.{address = item.address;
+      let entry = Records.{address = item.address;
         source_cipher_hash = item.source_cipher_hash; total = item.records; decision = audit} in
       entries (entry :: acc) rest in
   let* entries = entries [] totals in
-  Admission.create ~classifier:Admission.Receipt_v1 ~chain_id:value.chain_id
+  Records.create ~classifier:Records.Receipt_v1 ~chain_id:value.chain_id
     ~snapshot_epoch:first.last_epoch ~state_root ~activation_epoch entries

@@ -102,7 +102,11 @@ type deps = {
   now : unit -> float;
   require_sync : Sync_need.t -> unit;
   exit_error : unit -> unit;
+  exit_refused : unit -> unit;
 }
+
+val repair_set : ?policy:Octra_consensus.C_quorum_policy.t -> deps -> int64 ->
+  (Octra_consensus.C_types.validator_set, string) result
 
 val committed_reads :
   readable:(unit -> bool) ->
@@ -117,9 +121,12 @@ val enabled :
   int ->
   bool
 
-val run : deps -> unit
+val run : ?genesis:Genesis_start.t -> deps -> unit
+
+val root_replay : deps -> Sync_need.t -> (bool, string) result
 
 val sync_plan :
   head:int ->
+  limit:int ->
   Sync_mark.state ->
   (Sync_need.t option, string) result

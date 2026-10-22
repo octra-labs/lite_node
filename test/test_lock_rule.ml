@@ -528,7 +528,7 @@ let test_single_hash_cache () =
 
 let test_single_cache_miss () =
   let t = make_engine one_validator ~my_addr:"v0" in
-  let h_a = mk_header 0 in
+  let h_a = mk_header ~creator:"v0" 0 in
   let pid = C_hash.proposal_id h_a in
   C_engine.cache_proposal_header_only t pid h_a;
   t.state <- { t.state with
@@ -538,7 +538,7 @@ let test_single_cache_miss () =
     valid_value = Some h_a;
   };
   advance_to_round t 1;
-  let h_fresh = mk_header 5 in
+  let h_fresh = mk_header ~creator:"v0" 5 in
   C_engine.do_propose t h_fresh ["fresh"] ~sign_fn:dummy_sign;
   let outs = drain t in
   let send_propose =
@@ -548,7 +548,7 @@ let test_single_cache_miss () =
 
 let test_single_cache_hash () =
   let t = make_engine one_validator ~my_addr:"v0" in
-  let h_a = mk_header 0 in
+  let h_a = mk_header ~creator:"v0" 0 in
   let pid = C_hash.proposal_id h_a in
   let bogus_hashes = [String.make 32 '\x99'] in
   C_engine.cache_proposal_bundle
@@ -564,7 +564,7 @@ let test_single_cache_hash () =
     valid_value = Some h_a;
   };
   advance_to_round t 1;
-  let h_fresh = mk_header 5 in
+  let h_fresh = mk_header ~creator:"v0" 5 in
   C_engine.do_propose t h_fresh ["fresh"] ~sign_fn:dummy_sign;
   let outs = drain t in
   let send_propose =
@@ -996,7 +996,277 @@ let test_split_timer () =
   expire_step t;
   check_nil_step t
 
+let local_lock () =
+  let probe = make_engine four_validators in
+  let t = make_engine ~my_addr:(leader_addr probe 1) four_validators in
+  let header = { (mk_header ~creator:(leader_addr t 0) 4) with
+    tx_list_hash = C_engine.tx_list_hash_for_header [];
+  } in
+  ignore (lock_on_round_0 t header);
+  advance_to_round t 1;
+  t, header
+
+let test_local_prevote_lock nil_votes =
+  let t, header = local_lock () in
+  t.state <- {t.state with valid_round = -1; valid_value = None};
+  if nil_votes then
+    List.iter (nil_vote t) (List.filter ((<>) t.my_addr) four_validators);
+  let fresh = {header with creator_addr = t.my_addr;
+    proposed_state_root = String.make 32 'z'} in
+  C_engine.do_propose t fresh [] ~sign_fn:dummy_sign;
+  let outputs = drain t in
+  assert (Option.map (fun (v : C_types.vote) -> v.proposal_id)
+    (last_prevote outputs) = Some Octra_net.Hash_domain.nil_hash);
+  assert (t.state.locked_value = Some header && t.state.locked_round = 0);
+  assert (not (List.exists (function
+    | C_engine.SendVote (v, _) -> v.vote_type = C_types.Precommit
+      && not (Octra_net.Hash_domain.is_nil v.proposal_id)
+    | C_engine.SendFinalize _ | C_engine.Finalized _ -> true
+    | _ -> false) outputs))
+
+let test_pending_lock () =
+  let t, header = local_lock () in
+  let other = {header with proposed_state_root = String.make 32 'z'} in
+  let pid = C_hash.proposal_id other in
+  C_engine.cache_proposal_message t (mk_propose ~round:1 other);
+  t.pending_prevote <- Some (1L, 1, pid);
+  C_engine.on_ready t ~sign_fn:dummy_sign;
+  assert (Option.map (fun (v : C_types.vote) -> v.proposal_id)
+    (last_prevote (drain t)) = Some Octra_net.Hash_domain.nil_hash)
+
+let test_same_height_lock () =
+  let t, header = local_lock () in
+  C_engine.start_height t t.state.height;
+  assert (t.state.locked_value = Some header && t.state.locked_round = 0);
+  assert (t.state.valid_value = Some header && t.state.valid_round >= 0);
+  assert (t.state.round >= 1);
+  assert (C_engine.polc_matches t ~round:0 ~proposal_id:(C_hash.proposal_id header));
+  assert (Hashtbl.length t.prevotes.votes = 0);
+  assert (Hashtbl.length t.precommits.votes = 0);
+  assert (C_engine.find_tx_hashes t (C_hash.proposal_id header) = Some []);
+  C_engine.start_height t 2L;
+  assert (t.state.locked_round = -1 && t.state.valid_round = -1)
+
+let test_same_height_polc () =
+  let t, header = local_lock () in
+  let other = {header with creator_addr = leader_addr t 1;
+    proposed_state_root = String.make 32 'z'} in
+  let pid = C_hash.proposal_id other in
+  C_engine.cache_proposal_message t
+    (mk_propose ~round:1 ~proposer:(leader_addr t 1) other);
+  C_engine.start_round t 2;
+  drain_clear t;
+  List.iter (fun addr -> C_engine.on_vote t
+    (mk_vote ~round:1 C_types.Prevote pid addr) ~sign_fn:dummy_sign)
+    (List.filter ((<>) t.my_addr) four_validators);
+  assert (C_engine.polc_matches t ~round:1 ~proposal_id:pid);
+  C_engine.start_height t t.state.height;
+  assert (C_engine.polc_matches t ~round:1 ~proposal_id:pid);
+  assert (List.length (C_engine.polc_votes_for_round t 1) = 3);
+  let proposal = mk_propose ~round:t.state.round ~valid_round:(Some 1)
+    ~proposer:(leader_addr t t.state.round) other in
+  C_engine.on_propose t proposal ~verify_fn:always_true ~execute_fn:always_exec
+    ~sign_fn:dummy_sign;
+  assert (Option.map (fun (v : C_types.vote) -> v.proposal_id)
+    (last_prevote (drain t)) = Some pid)
+
+let test_old_polc_gate () =
+  let module P = Octra_consensus.C_quorum_policy in
+  let chain = "octra-devnet-9871-cluster" in
+  let activation = Option.get (P.linear_epoch ~chain_id:chain) in
+  List.iter (fun epoch ->
+    let original = make_engine four_validators in
+    let node = C_engine.create ~chain_id:chain ~my_addr:"v0"
+      ~validator_set:original.vs ~start_height:epoch ~can_vote:(fun () -> true) in
+    let header = mk_header ~chain_id:chain ~epoch_id:epoch 9 in
+    let pid = C_hash.proposal_id header in
+    node.state <- {node.state with round = 100};
+    Hashtbl.replace node.polc_by_round 0 pid;
+    C_engine.record_historical_prevote node (mk_vote ~chain_id:chain ~epoch_id:epoch
+      C_types.Prevote pid "v1");
+    assert (C_engine.historical_prevote_known node ~round:0 ~validator:"v1"
+      = (epoch >= activation));
+    C_engine.record_historical_prevote node (mk_vote ~chain_id:chain ~epoch_id:epoch
+      C_types.Prevote (String.make 32 'x') "v2");
+    assert (not (C_engine.historical_prevote_known node ~round:0 ~validator:"v2"));
+    C_engine.record_historical_prevote node (mk_vote ~chain_id:chain ~epoch_id:epoch
+      ~round:99 C_types.Prevote pid "v2");
+    assert (C_engine.historical_prevote_known node ~round:99 ~validator:"v2")
+  ) [Int64.pred activation; activation; Int64.succ activation]
+
+let test_same_height_vote () =
+  let t = make_engine four_validators in
+  expire_step t;
+  assert (Hashtbl.mem t.prevotes.votes t.my_addr);
+  C_engine.start_height t 1L;
+  assert (t.state.round > 0);
+  assert (t.state.locked_round = -1)
+
+let test_set_projects_votes remove_voter =
+  let t, header = local_lock () in
+  let pid = C_hash.proposal_id header in
+  let votes = C_engine.polc_votes_for_round t 0 in
+  let voted = List.map (fun (vote : C_types.vote) -> vote.validator) votes in
+  let removed = if remove_voter then
+    List.find (fun addr -> addr <> t.my_addr) voted
+  else List.find (fun addr -> not (List.mem addr voted)) four_validators in
+  let next = mk_vs (List.filter ((<>) removed) four_validators) in
+  C_engine.replace_validator_set t next;
+  assert (t.prevotes == Hashtbl.find t.prevotes_by_round t.state.round);
+  assert (t.precommits == Hashtbl.find t.precommits_by_round t.state.round);
+  assert (not (Hashtbl.mem t.prevotes.votes removed));
+  assert (not (Hashtbl.mem t.precommits.votes removed));
+  C_engine.start_height t t.state.height;
+  assert (C_engine.polc_matches t ~round:0 ~proposal_id:pid = not remove_voter);
+  assert (t.state.locked_value = Some header);
+  assert (t.state.valid_round >= t.state.locked_round)
+
+let test_valid_lock_floor () =
+  let t, header = local_lock () in
+  t.state <- {t.state with valid_round = -1; valid_value = None};
+  let other = {header with proposed_state_root = String.make 32 'z'} in
+  let pid = C_hash.proposal_id other in
+  C_engine.cache_proposal_header_only t pid other;
+  C_engine.promote_known_header t 0 pid;
+  assert (t.state.valid_value <> Some other)
+
+let test_relief_floor remove_creator =
+  let chain = "octra-devnet-9871-cluster" in
+  let height = 1_600_000L in
+  let entries = List.init 7 (fun i ->
+    C_types.{address = "member" ^ string_of_int i;
+      pubkey = String.make 32 (Char.chr (i + 1))}, Z.one) in
+  let full = Result.get_ok (C_types.make_weighted_validator_set entries) in
+  let creator = (C_types.leader_of full ~epoch_id:height ~round:0).address in
+  let removed = if remove_creator then creator else
+    (List.find (fun (v, _) -> v.C_types.address <> creator) entries |> fst).address in
+  let next = Result.get_ok (C_types.make_weighted_validator_set
+    (List.filter (fun (v, _) -> v.C_types.address <> removed) entries)) in
+  assert (full.n = 7 && next.n = 6 && full.quorum = 5 && next.quorum = 5);
+  let my_addr = (C_types.leader_of next ~epoch_id:height ~round:64).address in
+  let t = C_engine.create ~chain_id:chain ~my_addr ~validator_set:full
+    ~start_height:height ~can_vote:(fun () -> true) in
+  let header = { (mk_header ~chain_id:chain ~epoch_id:height ~creator 4) with
+    tx_list_hash = C_engine.tx_list_hash_for_header [];
+  } in
+  C_engine.on_propose t (mk_propose ~chain_id:chain ~epoch_id:height
+    ~proposer:creator header) ~verify_fn:always_true ~execute_fn:always_exec
+    ~sign_fn:dummy_sign;
+  let pid = C_hash.proposal_id header in
+  let voters = my_addr :: removed ::
+    (List.map (fun (v, _) -> v.C_types.address) entries
+      |> List.filter (fun addr -> addr <> my_addr && addr <> removed)
+      |> List.filteri (fun i _ -> i < 3)) in
+  List.iter (fun addr -> C_engine.on_vote t
+    (mk_vote ~chain_id:chain ~epoch_id:height C_types.Prevote pid addr)
+    ~sign_fn:dummy_sign) voters;
+  assert (t.state.locked_round = 0);
+  C_engine.reconfigure_validator_set t ~round:64 next;
+  assert (not (Hashtbl.mem t.polc_by_round 0));
+  assert (t.state.valid_round = 0 && t.state.valid_value = Some header);
+  drain_clear t;
+  let fresh = {header with creator_addr = my_addr;
+    proposed_state_root = String.make 32 'z'} in
+  C_engine.do_propose t fresh [] ~sign_fn:dummy_sign;
+  let outputs = drain t in
+  let sent = List.find_map (function
+    | C_engine.SendPropose proposal -> Some proposal
+    | _ -> None) outputs |> Option.get in
+  assert (C_types.proposal_is_well_formed ~chain_id:chain ~validator_set:next sent);
+  assert (Option.map (fun (v : C_types.vote) -> v.proposal_id)
+    (last_prevote outputs) = Some (if remove_creator then
+      Octra_net.Hash_domain.nil_hash else pid))
+
+let test_finalize_valid_floor () =
+  let t, header = local_lock () in
+  t.state <- {t.state with locked_round = 4; valid_round = 4};
+  assert (C_engine.accept_finalize_batch t (mk_finalize header));
+  assert (t.state.valid_round = t.state.locked_round)
+
+let test_lock_group reset remove_creator =
+  let chain = "octra-devnet-9871-cluster" in
+  let height = 1_600_000L in
+  let entries = List.init 7 (fun i ->
+    C_types.{address = "member" ^ string_of_int i;
+      pubkey = String.make 32 (Char.chr (i + 1))}, Z.one) in
+  let full = Result.get_ok (C_types.make_weighted_validator_set entries) in
+  let creator = (C_types.leader_of full ~epoch_id:height ~round:0).address in
+  let removed = if remove_creator then creator else
+    (List.find (fun (v, _) -> v.C_types.address <> creator) entries |> fst).address in
+  let next = if reset then full else
+    Result.get_ok (C_types.make_weighted_validator_set
+      (List.filter (fun (v, _) -> v.C_types.address <> removed) entries)) in
+  let nodes = List.map (fun (member, _) ->
+    C_engine.create ~chain_id:chain ~my_addr:member.C_types.address
+      ~validator_set:full ~start_height:height ~can_vote:(fun () -> true)) entries in
+  let header = { (mk_header ~chain_id:chain ~epoch_id:height ~creator 4) with
+    tx_list_hash = C_engine.tx_list_hash_for_header [];
+  } in
+  let pid = C_hash.proposal_id header in
+  let proposal = mk_propose ~chain_id:chain ~epoch_id:height ~proposer:creator header in
+  let votes = List.map (fun node ->
+    C_engine.on_propose node proposal ~verify_fn:always_true ~execute_fn:always_exec
+      ~sign_fn:dummy_sign;
+    Option.get (last_prevote (drain node))) nodes in
+  let selected = List.find (fun (v : C_types.vote) -> v.validator = removed) votes ::
+    (List.filter (fun (v : C_types.vote) -> v.validator <> removed) votes
+      |> List.filteri (fun i _ -> i < 4)) in
+  List.iter (fun node ->
+    List.iter (fun vote -> C_engine.on_vote node vote ~sign_fn:dummy_sign) selected;
+    assert (node.C_engine.state.locked_value = Some header);
+    drain_clear node;
+    if reset then C_engine.start_height node height
+    else C_engine.reconfigure_validator_set node ~round:64 next;
+    C_engine.start_round node 64;
+    drain_clear node) nodes;
+  let active = List.filter (fun node -> C_types.is_validator next node.C_engine.my_addr) nodes in
+  let leader = (C_types.leader_of next ~epoch_id:height ~round:64).address in
+  let sender = List.find (fun node -> node.C_engine.my_addr = leader) active in
+  let fresh = {header with creator_addr = leader; proposed_state_root = String.make 32 'z'} in
+  C_engine.do_propose sender fresh [] ~sign_fn:dummy_sign;
+  let finals = ref [] in
+  let rec deliver fuel outputs =
+    assert (fuel > 0);
+    List.iter (function
+      | C_engine.SendPropose sent ->
+        assert (C_types.proposal_is_well_formed ~chain_id:chain ~validator_set:next sent);
+        List.iter (fun node -> if node.C_engine.my_addr <> sent.proposer then
+          C_engine.on_propose node sent ~verify_fn:always_true ~execute_fn:always_exec
+            ~sign_fn:dummy_sign) active
+      | C_engine.SendVote (vote, _) ->
+        assert (Octra_net.Hash_domain.is_nil vote.proposal_id || vote.proposal_id = pid);
+        List.iter (fun node -> C_engine.on_vote node vote ~sign_fn:dummy_sign) active
+      | C_engine.Finalized {finalize; _} -> finals := finalize.proposal_id :: !finals
+      | _ -> ()) outputs;
+    let more = List.concat_map (fun node ->
+      drain node |> List.filter (function
+        | C_engine.Finalized {finalize; _} ->
+          finals := finalize.proposal_id :: !finals; false
+        | C_engine.SendPropose _ | C_engine.SendVote _ -> true
+        | _ -> false)) active in
+    if more <> [] then deliver (fuel - 1) more in
+  deliver 100 (drain sender);
+  if reset || not remove_creator then assert (List.mem pid !finals)
+  else assert (!finals = []);
+  assert (List.for_all (fun done_ -> done_ = pid) !finals)
+
 let () =
+  test_local_prevote_lock false;
+  test_local_prevote_lock true;
+  test_pending_lock ();
+  test_same_height_lock ();
+  test_same_height_polc ();
+  test_old_polc_gate ();
+  test_same_height_vote ();
+  test_set_projects_votes false;
+  test_set_projects_votes true;
+  test_valid_lock_floor ();
+  test_relief_floor false;
+  test_relief_floor true;
+  test_finalize_valid_floor ();
+  test_lock_group true false;
+  test_lock_group false false;
+  test_lock_group false true;
   test_nil_votes ();
   test_nil_lock ();
   test_nil_resume false;

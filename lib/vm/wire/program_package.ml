@@ -14,7 +14,10 @@ type compiled = {
 
 type admitted = {
   envelope : string;
-  program : Admission.t;
+  program : Code_check.t;
+  main : string;
+  sources : source list;
+  result : Oct_compile.compile_result;
 }
 
 type compiler = Protocol | Source | Preview
@@ -55,7 +58,7 @@ type error =
   | Compile_failed of string
   | Envelope_missing
   | Envelope_mismatch
-  | Admission_failed of string
+  | Check_failed of string
 
 let error_message = function
   | Invalid_encoding -> "invalid Program package encoding"
@@ -77,7 +80,7 @@ let error_message = function
   | Compile_failed reason -> "Program compile failed: " ^ reason
   | Envelope_missing -> "Program envelope missing"
   | Envelope_mismatch -> "Program source and envelope mismatch"
-  | Admission_failed reason -> "Program admission failed: " ^ reason
+  | Check_failed reason -> "Program admission failed: " ^ reason
 
 let magic = "OCPS"
 let wire_version = 1
@@ -234,7 +237,7 @@ let decode raw =
             match Program_envelope.decode envelope with
             | Error error ->
               Error
-                (Admission_failed
+                (Check_failed
                    (Program_envelope.error_message error))
             | Ok _ ->
               Ok {
@@ -297,16 +300,24 @@ let build_with ~point_ops compile package =
     | Some source -> Error (Unused_source source.path)
     | None ->
       bind
-        (match Admission.decode_program_source ~point_ops envelope with
+        (match Code_check.decode_program_source ~point_ops envelope with
          | Ok admitted -> Ok admitted
          | Error error ->
-           Error (Admission_failed (Admission.error_message error)))
+           Error (Check_failed (Code_check.error_message error)))
         (fun _ ->
           bind (encode { package with envelope }) (fun encoded ->
             Ok { package = encoded; envelope; result }))
 
-let build ~loops ~compiler ~point_ops package =
-  build_with ~point_ops (compile_sources ~loops ~compiler ~point_ops) package
+let build ?(consts = false) ~loops ~compiler ~point_ops package =
+  let checked = if not consts then Ok () else
+    List.fold_left (fun result source ->
+      Result.bind result (fun () ->
+        try Oct_scope.check_consts (Oct_parse.parse source.body) with
+        | Oct_lex.LexError (reason, line, _) | Oct_parse.ParseError (reason, line, _) ->
+          Error (Printf.sprintf "line %d: %s" line reason))) (Ok ()) package.sources
+    |> Result.map_error (fun reason -> Compile_failed reason) in
+  bind checked (fun () ->
+    build_with ~point_ops (compile_sources ~loops ~compiler ~point_ops) package)
 
 let compile_at ~loops ~compiler ~point_ops ~main ~sources =
   if compiler <> Protocol && not point_ops then Error Bad_compiler_profile
@@ -336,34 +347,38 @@ let compile ~main ~sources =
 let validate_base64 encoded =
   bind (decode_base64 encoded) (fun _ -> Ok ())
 
-let admit_base64 ?(compiler = Protocol) ?(point_ops = false) ?(loops = false) encoded =
+let admit_base64 ?(compiler = Protocol) ?(point_ops = false) ?(loops = false)
+    ?(consts = false) encoded =
   if compiler <> Protocol && not point_ops then Error Bad_compiler_profile
   else
   bind (decode_base64 encoded) (fun package ->
-    let built = build ~loops ~compiler ~point_ops { package with envelope = "" } in
+    let built = build ~consts ~loops ~compiler ~point_ops { package with envelope = "" } in
     let built = match compiler, built with
       | Preview, Ok compiled when String.equal compiled.envelope package.envelope -> built
-      | Preview, _ -> build ~loops ~compiler:Source ~point_ops { package with envelope = "" }
+      | Preview, _ -> build ~consts ~loops ~compiler:Source ~point_ops { package with envelope = "" }
       | Protocol, _ | Source, _ -> built
     in
     bind built (fun compiled ->
       if not (String.equal compiled.envelope package.envelope) then
         Error Envelope_mismatch
       else
-        match Admission.decode_program_source ~point_ops package.envelope with
+        match Code_check.decode_program_source ~point_ops package.envelope with
         | Error error ->
-          Error (Admission_failed (Admission.error_message error))
+          Error (Check_failed (Code_check.error_message error))
         | Ok admitted ->
           Ok {
             envelope = package.envelope;
             program = admitted;
+            main = package.main;
+            sources = package.sources;
+            result = compiled.result;
           }))
 
-let admit_transition ?(loops = false) ~point_ops encoded =
+let admit_transition ?(loops = false) ?(consts = false) ~point_ops encoded =
   if not point_ops then Error Bad_compiler_profile else
-  match admit_base64 ~compiler:Source ~point_ops ~loops encoded with
+  match admit_base64 ~compiler:Source ~point_ops ~loops ~consts encoded with
   | Ok admitted -> Ok admitted
   | Error source_error ->
-    match admit_base64 ~compiler:Protocol ~point_ops ~loops encoded with
+    match admit_base64 ~compiler:Protocol ~point_ops ~loops ~consts encoded with
     | Ok admitted -> Ok admitted
     | Error _ -> Error source_error

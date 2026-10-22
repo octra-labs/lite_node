@@ -89,6 +89,71 @@ Proof.
   apply Nat.eqb_eq in result. subst. reflexivity.
 Qed.
 
+Module AnchorCache.
+
+Definition sound (saved : list (nat * nat)) (roots : nat -> option nat) : Prop :=
+  forall epoch expected, In (epoch, expected) saved -> roots epoch = Some expected.
+
+Definition check (saved : list (nat * nat)) (roots : nat -> option nat)
+  (epoch expected : nat) : option (list (nat * nat)) :=
+  if existsb (fun pair => Nat.eqb (fst pair) epoch && Nat.eqb (snd pair) expected) saved
+  then Some saved
+  else match roots epoch with
+    | Some actual => if Nat.eqb actual expected then Some ((epoch, expected) :: saved) else None
+    | None => None
+    end.
+
+Lemma hit : forall saved epoch expected,
+  existsb (fun pair => Nat.eqb (fst pair) epoch && Nat.eqb (snd pair) expected) saved = true ->
+  In (epoch, expected) saved.
+Proof.
+  intros saved epoch expected found.
+  apply existsb_exists in found as [pair [member same]].
+  apply andb_true_iff in same as [left right].
+  apply Nat.eqb_eq in left. apply Nat.eqb_eq in right.
+  destruct pair as [seen root]. simpl in *. subst. exact member.
+Qed.
+
+Lemma accepted : forall saved roots epoch expected next,
+  sound saved roots -> check saved roots epoch expected = Some next ->
+  roots epoch = Some expected /\ sound next roots.
+Proof.
+  intros saved roots epoch expected next valid accepted.
+  unfold check in accepted.
+  destruct (existsb (fun pair => Nat.eqb (fst pair) epoch && Nat.eqb (snd pair) expected) saved)
+    eqn:found.
+  - inversion accepted; subst. split.
+    + apply valid. now apply hit.
+    + exact valid.
+  - destruct (roots epoch) as [actual|] eqn:read; try discriminate.
+    destruct (Nat.eqb actual expected) eqn:equal; try discriminate.
+    apply Nat.eqb_eq in equal. subst actual.
+    inversion accepted; subst. split; [reflexivity|].
+    intros epoch' expected' member. simpl in member.
+    destruct member as [same|member].
+    + inversion same; subst. exact read.
+    + now apply valid.
+Qed.
+
+Lemma refused : forall saved roots epoch expected,
+  sound saved roots -> roots epoch <> Some expected ->
+  check saved roots epoch expected = None.
+Proof.
+  intros saved roots epoch expected valid different.
+  unfold check.
+  destruct (existsb (fun pair => Nat.eqb (fst pair) epoch && Nat.eqb (snd pair) expected) saved)
+    eqn:found.
+  - exfalso. apply different. apply valid. now apply hit.
+  - destruct (roots epoch) as [actual|] eqn:read; auto.
+    destruct (Nat.eqb actual expected) eqn:equal; auto.
+    apply Nat.eqb_eq in equal. subst. contradiction.
+Qed.
+
+Print Assumptions accepted.
+Print Assumptions refused.
+
+End AnchorCache.
+
 Module Program.
 
 Definition select {A : Type} (p : option plan) (epoch : nat)

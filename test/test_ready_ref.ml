@@ -34,7 +34,7 @@ let parent = C.{
 
 let state = List.fold_left (fun state epoch ->
   F.note_final F.participating ~at:(Int64.succ epoch) ~active:[] ~signers:[]
-    ~final:F.{epoch; proposal_id = proposal; set_hash = String.make 32 's'} state
+    ~final:F.{epoch; proposal_id = proposal; set_hash = String.make 32 's'; round = None} state
   |> Result.get_ok) F.empty [Int64.sub head 2L; Int64.pred head]
 
 let env lag lookup = X.{

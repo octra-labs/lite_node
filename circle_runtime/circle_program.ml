@@ -25,7 +25,7 @@ type descriptor = {
 
 type octb = {
   bytecode : Octra_vm.Contract_vm.instr array;
-  profile : Octra_vm.Admission.profile;
+  profile : Octra_vm.Code_check.profile;
 }
 
 type code =
@@ -57,6 +57,7 @@ let loaded_cache_limit = 64
 
 let loaded_cache_key ?(float_mode=Octra_core.Rule_graph.Prior)
     ?(inspect_mode = Octra_core.Rule_graph.Prior)
+    ~table_mode
     ?(manifest_profile=Octra_core.Circle_wasm_host.Manifest) circle_id
     (info : Octra_core.Circles.circle_info) =
   String.concat ":" [
@@ -64,9 +65,13 @@ let loaded_cache_key ?(float_mode=Octra_core.Rule_graph.Prior)
     Octra_core.Circle_wasm_host.profile_name manifest_profile;
     string_of_bool (Octra_core.Circle_wasm_host.float_enabled float_mode);
   ]
-  |> fun key -> match inspect_mode with
+  |> fun key ->
+    let key = match inspect_mode with
+      | Octra_core.Rule_graph.Prior -> key
+      | Octra_core.Rule_graph.Active -> key ^ ":inspect" in
+    match table_mode with
     | Octra_core.Rule_graph.Prior -> key
-    | Octra_core.Rule_graph.Active -> key ^ ":inspect"
+    | Octra_core.Rule_graph.Active -> key ^ ":table"
 
 let prune_loaded_cache () =
   let now = Unix.gettimeofday () in
@@ -83,15 +88,15 @@ let prune_loaded_cache () =
 let decode_bytecode ?(trusted = []) ?(point_ops = false) code_b64 =
   try
     match
-      Octra_vm.Admission.decode_deploy
+      Octra_vm.Code_check.decode_deploy
         ~trusted ~point_ops (Base64.decode_exn code_b64)
     with
     | Ok admitted ->
       Ok {
-        bytecode = Octra_vm.Admission.code admitted;
-        profile = Octra_vm.Admission.profile admitted;
+        bytecode = Octra_vm.Code_check.code admitted;
+        profile = Octra_vm.Code_check.profile admitted;
       }
-    | Error e -> Error (Octra_vm.Admission.error_message e)
+    | Error e -> Error (Octra_vm.Code_check.error_message e)
   with
   | (Stack_overflow | Out_of_memory) as error -> raise error
   | e -> Error (Printexc.to_string e)
@@ -100,13 +105,13 @@ let decode_descriptor_bytecode code_b64 =
   try
     let raw = Base64.decode_exn code_b64 in
     if Octra_vm.Program_envelope.is_program raw then
-      match Octra_vm.Admission.decode_program_source ~point_ops:true raw with
+      match Octra_vm.Code_check.decode_program_source ~point_ops:true raw with
       | Ok admitted ->
         Ok {
-          bytecode = Octra_vm.Admission.code admitted;
-          profile = Octra_vm.Admission.profile admitted;
+          bytecode = Octra_vm.Code_check.code admitted;
+          profile = Octra_vm.Code_check.profile admitted;
         }
-      | Error e -> Error (Octra_vm.Admission.error_message e)
+      | Error e -> Error (Octra_vm.Code_check.error_message e)
     else
       decode_bytecode ~point_ops:true code_b64
   with
@@ -237,6 +242,7 @@ let describe
     ?(manifest_profile = Octra_core.Circle_wasm_host.Manifest)
     ?(float_mode = Octra_core.Rule_graph.Prior)
     ?(inspect_mode = Octra_core.Rule_graph.Prior)
+    ~table_mode
     store
     circle_id =
   let* info_opt = Octra_core.Store_irmin.get_circle_info ?snapshot store circle_id in
@@ -288,6 +294,7 @@ let describe
                     ~execution_profile:manifest_profile
                     ~float_mode
                     ~inspect_mode
+                    ~table_mode
                     code_b64 in
                 begin
                   match wasm_descriptor_result with
@@ -328,6 +335,7 @@ let load
     ?(manifest_profile = Octra_core.Circle_wasm_host.Manifest)
     ?(float_mode = Octra_core.Rule_graph.Prior)
     ?(inspect_mode = Octra_core.Rule_graph.Prior)
+    ~table_mode
     store
     circle_id =
   let* info_opt = Octra_core.Store_irmin.get_circle_info ?snapshot store circle_id in
@@ -337,7 +345,7 @@ let load
       (Error (Octra_core.Circle_wasm_host.Rejected "circle not found"))
   | Some info ->
     prune_loaded_cache ();
-    let cache_key = loaded_cache_key ~float_mode ~inspect_mode ~manifest_profile circle_id info in
+    let cache_key = loaded_cache_key ~float_mode ~inspect_mode ~table_mode ~manifest_profile circle_id info in
     begin
       match Hashtbl.find_opt loaded_cache cache_key with
       | Some entry ->
@@ -390,6 +398,7 @@ let load
                     ~execution_profile:manifest_profile
                     ~float_mode
                     ~inspect_mode
+                    ~table_mode
                     code_b64 in
                 begin
                   match wasm_descriptor_result with

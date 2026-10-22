@@ -5,13 +5,15 @@ import argparse
 import json
 import os
 import re
+import signal
 import stat
+import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 import validator_config
 
 from validator_common import ValidatorError
-from validator_common import copy_private
 from validator_common import load_network
 from validator_common import load_wallet
 from validator_common import parse_env
@@ -21,17 +23,41 @@ from validator_common import state_ready
 from validator_common import state_sync_sources
 from validator_common import validate_checkpoint
 from validator_common import validate_network_binding
+from validator_common import write_private_json
 from validator_config import sync_snapshot
 from validator_process import active_data_owners
 from validator_process import data_pids
 from validator_process import pm2_entries
 from sync_need import MAX_BYTES as NEED_BYTES
 from sync_need import choose
+from sync_need import carry_guard
 from sync_need import decode
-from validator_exit import command_lock, restore_control
+from sync_need import history_limit, snapshot_lag
+from sync_tip import sync_head, sync_issue
+from validator_exit import command_lock, read_outbox
+
+PLAN_SCHEMA = "octra_upgrade_sync"
 
 def emit(**fields):
     print(" ".join(f"{key} = {value}" for key, value in fields.items()))
+
+@contextmanager
+def interrupts():
+    signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    saved = {item: signal.getsignal(item) for item in signals}
+
+    def stop(number, _frame):
+        for item in signals:
+            signal.signal(item, signal.SIG_IGN)
+        raise ValidatorError(f"recovery interrupted signal = {number}")
+
+    try:
+        for item in signals:
+            signal.signal(item, stop)
+        yield
+    finally:
+        for item, handler in saved.items():
+            signal.signal(item, handler)
 
 def positive_int(values, key):
     try:
@@ -110,13 +136,19 @@ def read_need(data_path, chain):
         return marked
     return read_marker(data_path / "recovery/sync_need.json", chain)
 
-def preserve_state(identity_path, data_path, head):
-    data_wallet = data_path / "wallet.json"
-    if load_wallet(identity_path) != load_wallet(data_wallet):
-        raise ValidatorError("operator identity and state wallet mismatch")
-    preserved = free_state_path(data_path, "prior", head["epoch"])
-    move_state(data_path, preserved)
-    return preserved
+def read_plan(config, values):
+    path = Path(config).with_name(Path(config).name + ".sync.json")
+    record = read_outbox(path)
+    if record is None:
+        return None
+    data = str(Path(values["OCTRA_DATA_DIR"]).expanduser().resolve())
+    if (set(record) != {"schema", "data_dir", "need"}
+            or record["schema"] != PLAN_SCHEMA or record["data_dir"] != data):
+        raise ValidatorError("upgrade recovery plan identity differs")
+    plan = need_of(record["need"], values["OCTRA_CHAIN_ID"])
+    if plan.cause != "range":
+        raise ValidatorError("upgrade recovery plan cause differs")
+    return plan
 
 def restore_preserved_state(data_path, preserved):
     if os.path.lexists(data_path):
@@ -180,9 +212,11 @@ def restore_prior(config, values, prior):
              rejected = rejected or "none")
 
 def recover(config, replace_state = False, plan = None, min_epoch = None, prior = None):
+    if min_epoch is not None and (type(min_epoch) is not int or min_epoch < 0):
+        raise ValidatorError("minimum snapshot epoch is invalid")
     private_mode(config)
     values = parse_env(config)
-    with command_lock(values):
+    with interrupts(), command_lock(values):
         if prior is not None:
             if replace_state or plan is not None or min_epoch is not None:
                 raise ValidatorError("preserved restore cannot replace a snapshot")
@@ -194,7 +228,10 @@ def recover_state(config, values, replace_state, plan, min_epoch):
     data_ref = Path(values["OCTRA_DATA_DIR"]).expanduser()
     data_path = data_ref.resolve()
     marked = read_need(data_path, values["OCTRA_CHAIN_ID"])
-    need = choose(marked, plan, values["OCTRA_CHAIN_ID"])
+    saved = read_plan(config, values)
+    if saved is not None and (plan is None or (
+            plan.cause == "range" and saved.target > plan.target)):
+        plan = saved
     ready = state_ready(data_path)
     if ready:
         wallet = data_path / "wallet.json"
@@ -208,14 +245,41 @@ def recover_state(config, values, replace_state, plan, min_epoch):
         if ready
         else None
     )
+    if (ready and plan is not None and plan.cause == "range"
+            and plan.target - head["epoch"] <= history_limit(values)):
+        plan = None
+    need = choose(marked, plan, values["OCTRA_CHAIN_ID"])
+    pending = read_marker(data_path / "recovery/sync_need.json", values["OCTRA_CHAIN_ID"])
+    guard = carry_guard(pending, plan, values["OCTRA_CHAIN_ID"], saved = saved)
+    if ready and not replace_state and min_epoch is not None and head["epoch"] < min_epoch:
+        raise ValidatorError("state is below requested epoch; use --replace-state")
+    held = ready and need is not None and (need.cause == "conflict"
+        or (need.cause in ("root", "range") and (head["epoch"] < need.epoch
+            or (need.target is not None and need.target - head["epoch"] > history_limit(values))))
+        or head["epoch"] < need.head)
+    tip = sync_head(values) if held or replace_state or not ready else None
+    floor = max(int(values.get("OCTRA_CHECKPOINT_EPOCH", "0")), min_epoch or 0)
+    if need is not None:
+        floor = max(floor, need.epoch, (need.target or 0) - snapshot_lag(values))
+    if guard is not None:
+        floor = max(floor, guard.epoch, (guard.target or 0) - snapshot_lag(values))
+    if plan is not None and plan.target is not None:
+        floor = max(floor, plan.target - snapshot_lag(values))
+    if head is not None:
+        floor = max(floor, head["epoch"] + 1)
+    if tip is not None and tip["head"] is not None:
+        floor = max(floor, tip["head"] - snapshot_lag(values))
     if ready and need is not None and not replace_state:
-        held = need.cause == "conflict" or head["epoch"] < need.head
+        action = "start_observer"
+        if held:
+            issue = sync_issue(tip, floor)
+            action = issue or f"recover.sh --replace-state --min-epoch {floor}"
         emit(
             event="recovery",
             status="held" if held else "verify",
             cause=need.cause,
             epoch=need.epoch,
-            action="signed_snapshot_required" if held else "start_observer",
+            action = action,
         )
         return
     if ready and not replace_state:
@@ -230,7 +294,7 @@ def recover_state(config, values, replace_state, plan, min_epoch):
         raise ValidatorError("preserved state requires recovery with --prior")
     require_idle([data_ref, data_path])
     if not ready:
-        identity_path, _ = validator_config.operator_wallet(config)
+        identity_path, identity = validator_config.operator_wallet(config)
     bundle = Path(values["OCTRA_OPERATOR_NETWORK_BUNDLE"])
     _, _, network = load_network(
         bundle,
@@ -244,15 +308,13 @@ def recover_state(config, values, replace_state, plan, min_epoch):
         raise ValidatorError("state sync client hash mismatch")
     stage = Path(values["OCTRA_OPERATOR_SYNC_STAGE"])
     sources = state_sync_sources(values["OCTRA_STATE_SYNC_SOURCES"])
-    floor = int(values["OCTRA_CHECKPOINT_EPOCH"])
-    if need is not None:
-        floor = max(floor, need.epoch)
-    if min_epoch is not None:
-        floor = max(floor, int(min_epoch))
-    preserved = None
-    if ready:
-        preserved = preserve_state(identity_path, data_path, head)
+    issue = sync_issue(tip, floor)
+    if issue is not None:
+        raise ValidatorError(issue)
+    preserved = free_state_path(data_path, "prior", head["epoch"]) if ready else None
     try:
+        if preserved is not None:
+            move_state(data_path, preserved)
         sync_snapshot(
             sync_binary,
             stage,
@@ -262,17 +324,17 @@ def recover_state(config, values, replace_state, plan, min_epoch):
             positive_int(values, "OCTRA_OPERATOR_SYNC_CONCURRENCY"),
             positive_int(values, "OCTRA_OPERATOR_SYNC_SOURCE_CONCURRENCY"),
             min_epoch=floor,
+            guard = guard,
+            prior = preserved,
+            identity = (identity_path, identity),
         )
         head = validate_checkpoint(data_path, values, allow_progress=True)
-        if need is not None and head["epoch"] < need.epoch:
+        if head["epoch"] < floor:
             raise ValidatorError("signed snapshot is below recovery boundary")
-        if os.path.lexists(data_path / "validator-control"):
-            raise ValidatorError("snapshot contains validator control state")
-        if preserved is not None:
-            restore_control(preserved, data_path)
-        copy_private(identity_path, data_path / "wallet.json")
-    except Exception:
-        if preserved is not None:
+        if load_wallet(data_path / "wallet.json") != identity:
+            raise ValidatorError("installed state identity differs")
+    except BaseException:
+        if preserved is not None and os.path.lexists(preserved):
             rejected = rollback_state(data_path, preserved, head["epoch"])
             emit(
                 event="recovery",
@@ -294,12 +356,14 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--replace-state", action="store_true")
     parser.add_argument("--prior")
+    parser.add_argument("--min-epoch", type = int)
     args = parser.parse_args()
-    recover(args.config, replace_state = args.replace_state, prior = args.prior)
+    recover(args.config, replace_state = args.replace_state, prior = args.prior,
+        min_epoch = args.min_epoch)
 
 if __name__ == "__main__":
     try:
         main()
-    except (KeyError, OSError, ValidatorError) as error:
+    except (KeyError, OSError, subprocess.CalledProcessError, ValidatorError) as error:
         emit(status="refused", reason=str(error))
         sys.exit(1)

@@ -47,6 +47,7 @@ type t = {
   ready_exec_activation : activation option;
   program_source_activation : activation option;
   root_at : int -> root_read;
+  verified : (int * string) list ref;
 }
 
 let devnet_chain_id = "octra-devnet-9871-cluster"
@@ -263,6 +264,19 @@ let cipher_activation_for_chain = vm_bytes_activation_for_chain
 
 let settle_activation_for_chain _ : activation option = None
 
+let stake_activation_for_chain chain_id : activation option =
+  Option.map (fun (plan : Octra_consensus.C_quorum_policy.activation) -> {
+    anchor_epoch = plan.anchor_epoch;
+    anchor_state_root = plan.anchor_state_root;
+    activation_epoch = plan.activation_epoch;
+  }) (Octra_consensus.C_quorum_policy.stake_activation_for_chain chain_id)
+
+let program_records_activation_for_chain = stake_activation_for_chain
+
+let duty_marks_activation_for_chain = stake_activation_for_chain
+
+let proof_key_activation_for_chain = stake_activation_for_chain
+
 let profile_epochs ~chain_id =
   [standard_activation_for_chain chain_id;
    set_plan_activation_for_chain chain_id;
@@ -277,7 +291,10 @@ let profile_epochs ~chain_id =
    proof_activation_for_chain chain_id;
    vm_bytes_activation_for_chain chain_id;
    cipher_activation_for_chain chain_id;
-   settle_activation_for_chain chain_id]
+   settle_activation_for_chain chain_id;
+   program_records_activation_for_chain chain_id;
+   duty_marks_activation_for_chain chain_id;
+   proof_key_activation_for_chain chain_id]
   |> List.filter_map (Option.map (fun value -> value.activation_epoch))
   |> List.sort_uniq Int.compare
 
@@ -397,6 +414,22 @@ let consensus_id ~chain_id ~epoch =
     match settle_activation_for_chain chain_id with
     | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
     | Some _ | None -> plans)
+  |> (fun plans ->
+    match stake_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
+  |> (fun plans ->
+    match program_records_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
+  |> (fun plans ->
+    match duty_marks_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
+  |> (fun plans ->
+    match proof_key_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
   |> List.map activation_id
   |> String.concat "|"
 
@@ -426,6 +459,7 @@ let make ~ready_config_hash ~chain_id ~root_at =
     ready_exec_activation = ready_exec_activation_for_chain chain_id;
     program_source_activation = program_source_activation_for_chain chain_id;
     root_at;
+    verified = ref [];
   }
 
 let create ~chain_id ~root_at =
@@ -488,6 +522,10 @@ let root_after_floor ~chain_id ~floor_epoch ~epoch =
       vm_bytes_activation_for_chain chain_id;
       cipher_activation_for_chain chain_id;
       settle_activation_for_chain chain_id;
+      stake_activation_for_chain chain_id;
+      program_records_activation_for_chain chain_id;
+      duty_marks_activation_for_chain chain_id;
+      proof_key_activation_for_chain chain_id;
     ] in
     List.find_map
       (function
@@ -526,7 +564,18 @@ let activation_mode ~root_at activation ~epoch =
   | Some activation ->
     Result.map (fun () -> Active) (verify_anchor root_at activation)
 
-let mode t activation ~epoch = activation_mode ~root_at:t.root_at activation ~epoch
+let mode t activation ~epoch =
+  match activation with
+  | None -> Ok Prior
+  | Some plan when epoch < plan.activation_epoch -> Ok Prior
+  | Some plan ->
+    let key = plan.anchor_epoch, plan.anchor_state_root in
+    if List.mem key !(t.verified) then Ok Active
+    else match verify_anchor t.root_at plan with
+    | Error fault -> Error fault
+    | Ok () ->
+      t.verified := key :: !(t.verified);
+      Ok Active
 
 let circle t ~epoch = mode t t.circle_activation ~epoch
 
@@ -536,15 +585,18 @@ let wasm_compute t ~epoch =
   | None -> Ok Active
 
 let validator_quorum t ~epoch =
-  match t.validator_quorum_activation with
-  | Some activation -> mode t (Some activation) ~epoch
-  | None ->
-    if
-      Octra_consensus.C_quorum_policy.active
-        ~chain_id:t.chain_id
-        ~epoch_id:(Int64.of_int epoch)
-    then Ok Active
-    else Ok Prior
+  match mode t (stake_activation_for_chain t.chain_id) ~epoch with
+  | Error _ as error -> error
+  | Ok _ ->
+    match t.validator_quorum_activation with
+    | Some activation -> mode t (Some activation) ~epoch
+    | None ->
+      if
+        Octra_consensus.C_quorum_policy.active
+          ~chain_id:t.chain_id
+          ~epoch_id:(Int64.of_int epoch)
+      then Ok Active
+      else Ok Prior
 
 let epoch_time t ~epoch =
   match t.epoch_time_activation with
@@ -617,6 +669,30 @@ let proof_exec t ~epoch = mode t (proof_activation_for_chain t.chain_id) ~epoch
 let vm_bytes t ~epoch = mode t (vm_bytes_activation_for_chain t.chain_id) ~epoch
 
 let settle t ~epoch = mode t (settle_activation_for_chain t.chain_id) ~epoch
+
+let stake t ~epoch = mode t (stake_activation_for_chain t.chain_id) ~epoch
+
+let program_records t ~epoch =
+  mode t (program_records_activation_for_chain t.chain_id) ~epoch
+
+let proof_key t ~epoch = mode t (proof_key_activation_for_chain t.chain_id) ~epoch
+
+let proof_key_at ~chain_id ~epoch =
+  match proof_key_activation_for_chain chain_id with
+  | Some plan when epoch >= plan.activation_epoch -> Active
+  | Some _ | None -> Prior
+
+let duty_marks t ~epoch = mode t (duty_marks_activation_for_chain t.chain_id) ~epoch
+
+let duty_marks_at ~chain_id ~epoch =
+  match duty_marks_activation_for_chain chain_id with
+  | Some plan when epoch >= plan.activation_epoch -> Active
+  | Some _ | None -> Prior
+
+let program_records_at ~chain_id ~epoch =
+  match program_records_activation_for_chain chain_id with
+  | Some plan when epoch >= plan.activation_epoch -> Active
+  | Some _ | None -> Prior
 
 let settle_at ~chain_id ~epoch =
   match settle_activation_for_chain chain_id with

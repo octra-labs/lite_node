@@ -45,7 +45,7 @@ type self_membership =
   | Self_observer of string
   | Self_refused of string
 
-type quorum_admission =
+type quorum_check =
   | Quorum_ok
   | Quorum_refused of string list
   | Quorum_unsafe_allowed of string
@@ -90,11 +90,13 @@ val fingerprint_of_validator_set :
   string
 
 val light_scheduled_of_driver :
+  ?policy:Octra_consensus.C_quorum_policy.t ->
   chain_id:string ->
   Octra_consensus.C_driver.scheduled_validator_set_config option ->
   Octra_consensus.C_config.scheduled option
 
 val bind_persistent_updates :
+  ?policy:Octra_consensus.C_quorum_policy.t ->
   chain_id:string ->
   consensus_mode:bool ->
   current_height:int64 ->
@@ -122,12 +124,12 @@ val scheduled_self_warning :
   t ->
   string option
 
-val quorum_admission :
+val quorum_check :
   allow_unsafe:bool ->
   t ->
-  quorum_admission
+  quorum_check
 
-val startup_admission :
+val startup_check :
   ?permissionless:bool ->
   address:string ->
   voting:bool ->
@@ -137,7 +139,7 @@ val startup_admission :
   t ->
   startup_event list
 
-val node_startup_admission :
+val node_startup_check :
   getenv:(string -> string option) ->
   activation_epoch:(unit -> int64 option) ->
   address:string ->

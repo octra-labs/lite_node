@@ -26,7 +26,7 @@ let exporter_entries = ref []
 let historical = ref false
 
 let usage =
-  "octra_state_sync_manifest --command seal|build|sign-checkpoint|sign-manifest|assemble|assemble-finalized|verify"
+  "octra_state_sync_manifest --command seal|build|sign-checkpoint|sign-manifest|assemble|assemble-finalized|verify|compact"
 
 let options = [
   "--command", Arg.Set_string command, "operation";
@@ -462,6 +462,26 @@ let verify () =
         verified.manifest.file_count
         verified.manifest.chunk_count
 
+let compact () =
+  let certificate = load_certificate () in
+  let validators = validator_set () in
+  let exporters = exporter_set () in
+  let get = function Ok value -> value | Error reason -> fail reason in
+  let certificate = get (Manifest.verify_certificate
+    ~validator_set:validators ~exporter_set:exporters certificate) in
+  let encoded = match Manifest.finality certificate with
+    | Some encoded -> encoded | None -> fail "certificate has no finality path" in
+  let anchor = get (Sync_anchor.decode encoded) in
+  let reduced = get (Lwt_main.run (Sync_anchor.compact_lwt ~validator_set:validators anchor)) in
+  let wire = Sync_anchor.encode reduced in
+  let certificate = Manifest.{certificate with authority = Finalized wire} in
+  let certificate = get (Manifest.verify_certificate
+    ~validator_set:validators ~exporter_set:exporters certificate) in
+  Manifest.write_json (require "output" !output_path) (Manifest.certificate_json certificate);
+  Printf.printf "event = certificate_compacted steps_before = %d steps_after = %d bytes_before = %d bytes_after = %d\n%!"
+    (List.length (Sync_anchor.steps anchor)) (List.length (Sync_anchor.steps reduced))
+    (String.length encoded) (String.length wire)
+
 let run () =
   Arg.parse options (fun value -> fail ("unexpected argument: " ^ value)) usage;
   match !command with
@@ -472,9 +492,10 @@ let run () =
   | "assemble" -> assemble ()
   | "assemble-finalized" -> assemble_finalized ()
   | "verify" -> verify ()
+  | "compact" -> compact ()
   | _ ->
       fail
-        "command must be seal, build, sign-checkpoint, sign-manifest, assemble, assemble-finalized or verify"
+        "command must be seal, build, sign-checkpoint, sign-manifest, assemble, assemble-finalized, verify or compact"
 
 let () =
   run ()

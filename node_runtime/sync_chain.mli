@@ -18,8 +18,15 @@ val bridge_range :
   (int64 * int64) option
 
 val build :
+  ?policy:Octra_consensus.C_quorum_policy.t ->
   deps ->
   head_epoch:int64 ->
   Octra_consensus.C_types.validator_set ->
   Octra_consensus.C_types.validator_set ->
   (Octra_bootstrap.Sync_anchor.step list, string) result Lwt.t
+
+val keep_relief : deps -> Octra_consensus.C_types.validator_set ->
+  Octra_consensus.C_types.finalize ->
+  (unit, string) result Lwt.t
+
+val prune_local : string -> through_epoch:int64 -> unit

@@ -285,7 +285,7 @@ let duty_nonce sender confirmed =
     then None
     else Some nonce
 
-let duty_expired ?(mode = Rule_graph.Prior) ~head (tx : Transaction.t) =
+let duty_expired ?(marks = false) ?(mode = Rule_graph.Prior) ~head (tx : Transaction.t) =
   match head, tx.op_type with
   | Some head, ValidatorReady ->
     begin
@@ -296,13 +296,17 @@ let duty_expired ?(mode = Rule_graph.Prior) ~head (tx : Transaction.t) =
         | Rule_graph.Active ->
           ready.head_proposal_id = None
           || Validator_ready_policy.expired ~head ~reference:ready.head_epoch
-          || (match Set_fold.proof_of_message tx.message with
+          || (match Set_fold.evidence_of_message ~marks Set_fold.participating tx.message with
             | Error _ -> true
-            | Ok None -> false
-            | Ok (Some proof) ->
+            | Ok Set_fold.Pulse -> false
+            | Ok (Set_fold.Commit proof) ->
               let epoch = proof.vote.epoch_id in
               epoch < 0L || epoch <= head
-                && Int64.sub head epoch >= Set_fold.participating.challenge)
+                && Int64.sub head epoch >= Set_fold.participating.challenge
+            | Ok (Set_fold.Marks claims) ->
+              List.exists (fun (claim : Set_fold.mark_claim) ->
+                claim.epoch < 0L || claim.epoch <= head
+                  && Int64.sub head claim.epoch >= Set_fold.participating.challenge) claims)
         end
       | Error _ -> mode = Rule_graph.Active
     end
@@ -468,22 +472,22 @@ let add_smart ?head ?(ou_limit=max_ou) ?(tx_limit=max_staging_txs) ~lookup tx =
           let ou_deficit = Z.max Z.zero (Z.sub (Z.add !total_ou ou) ou_limit) in
           let count_deficit = max 0 (Hashtbl.length staging + 1 - tx_limit) in
           match Evict_index.min_elt_opt !evict_index with
-          | Some candidate
+          | Some entry
             when count_deficit <= 1
-                 && Z.geq candidate.ou ou_deficit
-                 && better_rate tx.Transaction.ou ou candidate ->
-            evict candidate;
+                 && Z.geq entry.ou ou_deficit
+                 && better_rate tx.Transaction.ou ou entry ->
+            evict entry;
             let dropped =
               record_drop
-                candidate.hash
-                candidate.tx
+                entry.hash
+                entry.tx
                 Evicted
                 "outbid by higher fee-rate"
             in
             let deps =
               evict_nonce_dependents
-                candidate.tx.Transaction.from
-                candidate.tx.Transaction.nonce
+                entry.tx.Transaction.from
+                entry.tx.Transaction.nonce
             in
             insert tx ou;
             Ok (dropped :: deps)
@@ -632,7 +636,7 @@ let drop_preview tx =
     remove_processed [hash];
     Some (record_drop hash entry.tx Evicted "preview rejected")
 
-let expire_duty ?sender ?(mode = Rule_graph.Prior) ~head () =
+let expire_duty ?sender ?(marks = false) ?(mode = Rule_graph.Prior) ~head () =
   match head with
   | None -> []
   | Some _ ->
@@ -641,15 +645,21 @@ let expire_duty ?sender ?(mode = Rule_graph.Prior) ~head () =
       | Some sender -> sender_entries sender
       | None -> Index.bindings !view_index |> List.map snd
     in
-    let expired =
-      List.filter (fun entry -> duty_expired ~mode ~head entry.tx) entries
+    let removed =
+      List.filter (fun entry ->
+        entry.tx.Transaction.op_type = Transaction.ValidatorReady
+        && (not (Tx_payload.size_ok ~limits:Tx_payload.standard entry.tx)
+            || duty_expired ~marks ~mode ~head entry.tx)) entries
     in
     let records =
       List.map (fun entry ->
-        record_drop entry.hash entry.tx Expired
-          "validator ready head has expired") expired
+        if Tx_payload.size_ok ~limits:Tx_payload.standard entry.tx then
+          record_drop entry.hash entry.tx Expired "validator ready head has expired"
+        else
+          record_drop entry.hash entry.tx Evicted
+            "encrypted_data or message exceeds size limit") removed
     in
-    remove_processed (List.map (fun entry -> entry.hash) expired);
+    remove_processed (List.map (fun entry -> entry.hash) removed);
     records
 
 let expiry_reason ~confirmed ~received =
@@ -715,15 +725,16 @@ let min_relay_fee tx =
   else if usage < 95 then Z.mul base (Z.of_int 2)
   else Z.mul base (Z.of_int 5)
 
-let stats_of txs =
+let stats_of ?(sender = fun (tx : Transaction.t) -> tx.from) txs =
   let by_sender = Hashtbl.create 50 in
   List.iter (fun (tx : Transaction.t) ->
     let cost = public_balance_cost tx in
-    let count, total = match Hashtbl.find_opt by_sender tx.from with
+    let address = sender tx in
+    let count, total = match Hashtbl.find_opt by_sender address with
       | Some (c, t) -> (c + 1, Z.add t cost)
       | None -> (1, cost)
     in
-    Hashtbl.replace by_sender tx.from (count, total)
+    Hashtbl.replace by_sender address (count, total)
   ) txs;
   by_sender
 

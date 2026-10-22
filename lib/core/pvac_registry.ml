@@ -15,7 +15,7 @@ type register_decision =
   | Existing_key_requires_key_switch
   | Canonical_key_switch_required
 
-type kat_admission =
+type kat_check =
   | Kat_ok
   | Kat_mismatch of {
       got : string;
@@ -34,6 +34,11 @@ let full_key_hash blob =
   Digestif.SHA256.digest_string blob
   |> Digestif.SHA256.to_hex
 
+let owner_blinding addr =
+  Digestif.SHA256.digest_string ("octra:pvac:key_owner\000" ^ addr)
+  |> Digestif.SHA256.to_raw_string
+  |> Bytes.of_string
+
 let decode_b64 s =
   try Ok (Base64.decode_exn s)
   with (Out_of_memory | Stack_overflow) as error -> raise error | e -> Error (Printexc.to_string e)
@@ -49,7 +54,7 @@ let register_blob_of_b64 s =
   | Error e -> Error e
   | Ok raw -> validate_size raw
 
-let kat_admission = function
+let kat_check = function
   | Some got ->
     let expected = expected_kat () in
     if got <> expected then Kat_mismatch { got; expected } else Kat_ok
@@ -82,12 +87,19 @@ let load_pubkey raw =
     | Error e -> Error e
     | Ok pk -> Ok pk
 
-let canonicalize_blob raw =
+let check_key ~keyed pk =
+  if not (FB.pubkey_supports_alias_rejection pk) then
+    Error "pvac pubkey proof circuit lacks alias rejection"
+  else if keyed && not (Pvac_ffi.pubkey_powers_ok pk) then
+    Error "pvac public key powers are not cyclic"
+  else Ok ()
+
+let key_blob ~keyed raw =
   match load_pubkey raw with
   | Error e -> Error e
-  | Ok pk when not (FB.pubkey_supports_alias_rejection pk) ->
-    Error "pvac pubkey proof circuit lacks alias rejection"
-  | Ok pk -> Ok (Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
+  | Ok pk ->
+    Result.map (fun () -> Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
+      (check_key ~keyed pk)
 
 let status_of_blob ~canonical_binding = function
   | None ->

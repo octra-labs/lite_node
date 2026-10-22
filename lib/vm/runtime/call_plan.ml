@@ -250,10 +250,10 @@ let plan_readonly_call ~method_name ~params ~caller_addr ~include_storage =
 let parse_deploy_payload_with_keys ~trusted ~point_ops ~bytecode_b64 ~deployer
     ~nonce ~target =
   let bytecode_raw = Base64.decode_exn bytecode_b64 in
-  match Admission.decode_deploy ~trusted ~point_ops bytecode_raw with
-  | Error err -> Deploy_invalid_bytecode (Admission.error_message err)
+  match Code_check.decode_deploy ~trusted ~point_ops bytecode_raw with
+  | Error err -> Deploy_invalid_bytecode (Code_check.error_message err)
   | Ok admitted ->
-    let bytecode = Admission.code admitted in
+    let bytecode = Code_check.code admitted in
     let expected_addr = Contract.addr_from_code bytecode_raw deployer nonce in
     if not (String.equal expected_addr target) then
       Deploy_address_mismatch

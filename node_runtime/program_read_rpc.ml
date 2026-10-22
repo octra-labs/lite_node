@@ -63,13 +63,15 @@ let compile_rpc handler input =
     Lwt.catch
       (fun () ->
         Lwt.finalize
-          (fun () ->
-            Octra_core.Exec_resource.detach
-              (fun () -> immediate (handler input))
-              ())
+          (fun () -> Octra_core.Rpc_work.run
+            ~busy:(fun () -> Lwt.return_error
+              (Octra_core.Rpc.err (-32005) "Program compiler busy" None))
+            (fun () -> Octra_core.Exec_resource.detach
+              (fun () -> immediate (handler input)) ()))
           (fun () ->
             compile_active := false;
-            Lwt.return_unit))
+            Lwt.return_unit)
+        |> Lwt.protected)
       (function
         | Octra_core.Exec_resource.Unavailable Memory ->
           Lwt.return_error (Octra_core.Rpc.err (-32005) "Program compiler resources unavailable" None)

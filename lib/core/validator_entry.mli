@@ -1,7 +1,7 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-type candidate = {
+type entry = {
   address : string;
   pubkey : string;
   bond : Z.t;
@@ -33,13 +33,13 @@ type snapshot = {
 }
 
 val validate_parameters : parameters -> (unit, string) result
-val validate_candidate : candidate -> (unit, string) result
+val validate_entry : entry -> (unit, string) result
 val quorum_weight : Z.t -> (Z.t, string) result
 val snapshot :
   ?incumbents:string list ->
   parameters ->
   activate_epoch:int64 ->
-  candidate list ->
+  entry list ->
   (snapshot, string) result
 val signed_weight :
   snapshot ->
@@ -57,10 +57,10 @@ val leader :
   (member, string) result
 val withdraw_epoch :
   parameters ->
-  candidate ->
+  entry ->
   (int64, string) result
 val can_withdraw :
   parameters ->
   current_epoch:int64 ->
-  candidate ->
+  entry ->
   (bool, string) result

@@ -228,14 +228,12 @@ let recent_transactions chaindata ~params =
   | Error e ->
     err e
 
-let address_history_status chaindata addr ~limit ~offset ~profile_tag =
-  Lwt.return
-    (Store_chaindata.txs_by_addr_rows_status
-       ~profile_tag
+let address_history_status chaindata addr ~limit ~offset ~profile_tag:_ =
+  Store_chaindata.public_addr_rows
        chaindata
        addr
        ~limit
-       ~offset)
+       ~offset
 
 let drop_json (row : Tx_drop.row) =
   `Assoc [
@@ -276,6 +274,9 @@ let transactions_by_address ~drops_by_addr chaindata ~params ~addr =
       ~offset:page.offset
       ~profile_tag:"octra_transactionsByAddress"
   in
+  match status with
+  | Error reason -> err {Rpc.service_unavailable with data = Some (`String reason)}
+  | Ok status ->
   let rejected =
     Store_chaindata.rejected_by_addr_rows
       chaindata
@@ -315,8 +316,9 @@ let transactions_by_address ~drops_by_addr chaindata ~params ~addr =
     err e
 
 let token_transfers_by_address chaindata ~params ~addr =
+  let open Lwt.Syntax in
   let req_page = History.rpc_page params in
-  let page =
+  let* result =
     Store_chaindata.token_txs_by_addr_page
       ~profile_tag:"octra_tokenTransfersByAddress"
       chaindata
@@ -324,6 +326,9 @@ let token_transfers_by_address chaindata ~params ~addr =
       ~limit:req_page.limit
       ~offset:req_page.offset
   in
+  match result with
+  | Error reason -> err {Rpc.service_unavailable with data = Some (`String reason)}
+  | Ok page ->
   match
     History.token_transactions_result
       ~mask_rows:Tx_view.mask_stealth_rows

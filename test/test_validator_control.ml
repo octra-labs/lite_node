@@ -105,7 +105,7 @@ let check_storage () =
       head_epoch = 10; state_root = ""; chain_id = identity.chain_id;
       head_proposal_id = None;
       config_hash = ""; duty = None; sets = (None, None);
-      candidate = Some Octra_core.Validator_admission.{
+      entry = Some Octra_core.Validator_entry.{
         address = identity.address; pubkey = Base64.decode_exn pubkey;
         bond = Z.one; bonded_epoch = identity.bonded_epoch;
         ready_epoch = None; exit_epoch = None;
@@ -262,28 +262,28 @@ let check_bonded () =
   let module Duty = Octra_node_runtime.Set_control in
   Test_workspace.with_dir "duty_bonded" (fun data_dir ->
     let control = Control.create ~data_dir in
-    let entry = Octra_core.Validator_admission.{
+    let entry = Octra_core.Validator_entry.{
       address = identity.address; pubkey = Base64.decode_exn pubkey;
       bond = Z.one; bonded_epoch = identity.bonded_epoch;
       ready_epoch = None; exit_epoch = None;
     } in
     let snapshot = Status.{
       head_epoch = 10; state_root = ""; chain_id = identity.chain_id;
-      config_hash = ""; candidate = Some entry; duty = None; sets = (None, None);
+      config_hash = ""; entry = Some entry; duty = None; sets = (None, None);
       head_proposal_id = None;
     } in
     let read = Duty.bonded ~control ~address:identity.address ~pubkey in
     expect "read errors retained" (read (Error "read failed") = Error "read failed");
-    expect "absent bond pauses" (read (Ok { snapshot with candidate = None }) = Ok false);
+    expect "absent bond pauses" (read (Ok { snapshot with entry = None }) = Ok false);
     expect "bond permits duty" (read (Ok snapshot) = Ok true);
     ignore (unwrap (Control.request control identity ~privkey));
     expect "exit intent pauses" (read (Ok snapshot) = Ok false);
     let newer = { entry with bonded_epoch = 10L } in
     expect "old intent cannot pause new bond"
-      (read (Ok { snapshot with candidate = Some newer }) = Ok true);
+      (read (Ok { snapshot with entry = Some newer }) = Ok true);
     let exiting = { entry with exit_epoch = Some 10L } in
     expect "committed exit pauses"
-      (read (Ok { snapshot with candidate = Some exiting }) = Ok false);
+      (read (Ok { snapshot with entry = Some exiting }) = Ok false);
     Unix.chmod (Filename.concat data_dir "validator-control/lock") 0o644;
     expect "lock error retained" (Result.is_error (read (Ok snapshot))))
 

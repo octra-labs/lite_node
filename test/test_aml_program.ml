@@ -435,16 +435,16 @@ let close_check () =
     | Ok _ -> fail "close prior admitted"
   end;
   begin
-    match Octra_vm.Admission.decode raw with
-    | Error (Octra_vm.Admission.Decode_error reason)
+    match Octra_vm.Code_check.decode raw with
+    | Error (Octra_vm.Code_check.Decode_error reason)
         when String.equal reason cap_error -> ()
-    | Error error -> fail (Octra_vm.Admission.error_message error)
+    | Error error -> fail (Octra_vm.Code_check.error_message error)
     | Ok _ -> fail "close prior admission"
   end;
   begin
-    match Octra_vm.Admission.decode ~point_ops:true raw with
+    match Octra_vm.Code_check.decode ~point_ops:true raw with
     | Ok _ -> ()
-    | Error error -> fail (Octra_vm.Admission.error_message error)
+    | Error error -> fail (Octra_vm.Code_check.error_message error)
   end;
   begin
     match Vm.Verifier.verify [|Vm.LDI (0, Vm.VCap cap); Vm.STOP|] with

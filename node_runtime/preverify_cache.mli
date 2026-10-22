@@ -6,6 +6,7 @@ type result = Preverify_submit.result = {
   balance_ok : bool;
   strict : bool;
   math : bool;
+  keyed : bool;
   sender_enc_snapshot : string;
 }
 
@@ -54,13 +55,13 @@ val has_capacity :
   bool
 
 val start_task :
-  ?math:bool ->
+  keyed:bool -> ?math:bool ->
   string ->
   (unit -> task_result Lwt.t) ->
   Preverify_submit.admit
 
 val insert_with_cap :
-  ?math:bool ->
+  keyed:bool -> ?math:bool ->
   string ->
   task_result Lwt.t ->
   unit
@@ -70,6 +71,8 @@ val remove :
   unit
 
 val state :
+  keyed:bool ->
+  math:bool ->
   string ->
   state
 
@@ -80,7 +83,7 @@ val gate :
   gate
 
 val ready_result :
-  ?math:bool ->
+  keyed:bool -> ?math:bool ->
   string ->
   strict:bool ->
   sender_enc_snapshot:string ->

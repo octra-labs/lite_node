@@ -75,6 +75,9 @@ val retain :
 val clear_stage :
   Octra_bootstrap.Sync_archive.t -> string -> unit Lwt.t
 
+val clear_incomplete :
+  Octra_bootstrap.Sync_archive.t -> string -> (string * string) list Lwt.t
+
 val publisher_addresses :
   Octra_consensus.C_types.validator_set ->
   string list

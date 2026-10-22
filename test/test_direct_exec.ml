@@ -250,6 +250,9 @@ let () =
   let before = !exits in
   Lwt.async (fun () -> Lwt.fail (Octra_core.Private_ledger.Worker_stopped "test"));
   ok "async worker failure became restart" (!exits = before && !refused = 1);
+  Lwt.async (fun () -> Lwt.fail
+    (Octra_node_runtime.Consensus_pending_commit_recovery.Store_fault "journal"));
+  ok "async store fault was contained" (!exits = before && !refused = 2);
   test_success ();
   test_failed_receipt ();
   test_reject ();

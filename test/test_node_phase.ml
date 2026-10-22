@@ -24,7 +24,7 @@ let boot dir =
           env = (fun _ -> None); exit_fatal;
         }) in
         let epoch = match outcome with
-          | Ok epoch -> epoch
+          | Ok (epoch, _) -> epoch
           | Error error ->
             Case.expect "recovery error path differs" (error.path = dir);
             Case.expect "recovery error reason missing" (error.reason <> "");

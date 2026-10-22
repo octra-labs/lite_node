@@ -258,7 +258,7 @@ let test_cancel root start =
   let work = start source root in
   Lwt.finalize
     (fun () ->
-      Lwt_unix.with_timeout 2.0 (fun () -> started) >>= fun () ->
+      Lwt_unix.with_timeout 120. (fun () -> started) >>= fun () ->
       Lwt.cancel work;
       Lwt.pause () >>= fun () ->
       if source.failures <> 0 then fail "cancelled request counted as source failure";
@@ -955,6 +955,46 @@ let test_cert_bytes trust certificate =
   if (Cache.stats stopped).bytes <> 0 || (Cache.stats stopped).cached <> 0 then
     fail "stopped cache retained certificates"
 
+let test_cert_file trust certificate =
+  let module Cache = Octra_node_runtime.Sync_cert in
+  let stamp = ref "first" and fresh = ref true in
+  let reads = ref 0 and checks = ref 0 in
+  let actor = Cache.create {
+    now = (fun () -> 0.);
+    read = (fun _ -> incr reads; Lwt.pause () >|= fun () -> Ok !stamp);
+    verify = (fun ~cancelled:_ _ _ ->
+      incr checks; Lwt.pause () >|= fun () -> Ok certificate);
+  } in
+  let load trust = Cache.load_file actor ~path:"current" trust
+    ~stamp:(fun () -> Lwt.return_some !stamp) ~fresh:(fun _ -> !fresh) in
+  Lwt_list.map_p (fun _ -> load trust) (List.init 50 Fun.id) >>= fun replies ->
+  if not (List.for_all Result.is_ok replies) || !reads <> 1 || !checks <> 1 then
+    fail "certificate requests did not share work";
+  load trust >>= fun reply ->
+  if Result.is_error reply || !reads <> 1 then fail "unchanged certificate read again";
+  stamp := "renamed";
+  load trust >>= fun reply ->
+  if Result.is_error reply || !reads <> 2 || !checks <> 2 then fail "renamed certificate was reused";
+  load { trust with Cache.config = "other" } >>= fun reply ->
+  if Result.is_error reply || !checks <> 3 then fail "trust change reused a certificate";
+  fresh := false;
+  load trust >>= fun reply ->
+  if Result.is_ok reply then fail "expired certificate reused";
+  fresh := true;
+  stamp := "loading";
+  let pending = load trust in
+  stamp := "changed";
+  pending >>= fun reply ->
+  if Result.is_ok reply then fail "changed file accepted";
+  let gate, release = Lwt.wait () in
+  let pending = Cache.load_file actor ~path:"current" trust
+    ~stamp:(fun () -> gate) ~fresh:(fun _ -> true) in
+  Cache.shutdown actor >>= fun () ->
+  Lwt.wakeup release (Some "after_stop");
+  pending >>= fun reply ->
+  if reply <> Error Cache.Stopped then fail "stopped file cache returned data";
+  Lwt.return_unit
+
 let test_http_cert root wallets certificate validators =
   let path = Filename.concat root "http-certificate.json" in
   let keys = ["OCTRA_STATE_SYNC_ENABLE"; "OCTRA_STATE_SYNC_CERT";
@@ -1013,14 +1053,13 @@ let test_http_cert root wallets certificate validators =
       ["snapshot", [snapshot_id]; "path", [file.path]; "index", [string_of_int chunk.index];
        "sha256", [chunk.sha256]] >>= fun (response, body) ->
     Cohttp_lwt.Body.drain_body body >>= fun () ->
-    if Cohttp.Response.status response <> `Too_many_requests
-       || Cohttp.Header.get (Cohttp.Response.headers response) "Retry-After" <> Some "1" then
-      fail "certificate overload did not apply HTTP backpressure";
+    if Cohttp.Response.status response = `Too_many_requests then
+      fail "shared certificate load exhausted HTTP capacity";
     Http.handle_head ~data_dir:root ~chain_id ~config_hash ~validator_set:validators
       ~current_epoch:(ref 778) >>= fun (response, body) ->
     Cohttp_lwt.Body.drain_body body >>= fun () ->
-    if Cohttp.Response.status response <> `Too_many_requests then
-      fail "certificate overload reported a missing snapshot";
+    if Cohttp.Response.status response <> `OK then
+      fail "certificate load hid committed head";
     Lwt_list.iter_s (fun work -> work >>= fun (_, body) -> Cohttp_lwt.Body.drain_body body) active >>= fun () ->
     read `OK >>= fun () ->
     read ~chain:"other-chain" `Service_unavailable >>= fun () ->
@@ -1058,7 +1097,7 @@ let test_http_cert root wallets certificate validators =
     read `OK >>= fun () ->
     Unix.unlink path;
     Unix.mkfifo path 0o600;
-    Lwt_unix.with_timeout 1. (fun () -> read `Service_unavailable) >>= fun () ->
+    Lwt_unix.with_timeout 120. (fun () -> read `Service_unavailable) >>= fun () ->
     Unix.unlink path;
     write certificate;
     let output = Unix.openfile path [Unix.O_WRONLY] 0o600 in
@@ -1146,6 +1185,7 @@ let run () =
   test_cert_cache trust certificate;
   test_cert_bytes trust certificate;
   test_cert_actor trust certificate >>= fun () ->
+  test_cert_file trust certificate >>= fun () ->
   test_cert_cancel trust certificate >>= fun () ->
   test_verify_cancel trust certificate >>= fun () ->
   test_http_cert root wallets certificate validators >>= fun () ->

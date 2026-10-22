@@ -30,6 +30,7 @@ type final = {
   epoch : int64;
   proposal_id : string;
   set_hash : string;
+  round : int option;
 }
 
 type t = {
@@ -55,6 +56,12 @@ type proof = {
   vote : C_types.vote;
   commit : C_types.parent_commit;
 }
+
+type mark_claim = { epoch : int64; signature : string }
+type mark_set = int64 * string * C_types.validator_set
+type evidence = Pulse | Commit of proof | Marks of mark_claim list
+
+let marks_id = "duty_marks:final_round:historic_set:precommit:ordered:atomic:age_2_16:wire_72"
 
 type counts = {
   live : int;
@@ -168,7 +175,7 @@ let compare_member left right =
   if by_address <> 0 then by_address
   else compare (phase_rank left.phase) (phase_rank right.phase)
 
-let compare_final left right = Int64.compare left.epoch right.epoch
+let compare_final (left : final) (right : final) = Int64.compare left.epoch right.epoch
 
 let sort_members members = List.sort compare_member members
 let sort_finals finals = List.sort compare_final finals
@@ -400,15 +407,15 @@ let add_signer cfg ~at signer table =
 let retain_finals cfg ~at finals =
   let span = Int64.add cfg.challenge 1L in
   let floor = if Int64.compare at span < 0 then 0L else Int64.sub at span in
-  List.filter (fun item -> Int64.compare item.epoch floor >= 0) finals
+  List.filter (fun (item : final) -> Int64.compare item.epoch floor >= 0) finals
 
-let put_final cfg ~at final finals =
-  match List.find_opt (fun item -> Int64.equal item.epoch final.epoch) finals with
+let put_final cfg ~at (final : final) finals =
+  match List.find_opt (fun (item : final) -> Int64.equal item.epoch final.epoch) finals with
   | Some item when item = final -> Ok (retain_finals cfg ~at finals)
   | Some _ -> Error "validator duty finality conflict"
   | None -> Ok (retain_finals cfg ~at (final :: finals) |> sort_finals)
 
-let note_final_step ~cap_mode cfg ~at ~active ~final ~signers state =
+let note_final_step ~cap_mode cfg ~at ~active ~(final : final) ~signers state =
   match validate_cfg cfg with
   | Error error -> Final_held (state, error)
   | Ok () when Int64.compare at 0L <= 0 ->
@@ -505,7 +512,7 @@ let note_pulse ?(cap_mode = Reject) ?credit cfg ~epoch ~active ~address state =
     end
 
 let find_final epoch state =
-  List.find_opt (fun item -> Int64.equal item.epoch epoch) state.finals
+  List.find_opt (fun (item : final) -> Int64.equal item.epoch epoch) state.finals
 
 let verify_vote ~chain_id ~address (commit : C_types.parent_commit)
     (vote : C_types.vote) =
@@ -546,7 +553,7 @@ let verify_commit ~chain_id commit =
   | Octra_consensus.C_qc.Invalid reason ->
     Error ("validator duty commit is invalid: " ^ reason)
 
-let read_parent ~chain_id (commit : C_types.parent_commit) =
+let read_parent ?(marks = false) ~chain_id (commit : C_types.parent_commit) =
   match verify_commit ~chain_id commit with
   | Error _ as error -> error
   | Ok () ->
@@ -555,6 +562,7 @@ let read_parent ~chain_id (commit : C_types.parent_commit) =
       epoch = cert.epoch_id;
       proposal_id = cert.proposal_id;
       set_hash = Octra_consensus.C_config.validator_set_hash commit.validator_set;
+      round = if marks then Some cert.commit_round else None;
     } in
     let signers =
       cert.precommits
@@ -568,7 +576,7 @@ let read_parent ~chain_id (commit : C_types.parent_commit) =
     in
     Ok (final, signers, active)
 
-let advance ?(cap_mode=Reject) cfg ~chain_id ~start ~at ~parent state =
+let advance ?(cap_mode=Reject) ?(marks = false) cfg ~chain_id ~start ~at ~parent state =
   match state.applied with
   | Some epoch when Int64.equal epoch at -> Ok (state, None, false)
   | Some epoch when Int64.compare epoch at > 0 ->
@@ -590,7 +598,7 @@ let advance ?(cap_mode=Reject) cfg ~chain_id ~start ~at ~parent state =
         | None -> Error "validator duty parent commit missing"
         | Some parent ->
           begin
-            match read_parent ~chain_id parent with
+            match read_parent ~marks ~chain_id parent with
             | Error _ as error -> error
             | Ok (final, signers, active) ->
               begin
@@ -660,6 +668,90 @@ let apply_proof ?(cap_mode=Reject) cfg ~chain_id ~epoch ~active ~address proof s
     |> Result.map (fun table ->
       { state with members = String_map.bindings table |> List.map snd })
 
+let check_mark_claim cfg ~epoch (claim : mark_claim) state =
+  if claim.epoch < 0L || epoch < claim.epoch || Int64.sub epoch claim.epoch < 2L then
+    Error "validator duty mark epoch is not final"
+  else if Int64.sub epoch claim.epoch > cfg.challenge then
+    Error "validator duty mark challenge expired"
+  else match find_final claim.epoch state with
+  | None -> Error "validator duty finalized reference is missing"
+  | Some {round = None; _} -> Error "validator duty mark round is missing"
+  | Some final -> Ok final
+
+let verify_mark_claim cfg ~chain_id ~epoch ~address ~sets (claim : mark_claim) state =
+  Result.bind (check_mark_claim cfg ~epoch claim state) (fun final ->
+    match List.filter (fun (at, _, _) -> at = claim.epoch) sets with
+    | [(_, chain, validators)] when chain = chain_id
+        && Octra_consensus.C_config.validator_set_hash validators = final.set_hash ->
+      begin match C_types.pubkey_of_addr validators address with
+      | None -> Error "validator duty mark signer is not in set"
+      | Some pubkey ->
+        let vote = C_types.{chain_id; epoch_id = claim.epoch;
+          round = Option.get final.round; vote_type = Precommit;
+          proposal_id = final.proposal_id; validator = address; signature = claim.signature} in
+        if Octra_consensus.C_hash.verify_vote ~pubkey_raw:pubkey vote then Ok ()
+        else Error "validator duty mark signature is invalid"
+      end
+    | _ -> Error "validator duty mark set mismatch")
+
+let check_mark_claims cfg ~epoch claims state =
+  let rec check previous = function
+    | [] -> Ok ()
+    | (claim : mark_claim) :: rest ->
+      if claim.epoch <= previous then Error "validator duty marks are not ordered"
+      else Result.bind (check_mark_claim cfg ~epoch claim state)
+        (fun _ -> check claim.epoch rest) in
+  if claims = [] || List.length claims >= Int64.to_int cfg.challenge then
+    Error "validator duty mark count is invalid"
+  else check (-1L) claims
+
+let apply_mark_claims ?(cap_mode = Reject) cfg ~chain_id ~epoch ~active ~address ~sets claims state =
+  let rec check previous = function
+    | [] -> Ok ()
+    | (claim : mark_claim) :: rest ->
+      if claim.epoch <= previous then Error "validator duty marks are not ordered"
+      else Result.bind (verify_mark_claim cfg ~chain_id ~epoch ~address ~sets claim state)
+        (fun () -> check claim.epoch rest) in
+  if claims = [] || List.length claims >= Int64.to_int cfg.challenge then
+    Error "validator duty mark count is invalid"
+  else Result.bind (check (-1L) claims) (fun () ->
+    let table = table_of_members state.members in
+    let first = (List.hd claims).epoch in
+    let member = match String_map.find_opt address table with
+      | Some item -> item
+      | None when active -> live_member first address
+      | None -> shadow_member address in
+    let marks = List.fold_left (fun marks (claim : mark_claim) ->
+      add_mark cfg claim.epoch marks) member.marks claims in
+    let table = String_map.add address {member with marks} table in
+    limit_table cfg ~cap_mode ~epoch table |> Result.map (fun table ->
+      {state with members = String_map.bindings table |> List.map snd}))
+
+let encode_marks claims =
+  Octra_net.Oce1.encode (fun buffer -> List.iter (fun (claim : mark_claim) ->
+    Octra_net.Oce1.put_u64 buffer claim.epoch;
+    if String.length claim.signature <> 64 then invalid_arg "validator duty mark signature size";
+    Buffer.add_string buffer claim.signature) claims) |> Base64.encode_exn
+
+let decode_marks cfg encoded =
+  let max_size = 72 * (Int64.to_int cfg.challenge - 1) in
+  if String.length encoded > 4 * ((max_size + 2) / 3) then
+    Error "validator duty mark count is invalid"
+  else match Base64.decode encoded with
+  | Error _ -> Error "validator duty marks encoding is invalid"
+  | Ok raw when Base64.encode_exn raw <> encoded || String.length raw = 0
+      || String.length raw mod 72 <> 0 || String.length raw > max_size ->
+    Error "validator duty marks encoding is invalid"
+  | Ok raw ->
+    try Ok (Octra_net.Oce1.decode (fun cursor ->
+      List.init (String.length raw / 72) (fun _ ->
+        let epoch = Octra_net.Oce1.get_u64 cursor in
+        let signature = Octra_net.Oce1.get_raw cursor 64 in
+        {epoch; signature})) raw)
+    with
+    | (Out_of_memory | Stack_overflow) as error -> raise error
+    | _ -> Error "validator duty marks encoding is invalid"
+
 let warm_end cfg start = Int64.add start (Int64.add cfg.window cfg.challenge)
 
 let evidence_range cfg source =
@@ -723,12 +815,12 @@ let exclusion cfg ~start ~source ~address state =
       Some (Pulse_old pulse.last)
     else Some (Pulse_short { first = pulse.first; last = pulse.last })
 
-let filter cfg ~start ~source candidates state =
+let filter cfg ~start ~source entries state =
   let table = table_of_members state.members in
   let allowed, live, shadow =
     List.fold_left
-      (fun (items, live, shadow) (candidate : Validator_admission.candidate) ->
-        let address = candidate.Validator_admission.address in
+      (fun (items, live, shadow) (entry : Validator_entry.entry) ->
+        let address = entry.Validator_entry.address in
         match String_map.find_opt address table with
         | Some member
           when member_allows
@@ -742,11 +834,11 @@ let filter cfg ~start ~source candidates state =
             | Live _ -> live + 1, shadow
             | Shadow _ -> live, shadow + 1
           in
-          candidate :: items, live, shadow
+          entry :: items, live, shadow
         | Some _ -> items, live, shadow + 1
         | None -> items, live, shadow)
       ([], 0, 0)
-      candidates
+      entries
   in
   List.rev allowed, { live; shadow; allowed = List.length allowed }
 
@@ -806,6 +898,30 @@ let proof_of_message = function
       with _ -> Error "validator duty message encoding is invalid"
     end
 
+let evidence_of_message ~marks cfg message =
+  if not marks then proof_of_message message
+    |> Result.map (function None -> Pulse | Some proof -> Commit proof)
+  else match message with
+  | None -> Error "validator duty message is missing"
+  | Some raw ->
+    try match Yojson.Safe.from_string raw with
+    | `Assoc fields ->
+      begin match duplicate_field fields with
+      | Some name -> Error ("validator duty field is duplicated: " ^ name)
+      | None ->
+        match List.assoc_opt "duty_marks" fields with
+        | None -> proof_of_message message
+          |> Result.map (function None -> Pulse | Some proof -> Commit proof)
+        | Some _ when List.mem_assoc "duty_vote" fields || List.mem_assoc "duty_commit" fields ->
+          Error "validator duty proof formats overlap"
+        | Some (`String encoded) -> decode_marks cfg encoded |> Result.map (fun claims -> Marks claims)
+        | Some _ -> Error "validator duty marks have wrong type"
+      end
+    | _ -> Error "validator duty message has wrong type"
+    with
+    | (Out_of_memory | Stack_overflow) as error -> raise error
+    | _ -> Error "validator duty message encoding is invalid"
+
 let b64_raw value = Base64.encode_exn value
 
 let raw_b64 label value =
@@ -851,12 +967,13 @@ let member_to_json member =
     "marks", marks_to_json member.marks;
   ]
 
-let final_to_json item =
-  `Assoc [
+let final_to_json (item : final) =
+  let fields = [
     "epoch", `String (Int64.to_string item.epoch);
     "proposal_id", `String (b64_raw item.proposal_id);
     "set_hash", `String (b64_raw item.set_hash);
-  ]
+  ] in
+  `Assoc (fields @ Option.fold ~none:[] ~some:(fun round -> ["round", `Int round]) item.round)
 
 let to_yojson state =
   let fields = [
@@ -1011,7 +1128,12 @@ let final_of_json json =
           raw_b64 "validator duty set hash" set_hash
           |> bind (fun set_hash ->
             if Int64.compare epoch 0L < 0 then Error "validator duty final epoch is negative"
-            else Ok { epoch; proposal_id; set_hash }))
+            else match List.assoc_opt "round" fields with
+              | None -> Ok {epoch; proposal_id; set_hash; round = None}
+              | Some json -> int_json "validator duty final round" json |> bind (fun round ->
+                if round < 0 || round > Octra_consensus.C_codec.max_round then
+                  Error "validator duty final round is invalid"
+                else Ok {epoch; proposal_id; set_hash; round = Some round})))
       | _ -> Error "validator duty final hash is missing"))
 
 let decode_list parse items =
@@ -1033,9 +1155,9 @@ let unique_members members =
 let unique_finals finals =
   let rec loop prior = function
     | [] -> Ok ()
-    | item :: _ when Some item.epoch = prior ->
+    | (item : final) :: _ when Some item.epoch = prior ->
       Error "validator duty final is duplicated"
-    | item :: rest -> loop (Some item.epoch) rest
+    | (item : final) :: rest -> loop (Some item.epoch) rest
   in
   loop None (sort_finals finals)
 

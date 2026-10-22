@@ -22,6 +22,9 @@ PAYMENT_FIELDS = frozenset({
     "nonce", "message", "encrypted_data",
 })
 
+class ControlMismatch(ValidatorError):
+    pass
+
 def valid_hash(value):
     return isinstance(value, str) and len(value) == 64 and all(
         char in "0123456789abcdef" for char in value
@@ -67,23 +70,30 @@ def command_lock(values):
     finally:
         os.close(fd)
 
-def restore_control(source, target):
+def restore_control(source, target, *, resume = False):
     prior = source / "validator-control"
     if not os.path.lexists(prior):
+        if resume and os.path.lexists(target / "validator-control"):
+            raise ControlMismatch("snapshot contains validator control state")
         return
     info = prior.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
         raise ValidatorError("preserved validator control directory is not private")
     destination = directory({"OCTRA_DATA_DIR": str(target)})
-    for path in prior.iterdir():
-        if path.name in {"lock", "exit.next"} or path.name.endswith(".json.new"):
-            continue
+    paths = [path for path in prior.iterdir()
+        if path.name not in {"lock", "exit.next"} and not path.name.endswith(".json.new")]
+    if resume:
+        names = {name for path in paths for name in (path.name, path.name + ".new")}
+        if any(path.name not in names for path in destination.iterdir()):
+            raise ControlMismatch("snapshot contains validator control state")
+    for path in paths:
         value = read_outbox(path)
         if value is None:
             raise ValidatorError("preserved validator control file disappeared")
         output = destination / path.name
         if os.path.lexists(output):
-            raise ValidatorError("snapshot contains validator control state")
+            if not resume or read_outbox(output) != value or sha256_file(output) != sha256_file(path):
+                raise ControlMismatch("snapshot contains validator control state")
         copy_private(path, output)
     sync_directory(destination)
 

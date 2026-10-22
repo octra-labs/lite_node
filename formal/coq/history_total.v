@@ -246,7 +246,7 @@ Qed.
 
 End Account.
 
-Module Admission.
+Module Code_check.
 
 Record scope := {
   network : nat;
@@ -320,7 +320,7 @@ Proof.
   apply complete in accepted as [equal _]. subst. auto.
 Qed.
 
-End Admission.
+End Code_check.
 
 Module Cipher.
 Open Scope Z_scope.

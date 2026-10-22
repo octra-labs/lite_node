@@ -34,7 +34,7 @@ let root_signers roots =
   |> List.sort String.compare
   |> uniq
 
-let verify_root_quorum ~validator_set_proof roots =
+let verify_root_quorum ?policy ~validator_set_proof roots =
   if not (C_light_validator_set.verify validator_set_proof) then None
   else
     match roots with
@@ -57,6 +57,7 @@ let verify_root_quorum ~validator_set_proof roots =
           let signers = root_signers roots in
           if not
             (C_types.has_quorum_at
+               ?policy
                ~chain_id:root.chain_id
                ~epoch_id:root.head_epoch
                vs

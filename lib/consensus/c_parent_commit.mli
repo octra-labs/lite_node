@@ -59,6 +59,7 @@ val same_block :
   bool
 
 val validate :
+  ?policy:C_quorum_policy.t ->
   expected ->
   t ->
   verdict

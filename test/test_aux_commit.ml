@@ -10,6 +10,10 @@ exception Commit_stop
 exception Cut_error
 
 let save_aux chain epoch =
+  Case.SC.save_rejected ~op_type:Octra_core.Transaction.ClaimOp chain
+    ~hash:(Case.hash 'z') ~from_addr:"private-from" ~to_addr:"private-to"
+    ~amount:"0" ~nonce:0 ~error_type:"test" ~reason:"private refused"
+    ~epoch_id:epoch ~ts:(float_of_int epoch);
   List.iter (fun label ->
     Case.SC.save_receipt chain ~tx_hash:(Case.hash label)
       ~contract_addr:"octPROGRAM" ~method_name:"run" ~success:true
@@ -42,7 +46,12 @@ let check_aux dir expected =
       "old_rejection", rejected 'e' = Some 0;
       "new_rejection", rejected 'c' = (if expected = 1 then Some 1 else None);
       "repeated_rejection", current = Some expected;
-      "epoch_rows", List.length future_rows = (if expected = 1 then 2 else 0);
+      "epoch_rows", List.length future_rows = (if expected = 1 then 3 else 0);
+      "private_rejection", (match Case.SC.get_rejected_tx chaindata (Case.hash 'z') with
+        | Some ("-", "-", _, _, _, _, epoch, _) -> epoch = expected
+        | _ -> false);
+      "private_sender_index", Case.SC.rejected_count_by_addr chaindata "private-from" = 0;
+      "private_target_index", Case.SC.rejected_count_by_addr chaindata "private-to" = 0;
     ] in
     List.iter (fun (name, ok) ->
       Printf.printf "event = aux_check name = %s head = %d status = %s\n%!"

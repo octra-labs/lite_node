@@ -13,6 +13,9 @@ module N = Octra_node_runtime
 module G = Octra_core.Rule_graph
 module H = Octra_consensus.C_hash
 module F = Octra_core.Set_fold
+module P = Pvac_ffi
+module FB = Octra_core.Crypto.FheBalance
+module T = Octra_core.Transaction
 
 let proposer = "octEpochStoreSample"
 let expect = R.require
@@ -22,17 +25,21 @@ let reward = R.X.{
   validators = [{ address = proposer; public_key = None; weight = Z.one }];
 }
 
-let sample ~chain_id ~parent_commit (cursor : R.J.cursor) state_root =
+let sample ?(txs = []) ?(receipts_json = []) ~chain_id ~parent_commit
+    (cursor : R.J.cursor) state_root =
   let epoch_int = Int64.to_int cursor.epoch in
   let _, expected_eic = R.E.next_root_from_hashes_i64 ~prev:cursor.eic
-    ~epoch_id:cursor.epoch ~start_txid:cursor.txid [] in
-  let tx_list_hash = R.J.root_hex64 (Octra_consensus.C_hash.tx_list_hash []) in
-  let receipt_root = R.J.root_hex64 (Octra_consensus.C_hash.receipt_root []) in
+    ~epoch_id:cursor.epoch ~start_txid:cursor.txid (R.hashes txs) in
+  let tx_list_hash = R.J.root_hex64
+    (Octra_net.Hash_domain.hash "octra:tx_list:v1"
+      (String.concat "" (R.hashes txs))) in
+  let receipt_root = R.J.root_hex64 (H.receipt_root receipts_json) in
   let epoch_ts = float_of_int (epoch_int * 10) in
   let header, _ = N.Consensus_replay.parse_header ~default_chain_id:chain_id
     (`Assoc [
       "epoch_id", `Int epoch_int;
-      "txid_hi", `Intlit (Int64.to_string (Int64.pred cursor.txid));
+      "txid_hi", `Intlit (Int64.to_string (Int64.add
+        (Int64.pred cursor.txid) (Int64.of_int (List.length txs))));
       "creator_addr", `String proposer;
       "prev_state_root", `String cursor.prev_root;
       "proposed_state_root", `String state_root;
@@ -42,7 +49,7 @@ let sample ~chain_id ~parent_commit (cursor : R.J.cursor) state_root =
       "ts", `Float epoch_ts;
     ]) in
   let plan = N.Consensus_replay.build_plan
-    ~parent_commit ~header ~commit_round:0 ~receipts_json:[] ~txs:[] in
+    ~parent_commit ~header ~commit_round:0 ~receipts_json ~txs in
   let validator_set = match parent_commit with
     | Some commit -> commit.C.validator_set
     | None -> C.make_validator_set []
@@ -52,9 +59,9 @@ let sample ~chain_id ~parent_commit (cursor : R.J.cursor) state_root =
     prev_state_root = cursor.prev_root;
     state_root;
     tx_list_hash;
-    tx_hashes = [];
-    txs_json = [];
-    receipts_json = [];
+    tx_hashes = R.hashes txs;
+    txs_json = List.map (fun tx -> Yojson.Safe.to_string (T.to_yojson tx)) txs;
+    receipts_json;
     receipt_root;
     epoch_ts;
     creator_addr = proposer;
@@ -62,10 +69,10 @@ let sample ~chain_id ~parent_commit (cursor : R.J.cursor) state_root =
     reward_source = R.get (N.Consensus_reward_attribution.to_source reward);
     finality = { finalize = plan.finalize; validator_set };
   } in
-  R.J.{ record; txs = []; expected_eic; epoch_int;
+  R.J.{ record; txs; expected_eic; epoch_int;
     proposer_info = plan.proposer_info; reward;
     next_cursor = { epoch = Int64.succ cursor.epoch; prev_root = state_root;
-      eic = expected_eic; txid = cursor.txid } }
+      eic = expected_eic; txid = Int64.add cursor.txid (Int64.of_int (List.length txs)) } }
 
 let epoch (context : A.context) parent (cursor : R.J.cursor) =
   let parent_commit = parent cursor in
@@ -217,6 +224,9 @@ let parent ~chain_id keys (cursor : R.J.cursor) =
       "creator_addr", `String "octEpochA";
       "prev_state_root", `String (String.make 64 '1');
       "proposed_state_root", `String cursor.prev_root;
+      "tx_list_hash", `String (Octra_net.Hash_domain.hash
+        "octra:tx_list:v1" "");
+      "receipt_root", `String (H.receipt_root []);
     ]) in
   let plan = N.Consensus_replay.build_plan
     ~parent_commit:None ~header ~commit_round:0 ~receipts_json:[] ~txs:[] in
@@ -244,6 +254,110 @@ let rec remove path =
     Unix.rmdir path
   | _ -> Unix.unlink path
 
+let private_epoch keys path =
+  let chain_id = "octra-devnet-9871-cluster" in
+  let epoch_id = (Option.get (Octra_core.Rule_graph.proof_key_activation_for_chain
+    chain_id)).activation_epoch in
+  let signing = Bytes.make 32 '\071' |> Bytes.to_string in
+  let secret = Base64.encode_exn signing in
+  let public_key = Mirage_crypto_ec.Ed25519.priv_of_octets signing
+    |> Result.get_ok |> Mirage_crypto_ec.Ed25519.pub_of_priv
+    |> Mirage_crypto_ec.Ed25519.pub_to_octets |> Base64.encode_exn in
+  let address = Octra_core.Crypto.Address.address_from_pubkey public_key in
+  let pk, sk = P.keygen_from_seed (P.default_params ()) (Bytes.make 32 '\072') in
+  let cipher = P.enc_value_seeded pk sk 10L (Bytes.make 32 '\073') in
+  let blind = Bytes.make 32 '\074' in
+  let payload keyed =
+    let proof = P.make_zero_proof_bound ~keyed ~math:true pk sk cipher 10L blind in
+    Yojson.Safe.to_string (`Assoc [
+      "cipher", `String (FB.encode_cipher cipher);
+      "amount_commitment", `String (P.pedersen_commit_amount 10L blind
+        |> Bytes.to_string |> Base64.encode_exn);
+      "zero_proof", `String (FB.encode_zero_proof proof);
+      "blinding", `String (Base64.encode_exn (Bytes.to_string blind));
+    ]) in
+  let tx keyed = T.sign_with_privkey T.{
+    from = address; to_ = address; amount = Z.of_int 10; nonce = 1;
+    ou = Z.of_int 3000; timestamp = float_of_int (epoch_id * 10);
+    signature = ""; public_key = Some public_key; message = None;
+    op_type = EncryptOp; encrypted_data = Some (payload keyed);
+  } secret in
+  let run_case keyed =
+    Unix.mkdir path 0o700;
+    Lwt_main.run (Lwt.finalize (fun () -> with_stores path (fun store chaindata ->
+      let ledger = L.create store in
+      L.add_account_with_pubkey ledger address (Z.of_int 1_000_000) public_key |> R.get;
+      let* () = L.set_pvac_pubkey ledger address
+        (P.serialize_pubkey pk |> Bytes.to_string) in
+      let* () = L.flush_dirty_lwt ledger in
+      let* () = S.begin_epoch_batch store in
+      let* () = Lwt_list.iter_s (fun (name, value) -> S.set_meta store name value)
+        ["total_supply", "1000000"; "emission_remaining", "0";
+         "last_epoch", string_of_int (epoch_id - 1);
+         "current_epoch", string_of_int epoch_id] in
+      let* () = S.commit_epoch_batch store "private replay input" in
+      let context = A.{store; chaindata; ledger; chain_id;
+        trust = Octra_vm.Program_trust.empty;
+        rules = G.create_ready ~ready_config_hash:(String.make 64 'a') ~chain_id
+          ~root_at:(fun epoch -> match G.root_after_floor ~chain_id
+            ~floor_epoch:epoch_id ~epoch with
+            | Some root -> G.Root root
+            | None -> G.Missing);
+        ready_root = (fun _ -> Lwt.return_none);
+        legacy_replay = (fun ~epoch:_ ~address:_ ~cipher:_ ->
+          failwith "private replay requested legacy history");
+        result_policy = (fun _ -> Octra_core.Private_result_policy.Recoverable);
+      } in
+      let* initial = S.state_hash store in
+      let cursor = R.J.{epoch = Int64.of_int epoch_id; txid = 1L;
+        eic = R.E.genesis_root;
+        prev_root = R.E.folded_state_root ~ledger_state_root:initial
+          ~epoch_index_root:R.E.genesis_root} in
+      let parent_commit = parent ~chain_id keys cursor in
+      let transaction = tx keyed in
+      expect "private replay transaction signature differs"
+        (T.verify transaction public_key);
+      let make ?(receipts_json = []) root = sample ~chain_id ~parent_commit
+        ~txs:[transaction] ~receipts_json cursor root in
+      let provisional = sample ~chain_id ~parent_commit cursor cursor.prev_root in
+      let deps = A.deps context ~cursor ~prepared:provisional in
+      let* batch = deps.preverify [transaction] in
+      if not keyed then begin
+        expect "prior proof accepted after key rule"
+          (List.length batch.ready = 0 || List.length batch.skipped > 0);
+        Lwt.return_unit
+      end else begin
+        expect "keyed private replay preverify refused"
+          (List.length batch.ready = 1 && batch.skipped = []);
+        let receipts = R.W.receipts_for_hashes batch.ready [T.hash transaction] in
+        let receipts_json = R.O.encode (R.W.json_of_receipts receipts) [] in
+        let gate = R.G.create receipts in
+        let* preview = deps.preview gate [transaction] in
+        let preview = R.get preview in
+        let _, index_root = R.E.next_root_from_hashes_i64 ~prev:cursor.eic
+          ~epoch_id:cursor.epoch ~start_txid:cursor.txid [T.hash transaction] in
+        let root = R.E.folded_state_root ~ledger_state_root:preview.post_state_root
+          ~epoch_index_root:index_root in
+        let prepared = make ~receipts_json root in
+        let* trace = R.run (A.deps context ~cursor ~prepared) ~cursor ~prepared in
+        expect "private replay omitted confirmed transaction"
+          (trace.confirmed = [T.hash transaction]);
+        let* stored = S.get_account store address in
+        let account = Option.get stored in
+        expect "private replay nonce differs" (account.nonce = 1);
+        expect "private replay public balance differs"
+          (Z.equal account.balance (Z.of_int 996_990));
+        let cipher = Option.get account.encrypted_balance
+          |> FB.decode_cipher ~strict:true |> R.get in
+        expect "private replay encrypted balance differs"
+          (P.dec_value pk sk cipher = 10L);
+        Lwt.return_unit
+      end)) (fun () -> remove path; Lwt.return_unit))
+  in
+  run_case false;
+  run_case true;
+  Printf.printf "event = epoch_store_private status = pass epoch = %d\n" epoch_id
+
 let rec node_root path =
   if Sys.file_exists (Filename.concat path "lib/core/store_irmin.ml") then path
   else
@@ -260,6 +374,122 @@ let rec with_env values f =
     Fun.protect
       ~finally:(fun () -> Unix.putenv name (Option.value ~default:"" previous))
       (fun () -> with_env rest f)
+
+let circle_epoch keys path =
+  let chain_id = "octra-devnet-9871-cluster" in
+  let start = (Option.get (G.batch_activation_for_chain chain_id)).activation_epoch in
+  let key = Mirage_crypto_ec.Ed25519.priv_of_octets (String.make 32 '\075')
+    |> Result.get_ok in
+  let public_key = Mirage_crypto_ec.Ed25519.pub_of_priv key
+    |> Mirage_crypto_ec.Ed25519.pub_to_octets |> Base64.encode_exn in
+  let secret = Mirage_crypto_ec.Ed25519.priv_to_octets key |> Base64.encode_exn in
+  let owner = Octra_core.Crypto.Address.address_from_pubkey public_key in
+  let target = "oct" ^ String.make 44 '2' in
+  let compiled = Octra_vm.Oct_compile.compile {|
+Program ReplayOrder {
+  state { observed: int }
+  fn watch(who: address): int {
+    self.observed = balance(who)
+    return self.observed
+  }
+}
+|} in
+  Option.iter failwith compiled.error;
+  let run_case epoch_id payment_first =
+    Unix.mkdir path 0o700;
+    Lwt_main.run (Lwt.finalize (fun () -> with_stores path (fun store chaindata ->
+      let ledger = L.create store in
+      L.add_account_with_pubkey ledger owner (Z.of_int 1_000_000) public_key |> R.get;
+      let module Circle = Octra_core.Circles in
+      let info = Circle.{circle_id = target; runtime = Octb; version = 1L; owner;
+        code_hash = sha256_hex compiled.bytecode; stable_root = zero_hash_hex;
+        assets_root = zero_hash_hex; privacy_class = Public; browser_mode = Native_sealed;
+        resource_mode = Public_resources; policy_hash = None; members_root = None;
+        export_policy = None; limits = default_limits} in
+      let* () = S.deploy_circle store info in
+      let* () = S.save_circle_program_code_b64 store target
+        (Base64.encode_exn compiled.bytecode) in
+      let* () = L.flush_dirty_lwt ledger in
+      let* () = S.begin_epoch_batch store in
+      let* () = Lwt_list.iter_s (fun (name, value) -> S.set_meta store name value)
+        ["total_supply", "1000000"; "emission_remaining", "0";
+         "last_epoch", string_of_int (epoch_id - 1);
+         "current_epoch", string_of_int epoch_id] in
+      let* () = S.commit_epoch_batch store "circle replay input" in
+      let context = A.{store; chaindata; ledger; chain_id;
+        trust = Octra_vm.Program_trust.empty;
+        rules = G.create_ready ~ready_config_hash:(String.make 64 'a') ~chain_id
+          ~root_at:(fun epoch -> match G.root_after_floor ~chain_id
+            ~floor_epoch:epoch_id ~epoch with
+            | Some root -> G.Root root
+            | None -> G.Missing);
+        ready_root = (fun _ -> Lwt.return_none);
+        legacy_replay = (fun ~epoch:_ ~address:_ ~cipher:_ ->
+          failwith "circle replay requested private history");
+        result_policy = (fun _ -> Octra_core.Private_result_policy.Recoverable)} in
+      let transaction ~nonce ~circle =
+        T.sign_with_privkey T.{from = owner; to_ = if circle then target else owner;
+          nonce; amount = if circle then Z.zero else Z.one; ou = Z.of_int 100_000;
+          timestamp = float_of_int (epoch_id * 10); signature = "";
+          public_key = Some public_key; op_type = if circle then CircleCall else Standard;
+          message = Some (if circle then Yojson.Safe.to_string (`List [`String owner]) else "");
+          encrypted_data = if circle then Some "watch" else None} secret in
+      let active = epoch_id >= start in
+      let txs = if not active then [transaction ~nonce:1 ~circle:true]
+        else [transaction ~nonce:1 ~circle:(not payment_first);
+          transaction ~nonce:2 ~circle:payment_first] in
+      let* initial = S.state_hash store in
+      let cursor = R.J.{epoch = Int64.of_int epoch_id; txid = 1L; eic = R.E.genesis_root;
+        prev_root = R.E.folded_state_root ~ledger_state_root:initial
+          ~epoch_index_root:R.E.genesis_root} in
+      let parent_commit = parent ~chain_id keys cursor in
+      let make ?(receipts_json = []) root =
+        sample ~chain_id ~parent_commit ~txs ~receipts_json cursor root in
+      let provisional = sample ~chain_id ~parent_commit cursor cursor.prev_root in
+      let deps = A.deps context ~cursor ~prepared:provisional in
+      let* batch = deps.preverify txs in
+      expect "circle replay omitted an input"
+        (batch.skipped = [] && R.hashes (R.W.txs batch) = R.hashes txs);
+      let receipts = R.W.receipts_for_hashes batch.ready (R.hashes txs) in
+      expect "circle replay receipt absent" (List.length receipts = 1);
+      let gate = R.G.create receipts in
+      let* preview = deps.preview gate txs in
+      let preview = R.get preview in
+      expect "circle replay execution refused"
+        (R.hashes (List.map fst preview.artifacts.confirmed) = R.hashes txs
+         && preview.artifacts.rejected = []);
+      let* unchanged = S.state_hash store in
+      expect "circle replay preparation wrote live state" (unchanged = initial);
+      let _, index_root = R.E.next_root_from_hashes_i64 ~prev:cursor.eic
+        ~epoch_id:cursor.epoch ~start_txid:cursor.txid (R.hashes txs) in
+      let root = R.E.folded_state_root ~ledger_state_root:preview.post_state_root
+        ~epoch_index_root:index_root in
+      let prepared = make ~receipts_json:(R.O.encode (R.W.json_of_receipts receipts) []) root in
+      let bad = {prepared with R.J.record = {prepared.record with receipts_json = []}} in
+      let* rejected = Lwt.catch
+        (fun () -> let* _ = R.run (A.deps context ~cursor ~prepared:bad)
+          ~cursor ~prepared:bad in Lwt.return_false)
+        (function Failure reason when reason = "replay preverify receipts differ" -> Lwt.return_true
+          | error -> Lwt.fail error) in
+      expect "circle replay accepted missing receipt" rejected;
+      let* unchanged = S.state_hash store in
+      expect "circle replay refusal wrote live state" (unchanged = initial);
+      let* trace = R.run (A.deps context ~cursor ~prepared) ~cursor ~prepared in
+      expect "circle replay changed confirmed order" (trace.confirmed = R.hashes txs);
+      expect "circle replay fees differ"
+        (Z.equal trace.fees (Z.of_int (100_000 * List.length txs)));
+      let* stored = S.get_account store owner in
+      expect "circle replay lost following nonce"
+        ((Option.get stored).nonce = List.length txs);
+      let* storage = S.load_circle_stable_storage store target in
+      let expected = if payment_first then "800000" else "900000" in
+      expect "circle replay observed wrong transaction state"
+        (Hashtbl.find_opt (R.get storage) "observed" = Some expected);
+      Lwt.return_unit)) (fun () -> remove path; Lwt.return_unit)) in
+  run_case (start - 1) false;
+  run_case start false;
+  run_case (start + 1) true;
+  Printf.printf "event = epoch_store_circle status = pass cases = 3\n"
 
 let network key =
   let chain_id = "octra-devnet-9871-cluster" in
@@ -332,7 +562,8 @@ let () =
   with_env ["OCTRA_EMISSION_GUARD", "0"; "OCTRA_EMISSION_PROFILE", "";
     "OCTRA_EMISSION_ACTIVATION_EPOCH", "";
     "OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH", "";
-    "OCTRA_PRIVATE_RESULT_ACTIVATION_EPOCH", "0"] (fun () ->
+    "OCTRA_PRIVATE_RESULT_ACTIVATION_EPOCH", "0";
+    "OCTRA_BFT_RELEASE_PROFILE", "devnet_full_v1"] (fun () ->
     let check ~chain_id ~start ~count ~parent =
       Unix.mkdir path 0o700;
       Lwt_main.run (Lwt.finalize (fun () -> run ~chain_id ~start ~count ~parent path)
@@ -341,5 +572,7 @@ let () =
     check ~chain_id:"epoch-store-sample" ~start:1 ~count:2 ~parent:(fun _ -> None);
     let chain_id = "octra-devnet-9871-cluster" in
     check ~chain_id ~start:1_499_999 ~count:3 ~parent:(parent ~chain_id keys);
-    check ~chain_id ~start:1_500_001 ~count:2 ~parent:(parent ~chain_id keys));
+    check ~chain_id ~start:1_500_001 ~count:2 ~parent:(parent ~chain_id keys);
+    circle_epoch keys path;
+    private_epoch keys path);
   Printf.printf "event = epoch_store status = pass scope = adapter_control auth = sample execution = production epochs = 7\n"

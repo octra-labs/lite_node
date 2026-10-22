@@ -111,7 +111,8 @@ let test_set_plan () =
     "set plan activation changed";
   require
     (Graph.profile_epochs ~chain_id =
-      [1_500_000; 1_510_000; 1_572_000; 1_614_500; 1_663_000; 1_688_734])
+      [1_500_000; 1_510_000; 1_572_000; 1_614_500; 1_663_000; 1_688_734;
+       (Option.get (Graph.stake_activation_for_chain chain_id)).activation_epoch])
     "profile epochs changed";
   List.iter (fun epoch ->
     require (Graph.set_plan seed ~epoch = Ok Graph.Prior)
@@ -899,3 +900,70 @@ let () =
     "new mainnet did not require strict private payloads at genesis";
   Printf.printf
     "status = pass test = rule_graph before = true activation = true after = true mixed = true\n%!"
+
+let () =
+  let chain_id = "octra-devnet-9871-cluster" in
+  let plan = Option.get (Graph.duty_marks_activation_for_chain chain_id) in
+  require (Graph.program_records_activation_for_chain chain_id = Some plan)
+    "publication date differs";
+  let old = Option.get (Octra_consensus.C_quorum_policy.activation_for_chain chain_id) in
+  let make root = Graph.create ~chain_id ~root_at:(fun epoch ->
+    if epoch = plan.anchor_epoch then root
+    else if epoch = old.anchor_epoch then Graph.Root old.anchor_state_root
+    else Graph.Missing) in
+  let valid = make (Graph.Root plan.anchor_state_root) in
+  let cases = [Graph.stake; Graph.proof_key; Graph.duty_marks;
+    Graph.program_records; Graph.validator_quorum] in
+  List.iter (fun read ->
+    List.iter (fun epoch ->
+      require (read valid ~epoch = Ok Graph.Active) "release inactive";
+      List.iter (fun (root, fault) ->
+        require (read (make root) ~epoch = Error fault) "release accepted invalid root")
+        [Graph.Missing, Graph.Anchor_missing plan.anchor_epoch;
+         Graph.Unreadable "read", Graph.Anchor_unreadable {
+           epoch = plan.anchor_epoch; reason = "read"};
+         Graph.Root "wrong", Graph.Anchor_mismatch {
+           epoch = plan.anchor_epoch; expected = plan.anchor_state_root; actual = "wrong"}])
+      [plan.activation_epoch; plan.activation_epoch + 1]) cases;
+  let before = make (Graph.Unreadable "must not read") in
+  require (Graph.validator_quorum before ~epoch:(plan.activation_epoch - 1) = Ok Graph.Active)
+    "stake root read before activation";
+  List.iter (fun read ->
+    require (read before ~epoch:(plan.activation_epoch - 1) = Ok Graph.Prior)
+      "release active early") [Graph.stake; Graph.proof_key;
+        Graph.duty_marks; Graph.program_records];
+  let reads = ref 0 in
+  let shared = Graph.create ~chain_id ~root_at:(fun epoch ->
+    if epoch = plan.anchor_epoch then begin
+      incr reads;
+      Graph.Root plan.anchor_state_root
+    end else Graph.Root old.anchor_state_root) in
+  List.iter (fun read ->
+    List.iter (fun epoch ->
+      require (read shared ~epoch = Ok Graph.Active)
+        "shared anchor refused") [plan.activation_epoch; plan.activation_epoch + 1]) cases;
+  require (!reads = 1) "verified anchor read more than once";
+  let attempts = ref 0 in
+  let recovered = Graph.create ~chain_id ~root_at:(fun epoch ->
+    if epoch <> plan.anchor_epoch then Graph.Root old.anchor_state_root
+    else begin
+      incr attempts;
+      if !attempts = 1 then Graph.Unreadable "read"
+      else Graph.Root plan.anchor_state_root
+    end) in
+  require (Graph.proof_key recovered ~epoch:plan.activation_epoch = Error
+    (Graph.Anchor_unreadable {epoch = plan.anchor_epoch; reason = "read"}))
+    "anchor read error was ignored";
+  require (Graph.proof_key recovered ~epoch:plan.activation_epoch = Ok Graph.Active
+    && !attempts = 2) "failed anchor read was saved";
+  require (Graph.settle valid ~epoch:max_int = Ok Graph.Prior) "settlement enabled";
+  require (Graph.root_after_floor ~chain_id ~floor_epoch:plan.anchor_epoch
+    ~epoch:plan.anchor_epoch = Some plan.anchor_state_root) "release root missing";
+  require (Graph.root_after_floor ~chain_id ~floor_epoch:(plan.anchor_epoch - 1)
+    ~epoch:plan.anchor_epoch = None) "release root accepted before snapshot";
+  List.iter (fun chain_id ->
+    require (Graph.duty_marks_at ~chain_id ~epoch:max_int = Graph.Prior) "other marks enabled";
+    require (Graph.program_records_at ~chain_id ~epoch:max_int = Graph.Prior) "other records enabled";
+    require (Octra_consensus.C_quorum_policy.linear_epoch ~chain_id = None) "other stake enabled")
+    ["octra-mainnet"; "other-chain"];
+  print_endline "status = pass test = release_rules"

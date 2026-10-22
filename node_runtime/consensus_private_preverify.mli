@@ -6,6 +6,7 @@ type t
 val eligible : Octra_core.Transaction.t -> bool
 
 val create :
+  keyed:(unit -> bool) ->
   field_policy:(unit -> Octra_core.Private_ledger.field_policy) ->
   strict:(unit -> bool) ->
   math:(unit -> bool) ->

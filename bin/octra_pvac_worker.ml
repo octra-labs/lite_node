@@ -48,7 +48,7 @@ let run () =
       | Error reason ->
         failure (request_hash_of_raw raw) reason
       | Ok request ->
-        D.response request
+        D.response ~keyed:false request
     end
 
 let () =

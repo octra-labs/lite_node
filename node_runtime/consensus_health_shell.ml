@@ -24,7 +24,7 @@ type deps = {
   catchup_next_target : unit -> int64 option;
   attested_head : int -> bool;
   clear_state_attested : unit -> unit;
-  set_catchup_in_progress : bool -> unit;
+  catchup_active : unit -> bool;
   set_state_attested : head:int -> root:string -> unit;
   clear_quarantine : string -> unit;
   mark_quarantine : string -> unit;
@@ -184,6 +184,9 @@ let accept_current_root
     ~consensus_proved
     reason =
   let open Lwt.Syntax in
+  if deps.catchup_active () || deps.committed_head_epoch () <> head then
+    Lwt.return_unit
+  else
   let quarantine_active = deps.quarantine_active () in
   let quarantine_reason = deps.quarantine_reason () in
   let clear_evidence =
@@ -198,23 +201,24 @@ let accept_current_root
   match clear_evidence with
   | None ->
     deps.clear_state_attested ();
-    deps.set_catchup_in_progress false;
     Log.warn "catchup"
       "event = quarantine_preserved reason = %s evidence = %s head = %d matching = %d consensus_proved = %b"
       quarantine_reason reason head matching consensus_proved;
     Lwt.return_unit
   | Some clear_evidence ->
     deps.set_state_attested ~head ~root;
-    deps.set_catchup_in_progress false;
     deps.clear_quarantine clear_evidence;
     let* () = deps.drain_pending_finalized () in
-    deps.wake_ready ()
+    if deps.catchup_active () || deps.committed_head_epoch () <> head then
+      Lwt.return_unit
+    else
+      deps.wake_ready ()
 
 let wake_if_ready (deps : deps) wake_ready =
   let open Lwt.Syntax in
-  if wake_ready then
+  if wake_ready && not (deps.catchup_active ()) then
     let* () = deps.drain_pending_finalized () in
-    deps.wake_ready ()
+    if deps.catchup_active () then Lwt.return_unit else deps.wake_ready ()
   else
     Lwt.return_unit
 
@@ -223,6 +227,8 @@ let range_recovery_reason reason =
   || String.starts_with ~prefix:"catchup_apply_failed:" reason
   || String.starts_with ~prefix:"lag_" reason
   || String.starts_with ~prefix:"bundle_wait_timeout_epoch_" reason
+  || String.starts_with ~prefix:"finalized_bundle_unavailable:" reason
+  || String.starts_with ~prefix:"rule anchor unreadable epoch = " reason
 
 let run ?(stale_retries = 1) ?repair
     ?(http_target = fun () -> Lwt.return_none) cfg deps =
@@ -234,7 +240,8 @@ let run ?(stale_retries = 1) ?repair
       ~configured:cfg.state_attest_configured
   in
   let rec attempt stale_retries =
-    deps.normalize_next_epoch_for_head ~source:"probe_consensus_health";
+    if deps.catchup_active () then Lwt.return_unit else
+    let () = deps.normalize_next_epoch_for_head ~source:"probe_consensus_health" in
     let our_head_int = deps.committed_head_epoch () in
     let our_head = Int64.of_int our_head_int in
     let already_attested = deps.attested_head our_head_int in
@@ -244,7 +251,8 @@ let run ?(stale_retries = 1) ?repair
       deps.query_epoch_root ~epoch_id:our_head ~timeout_seconds:5.0
     in
     let head_after_query = deps.committed_head_epoch () in
-    if head_after_query <> our_head_int then begin
+    if deps.catchup_active () then Lwt.return_unit
+    else if head_after_query <> our_head_int then begin
       Log.trace "catchup"
         "event = moving_head phase = query start_head = %d head_after_query = %d retries_left = %d"
         our_head_int head_after_query stale_retries;
@@ -259,7 +267,6 @@ let run ?(stale_retries = 1) ?repair
         log "catchup"
           "event = low_peer_responses responses = %d required = %d head = %d attested = %b"
           n_resp state_attest_required our_head_int has_head;
-        deps.set_catchup_in_progress false;
         if not has_head then deps.clear_state_attested ();
         let range_allowed =
           if deps.quarantine_active () then
@@ -268,16 +275,26 @@ let run ?(stale_retries = 1) ?repair
             true
         in
         if range_allowed then begin
-          let* target = http_target () in
-          match target with
-          | Some target when Int64.compare target our_head > 0 ->
-            Log.warn "catchup"
-              "event = attestation_http_secondary head = %d target = %Ld responses = %d required = %d"
-              our_head_int target n_resp state_attest_required;
-            deps.run_catchup_to_target
-              ~target_epoch:target
-              ~reason:"attestation_secondary"
-          | _ -> Lwt.return_unit
+          let* http = http_target () in
+          let target = match http, deps.catchup_next_target () with
+            | Some left, Some right ->
+              Some (if Int64.compare left right >= 0 then left else right)
+            | Some value, None | None, Some value -> Some value
+            | None, None -> None in
+          let current_head = deps.committed_head_epoch () in
+          if deps.catchup_active () || current_head <> our_head_int then
+            Lwt.return_unit
+          else
+            match target with
+            | Some target when Int64.compare target
+                (Int64.of_int current_head) > 0 ->
+              Log.warn "catchup"
+                "event = attestation_http_secondary head = %d target = %Ld responses = %d required = %d"
+                our_head_int target n_resp state_attest_required;
+              deps.run_catchup_to_target
+                ~target_epoch:target
+                ~reason:"attestation_secondary"
+            | _ -> Lwt.return_unit
         end else
           Lwt.return_unit
       end else
@@ -302,7 +319,8 @@ let run ?(stale_retries = 1) ?repair
         | C_catchup.Fresh ->
           let* live_root = deps.read_local_root_raw () in
           let head_after_root = deps.committed_head_epoch () in
-          if head_after_root <> our_head_int then begin
+          if deps.catchup_active () then Lwt.return_unit
+          else if head_after_root <> our_head_int then begin
             Log.trace "catchup"
               "event = moving_head phase = root_read start_head = %d head_after_root = %d retries_left = %d"
               our_head_int head_after_root stale_retries;
@@ -337,7 +355,6 @@ let run ?(stale_retries = 1) ?repair
                 deps.mark_quarantine
                   (Printf.sprintf "local_state_root_mismatch_at_head_%d" our_head_int);
                 deps.clear_state_attested ();
-                deps.set_catchup_in_progress false;
                 Lwt.return_unit
               | _ ->
                 let peer_root_quorum =
@@ -404,7 +421,6 @@ let run ?(stale_retries = 1) ?repair
                         "event = missing_peer_root_quorum head = %d count = %d required = %d"
                         our_head_int count state_attest_required;
                       clear_unattested_current_head deps our_head_int;
-                      deps.set_catchup_in_progress false;
                       Lwt.return_unit
                     | H.Accept_current_root ->
                       accept_current_root deps ~head:our_head_int ~root:live_root
@@ -414,7 +430,6 @@ let run ?(stale_retries = 1) ?repair
                   end
                 | C_catchup.Ahead_of_target n ->
                   deps.incr_ahead_streak ();
-                  deps.set_catchup_in_progress false;
                   if not (H.root_quorum_has_quorum peer_root_quorum) then begin
                     Log.warn "catchup"
                       "event = ahead_no_quorum ahead = %d count = %d required = %d"
@@ -440,6 +455,10 @@ let run ?(stale_retries = 1) ?repair
                           ~epoch_id:our_head
                           ~timeout_seconds:2.0
                       in
+                      if deps.catchup_active ()
+                        || deps.committed_head_epoch () <> our_head_int then
+                        Lwt.return_unit
+                      else
                       let head_root_quorum =
                         H.peer_root_quorum
                           ~required:state_attest_required
@@ -472,7 +491,6 @@ let run ?(stale_retries = 1) ?repair
                               "event = ahead_wait_current_root_quorum head = %d target = %Ld"
                               our_head_int
                               target_epoch;
-                            deps.set_catchup_in_progress false;
                             Lwt.return_unit
                           | Some repair ->
                             let* target_root =
@@ -485,7 +503,8 @@ let run ?(stale_retries = 1) ?repair
                             begin
                               match target_root with
                               | Some majority
-                                when deps.committed_head_epoch () = our_head_int ->
+                                when deps.committed_head_epoch () = our_head_int
+                                  && not (deps.catchup_active ()) ->
                                 let* repaired =
                                   repair
                                     ~target_epoch
@@ -499,9 +518,13 @@ let run ?(stale_retries = 1) ?repair
                                     "event = ahead_wait_current_root_quorum head = %d target = %Ld"
                                     our_head_int
                                     target_epoch;
-                                  deps.set_catchup_in_progress false;
                                   Lwt.return_unit
                                 end
+                              | Some _ when deps.catchup_active () ->
+                                Log.info "catchup"
+                                  "event = fork_repair_skipped reason = catchup_active head = %d"
+                                  our_head_int;
+                                Lwt.return_unit
                               | Some _ ->
                                 Log.trace "catchup"
                                   "event = moving_head phase = fork_proof start_head = %d head_after_query = %d"
@@ -513,7 +536,6 @@ let run ?(stale_retries = 1) ?repair
                                   "event = ahead_wait_current_root_quorum head = %d target = %Ld"
                                   our_head_int
                                   target_epoch;
-                                deps.set_catchup_in_progress false;
                                 Lwt.return_unit
                             end
                         end
@@ -552,15 +574,12 @@ let run ?(stale_retries = 1) ?repair
                     our_head_int
                     target_epoch
                     lag;
-                  deps.set_catchup_in_progress false;
-                  if our_head_int < 0 || our_head_int = max_int then begin
+                  begin match Sync_need.lost ~head:our_head_int ~target:target_epoch with
+                  | None ->
                     deps.mark_quarantine "snapshot_plan_invalid";
                     Lwt.return_unit
-                  end else begin
-                    deps.require_sync
-                      (Sync_need.root
-                         ~epoch:(our_head_int + 1)
-                         ~head:our_head_int);
+                  | Some need ->
+                    deps.require_sync need;
                     Lwt.return_unit
                   end
                 | C_catchup.Do_catchup lag ->
@@ -570,6 +589,7 @@ let run ?(stale_retries = 1) ?repair
                             ~soft_lag:cfg.soft_catchup_max_lag with
                     | H.Lagging_soft lag ->
                       let* () = deps.drain_pending_finalized () in
+                      if deps.catchup_active () then Lwt.return_unit else
                       let refreshed_head = deps.committed_head_epoch () in
                       if refreshed_head > our_head_int then begin
                         Log.info "catchup"

@@ -963,6 +963,7 @@ let reserve_call t call validators =
   | None -> Lwt.return (Ok Skipped)
   | Some _ ->
     let request = call.Protocol.request in
+    let room = Record.reply_space call validators t.deps.node_id in
     let* saved = use_history t (fun history ->
       match Octra_core.Compute_history.reply history ~caller:request.caller
         ~session:request.session_id ~sequence:request.sequence ~request:(request_id call) with
@@ -973,7 +974,7 @@ let reserve_call t call validators =
           (Octra_core.Compute_history.reserve history ~caller:request.caller
             ~session:request.session_id ~sequence:request.sequence ~request:(request_id call)
             ~scope:(Record.encode_scope call validators)
-            ~room:(Record.reply_space call validators t.deps.node_id))) in
+            ~room)) in
     Lwt.return (match saved with
       | Error _ as error -> error
       | Ok (None, true) -> Ok Execute
@@ -1075,11 +1076,12 @@ let record_result t result =
       let before = Record.encode (record_of_state state (table_values state.votes)) in
       let after = Record.encode (record_of_state state (result :: table_values state.votes)) in
       let request = state.call.request in
+      let own = node = t.deps.node_id in
       let* saved = use_history t (fun history ->
         let id = intent_id state.call in
         match Octra_core.Compute_history.work history ~caller:request.caller ~id with
         | Error _ as error -> error
-        | Ok None when node = t.deps.node_id ->
+        | Ok None when own ->
           begin match Octra_core.Compute_history.load_job history ~caller:request.caller ~id with
           | Error _ as error -> error
           | Ok (Some body) when (Record.decode body).call = state.call ->
@@ -1299,9 +1301,10 @@ let verify_cancel_ack t (ack : Protocol.cancel_ack) =
   && signed ack.node_id ack.node_key (Protocol.cancel_ack_sign ack) ack.signature
 
 let cancel_scope t (cancel : Protocol.cancellation) origin accept =
+  let chain_id = t.deps.chain_id in
   let matches (call : Protocol.call) validators =
     Protocol.call_shape call
-    && call.request.chain_id = t.deps.chain_id && cancel.chain_id = t.deps.chain_id
+    && call.request.chain_id = chain_id && cancel.chain_id = chain_id
     && call.request.caller = cancel.caller && call.caller_public_key = cancel.caller_public_key
     && call.request.session_id = cancel.session_id && call.coordinator = origin
     && call.request.validator_set_root = Octra_consensus.C_config.validator_set_hash validators
@@ -1329,10 +1332,11 @@ let cancel_scope t (cancel : Protocol.cancellation) origin accept =
       | _ -> None)
 
 let round_validators ?(member = false) t (value : Protocol.cancel_round) =
+  let node_id = t.deps.node_id in
   let signed validators = verify_node validators value.origin
     (Protocol.cancel_round_sign value) value.signature
     && (not member
-        || Option.is_some (Octra_consensus.C_types.pubkey_of_addr validators t.deps.node_id)) in
+        || Option.is_some (Octra_consensus.C_types.pubkey_of_addr validators node_id)) in
   let+ prior = cancel_scope t value.cancel value.origin signed in
   match prior with
   | Some validators when signed validators -> prior
@@ -1439,6 +1443,7 @@ let cancel_session_direct ?(send = false) ?round t (cancel : cancellation) =
     if not (cancel_available t cancel.caller cancel.session_id) then
       Lwt.return (Error "resource compute cancellation table full")
     else
+      let body = Protocol.encode (Protocol.Cancel (wire_cancel t cancel)) in
       let* saved = use_history t (fun history ->
         match round with
         | Some _ -> Octra_core.Compute_history.cancel ?expires:cancel.until history
@@ -1449,7 +1454,7 @@ let cancel_session_direct ?(send = false) ?round t (cancel : cancellation) =
           else Octra_core.Compute_history.queue_cancel ?until:cancel.until history
             ~epoch:head.epoch_id ~expires:(Option.value cancel.until ~default:(Int64.add head.epoch_id call_ttl))
             ~caller:cancel.caller ~session:cancel.session_id
-            ~body:(Protocol.encode (Protocol.Cancel (wire_cancel t cancel)))
+            ~body
         | None -> Octra_core.Compute_history.cancel ?expires:cancel.until history
           ~caller:cancel.caller ~session:cancel.session_id) in
       match saved with
@@ -1764,21 +1769,21 @@ and local_provider_flow t offer =
     else
       let () =
         Log.info "compute"
-          "event = provider_candidate status = checking phase = self_test" in
+          "event = provider_check status = checking phase = self_test" in
       let* test_result =
         actor_call t Ensure_self_test in
       begin
         match test_result with
         | Error reason ->
           Log.warn "compute"
-            "event = provider_candidate status = refused phase = self_test reason = %s"
+            "event = provider_check status = refused phase = self_test reason = %s"
             reason;
           Lwt.return_unit
         | Ok test when test.executor_root <> offer.executor_root ->
           Lwt.return_unit
         | Ok test ->
           Log.info "compute"
-            "event = provider_candidate status = checking phase = prepare";
+            "event = provider_check status = checking phase = prepare";
           let* prepared_result =
             Engine.prepare provider.engine (prepare_request offer) in
           begin
@@ -1794,7 +1799,7 @@ and local_provider_flow t offer =
               let* () = publish t (Protocol.Capability capability) in
               let* () = publish t (Protocol.Commitment commitment) in
               Log.info "compute"
-                "event = provider_candidate status = committed commit_epoch = %Ld"
+                "event = provider_check status = committed commit_epoch = %Ld"
                 current.epoch_id;
               schedule_reveal
                   t
@@ -1804,12 +1809,12 @@ and local_provider_flow t offer =
                   nonce
             | Error reason, _ ->
               Log.warn "compute"
-                "event = provider_candidate status = refused phase = prepare reason = %s"
+                "event = provider_check status = refused phase = prepare reason = %s"
                 reason;
               Lwt.return_unit
             | Ok _, Error reason ->
               Log.warn "compute"
-                "event = provider_candidate status = refused phase = head reason = %s"
+                "event = provider_check status = refused phase = head reason = %s"
                 reason;
               Lwt.return_unit
             | Ok _, Ok _ -> Lwt.return_unit
@@ -1824,7 +1829,7 @@ and schedule_reveal t expires_epoch commitment evidence_root nonce =
   | Ok head when Int64.sub head.epoch_id commitment.Selection.commit_epoch >= reveal_delay ->
     let reveal = signed_reveal t commitment nonce evidence_root head.epoch_id in
     Log.info "compute"
-      "event = provider_candidate status = revealed reveal_epoch = %Ld"
+      "event = provider_check status = revealed reveal_epoch = %Ld"
       head.epoch_id;
     publish t (Protocol.Reveal reveal)
   | Ok _ ->
@@ -1967,7 +1972,7 @@ let rec wait_for_providers t offer_key =
     then
       let () =
         Log.info "compute"
-          "event = committee status = ready candidates = %d target = %d"
+          "event = committee status = ready entries = %d target = %d"
           (List.length nodes)
           committee_size in
       Lwt.return (Ok (head, snapshot))
@@ -2618,11 +2623,12 @@ let compute_reused t request lease =
   send_call t call
 
 let prune_jobs t epoch =
+  let chain_id = t.deps.chain_id in
   use_history t (fun history ->
     Octra_core.Compute_history.prune_jobs history ~expired:(fun ~caller ~session ~id body ->
       let record = Record.decode body in
       let call = record.Record.call in
-      call.request.chain_id = t.deps.chain_id && call.request.caller = caller
+      call.request.chain_id = chain_id && call.request.caller = caller
       && call.request.session_id = session && intent_id call = id
       && call.request.expires_epoch < epoch))
 
@@ -3001,8 +3007,9 @@ let wake_reveals t =
     let local = match Protocol.decode payload with
       | Protocol.Reveal reveal -> reveal.Selection.node_id = t.deps.node_id
       | _ -> false in
+    let now = t.deps.now () in
     let* allowed = use_history t (fun history ->
-      Octra_core.Compute_history.claim_send ~local history ~now:(t.deps.now ())) in
+      Octra_core.Compute_history.claim_send ~local history ~now) in
     if allowed = Ok true then begin
       t.relay_pending <- Some payload;
       spawn_background t "reveal_send" (fun () -> send_reveal t payload)
@@ -3054,15 +3061,17 @@ let handle_actor_message : type reply. t -> reply actor_message -> reply Lwt.t =
               if session_cancelled t cancel.caller cancel.session_id
               then Octra_core.Compute_history.claim_relay else Octra_core.Compute_history.claim_transit
             | _ -> Octra_core.Compute_history.claim_send ~local:(source = None) in
+          let now = t.deps.now () in
           let+ allowed = use_history t (fun history ->
-            claim history ~now:(t.deps.now ())) in
+            claim history ~now) in
           allowed = Ok true in
         let* allowed = match allowed, message with
           | true, Protocol.Cancel_round value ->
             let transit = not (session_cancelled t value.cancel.caller value.cancel.session_id) in
+            let now = t.deps.now () in
             let+ saved = use_history t (fun history ->
               Octra_core.Compute_history.relay_cancel ~close:false history
-                ~now:(t.deps.now ())
+                ~now
                 ~transit
                 ~epoch ~expires:value.expires ~round:value.round ~origin:value.origin
                 ~id:(wire_id (Protocol.encode (Protocol.Cancel value.cancel)))
@@ -3179,9 +3188,11 @@ let handle_actor_message : type reply. t -> reply actor_message -> reply Lwt.t =
         begin match loaded with
         | Error _ as error -> Lwt.return error
         | Ok () ->
+          let now = t.deps.now () in
+          let rounds = t.deps.cancel_rounds () in
           let* next = use_history t (fun history ->
-            Octra_core.Compute_history.claim_notice ?target ~now:(t.deps.now ())
-              ~rounds:(t.deps.cancel_rounds ()) history ~epoch:head.epoch_id) in
+            Octra_core.Compute_history.claim_notice ?target ~now
+              ~rounds history ~epoch:head.epoch_id) in
           let* () = match next with
             | Ok (Some notice) when notice.round > 1 ->
               begin match Protocol.decode notice.body with
@@ -3223,8 +3234,9 @@ let handle_actor_message : type reply. t -> reply actor_message -> reply Lwt.t =
         | Some origin_key, Some node_key -> Some (origin_key, node_key)
         | _ -> None) in
       if Option.is_none keys then Lwt.return_none else
+      let now = t.deps.now () in
       let+ allowed = use_history t (fun history ->
-        Octra_core.Compute_history.claim_relay history ~now:(t.deps.now ())) in
+        Octra_core.Compute_history.claim_relay history ~now) in
       if allowed = Ok true then keys else None
     | Read_cancels cancel ->
       begin match current_head t with

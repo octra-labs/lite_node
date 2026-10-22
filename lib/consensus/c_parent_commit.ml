@@ -89,13 +89,10 @@ let participant_set value =
 let proposer value =
   let address = value.certificate.header.creator_addr in
   match
-    List.find_opt
-      (fun (validator : validator_info) ->
-        String.equal validator.address address)
-      value.validator_set.validators,
-    C_types.weight_of_addr value.validator_set address
+    C_types.author_entry ~chain_id:value.certificate.chain_id
+      ~epoch_id:value.certificate.epoch_id value.validator_set address
   with
-  | Some validator, Some weight when Z.sign weight > 0 ->
+  | Some (validator, weight) when Z.sign weight > 0 ->
     Ok { address; pubkey = validator.pubkey; weight }
   | _ -> Error "parent commit proposer is not in validator set"
 
@@ -104,7 +101,7 @@ let same_block left right =
   && left.certificate.proposal_id = right.certificate.proposal_id
   && left.certificate.header = right.certificate.header
 
-let validate expected value =
+let validate ?policy expected value =
   let value = canonical value in
   let certificate = value.certificate in
   if certificate.chain_id <> expected.chain_id then
@@ -130,7 +127,7 @@ let validate expected value =
       | None -> false
       | Some pubkey -> C_hash.verify_vote ~pubkey_raw:pubkey vote
     in
-    match C_qc.validate_certificate
+    match C_qc.validate_certificate ?policy
       ~chain_id:expected.chain_id
       ~validator_set:value.validator_set
       ~verify_vote

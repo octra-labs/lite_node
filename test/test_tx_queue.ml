@@ -57,6 +57,7 @@ let test_intake () = List.iter (fun duty ->
         proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
         compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
         settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
+        marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
         queue_head = (fun () -> None);
         duty_head = (fun () -> Some (10L, Octra_core.Rule_graph.Prior));
         preverify_admit = (fun tx -> seen := tx :: !seen; Ok ());
@@ -133,6 +134,7 @@ let test_circle_intake () =
         proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
         compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
         settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
+        marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
         queue_head = (fun () -> None);
         preverify_admit = (fun tx -> seen := tx :: !seen; Ok ());
         save_drops = (fun rows -> drops := rows @ !drops);
@@ -180,7 +182,7 @@ let test_circle_intake () =
       let carried = {exact with Tx.public_key = Some (String.make 44 '"')} in
       expect "circle escaped signed size" (Lane.tx_bytes exact = budget.max_bytes);
       expect "circle carried key inflates wire size" (Lane.tx_bytes carried = budget.max_bytes + 44);
-      expect "circle carried key resolves before admission" (Rest.prepare_tx ledger carried = Ok exact);
+      expect "circle carried key resolves before check" (Rest.prepare_tx ledger carried = Ok exact);
       expect "circle normalized RPC control accepted"
         (Rest.validate_and_submit_tx runtime ledger exact = Ok (Tx.hash exact));
       Pool.clear ();
@@ -194,7 +196,7 @@ let test_circle_intake () =
       Pool.clear ();
       expect "circle non-bft policy unchanged"
         (Rest.add_tx_to_staging ~relay:false runtime ledger refused = Ok (Tx.hash refused));
-      expect "circle admission does not charge"
+      expect "circle check does not charge"
         ((Ledger.find ledger allowed.from).nonce = 0
          && Z.equal (Ledger.find ledger allowed.from).balance (Z.of_int 100_000_000)))))
 
@@ -222,6 +224,7 @@ let test_program_intake () =
           proof_mode = (fun () -> !mode);
           compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
           settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
+          marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
           queue_head = (fun () -> None);
           preverify_admit = (fun tx -> seen := tx :: !seen; Ok ());
           save_drops = (fun rows -> expect "unexpected queue drop" (rows = []));
@@ -269,6 +272,7 @@ let test_deploy_intake () =
         proof_mode = (fun () -> !mode); preverify_admit = (fun _ -> Ok ());
         compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
         settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
+        marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
         queue_head = (fun () -> None);
         save_drops = (fun rows -> expect "deploy replaced queue data" (rows = []));
         find_drop = (fun _ -> None); drops_by_addr = (fun _ ~limit:_ ~offset:_ -> [])} in
@@ -313,11 +317,11 @@ let test_circle_bytes () =
   let exact = {empty with Tx.message = Some (String.make size 'a')} in
   let larger = {empty with Tx.message = Some (String.make (size + 1) 'a')} in
   expect "circle byte count matches gate" (Lane.tx_bytes exact = budget.max_bytes);
-  expect "circle byte limit inclusive" (Lane.circle_admission exact = Ok ());
+  expect "circle byte limit inclusive" (Lane.circle_check exact = Ok ());
   expect "circle byte excess refused"
-    (Lane.circle_admission larger = Error "circle resource limit: bytes");
+    (Lane.circle_check larger = Error "circle resource limit: bytes");
   expect "circle policy leaves other lanes unchanged"
-    (Lane.circle_admission {larger with Tx.op_type = ProgramExec; ou = Z.succ budget.max_ou} = Ok ())
+    (Lane.circle_check {larger with Tx.op_type = ProgramExec; ou = Z.succ budget.max_ou} = Ok ())
 
 let test_circle_selection () =
   let module Lane = Octra_core.Resource_lanes in
@@ -395,6 +399,7 @@ let test_delivery () =
         proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
         compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
         settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
+        marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
         queue_head = (fun () -> None);
         duty_head = (fun () -> Some (10L, Octra_core.Rule_graph.Prior));
         preverify_admit = (fun value ->
@@ -562,6 +567,7 @@ let test_hold_intake () =
         let runtime = Rest.{swarm_ref = ref None; queue_head = point;
           compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
           settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
+          marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
           proof_mode = (fun () -> Octra_core.Rule_graph.Prior);
           duty_head = (fun () -> Some (10L, Octra_core.Rule_graph.Prior));
           preverify_admit = (fun tx -> seen := tx :: !seen; Ok ());

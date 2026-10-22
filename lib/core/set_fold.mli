@@ -18,12 +18,25 @@ type final = {
   epoch : int64;
   proposal_id : string;
   set_hash : string;
+  round : int option;
 }
 
 type proof = {
   vote : Octra_consensus.C_types.vote;
   commit : Octra_consensus.C_types.parent_commit;
 }
+
+type mark_claim = { epoch : int64; signature : string }
+type mark_set = int64 * string * Octra_consensus.C_types.validator_set
+type evidence = Pulse | Commit of proof | Marks of mark_claim list
+
+val marks_id : string
+val encode_marks : mark_claim list -> string
+val decode_marks : cfg -> string -> (mark_claim list, string) result
+val evidence_of_message : marks:bool -> cfg -> string option -> (evidence, string) result
+val verify_mark_claim : cfg -> chain_id:string -> epoch:int64 -> address:string ->
+  sets:mark_set list -> mark_claim -> t -> (unit, string) result
+val check_mark_claims : cfg -> epoch:int64 -> mark_claim list -> t -> (unit, string) result
 
 type counts = {
   live : int;
@@ -45,6 +58,9 @@ type exclusion =
   | Marks_short of { low : int64; high : int64; signed : int; required : int }
 
 type cap_mode = Reject | Prune
+
+val apply_mark_claims : ?cap_mode:cap_mode -> cfg -> chain_id:string -> epoch:int64 ->
+  active:bool -> address:string -> sets:mark_set list -> mark_claim list -> t -> (t, string) result
 
 val meta_key : string
 val standard : cfg
@@ -114,19 +130,21 @@ val filter :
   cfg ->
   start:int64 ->
   source:int64 ->
-  Validator_admission.candidate list ->
+  Validator_entry.entry list ->
   t ->
-  Validator_admission.candidate list * counts
+  Validator_entry.entry list * counts
 val decode_proof :
   vote_b64:string ->
   commit_b64:string ->
   (proof, string) result
 val read_parent :
+  ?marks:bool ->
   chain_id:string ->
   Octra_consensus.C_types.parent_commit ->
   ((final * string list * string list), string) result
 val advance :
   ?cap_mode:cap_mode ->
+  ?marks:bool ->
   cfg ->
   chain_id:string ->
   start:int64 ->

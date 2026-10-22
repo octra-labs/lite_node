@@ -1,0 +1,131 @@
+[
+  {
+    "name": "decimal_padding",
+    "tx": {
+      "from": "octAlice",
+      "to_": "octBob",
+      "amount": "0007",
+      "nonce": 1,
+      "ou": "001000",
+      "timestamp": 1700000000.0,
+      "signature": "signed",
+      "op_type": "standard"
+    },
+    "hash": "38c72777520e81828797d17ae76f2c593fb738719dd6206bba479204b7240e10",
+    "signing": "{\"from\":\"octAlice\",\"to_\":\"octBob\",\"amount\":\"7\",\"nonce\":1,\"ou\":\"1000\",\"timestamp\":1700000000.0,\"op_type\":\"standard\"}"
+  },
+  {
+    "name": "plain",
+    "tx": {
+      "from": "octAlice",
+      "to_": "octBob",
+      "amount": "7",
+      "nonce": 1,
+      "ou": "1000",
+      "timestamp": 1700000000.0,
+      "signature": "signed",
+      "op_type": "standard"
+    },
+    "hash": "38c72777520e81828797d17ae76f2c593fb738719dd6206bba479204b7240e10",
+    "signing": "{\"from\":\"octAlice\",\"to_\":\"octBob\",\"amount\":\"7\",\"nonce\":1,\"ou\":\"1000\",\"timestamp\":1700000000.0,\"op_type\":\"standard\"}"
+  },
+  {
+    "name": "stealth",
+    "tx": {
+      "from": "octAlice",
+      "to_": "octBob",
+      "amount": "0",
+      "nonce": 2,
+      "ou": "1000",
+      "timestamp": 1700000000.1234567,
+      "signature": "c2ln",
+      "public_key": "cGs=",
+      "op_type": "stealth",
+      "message": "{\"proof\":\"AA==\"}",
+      "encrypted_data": "cipher"
+    },
+    "hash": "5b6c8a6342a6714e9c859c0f50985b29d7155b653a56d16e2ee0c64a88493896",
+    "signing": "{\"from\":\"octAlice\",\"to_\":\"octBob\",\"amount\":\"0\",\"nonce\":2,\"ou\":\"1000\",\"timestamp\":1700000000.1234567,\"op_type\":\"stealth\",\"encrypted_data\":\"cipher\",\"message\":\"{\\\"proof\\\":\\\"AA==\\\"}\"}"
+  },
+  {
+    "name": "claim",
+    "tx": {
+      "from": "octBob",
+      "to_": "octBob",
+      "amount": "0",
+      "nonce": 3,
+      "ou": "1000",
+      "timestamp": 1.2345678901234567e-06,
+      "signature": "claim",
+      "public_key": "cGs=",
+      "op_type": "claim",
+      "message": "line\n\t\u0001\u007f\u03b1",
+      "encrypted_data": "cipher"
+    },
+    "hash": "675b6f93a65730ff72d7464d1faf5d6e423586c86ce6e38a894d3e39e16a05ab",
+    "signing": "{\"from\":\"octBob\",\"to_\":\"octBob\",\"amount\":\"0\",\"nonce\":3,\"ou\":\"1000\",\"timestamp\":1.2345678901234567e-06,\"op_type\":\"claim\",\"encrypted_data\":\"cipher\",\"message\":\"line\\n\\t\\u0001\\u007f\u03b1\"}"
+  },
+  {
+    "name": "large_time",
+    "tx": {
+      "from": "octAlice",
+      "to_": "octBob",
+      "amount": "1",
+      "nonce": 4,
+      "ou": "1000",
+      "timestamp": 1.2345678901234567e+20,
+      "signature": "quote\"slash\\",
+      "op_type": "standard",
+      "public_key": null,
+      "message": null,
+      "encrypted_data": null
+    },
+    "hash": "5cad6c0f5967f71fa0b4749d6faceee9ff5cd98cf9a5d016403300faf62daa99",
+    "signing": "{\"from\":\"octAlice\",\"to_\":\"octBob\",\"amount\":\"1\",\"nonce\":4,\"ou\":\"1000\",\"timestamp\":1.2345678901234567e+20,\"op_type\":\"standard\"}"
+  },
+  {
+    "name": "negative_zero",
+    "tx": {
+      "from": "octAlice",
+      "to_": "octBob",
+      "amount": "1",
+      "nonce": 5,
+      "ou": "1000",
+      "timestamp": -0.0,
+      "signature": "s",
+      "op_type": "standard"
+    },
+    "hash": "3292801a59820cc626d2ac12d8b2af84ed42d8f8e22eb618f83a8b3aa1a8254a",
+    "signing": "{\"from\":\"octAlice\",\"to_\":\"octBob\",\"amount\":\"1\",\"nonce\":5,\"ou\":\"1000\",\"timestamp\":-0.0,\"op_type\":\"standard\"}"
+  },
+  {
+    "name": "small_time",
+    "tx": {
+      "from": "octAlice",
+      "to_": "octBob",
+      "amount": "1",
+      "nonce": 6,
+      "ou": "1000",
+      "timestamp": 1e-07,
+      "signature": "s",
+      "op_type": "standard"
+    },
+    "hash": "678e2d6ace06c0b7213e03f19a8684d643d6112fa8e91f04f4bcf34e70225c87",
+    "signing": "{\"from\":\"octAlice\",\"to_\":\"octBob\",\"amount\":\"1\",\"nonce\":6,\"ou\":\"1000\",\"timestamp\":1e-07,\"op_type\":\"standard\"}"
+  },
+  {
+    "name": "decimal_time",
+    "tx": {
+      "from": "octAlice",
+      "to_": "octBob",
+      "amount": "1",
+      "nonce": 7,
+      "ou": "1000",
+      "timestamp": 0.1,
+      "signature": "s",
+      "op_type": "standard"
+    },
+    "hash": "8bc73d1a98d5d7f1ea3a0fb14d4a48413dd6992dc241f2c70e590caaa8bd7c97",
+    "signing": "{\"from\":\"octAlice\",\"to_\":\"octBob\",\"amount\":\"1\",\"nonce\":7,\"ou\":\"1000\",\"timestamp\":0.1,\"op_type\":\"standard\"}"
+  }
+]

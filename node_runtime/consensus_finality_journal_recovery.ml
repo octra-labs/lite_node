@@ -205,15 +205,15 @@ let run deps =
   match deps.read_journal () with
   | Error error ->
     let action, prefix, reason = match error with
-      | Journal.Read_set reason -> "wait_set", "finality_journal_set_unavailable:", reason
-      | Journal.Read_record reason -> "wait_record", "finality_journal_record_unreadable:", reason
-      | Journal.Read_bundle reason -> "wait_bundle", "finality_journal_bundle_invalid:", reason in
+      | Journal.Read_set reason -> "stop_set", "finality_journal_set_unavailable:", reason
+      | Journal.Read_record reason -> "stop_record", "finality_journal_record_unreadable:", reason
+      | Journal.Read_bundle reason -> "stop_bundle", "finality_journal_bundle_invalid:", reason in
     deps.clear_state_attested ();
     deps.mark_quarantine (prefix ^ reason);
     Log.warn "finality"
       "event = finality_journal_recovery action = %s reason = %s"
       action reason;
-    Blocked
+    raise (Consensus_pending_commit_recovery.Store_fault (prefix ^ reason))
   | Ok Journal.Missing -> Continue
   | Ok (Journal.Invalid reason) ->
     invalid deps reason

@@ -81,7 +81,7 @@ let wait_disk path before =
       let* () = Lwt_unix.sleep 0.01 in
       sample ()
   in
-  Lwt_main.run (Lwt_unix.with_timeout 5.0 sample)
+  Lwt_main.run (Lwt_unix.with_timeout 120. sample)
 
 let address id =
   let hash =

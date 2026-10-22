@@ -126,7 +126,7 @@ let staging_view () =
 
 let staging_stats () =
   let txs = Staging.sample sample_limit |> List.map snd in
-  let by_sender = Staging.stats_of txs in
+  let by_sender = Staging.stats_of ~sender:Tx_view.display_from txs in
   ok
     (Rest_view.staging_stats_response
        ~tx_count:(Staging.staging_size ())

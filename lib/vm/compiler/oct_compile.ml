@@ -657,8 +657,8 @@ let emit_program_with_facts result facts =
           (match Program_policy.effects code facts with
            | Error error -> error_result ("Program effect policy: " ^ error)
            | Ok effects ->
-             match Admission.of_program ~point_ops:true ~facts code with
-             | Error error -> error_result ("Program admission: " ^ Admission.error_message error)
+             match Code_check.of_program ~point_ops:true ~facts code with
+             | Error error -> error_result ("Program admission: " ^ Code_check.error_message error)
              | Ok _ ->
                (match program_certificate result.certificate_json effects facts with
                 | Error error -> error_result error
@@ -746,9 +746,9 @@ let admit_program_source source raw =
   | None, Some expected when not (String.equal expected raw) ->
     Error "Program source does not match envelope"
   | None, Some _ ->
-    (match Admission.decode_program_source ~point_ops:true raw with
+    (match Code_check.decode_program_source ~point_ops:true raw with
      | Ok admitted -> Ok admitted
-     | Error error -> Error (Admission.error_message error))
+     | Error error -> Error (Code_check.error_message error))
 
 let compile_program_multi resolver main_path =
   emit_program (compile_multi_mode ~program_only:true resolver main_path)

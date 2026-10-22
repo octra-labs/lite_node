@@ -16,16 +16,16 @@ val next_delay_ms : now:float -> previous:float -> int64
 val check :
   now:float ->
   previous:t option ->
-  candidate:float ->
+  entry:float ->
   (t, string) result
 val check_reproposal :
   previous:t option ->
-  candidate:float ->
+  entry:float ->
   (t, string) result
 val check_proposal :
   rule:rule ->
   kind:proposal_kind ->
   now:float ->
   previous:t option ->
-  candidate:float ->
+  entry:float ->
   (t, string) result

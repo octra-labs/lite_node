@@ -45,10 +45,10 @@ let enrollment_epoch = function
   | Some epoch -> `String (Int64.to_string epoch)
 
 let validator_enrollment ~chain_id ~head_epoch ~address ~pubkey
-    (candidate : Octra_core.Validator_admission.candidate option) =
+    (entry : Octra_core.Validator_entry.entry option) =
   if head_epoch < 0 then
     Error (Rpc.err (-32000) "invalid committed validator head" None)
-  else match candidate with
+  else match entry with
   | None ->
     Ok
       (`Assoc [
@@ -64,24 +64,24 @@ let validator_enrollment ~chain_id ~head_epoch ~address ~pubkey
         "withdraw_epoch", `Null;
         "withdraw_remaining_epochs", `Null;
       ])
-  | Some candidate ->
-    let candidate_pubkey = Base64.encode_exn candidate.pubkey in
-    if not (String.equal candidate.address address) then
+  | Some entry ->
+    let entry_pubkey = Base64.encode_exn entry.pubkey in
+    if not (String.equal entry.address address) then
       Error (Rpc.err (-32000) "validator enrollment address differs" None)
-    else if not (String.equal candidate_pubkey pubkey) then
+    else if not (String.equal entry_pubkey pubkey) then
       Error (Rpc.err (-32000) "validator enrollment public key differs" None)
     else
       let state =
-        match candidate.exit_epoch, candidate.ready_epoch with
+        match entry.exit_epoch, entry.ready_epoch with
         | Some _, _ -> "exiting"
         | None, Some _ -> "ready"
         | None, None -> "bonded"
       in
       let withdrawal =
-        match candidate.exit_epoch with
+        match entry.exit_epoch with
         | None -> Ok None
         | Some _ ->
-          Octra_core.Validator_policy.withdraw_epoch ~chain_id ~epoch:head_epoch candidate
+          Octra_core.Validator_policy.withdraw_epoch ~chain_id ~epoch:head_epoch entry
           |> Result.map Option.some
           |> Result.map_error (fun reason -> Rpc.err (-32000) reason None)
       in
@@ -92,10 +92,10 @@ let validator_enrollment ~chain_id ~head_epoch ~address ~pubkey
           "consensus_pubkey", `String pubkey;
           "identity", `String "self_reported";
           "state", `String state;
-          "bond", `String (Z.to_string candidate.bond);
-          "bonded_epoch", `String (Int64.to_string candidate.bonded_epoch);
-          "ready_epoch", enrollment_epoch candidate.ready_epoch;
-          "exit_epoch", enrollment_epoch candidate.exit_epoch;
+          "bond", `String (Z.to_string entry.bond);
+          "bonded_epoch", `String (Int64.to_string entry.bonded_epoch);
+          "ready_epoch", enrollment_epoch entry.ready_epoch;
+          "exit_epoch", enrollment_epoch entry.exit_epoch;
           "withdraw_epoch", enrollment_epoch withdraw_epoch;
           "withdraw_remaining_epochs", enrollment_epoch
             (Option.map (fun epoch -> Int64.max 0L

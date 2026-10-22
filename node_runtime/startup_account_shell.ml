@@ -65,11 +65,16 @@ let log_genesis_account addr amount = function
 
 let run_genesis deps =
   let validators = deps.validators () in
+  let addresses = List.map fst validators in
+  if validators = []
+     || List.length (List.sort_uniq String.compare addresses) <> List.length validators
+  then invalid_arg "genesis validator set is empty or repeats an address";
   let amounts = genesis_amounts ~validator_count:(List.length validators) in
   List.iter
     (fun (addr, pub) ->
-      deps.add_account ~addr ~pub ~amount:amounts.per_validator
-      |> log_genesis_account addr amounts.per_validator)
+      match deps.add_account ~addr ~pub ~amount:amounts.per_validator with
+      | Ok () -> log_genesis_account addr amounts.per_validator (Ok ())
+      | Error reason -> failwith ("genesis account creation failed: " ^ reason))
     validators;
   Octra_log.info "init"
     "genesis validators = %d per_validator = %s total = %s"
@@ -104,12 +109,14 @@ let run deps =
           ~observer_mode:deps.observer_mode
           ~wallet_present:(deps.wallet_present ())
           ~consensus_port_configured:(deps.consensus_port_configured ()) with
-  | Genesis_bootstrap -> run_genesis deps
+  | Genesis_bootstrap -> run_genesis deps; true
   | Observer_existing ->
     Octra_log.info "init"
-      "observer mode = true local_account_creation = skipped epoch_production = skipped"
-  | Create_joining_account -> run_create_joining deps
+      "observer mode = true local_account_creation = skipped epoch_production = skipped";
+    false
+  | Create_joining_account -> run_create_joining deps; false
   | Skip_consensus_account ->
     Octra_log.info "init"
-      "consensus mode = true local_account_creation = skipped reason = fund_with_transfer"
-  | Account_ready -> ()
+      "consensus mode = true local_account_creation = skipped reason = fund_with_transfer";
+    false
+  | Account_ready -> false

@@ -42,7 +42,7 @@ type config = {
   validator_view_sk : string;
   validator_view_pub : string;
   program_trust : Octra_vm.Program_trust.t;
-  migration_admissions : Octra_core.Pvac_migration_admission.t;
+  migration_checks : Octra_core.Pvac_migration_check.t;
   rules : Octra_core.Rule_graph.t;
   chaindata : Store_chaindata.t;
   consensus_driver_ref : Octra_consensus.C_driver.t option ref;
@@ -50,6 +50,11 @@ type config = {
   resource_compute : Resource_compute_service.t;
   deps : deps;
 }
+
+val migration_policy :
+  Octra_core.Rule_graph.t -> epoch:int ->
+  ((Octra_core.Rule_graph.mode * Octra_core.Rule_graph.mode * Octra_core.Rule_graph.mode *
+    Octra_core.Rule_graph.mode * Octra_core.Rule_graph.mode), Octra_core.Rule_graph.fault) result
 
 val run_s :
   'a Lwt.t ->

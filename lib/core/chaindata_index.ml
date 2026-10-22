@@ -16,7 +16,7 @@ type tx_write = {
 type batch = {
   mutable txs : tx_write list;
   mutable epochs : (int * string) list;
-  mutable rejected : (string * string * string * int) list;
+  mutable rejected : (string * string option * string * int) list;
   mutable receipts : (string * string) list;
   mutable meta_writes : (string * string) list;
   mutable clear_rebuild_tables : bool;
@@ -253,7 +253,7 @@ let buffer_epoch t epoch_id json =
   | None -> failwith "history_index: no batch active"
   | Some b -> b.epochs <- (epoch_id, json) :: b.epochs
 
-let buffer_rejected t ~hash ~addr ~json ~epoch_id =
+let buffer_rejected ?addr t ~hash ~json ~epoch_id =
   match t.batch with
   | None -> failwith "history_index: no batch active"
   | Some b -> b.rejected <- (hash, addr, json, epoch_id) :: b.rejected
@@ -339,12 +339,14 @@ let commit_tx_loc_only t =
     t.batch <- None
 
 let auxiliary_writes (b : batch) =
-  List.concat_map (fun (hash, addr, json, epoch_id) -> Aux_delta.[
-    Rejected hash, Value (Some json);
-    Address (addr, hash), Member false;
-    Address (addr, rejected_addr_ref ~epoch_id ~hash), Member true;
-    Epoch (epoch_id, hash), Member true
-  ]) (List.rev b.rejected)
+  List.concat_map (fun (hash, addr, json, epoch_id) ->
+    let addresses = match addr with
+      | None -> []
+      | Some addr -> Aux_delta.[
+        Address (addr, hash), Member false;
+        Address (addr, rejected_addr_ref ~epoch_id ~hash), Member true] in
+    Aux_delta.((Rejected hash, Value (Some json)) :: addresses
+      @ [Epoch (epoch_id, hash), Member true])) (List.rev b.rejected)
   @ List.map (fun (hash, json) -> Aux_delta.Receipt hash, Aux_delta.Value (Some json)) b.receipts
   @ List.map (fun (key, value) -> Aux_delta.Metadata key, Aux_delta.Value (Some value)) (List.rev b.meta_writes)
 
@@ -534,6 +536,26 @@ let addr_txids_rev t addr ~limit ~offset =
       end
     )
   with Not_found -> (0, [])
+
+let addr_chunk t addr ~after ~limit =
+  try
+    Lmdb.Cursor.go Lmdb.Ro t.addr_tx (fun cursor ->
+      ignore (Lmdb.Cursor.seek cursor addr);
+      let key, _ = Lmdb.Cursor.current cursor in
+      if key <> addr || limit <= 0 then [] else begin
+        let first = match after with
+          | None -> Lmdb.Cursor.first_dup cursor
+          | Some txid ->
+            ignore (Lmdb.Cursor.seek_dup cursor addr txid);
+            Lmdb.Cursor.next_dup cursor in
+        let rows = ref [first] in
+        (try for _ = 2 to limit do
+          let txid = Lmdb.Cursor.next_dup cursor in
+          rows := txid :: !rows
+        done with Not_found -> ());
+        List.rev !rows
+      end)
+  with Not_found -> []
 
 let addr_tx_count t addr =
   try

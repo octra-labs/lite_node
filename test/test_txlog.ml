@@ -50,14 +50,17 @@ let test_reads () =
       let path = T.seg_path dir seg_id in
       let bytes = Digest.file path in
       List.iter (fun (name, read) ->
+        let cursor = Unix.lseek log.current_fd 0 Unix.SEEK_CUR in
         expect (name ^ " valid record") (read ~seg_id ~offset ~len = (epoch, payload));
         released (name ^ " eof") (Some (`Failure "txlog: unexpected EOF"))
           (fun () -> read ~seg_id ~offset:(offset + 4 + len) ~len);
-        released (name ^ " seek") (Some (`Unix Unix.EINVAL))
+        released (name ^ " offset") (Some `Argument)
           (fun () -> read ~seg_id ~offset:(-1) ~len);
         released (name ^ " length") (Some (`Failure "txlog: record_len mismatch"))
           (fun () -> read ~seg_id ~offset ~len:(len - 1));
         expect (name ^ " read after error") (read ~seg_id ~offset ~len = (epoch, payload));
+        expect (name ^ " cursor preserved")
+          (Unix.lseek log.current_fd 0 Unix.SEEK_CUR = cursor);
         expect (name ^ " content preserved") (Digest.file path = bytes)) readers;
       released "negative allocation" (Some `Argument)
         (fun () -> T.read_record log ~seg_id ~offset ~len:(-5))) [

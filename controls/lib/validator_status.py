@@ -206,7 +206,7 @@ def main():
     emit("state_sync", "verified" if sync_marker.is_file() else "direct")
     emit("promotion_readiness", promotion_readiness(values, data_dir))
     emit(
-        "validator_admission_epoch",
+        "validator_entry_epoch",
         values["OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH"],
     )
     binary = Path(values["OCTRA_OPERATOR_BINARY"])

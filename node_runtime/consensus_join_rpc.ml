@@ -321,24 +321,36 @@ let read_http_body body =
   read 0
 
 let http_get_json ?(timeout = 20.0) url =
-  Lwt_unix.with_timeout timeout (fun () ->
-    let open Lwt.Syntax in
-    let* resp, body = Cohttp_lwt_unix.Client.get (Uri.of_string url) in
-    let code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
-    let* body_s = read_http_body body in
-    if code < 200 || code >= 300 then
-      Lwt.fail
-        (Fetch_retry
-           (Printf.sprintf "GET %s failed HTTP %d: %s" url code body_s))
-    else
-      try Lwt.return (Yojson.Safe.from_string body_s)
-      with exn ->
+  let module Net = Cohttp_lwt_unix.Net in
+  let module Connection = Cohttp_lwt_unix.Connection in
+  Lwt_switch.with_switch (fun switch ->
+    let read () =
+      let open Lwt.Syntax in
+      let uri = Uri.of_string url in
+      let ctx = Lazy.force Net.default_ctx in
+      let* endpoint = Net.resolve ~ctx uri in
+      Lwt_switch.check (Some switch);
+      let* connection = Connection.connect ~ctx ~persistent:false endpoint in
+      Lwt_switch.add_hook (Some switch) (fun () ->
+        Connection.close connection;
+        Lwt.return_unit);
+      let* resp, body = Connection.call connection `GET uri in
+      let code = Cohttp.Response.status resp |> Cohttp.Code.code_of_status in
+      let* body_s = read_http_body body in
+      Lwt_switch.check (Some switch);
+      if code < 200 || code >= 300 then
         Lwt.fail
           (Fetch_retry
-             (Printf.sprintf
-                "GET %s returned invalid JSON: %s"
-                url
-                (Printexc.to_string exn))))
+             (Printf.sprintf "GET %s failed HTTP %d: %s" url code body_s))
+      else
+        try Lwt.return (Yojson.Safe.from_string body_s)
+        with exn ->
+          Lwt.fail
+            (Fetch_retry
+               (Printf.sprintf "GET %s returned invalid JSON: %s"
+                  url (Printexc.to_string exn)))
+    in
+    Lwt_unix.with_timeout timeout read)
 
 let fetch_range_json fetch_json base ~from_epoch ~max_epochs =
   let open Lwt.Syntax in
@@ -573,41 +585,77 @@ let range_response ~source ~from_epoch ~max_epochs = function
   | Missing
   | Records _ -> None
 
-let http_range ?(fetch_json = fun url -> http_get_json url) ?(timeout = 20.0)
+let http_fetch ~timeout ~budget fetch_json use =
+  Lwt_switch.with_switch (fun switch ->
+    let get url =
+      let open Lwt.Syntax in
+      Lwt_switch.check (Some switch);
+      let* json = Lwt_unix.with_timeout timeout (fun () -> fetch_json url) in
+      Lwt_switch.check (Some switch);
+      Lwt.return json in
+    Lwt.catch
+      (fun () -> Lwt_unix.with_timeout budget (fun () -> use get))
+      (function
+        | Lwt_unix.Timeout ->
+          Octra_log.warn "catchup" "event = http_deadline seconds = %g" budget;
+          Lwt.return_none
+        | exn -> Lwt.fail exn))
+
+let source_health = Sync_sources.create ()
+
+let http_range ?(health = source_health) ?(fetch_json = fun url -> http_get_json url) ?(timeout = 20.0)
+    ?(budget = 25.0)
     env ~from_epoch ~max_epochs ~validate =
   let open Lwt.Syntax in
-  let get url =
-    Lwt_unix.with_timeout timeout (fun () -> fetch_json url)
-  in
-  let rec next = function
+  let started = Mtime_clock.elapsed_ns () in
+  http_fetch ~timeout ~budget fetch_json (fun get ->
+  let sources = List.map normalize_base (configured_sources env) in
+  let ready, paused = Sync_sources.plan health Range sources in
+  let rec next paused = function
+    | [] when paused <> [] -> next [] paused
     | [] -> Lwt.return_none
     | base :: rest ->
       let source = normalize_base base in
+      let elapsed =
+        Int64.to_float (Int64.sub (Mtime_clock.elapsed_ns ()) started)
+        /. 1_000_000_000. in
+      let left = max 0.0 (budget -. elapsed) in
+      let source_seconds = left /. float_of_int (List.length rest + 1) in
+      let ticket = Sync_sources.start health Range source in
       let* result =
         fetch (fun () ->
-          let* json = fetch_range_json get source ~from_epoch ~max_epochs in
-          Lwt.return
-            (range_response
-               ~source
-               ~from_epoch
-               ~max_epochs
-               (parse_range ~from_epoch json)))
+          Lwt_unix.with_timeout source_seconds (fun () ->
+            let* json = fetch_range_json get source ~from_epoch ~max_epochs in
+            let status = match json with
+              | `Assoc fields -> List.assoc_opt "status" fields |> Option.value ~default:`Null
+              | _ -> `Null in
+            if status = `String "busy" then raise (Fetch_retry "state_sync_range_busy");
+            let parsed = try Some (parse_range ~from_epoch json) with
+              | Failure _ | Yojson.Safe.Util.Type_error _ -> None in
+            Lwt.return
+              (Option.bind parsed (range_response
+                 ~source
+                 ~from_epoch
+                 ~max_epochs))))
       in
       match result with
       | Ok (Some response) when validate response ->
+        Sync_sources.finish health ticket Good;
         Lwt.return_some response
       | Ok _ ->
+        Sync_sources.finish health ticket Neutral;
         Octra_log.info "catchup"
           "event = range_http_next from = %Ld source = %s"
           from_epoch source;
-        next rest
+        next paused rest
       | Error error ->
+        Sync_sources.finish health ticket (Sync_sources.error error);
         Octra_log.warn "catchup"
           "event = range_http_unavailable from = %Ld source = %s error = %s"
           from_epoch source error;
-        next rest
+        next [] rest
   in
-  next (configured_sources env)
+  next paused ready)
 
 let proved_head ~chain_id ~validator_hash (head : head) (record : record) =
   if record.epoch_id <> head.epoch || record.state_root <> head.root then
@@ -636,23 +684,30 @@ let prefix_head ~chain_id ~validator_hash ~after records =
   in
   next (Int64.succ after) None None records
 
-let http_head ?(fetch_json = fun url -> http_get_json url) ?(timeout = 20.0)
+let http_head ?(health = source_health) ?(fetch_json = fun url -> http_get_json url) ?(timeout = 20.0)
+    ?(budget = 25.0)
     env ~chain_id ~validator_hash ~after =
   let open Lwt.Syntax in
-  let get url =
-    Lwt_unix.with_timeout timeout (fun () -> fetch_json url)
-  in
+  let best = ref None in
+  let sources = List.map normalize_base (configured_sources env) in
+  let ready, paused = Sync_sources.plan health Head sources in
+  let* _ = http_fetch ~timeout ~budget fetch_json (fun get ->
   let range source ~from_epoch ~max_epochs =
     fetch (fun () ->
       let* json = fetch_range_json get source ~from_epoch ~max_epochs in
-      Lwt.return (parse_range ~from_epoch json))
+      match decode (fun () -> parse_range ~from_epoch json) with
+      | Ok parsed -> Lwt.return parsed
+      | Error _ -> Lwt.fail (Fetch_retry "invalid JSON range"))
   in
   let read source =
+    let ticket = Sync_sources.start health Head source in
     let* result =
       fetch (fun () ->
         let source = normalize_base source in
         let* json = get (head_url source) in
-        let head = parse_head json in
+        let head = match decode (fun () -> parse_head json) with
+          | Ok head -> head
+          | Error _ -> raise (Fetch_retry "invalid JSON head") in
         if Int64.compare head.epoch 0L < 0
            || Int64.compare head.epoch after <= 0
            || Int64.compare head.epoch (Int64.of_int max_int) > 0 then
@@ -674,21 +729,26 @@ let http_head ?(fetch_json = fun url -> http_get_json url) ?(timeout = 20.0)
             Lwt.return epoch)
     in
     match result with
-    | Ok epoch -> Lwt.return epoch
+    | Ok epoch ->
+      Sync_sources.finish health ticket (if epoch = None then Neutral else Good);
+      Lwt.return epoch
     | Error error ->
+      Sync_sources.finish health ticket (Sync_sources.error error);
       Octra_log.warn "catchup"
         "event = head_http_unavailable source = %s error = %s"
         source error;
       Lwt.return_none
   in
-  let* heads = Lwt_list.map_p read (configured_sources env) in
-  Lwt.return
-    (List.fold_left
-       (fun best head ->
-         match best, head with
-         | None, value | value, None -> value
-         | Some left, Some right -> Some (Int64.max left right))
-       None heads)
+  let run sources = Lwt_list.iter_p (fun source ->
+    let* head = read source in
+    best := (match !best, head with
+      | None, value | value, None -> value
+      | Some left, Some right -> Some (Int64.max left right));
+    Lwt.return_unit) sources in
+  let* () = run ready in
+  let* () = if !best = None then run paused else Lwt.return_unit in
+  Lwt.return !best) in
+  Lwt.return !best
 
 let prepare_record ~chain_id ~expected_validator_set_hash ~cursor record =
   if record.epoch_id < 0L || record.epoch_id >= Int64.of_int max_int then
@@ -724,7 +784,7 @@ let prepare_record ~chain_id ~expected_validator_set_hash ~cursor record =
     | Error error -> failwith ("join reward source: " ^ error)
     | Ok reward ->
       match
-        Consensus_reward_attribution.bind_finality
+        Consensus_reward_attribution.prove_finality
           ~validator_set:record.finality.validator_set
           record.finality.finalize
           reward
@@ -988,13 +1048,20 @@ let node_apply_deps (deps : node_deps) =
     eic = deps.local_eic;
   } : apply_deps)
 
-let run_node_catchup (deps : node_deps) base =
+let run_node_catchup ?(budget = 25.0) (deps : node_deps) base =
   let open Lwt.Syntax in
   let apply_deps = node_apply_deps deps in
+  let request use =
+    let* result = http_fetch ~timeout:20.0 ~budget deps.fetch_json (fun get ->
+      let* json = use get in
+      Lwt.return_some json) in
+    match result with
+    | Some json -> Lwt.return json
+    | None -> Lwt.fail (Fetch_retry "HTTP request expired") in
   let run_deps = {
-    fetch_head = (fun base -> deps.fetch_json (head_url base));
+    fetch_head = (fun base -> request (fun get -> get (head_url base)));
     fetch_range = (fun base ~from_epoch ~max_epochs ->
-      fetch_range_json deps.fetch_json base ~from_epoch ~max_epochs);
+      request (fun get -> fetch_range_json get base ~from_epoch ~max_epochs));
     local_next = (fun () -> Int64.of_int (deps.current_epoch ()));
     local_root = deps.local_root;
     cursor = node_cursor deps;

@@ -17,7 +17,7 @@ type network_config = {
   chain_id : string;
 }
 
-type local_wallet_admission =
+type local_wallet_check =
   | Wallet_admitted
   | Missing_voting_validator
   | Missing_non_voting_validator
@@ -131,7 +131,7 @@ let validator_pubkeys_boot ~current ~next ~fallback =
   | [] -> fallback
   | validators -> validators
 
-let local_wallet_admission ~permissionless ~validator_env_present
+let local_wallet_check ~permissionless ~validator_env_present
     ~validators ~wallet_addr ~wallet_pub ~voting_consensus_mode
     ~consensus_mode =
   if not validator_env_present then
@@ -152,7 +152,7 @@ let admit_local_wallet ~permissionless ~validator_env_present
     ~validators ~wallet_addr ~wallet_pub ~voting_consensus_mode
     ~consensus_mode ~role_label ~exit_fatal =
   match
-    local_wallet_admission
+    local_wallet_check
       ~permissionless
       ~validator_env_present
       ~validators
@@ -223,6 +223,10 @@ let configure_lwt ~exit_fatal ~exit_refused =
   Lwt.Exception_filter.set Lwt.Exception_filter.handle_all;
   set_async_exception_hook (fun error ->
     match error with
+    | Consensus_pending_commit_recovery.Store_fault reason ->
+        Fun.protect ~finally:exit_refused (fun () ->
+          Octra_log.fatal "runtime"
+            "event = startup_store_fault reason = %s action = exit code = 78" reason)
     | Octra_core.Private_ledger.Worker_stopped _ ->
         Fun.protect ~finally:exit_refused (fun () ->
           Octra_log.fatal "runtime"

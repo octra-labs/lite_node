@@ -13,7 +13,8 @@ let absent = "oct" ^ String.make 44 '3'
 let profile ~epoch = Ok V.Contract_rpc.{
   epoch; point_ops = true; math = false; object_cost = false;
   int_work = V.Int_work.Active; fhe_work = Octra_core.Rule_graph.Prior;
-  proof_exec = Octra_core.Rule_graph.Prior; wasm_float = Octra_core.Rule_graph.Prior;
+  proof_exec = Octra_core.Rule_graph.Prior;
+  proof_key = Octra_core.Rule_graph.Prior; wasm_float = Octra_core.Rule_graph.Prior;
 }
 
 let compile source =
@@ -24,7 +25,7 @@ let compile source =
 
 let deploy store address code =
   S.deploy_contract store ~address ~owner:parent ~ctype:"CUSTOM" ~version:"1"
-    ~admission:"binary" ~code_hash:Digestif.SHA256.(digest_string code |> to_hex)
+    ~check:"binary" ~code_hash:Digestif.SHA256.(digest_string code |> to_hex)
     ~bytecode_b64:(Base64.encode_exn code)
 
 let put store mode epoch amount count key main nested =
@@ -952,6 +953,16 @@ let asset_root path =
         | _ -> direct state in
       V.Contract.run_s result in
     let query route params = Lwt_main.run ((List.assoc route routes) params store) in
+    List.iter (fun privacy_class ->
+      List.iter (fun resource_mode ->
+        V.Contract.run_s (put 50 first);
+        V.Contract.run_s (S.deploy_circle store {info with privacy_class; resource_mode});
+        V.Contract.run_s (S.commit_epoch_batch store "asset resource mode");
+        let params = `List [`String parent; `String page] in
+        expect "asset resource mode changed with Circle class"
+          (Result.is_ok (query "octra_circleAsset" params)
+            = (resource_mode = C.Public_resources)))
+        C.[Public_resources; Sealed_read]) C.[Public; Scoped; Circle; Sealed];
     List.iter (fun (name, alias, key) ->
       List.iter (fun route ->
         V.Contract.run_s (put 50 first);
@@ -1338,7 +1349,8 @@ program Value {
     let answer = Lwt_main.run (Read.program_params store code_params) in
     expect "circle source used pending root"
       (field "code_b64" answer = `String (Base64.encode_exn raw));
-    let answer = Lwt_main.run (Read.program_info_public_params store code_params) in
+    let answer = Lwt_main.run (Read.program_info_public_params
+      ~table_mode:Octra_core.Rule_graph.Prior store code_params) in
     expect "circle descriptor used pending root"
       (field "code_hash" answer = `String info.code_hash);
     expect "circle descriptor used pending owner" (field "owner" answer = `String owner);
@@ -1565,6 +1577,11 @@ program WorkRead {
        "circle_view_auth", true; "octra_circleViewAuth", true])
 
 let () =
+  if Array.exists (String.equal "--assets") Sys.argv then begin
+    Test_workspace.with_dir "asset_access" asset_root;
+    print_endline "event = asset_access status = pass";
+    exit 0
+  end;
   if Array.exists (String.equal "--fhe") Sys.argv then begin
     Test_workspace.with_dir "view_fhe" fhe_view;
     print_endline "event = view_fhe status = pass";

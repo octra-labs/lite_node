@@ -22,7 +22,7 @@ let one name fields =
   | [] -> Error (name ^ " missing")
   | _ -> Error (name ^ " duplicated")
 
-let parse_message raw =
+let parse_message_for schema raw =
   try
     match Octra_core.Json_tree.read raw with
     | `Assoc fields when List.length fields = 2 ->
@@ -44,6 +44,29 @@ let parse_message raw =
       Error "program upgrade payload must be an object"
   with _ ->
     Error "program upgrade payload invalid"
+
+let parse_message raw = parse_message_for schema raw
+
+let is_source (tx : Octra_core.Transaction.t) =
+  match tx.message with
+  | Some raw -> Result.is_ok (parse_message_for Program_record.schema raw)
+  | None -> false
+
+let source_request (tx : Octra_core.Transaction.t) =
+  let ( let* ) = Result.bind in
+  if not (Z.equal tx.amount Z.zero) then Error "program source value must be zero"
+  else match tx.message, tx.encrypted_data with
+  | Some message, Some data ->
+    let* hash = parse_message_for Program_record.schema message in
+    let* sources = Program_record.decode_sources data in
+    Ok (hash, sources)
+  | _ -> Error "program source payload missing"
+
+let source_message ~expected_code_hash =
+  Yojson.Safe.to_string (`Assoc [
+    "schema", `String Program_record.schema;
+    "expected_code_hash", `String expected_code_hash;
+  ])
 
 let parse (tx : Octra_core.Transaction.t) =
   if not (Z.equal tx.amount Z.zero) then

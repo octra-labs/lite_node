@@ -2,6 +2,7 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 val eligible :
+  marks:bool ->
   mode:Octra_core.Rule_graph.mode ->
   head:int64 ->
   bonded_epoch:int64 ->

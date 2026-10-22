@@ -25,6 +25,7 @@ type t = {
   weighted : bool;
   validators : validator list;
   scheduled : scheduled option;
+  authors : (int64 * validator list) option;
   program_trust_hash : string option;
   runtime_profile_hash : string option;
 }
@@ -55,11 +56,18 @@ let to_weighted_validator_set validators =
     to_consensus_validator validator, validator.weight)
   |> C_types.make_weighted_validator_set
 
-let validator_set ~weighted validators =
-  if weighted then
+let validator_set ?(authors = None) ~weighted validators =
+  let result = if weighted then
     to_weighted_validator_set validators
   else
-    Ok (to_validator_set validators)
+    Ok (to_validator_set validators) in
+  Result.bind result (fun set -> match authors with
+    | None -> Ok set
+    | Some (height, entries) ->
+      let entries = List.map (fun v -> to_consensus_validator v, v.weight) entries in
+      let set = {set with C_types.authors = Some (height, entries)} in
+      try Ok (C_codec.decode_validator_set (C_codec.encode_validator_set set))
+      with _ -> Error "validator author context is invalid")
 
 let scheduled_to_config (s : scheduled) =
   match validator_set ~weighted:s.weighted s.validators with
@@ -95,12 +103,15 @@ let of_validator_set ~chain_id ~config_hash ?scheduled ?program_trust_hash
     weighted = vs.weighted;
     validators;
     scheduled = Option.map scheduled_of_config scheduled;
+    authors = Option.map (fun (height, entries) -> height,
+      List.map (fun ((member : C_types.validator_info), weight) ->
+        {address = member.address; pubkey = member.pubkey; weight}) entries) vs.authors;
     program_trust_hash;
     runtime_profile_hash;
   }
 
 let recomputed_config_hash t =
-  match validator_set ~weighted:t.weighted t.validators with
+  match validator_set ~authors:t.authors ~weighted:t.weighted t.validators with
   | Error _ -> None
   | Ok vs ->
     let scheduled =
@@ -123,7 +134,7 @@ let recomputed_config_hash t =
       scheduled
 
 let verify t =
-  match validator_set ~weighted:t.weighted t.validators with
+  match validator_set ~authors:t.authors ~weighted:t.weighted t.validators with
   | Error _ -> false
   | Ok vs ->
     t.chain_id <> ""
@@ -135,6 +146,8 @@ let verify t =
     && Z.equal t.total_weight vs.total_weight
     && Z.equal t.quorum_weight vs.quorum_weight
     && t.validator_set_hash = C_config.validator_set_hash vs
+    && Option.fold ~none:true ~some:(fun (height, _) ->
+      C_quorum_policy.linear_weight ~chain_id:t.chain_id ~epoch_id:height) t.authors
     && (match t.program_trust_hash with
         | None -> true
         | Some value -> String.length value = 32)

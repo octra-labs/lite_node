@@ -59,7 +59,7 @@ type t
 
 val graph_limits : int64 -> Octra_core.Resource_compute_graph.limits
 val model_of_loaded : Resource_compute_provider_rpc.prepare -> Resource_compute_model_cache.loaded -> (model, string) result
-val replay_deps : limits:Resource_compute_provider_config.limits -> deps
+val replay_deps : chain_id:string -> limits:Resource_compute_provider_config.limits -> deps
 
 val measure :
   model:model -> program:program -> storage:(string * string) list ->
@@ -95,6 +95,7 @@ val stop : t -> unit Lwt.t
 val native_accelerator :
   Resource_compute_provider_config.accelerator -> (unit, string) result
 val native_deps :
+  chain_id:string ->
   limits:Resource_compute_provider_config.limits ->
   store:Octra_core.Store_irmin.t ->
   state_root_at:(int64 -> string option) ->

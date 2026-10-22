@@ -65,45 +65,36 @@ let derived_abi ~trusted ~point_ops ~store ~addr =
       "instruction_count", `Int (Array.length bytecode);
     ])
 
-let source_entry = function
-  | Some meta -> String.equal meta.Store_irmin.admission "source"
-  | None -> false
+let program_snapshot ~store ~addr =
+  let open Lwt.Syntax in
+  let* view = Store_irmin.capture_read_snapshot store in
+  match view with
+  | Error _ as error -> Lwt.return error
+  | Ok snapshot ->
+    let+ meta = Store_irmin.get_contract_meta ~snapshot store addr in
+    Ok (snapshot, meta)
 
 let current_program_record ~store ~chaindata ~addr =
   let open Lwt.Syntax in
-  let* info = Store_irmin.get_contract_info store addr in
-  let* meta = Store_irmin.get_contract_meta store addr in
-  match info, source_entry meta with
-  | None, _ -> Lwt.return_ok None
-  | Some _, false -> Lwt.return_ok None
-  | Some (_, code_hash, _, _), true ->
-    begin
-      match
-        Store_chaindata.get_program_record
-          chaindata
-          ~address:addr
-          ~code_hash
-      with
-      | Error _ as error -> Lwt.return error
-      | Ok record ->
-        let* current = Store_irmin.get_contract_info store addr in
-        let* current_meta = Store_irmin.get_contract_meta store addr in
-        begin
-          match current, source_entry current_meta with
-          | Some (_, current_hash, _, _), true
-            when String.equal code_hash current_hash ->
-            Lwt.return_ok record
-          | Some _, _ -> Lwt.return_error "program changed during metadata read"
-          | None, _ -> Lwt.return_error "program disappeared during metadata read"
-        end
-    end
+  let* view = program_snapshot ~store ~addr in
+  match view with
+  | Error _ as error -> Lwt.return error
+  | Ok (_, None) -> Lwt.return_ok None
+  | Ok (snapshot, Some meta) ->
+    let code_hash = meta.Store_irmin.code_hash in
+    let* committed = Program_record.read ~snapshot ~store ~address:addr ~code_hash () in
+    Lwt.return (match committed with
+      | Error _ as error -> error
+      | Ok (Some record) -> Ok (Some (record, true, snapshot))
+      | Ok None -> Store_chaindata.get_program_record chaindata ~address:addr ~code_hash
+        |> Result.map (Option.map (fun record -> record, false, snapshot)))
 
 let abi ~trusted ~point_ops ~store ~chaindata ~addr =
   let open Lwt.Syntax in
   let* record = current_program_record ~store ~chaindata ~addr in
   match record with
   | Error reason -> err_lwt (Rpc.err (-32000) reason None)
-  | Ok (Some record) ->
+  | Ok (Some (record, _, _)) ->
     begin
       match decode_real_abi (Some record.Store_chaindata.abi) with
       | Some abi_json -> abi_result addr (Some abi_json)
@@ -201,7 +192,7 @@ let source_files ?(main = "main.aml") source files_json =
   in
   `Assoc ((main, `String source) :: files)
 
-let compile_source ?(main = "main.aml") source files_json =
+let compile_source_with ~single ~multi ?(main = "main.aml") source files_json =
   match files_json with
   | Some files_json ->
     let file_map = Hashtbl.create 16 in
@@ -213,9 +204,17 @@ let compile_source ?(main = "main.aml") source files_json =
       files_json;
     Hashtbl.replace file_map main source;
     let resolver path = Hashtbl.find_opt file_map path in
-    Oct_compile.compile_multi resolver main
+    multi resolver main
   | None ->
-    Oct_compile.compile source
+    single source
+
+let compile_source ?main source files_json =
+  compile_source_with ~single:Oct_compile.compile ~multi:Oct_compile.compile_multi
+    ?main source files_json
+
+let compile_historical ?main source files_json =
+  compile_source_with ~single:Prior_compile.compile ~multi:Prior_compile.compile_multi
+    ?main source files_json
 
 let parse_optional_json raw =
   if String.equal raw "" then []
@@ -300,8 +299,8 @@ let compile_result_response ?deploy_payload (result : Oct_compile.compile_result
   in
   let bytecode_b64 = Base64.encode_exn executable in
   let disasm =
-    match Admission.decode result.bytecode with
-    | Ok admitted -> Assembler.emit (Admission.code admitted)
+    match Code_check.decode result.bytecode with
+    | Ok admitted -> Assembler.emit (Code_check.code admitted)
     | Error _ -> ""
   in
   let envelope =
@@ -329,11 +328,11 @@ let compile_assembly ~source =
     err_lwt (Rpc.invalid_params "assembly source exceeds compile limit")
   else try
     let instrs = Assembler.parse source in
-    match Admission.of_code instrs with
+    match Code_check.of_code instrs with
     | Error error ->
-      err_lwt (Rpc.err (-32000) (Admission.error_message error) None)
+      err_lwt (Rpc.err (-32000) (Code_check.error_message error) None)
     | Ok admitted ->
-      let code = Admission.code admitted in
+      let code = Code_check.code admitted in
       let bytecode_raw = Bytecode.encode code in
       ok_lwt (compile_assembly_response
         ~bytecode_b64:(Base64.encode_exn bytecode_raw)
@@ -754,7 +753,9 @@ let run_verify handler =
   else begin
     verify_active := true;
     Lwt.finalize
-      handler
+      (fun () -> Octra_core.Rpc_work.run
+        ~busy:(fun () -> Lwt.return_error (Rpc.err (-32005) "Program verification busy" None))
+        handler)
       (fun () ->
         verify_active := false;
         Lwt.return_unit)
@@ -762,8 +763,14 @@ let run_verify handler =
   end
 
 let verify_compilation ~main ~meta ~source ~files_json =
+  let files = Program_package.{path = main; body = source} ::
+    (Option.value files_json ~default:[] |> List.filter_map (fun item ->
+      Option.map (fun (path, body) -> Program_package.{path; body}) (file_source item))) in
+  let scope = Program_record.scope_check ~main ~files in
+  let checked rows = List.filter (fun (_, result) ->
+    Program_record.scope_matches scope result.Oct_compile.bytecode) rows in
   match meta with
-  | Some meta when String.equal meta.Store_irmin.admission "source" ->
+  | Some meta when String.equal meta.Store_irmin.check "source" ->
     let sources =
       Program_package.{ path = main; body = source }
       ::
@@ -788,7 +795,7 @@ let verify_compilation ~main ~meta ~source ~files_json =
       | Ok (compiled : Program_package.compiled) ->
         Some (compiled.envelope, compiled.result)
       | Error _ -> None
-    ) ([current; prior; source_result; preview] @ scoped) in
+    ) ([current; prior; source_result; preview] @ scoped) |> checked in
     begin
       match results, current with
       | [], Error error -> Error (Program_package.error_message error)
@@ -801,21 +808,23 @@ let verify_compilation ~main ~meta ~source ~files_json =
     let scoped = aml_source_result ~loops:true ~main ~syntax:Oct_gen.Source source files_json in
     let scoped_forms = aml_source_result ~loops:true ~main ~syntax:Oct_gen.Forms source files_json in
     let prior = compile_source ~main source files_json in
+    let historical = compile_historical ~main source files_json in
     let results =
       List.filter_map (function
         | Ok result -> Some (result.Oct_compile.bytecode, result)
         | Error _ -> None) [current; forms; scoped; scoped_forms]
     in
-    let results =
-      match prior.error with
-      | None when
-          not
-            (List.exists
-               (fun (code, _) -> String.equal code prior.bytecode)
-               results) ->
-        results @ [prior.bytecode, prior]
-      | None | Some _ -> results
-    in
+    let results = List.fold_left (fun rows result ->
+      match result.Oct_compile.error with
+      | None when not (List.exists (fun (code, _) -> code = result.bytecode) rows) ->
+        rows @ [result.bytecode, result]
+      | None | Some _ -> rows) results [prior; historical] in
+    let envelopes = List.filter_map (fun (_, result) ->
+      let checked = Oct_compile.emit_program result in
+      Option.map (fun code -> code, checked) checked.program_envelope) results in
+    let archived = Prior_compile.emit_program historical in
+    let results = checked (results @ envelopes @
+      (Option.fold ~none:[] ~some:(fun code -> [code, archived]) archived.program_envelope)) in
     begin
       match results, current, prior.error with
       | _ :: _, _, _ -> Ok results
@@ -835,19 +844,86 @@ let run_verify_worker handler =
         Lwt.return_error "compiler complexity limit exceeded"
       | _ -> Lwt.return_error "compiler failed")
 
+let compile_record ~main ~meta ~source ~files_json ~stored =
+  let files_json = if main = "main.aml" && files_json = Some [] then None else files_json in
+  let executable code =
+    if Program_envelope.is_program code then
+      Result.bind (Program_envelope.decode code
+        |> Result.map_error Program_envelope.error_message) (fun value ->
+        Program_attestation.payload ~key_id:"source-check" value.Program_envelope.cert
+        |> Result.map (fun certificate -> value.code, Some certificate)
+        |> Result.map_error Program_attestation.error_message)
+    else Ok (code, None) in
+  let ( let* ) = Result.bind in
+  let* stored_code = executable stored in
+  match verify_compilation ~main ~meta ~source ~files_json with
+  | Error reason -> Error ("compile error: " ^ reason)
+  | Ok compilations ->
+    let hash code = Digestif.SHA256.(digest_string code |> to_hex) in
+    let stored_hash = hash stored in
+    let matching = match List.find_opt (fun (code, _) -> code = stored) compilations with
+      | Some _ as exact -> exact
+      | None when Option.fold ~none:false
+          ~some:(fun meta -> meta.Store_irmin.check = "source") meta -> None
+      | None -> List.find_opt (fun (code, _) -> executable code = Ok stored_code) compilations in
+    match matching with
+    | None ->
+      let compiled_hash = match compilations with
+        | (code, _) :: _ -> String.sub (hash code) 0 16
+        | [] -> "" in
+      Error (Printf.sprintf "bytecode mismatch: stored=%s compiled=%s"
+        (String.sub stored_hash 0 16) compiled_hash)
+    | Some (_, result) ->
+      let files = Program_package.{path = main; body = source} ::
+        (Option.value files_json ~default:[] |> List.filter_map (fun file ->
+          Option.map (fun (path, body) -> Program_package.{path; body}) (file_source file))) in
+      let* files = Program_package.normalize ~main files
+        |> Result.map_error Program_package.error_message in
+      let source = Program_record.source_text ~main files in
+      Ok (Program_record.make ~source ~code:stored result)
+
+let publication ~addr ~main ~source ~files_json ~meta ~stored record =
+  let files = Program_package.{path = main; body = source} ::
+    (Option.value files_json ~default:[] |> List.filter_map (fun file ->
+      Option.map (fun (path, body) -> Program_package.{path; body}) (file_source file))) in
+  match Program_package.normalize ~main files with
+  | Error _ -> []
+  | Ok files ->
+    let profile = List.find_map (fun (compiler, loops) ->
+      let sources = Program_record.{main; files; compiler; loops} in
+      match Program_record.verify sources ~exact:(meta.Store_irmin.check = "source") ~stored with
+      | Ok checked when Program_record.matches_verification record checked -> Some sources
+      | Ok _ | Error _ -> None) Program_record.profiles in
+    match profile with
+    | None -> []
+    | Some sources -> ["publication", `Assoc [
+      "requires_rule", `String "program_records";
+      "op_type", `String "upgrade";
+      "to", `String addr;
+      "amount", `String "0";
+      "ou", `String (Z.to_string (Program_record.fee record));
+      "message", `String (Program_upgrade.source_message ~expected_code_hash:record.Store_chaindata.code_hash);
+      "encrypted_data", `String (Base64.encode_exn
+        (Program_record.encode_sources sources));
+    ]]
+
 let verify_request ~main ~store ~chaindata ~addr ~source ~files_json =
   let open Lwt.Syntax in
   match validate_compile_input ~reserved_path:main source files_json with
   | Error msg -> err_lwt (Rpc.invalid_params msg)
   | Ok () ->
+    let* view = program_snapshot ~store ~addr in
+    match view with
+    | Error reason -> err_lwt (Rpc.err (-32005) reason None)
+    | Ok (_, None) -> err_lwt (Rpc.not_found "program not found")
+    | Ok (snapshot, Some meta) ->
     let* stored_b64 =
-      Store_irmin.read store ["contracts"; addr; "bytecode"]
+      Store_irmin.load_bytecode ~snapshot store addr
     in
     match stored_b64 with
     | None ->
       err_lwt (Rpc.not_found "contract not found or no bytecode")
     | Some b64 ->
-      let* meta = Store_irmin.get_contract_meta store addr in
       let stored =
         match Base64.decode b64 with
         | Ok raw when String.equal (Base64.encode_exn raw) b64 -> Ok raw
@@ -859,114 +935,48 @@ let verify_request ~main ~store ~chaindata ~addr ~source ~files_json =
       | Ok stored ->
         let* compilation =
           run_verify_worker (fun () ->
-            verify_compilation ~main ~meta ~source ~files_json)
+            compile_record ~main ~meta:(Some meta) ~source ~files_json ~stored
+            |> Result.map (fun record -> record,
+              publication ~addr ~main ~source ~files_json ~meta ~stored record))
         in
         match compilation with
         | Error msg ->
-          err_lwt
-            (Rpc.err
-               (-32000)
-               (Printf.sprintf "compile error: %s" msg)
-               None)
-        | Ok compilations ->
-          let stored_hash =
-            Digestif.SHA256.(digest_string stored |> to_hex)
-          in
-          let matching =
-            List.find_opt
-              (fun (compiled, _) ->
-                String.equal
-                  stored_hash
-                  Digestif.SHA256.(digest_string compiled |> to_hex))
-              compilations
-          in
-          begin
-            match matching with
-            | None ->
-              let compiled_hash =
-                match compilations with
-                | (compiled, _) :: _ ->
-                  Digestif.SHA256.(digest_string compiled |> to_hex)
-                | [] -> ""
-              in
-            err_lwt
-              (Rpc.err
-                 (-32000)
-                 (Printf.sprintf
-                    "bytecode mismatch: stored=%s compiled=%s"
-                    (String.sub stored_hash 0 16)
-                    (String.sub compiled_hash 0 16))
-                 None)
-            | Some (_, result) ->
-              let source_json =
-                match files_json with
-                | Some files ->
-                  let files = source_files ~main source files in
-                  let stored =
-                    if String.equal main "main.aml" then files
-                    else `Assoc ["main", `String main; "files", files]
-                  in
-                  Yojson.Safe.to_string stored
-                | None -> source
-              in
-              let record = Store_chaindata.{
-                source = source_json;
-                abi = result.abi_json;
-                report =
-                  (if String.equal result.verification_json "" then None
-                   else Some result.verification_json);
-                certificate =
-                  (if String.equal result.certificate_json "" then None
-                   else Some result.certificate_json);
-                code_hash = stored_hash;
-              } in
-              let* current = Store_irmin.get_contract_info store addr in
-              let* current_meta = Store_irmin.get_contract_meta store addr in
-              begin
-                match current with
-                | Some (_, code_hash, _, _)
-                  when String.equal code_hash stored_hash ->
-                  if not (source_entry meta) then
-                    ok_lwt (verified_record_response ~published:false record)
-                  else if not (source_entry current_meta) then
-                    err_lwt
-                      (Rpc.err
-                         (-32000)
-                         "program changed during verification"
-                         None)
-                  else begin
-                    let* saved =
-                      Octra_core.Exec_resource.detach
-                        (fun () ->
-                          Store_chaindata.save_program_record
-                            chaindata
-                            addr
-                            record)
-                        ()
-                    in
-                    match saved with
-                    | Error Store_chaindata.Program_record_conflict ->
-                      err_lwt
-                        (Rpc.err
-                           (-32000)
-                           "program record differs"
-                           (Some
-                              (`Assoc
-                                 ["reason", `String "record_conflict"])))
-                    | Error (Store_chaindata.Program_record_store_error reason) ->
-                      err_lwt (Rpc.err (-32000) reason None)
-                    | Ok saved ->
-                      ok_lwt
-                        (verified_record_response ~published:true saved)
-                  end
-                | Some _ ->
-                  err_lwt
-                    (Rpc.err
-                       (-32000)
-                       "program changed during verification"
-                       None)
-                | None -> err_lwt (Rpc.not_found "program not found")
+          err_lwt (Rpc.err (-32000) msg None)
+        | Ok (record, publication) ->
+          let* current = program_snapshot ~store ~addr in
+          begin match current with
+          | Ok (snapshot, Some meta) when String.equal meta.Store_irmin.code_hash record.code_hash ->
+            let* saved = Program_record.read ~snapshot ~store ~address:addr
+              ~code_hash:meta.code_hash () in
+            begin match saved with
+            | Error reason -> err_lwt (Rpc.err (-32000) reason None)
+            | Ok saved ->
+              let committed = Option.fold ~none:false
+                ~some:(Program_record.matches_verification record) saved in
+              let* published =
+                if committed then Lwt.return_ok true
+                else if saved <> None || meta.check <> "source" then Lwt.return_ok false
+                else
+                  let+ result = Octra_core.Exec_resource.detach (fun () ->
+                    Store_chaindata.save_program_record chaindata addr record) () in
+                  Result.map (fun _ -> true) result in
+              begin match published with
+              | Error Store_chaindata.Program_record_conflict ->
+                err_lwt (Rpc.err (-32000) "program record differs"
+                  (Some (`Assoc ["reason", `String "record_conflict"])))
+              | Error (Store_chaindata.Program_record_store_error reason) ->
+                err_lwt (Rpc.err (-32000) reason None)
+              | Ok published ->
+                let fields = match verified_record_response ~published record with
+                  | `Assoc fields -> fields
+                  | _ -> assert false in
+                ok_lwt (`Assoc (("committed", `Bool committed) ::
+                  fields @ publication))
               end
+            end
+          | Ok (_, Some _) -> err_lwt (Rpc.err (-32000) "program changed during verification" None)
+          | Ok (_, None) -> err_lwt (Rpc.not_found "program not found")
+          | Error reason -> err_lwt (Rpc.err (-32005) reason None)
           end
 
 let verify ~store ~chaindata ~addr ~source ~files_json =
@@ -1077,18 +1087,38 @@ let source_response source meta_fields =
     with _ ->
       `Assoc (["source", `String raw] @ meta_fields)
 
+let source_reader = Source_read.create ()
+
 let source ~store ~chaindata ~addr =
   let open Lwt.Syntax in
   let* record = current_program_record ~store ~chaindata ~addr in
   match record with
   | Error reason -> err_lwt (Rpc.err (-32000) reason None)
-  | Ok (Some record) ->
+  | Ok (Some (record, committed, snapshot)) ->
+    let* stored = Store_irmin.load_bytecode ~snapshot store addr in
+    let* checked = Source_read.query source_reader {stored; record} in
+    begin match checked with
+    | Source_read.Different | Source_read.Pending ->
+      let fields = match source_response (Some record.source) [
+        "verified", `Bool false;
+        "verification_status", `String (if checked = Source_read.Pending then "pending" else "scope_unproven");
+        "code_hash", `String record.code_hash;
+      ] with
+      | `Assoc fields -> fields
+      | _ -> assert false in
+      ok_lwt (`Assoc (("committed", `Bool committed) :: fields))
+    | Source_read.Failed -> err_lwt (Rpc.err (-32000) "program source check unavailable" None)
+    | Source_read.Checked ->
     let meta_fields =
       source_meta_fields
         ~verification:record.Store_chaindata.report
         ~certificate:record.certificate
     in
-    ok_lwt (source_response (Some record.source) meta_fields)
+    let fields = match source_response (Some record.source) meta_fields with
+      | `Assoc fields -> fields
+      | _ -> assert false in
+    ok_lwt (`Assoc (("committed", `Bool committed) :: fields))
+    end
   | Ok None -> ok_lwt (source_response None [])
 
 let source_params ~store ~chaindata params =
@@ -1179,6 +1209,7 @@ type view_profile = {
   int_work : Int_work.mode;
   fhe_work : Octra_core.Rule_graph.mode;
   proof_exec : Octra_core.Rule_graph.mode;
+  proof_key : Octra_core.Rule_graph.mode;
   wasm_float : Octra_core.Rule_graph.mode;
 }
 
@@ -1190,6 +1221,7 @@ let view_profile rules ~epoch =
   let* object_cost = R.object_cost rules ~epoch in
   let* fhe_work = R.fhe_work rules ~epoch in
   let* proof_exec = R.proof_exec rules ~epoch in
+  let* proof_key = R.proof_key rules ~epoch in
   let* wasm_float = R.wasm_float rules ~epoch in
   Ok {
     epoch;
@@ -1199,6 +1231,7 @@ let view_profile rules ~epoch =
     int_work = if standard = R.Active then Int_work.Active else Int_work.Prior;
     fhe_work;
     proof_exec;
+    proof_key;
     wasm_float;
   }
 
@@ -1241,6 +1274,7 @@ let make_view_ctx ?snapshot ?running ~trusted ~profile ~store ~ledger ~get_fhe_p
     byte_work = Some (Byte_work.create view_byte_limits);
     fhe_work = profile.fhe_work;
     proof_exec = profile.proof_exec;
+    proof_key = profile.proof_key;
     wasm_float = profile.wasm_float;
     fhe_memory = Some (Fhe_memory.create ());
     point_ops = profile.point_ops;

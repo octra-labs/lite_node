@@ -2,6 +2,7 @@
 # Copyright (c) 2023-2026 Octra Labs <dev@octra.org>
 
 import argparse
+import base64
 import json
 import os
 import re
@@ -14,25 +15,29 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-from urllib.request import Request
-from urllib.request import urlopen
+from sync_tip import sync_head, sync_epoch, sync_fields, sync_issue
 
 from release import trusted as trusted_release
 from validator_common import ValidatorError
 from validator_common import load_network
+from validator_common import load_head
 from validator_common import load_wallet
 from validator_common import parse_env
 from validator_common import sha256_file
 from validator_common import state_ready
-from validator_common import state_sync_sources
 from validator_common import validate_checkpoint
+from validator_common import write_private_json
 from validator_enroll import membership
 from validator_process import entry_data
 from validator_process import node_owners
 from validator_process import process_alive
 from validator_process import wait_stopped
 from validator_recover import read_need
+from validator_recover import read_plan
+from validator_recover import PLAN_SCHEMA
 from validator_recover import recover
+from validator_recover import sync_dir
+from validator_exit import command_lock
 from validator_rejoin import place_floor
 from validator_status import rpc_method
 from validator_status import rpc_status
@@ -40,19 +45,15 @@ from validator_status import recent_heads
 from sync_need import Need
 from sync_need import choose as choose_need
 from sync_need import make
+from sync_need import SCHEMA as NEED_SCHEMA
+from sync_need import history_limit, snapshot_lag
 from validator_config import operator_wallet
 from wal_check import inspect as inspect_wal
 
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 ACTIVE = frozenset({"launching", "online", "stopping"})
 VOTE = re.compile(r"^[0-9]{20}_[0-9]{8}_[0-9a-f]{64}\.vote$")
-SYNC_LIMIT = 65_536
-CERT_LIMIT = 33_554_432
 RESTART_CODE = 75
-SYNC_HEADERS = {
-    "Accept": "application/json",
-    "User-Agent": "octra-upgrade/1",
-}
 
 @dataclass(frozen=True)
 class DiskState:
@@ -439,9 +440,38 @@ def inspect_votes(data_dir):
             meta = path.lstat()
             if not stat.S_ISREG(meta.st_mode) or meta.st_size <= 0 or meta.st_size > 512:
                 faults.append(("vote_record_unreadable", path))
+        except FileNotFoundError:
+            continue
         except OSError as error:
             faults.append(("vote_record_unreadable", path, str(error)))
     return faults
+
+def durable_faults(data_dir, head=None):
+    if not isinstance(head, int) or isinstance(head, bool) or head < 0:
+        head = None
+        try:
+            head = load_head(data_dir)["epoch"]
+        except ValidatorError:
+            pass
+    votes = inspect_votes(data_dir)
+    return inspect_pending(data_dir) + [fault for fault in votes
+        if head is None or not VOTE.fullmatch(Path(fault[1]).name)
+        or int(Path(fault[1]).name.split("_", 1)[0]) >= head]
+
+def check_built(root, values):
+    entries = (
+        ("octra_node.exe", "OCTRA_OPERATOR_BINARY", "OCTRA_BINARY_HASH"),
+        ("octra_pvac_worker.exe", "OCTRA_PVAC_VERIFY_WORKER", "OCTRA_PVAC_VERIFY_WORKER_HASH"),
+        ("octra_state_sync_client.exe", "OCTRA_OPERATOR_SYNC_BINARY", "OCTRA_OPERATOR_SYNC_BINARY_HASH"),
+    )
+    for name, path_key, hash_key in entries:
+        built = Path(root) / "_build/default/bin" / name
+        selected = Path(values.get(path_key, "")).expanduser()
+        if not built.is_file() or not selected.is_file():
+            raise ValidatorError(f"built binary is missing: {name}; node was not stopped")
+        digest = sha256_file(built)
+        if sha256_file(selected) != digest or values.get(hash_key) != digest:
+            raise ValidatorError(f"built binary differs from selected runtime: {name}; node was not stopped")
 
 def peer_head(payload):
     return max(recent_heads(payload), default=None)
@@ -455,80 +485,6 @@ def round_value(payload, key):
         return None
     return value if value >= 0 else None
 
-def cert_epoch(source):
-    request = Request(
-        source + "/state-sync/manifest",
-        headers=SYNC_HEADERS,
-    )
-    with urlopen(request, timeout=15.0) as response:
-        raw = response.read(CERT_LIMIT + 1)
-    if len(raw) > CERT_LIMIT:
-        raise ValidatorError("state sync certificate exceeds byte limit")
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-        epoch = int(payload["checkpoint"]["epoch"])
-        files = payload["manifest"]["files"]
-        roots = [
-            item for item in files
-            if isinstance(item, dict) and item.get("path") == "ready_roots"
-        ]
-        root_size = int(roots[0]["size"]) if len(roots) == 1 else 0
-    except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValidatorError("state sync certificate is invalid") from error
-    if (
-        payload.get("version") != "octra-state-sync"
-        or not isinstance(files, list)
-        or epoch < 0
-    ):
-        raise ValidatorError("state sync certificate fields differ")
-    if len(roots) != 1 or root_size <= 0:
-        raise ValidatorError("state sync root window is unavailable")
-    return epoch
-
-def sync_epoch(source):
-    request = Request(
-        source + "/state-sync/head",
-        headers=SYNC_HEADERS,
-    )
-    with urlopen(request, timeout=15.0) as response:
-        raw = response.read(SYNC_LIMIT + 1)
-    if len(raw) > SYNC_LIMIT:
-        raise ValidatorError("state sync manifest exceeds byte limit")
-    try:
-        payload = json.loads(raw.decode("utf-8"))
-        epoch = int(payload["head_epoch"])
-        current = int(payload["current_epoch"])
-        certificate = cert_epoch(source)
-        snapshot = payload.get("snapshot_epoch")
-        snapshot = certificate if snapshot is None else int(snapshot)
-    except (KeyError, TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValidatorError("state sync head is invalid") from error
-    if (
-        payload.get("version") != "octra-state-sync"
-        or payload.get("mode") != "live_head"
-        or epoch < 0
-        or current != epoch + 1
-        or snapshot < 0
-        or snapshot > epoch
-        or snapshot != certificate
-    ):
-        raise ValidatorError("state sync head fields differ")
-    return {"head": epoch, "snapshot": snapshot}
-
-def sync_head(values):
-    tips = []
-    for source in state_sync_sources(values["OCTRA_STATE_SYNC_SOURCES"]):
-        try:
-            tips.append(sync_epoch(source))
-        except (OSError, ValidatorError):
-            pass
-    if not tips:
-        return None
-    return {
-        "head": max(value["head"] for value in tips),
-        "snapshot": max(value["snapshot"] for value in tips),
-    }
-
 def sync_target(state, tip):
     values = [
         value
@@ -540,43 +496,73 @@ def sync_target(state, tip):
     ]
     return max(values) if values else None
 
-def sync_wait(values, need, wait, interval):
+def sync_wait(values, need, wait, interval, *, min_epoch = 0):
     deadline = time.monotonic() + wait
     seen = None
     while True:
         tip = sync_head(values)
         head = tip["head"] if tip is not None else None
-        snapshot = tip["snapshot"] if tip is not None else None
-        required = need.epoch
+        required = max(need.epoch, min_epoch)
         target = need.target
         if isinstance(target, int):
-            required = max(required, target - sync_limit(values))
+            required = max(required, target - snapshot_lag(values))
         if head is not None:
-            required = max(required, head - sync_limit(values))
-        current = (head, snapshot, required)
+            required = max(required, head - snapshot_lag(values))
+        issue = sync_issue(tip, required)
+        current = sync_fields(tip, required)
         if current != seen:
             emit(
-                event="sync_snapshot",
-                status="ready" if snapshot is not None and snapshot >= required else "wait",
-                head=head if head is not None else "unknown",
-                snapshot=snapshot if snapshot is not None else "unknown",
-                required=required,
+                event = "sync_snapshot",
+                status = "ready" if issue is None else
+                    "refused" if current["head_status"] == "independent_missing" else "wait",
+                **current,
             )
             seen = current
-        if snapshot is not None and snapshot >= required:
+        if issue is None:
             return {**tip, "required": required}
-        if time.monotonic() >= deadline:
-            if snapshot is None:
-                raise ValidatorError("signed snapshot metadata is unavailable")
-            raise ValidatorError("signed snapshot is below recovery boundary")
+        if current["head_status"] == "independent_missing" or time.monotonic() >= deadline:
+            raise ValidatorError(issue)
         time.sleep(interval)
 
 def sync_limit(values):
+    return history_limit(values)
+
+def need_reached(need, head, limit):
+    return (need is not None and need.cause in ("root", "range")
+        and type(head) is int and head >= max(need.epoch, (need.target or 0) - limit))
+
+def stored_epoch(values):
     try:
-        value = int(values.get("OCTRA_CATCHUP_MAX_LAG", "5000"))
-    except ValueError:
-        return 5000
-    return value if value > 0 else 5000
+        return load_head(Path(values["OCTRA_DATA_DIR"]))["epoch"]
+    except (OSError, ValueError, KeyError, ValidatorError):
+        return None
+
+def remember_plan(config, values, state, planned):
+    path = Path(config).with_name(Path(config).name + ".sync.json")
+    data = str(Path(values["OCTRA_DATA_DIR"]).expanduser().resolve())
+    with command_lock(values):
+        stored = read_plan(config, values)
+        head = state.get("head_epoch")
+        if state.get("rpc") != "ready" or type(head) is not int:
+            head = stored_epoch(values)
+        if need_reached(stored, head, sync_limit(values)):
+            path.unlink()
+            sync_dir(path.parent)
+            stored = None
+        if need_reached(planned, head, sync_limit(values)):
+            planned = None
+        plan = planned if stored is None else stored
+        if planned is not None and (plan is None or planned.target > plan.target):
+            plan = planned
+        if plan is not None and plan != stored:
+            write_private_json(path, {
+                "schema": PLAN_SCHEMA, "data_dir": data, "need": {
+                    "schema": NEED_SCHEMA, "chain_id": plan.chain, "cause": plan.cause,
+                    "epoch": plan.epoch, "head": plan.head, "target": plan.target,
+                },
+            })
+            sync_dir(path.parent)
+        return plan
 
 def sync_plan(values, state, target):
     head = state.get("head_epoch")
@@ -589,6 +575,37 @@ def sync_plan(values, state, target):
     ):
         return None
     return make(values["OCTRA_CHAIN_ID"], "range", head + 1, head, target)
+
+def profile_match(version, release):
+    if not isinstance(version, dict):
+        return False
+    direct = version.get("runtime_profile_hash") == release["runtime_profile_hash"]
+    rows = version.get("runtime_profiles")
+    if rows is None:
+        return direct
+    epoch = version.get("profile_epoch")
+    if (type(epoch) is not int or epoch < 0
+            or version.get("chain_id") != release["chain_id"]
+            or not isinstance(rows, list) or not 1 <= len(rows) <= 128):
+        return False
+    previous = -1
+    selected = None
+    hashes = set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"from_epoch", "hash"}:
+            return False
+        start, digest = row["from_epoch"], row["hash"]
+        if (type(start) is not int or start < 0 or start <= previous
+                or not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None):
+            return False
+        if previous == -1 and start != 0:
+            return False
+        previous = start
+        hashes.add(digest)
+        if start <= epoch:
+            selected = digest
+    return (release["runtime_profile_hash"] in hashes
+        and selected == version.get("runtime_profile_hash"))
 
 def view(values, pid, release):
     status = rpc_status(values["OCTRA_API_PORT"])
@@ -614,7 +631,7 @@ def view(values, pid, release):
     )
     runtime_match = (
         source_match
-        and version.get("runtime_profile_hash") == release["runtime_profile_hash"]
+        and profile_match(version, release)
         and version.get("consensus_profile") == release["consensus_profile"]
         and version.get("consensus_rules_id") == release["consensus_rules_id"]
     )
@@ -622,13 +639,15 @@ def view(values, pid, release):
         "pid": pid,
         "process": "online" if process_alive(pid) else "offline",
         "live_binary": live or "unknown",
-        "binary_match": live is not None and live == expected,
+        "binary_match": (live is not None and live == expected
+            and isinstance(version, dict) and version.get("binary_hash") == live),
         "live_source": version.get("source_commit", "unknown")
         if isinstance(version, dict) else "unknown",
         "source_match": source_match,
         "runtime_match": runtime_match,
         "live_profile": version.get("runtime_profile_hash")
         if isinstance(version, dict) else None,
+        "profile_epoch": version.get("profile_epoch") if isinstance(version, dict) else None,
         "live_consensus_profile": version.get("consensus_profile")
         if isinstance(version, dict) else None,
         "live_rules_id": version.get("consensus_rules_id")
@@ -660,6 +679,7 @@ def require_profile(state, release, *, allow_missing = False):
             "release runtime mismatch"
             f"; source = {release['source_commit']}"
             f"; head = {state.get('head_epoch')}"
+            f"; profile_epoch = {state.get('profile_epoch')}"
             f"; marker_profile = {release['runtime_profile_hash']}"
             f"; live_profile = {state.get('live_profile')}"
             f"; marker_consensus_profile = {release['consensus_profile']}"
@@ -678,6 +698,20 @@ def matches(state):
         and state.get("runtime_match") is True
         and isinstance(state.get("head_epoch"), int)
     )
+
+def startup_running(sup, values, state, release, public):
+    expected = values.get("OCTRA_BINARY_HASH")
+    return (sup.get("active") is True and type(sup.get("pid")) is int and sup["pid"] > 0
+        and state.get("process") == "online" and state.get("rpc") == "unavailable"
+        and public == release["public_commit"]
+        and values.get("OCTRA_SOURCE_COMMIT") == release["source_commit"]
+        and isinstance(expected, str) and re.fullmatch(r"[0-9a-f]{64}", expected) is not None
+        and state.get("live_binary") == expected)
+
+def snapshot_running(values, need, plan):
+    head = stored_epoch(values)
+    return (need_reached(need, head, snapshot_lag(values))
+        and (plan is None or need_reached(plan, head, snapshot_lag(values))))
 
 def installed(role, state):
     if role == "validator":
@@ -869,18 +903,26 @@ def restore_cycle(root, sup, values, args, before, plan, min_epoch):
     start(root, sup, sup["config"], args.sudo)
     return restored
 
-def preflight(root, sup, values, use_sudo):
+def preflight(root, sup, values, use_sudo, head=None):
+    for name in ("octra_node.exe", "octra_pvac_worker.exe", "octra_state_sync_client.exe",
+                 "bft_control_tx.exe", "vote_floor.exe"):
+        path = Path(root) / "artifacts" / name
+        if os.path.lexists(path):
+            raise ValidatorError(
+                f"runtime_layout_artifacts: {path}; use a separate source checkout; no changes performed"
+            )
     owners = data_pids(values["OCTRA_DATA_DIR"])
     if owners and not node_owners(owners, sup["pid"], values):
         raise ValidatorError(
             "data directory is used by unexpected processes: "
             + ",".join(map(str, owners))
         )
-    faults = inspect_pending(values["OCTRA_DATA_DIR"])
+    faults = durable_faults(values["OCTRA_DATA_DIR"], head)
     if faults:
         for fault in faults:
-            emit(fault = fault[0], path = fault[1], detail = fault[2], action = "do_not_delete")
-        raise ValidatorError("WAL requires review; no build, stop or data changes performed")
+            emit(fault = fault[0], path = fault[1],
+                detail = fault[2] if len(fault) > 2 else "invalid", action = "do_not_delete")
+        raise ValidatorError("durable record requires review; no build, stop or data changes performed")
     if sup["kind"] == "systemd" and not storage_stop_ready(sup.get("restart", {})):
         raise ValidatorError(
             "storage restart policy does not stop on exit 78; review RestartPreventExitStatus "
@@ -982,6 +1024,35 @@ def verify_unit(sup, values):
         )
     return binary
 
+def journal_restart(need, head, epoch):
+    return (need is not None and need.cause == "root" and need.target is None
+        and type(head) is int and type(epoch) is int
+        and need.head == head and need.epoch == epoch == head + 1)
+
+def local_journal(values, need):
+    if need is None or need.chain != values["OCTRA_CHAIN_ID"]:
+        return False
+    try:
+        data = Path(values["OCTRA_DATA_DIR"])
+        head = load_head(data)["epoch"]
+        path = data / "finality" / "pending_finalized.json"
+        meta = path.lstat()
+        if not stat.S_ISREG(meta.st_mode) or not 0 < meta.st_size <= 128 * 1024 * 1024:
+            return False
+        saved = json.loads(path.read_text(encoding = "utf-8"))
+        if not isinstance(saved, dict) or saved.get("schema") != "octra_finality_journal":
+            return False
+        raw = base64.b64decode(saved["finalize"], validate = True)
+        size = int.from_bytes(raw[:4], "big")
+        if not 0 < size <= 128 or len(raw) < size + 12:
+            return False
+        if raw[4:4 + size] != need.chain.encode("utf-8"):
+            return False
+        epoch = int.from_bytes(raw[4 + size:12 + size], "big")
+        return journal_restart(need, head, epoch)
+    except (OSError, ValueError, TypeError, KeyError, UnicodeError, RecursionError, ValidatorError):
+        return False
+
 def diagnose(root, sup, values, release):
     pid = sup["pid"] if sup["active"] else 0
     emit(
@@ -1001,6 +1072,10 @@ def diagnose(root, sup, values, release):
     else:
         state = {"process": "offline", "source_match": False, "binary_match": False}
     marked = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
+    if marked is not None and marked.cause == "range":
+        emit(event = "binary_rollback", status = "hold", target_source = "f7637a7e",
+            reason = "range_marker", action = "use_upgrade",
+            path = Path(values["OCTRA_DATA_DIR"]) / "recovery" / "sync_need.json")
     profile_error = None
     try:
         require_profile(state, release, allow_missing = marked is not None)
@@ -1010,8 +1085,15 @@ def diagnose(root, sup, values, release):
     remote_known = git["upstream_head"] != "unknown"
     published = remote_known and git["upstream_head"] == release["public_commit"]
     tip = sync_head(values)
-    planned = sync_plan(values, state, sync_target(state, tip))
+    planned = remember_plan(sup["config"], values, state,
+        sync_plan(values, state, sync_target(state, tip)))
     need = choose_need(marked, planned, values["OCTRA_CHAIN_ID"])
+    replay = planned is None and local_journal(values, marked)
+    resumed = need is not None and snapshot_running(values, need, planned)
+    starting = (need is None or replay or resumed) and (startup_running(
+        sup, values, state, release, git["repo_head"]) or ((replay or resumed) and matches(state)))
+    restart_error = (need is not None and need.cause in ("root", "range")
+        and sup["kind"] == "systemd" and not restart_ready(sup.get("restart", {})))
     upgrade = (
         git["repo_head"] != release["public_commit"]
         or state.get("source_match") is not True
@@ -1019,9 +1101,15 @@ def diagnose(root, sup, values, release):
         or state.get("runtime_match") is not True
         or need is not None
     )
-    action = "recover" if need is not None else ("upgrade" if upgrade else "none")
-    if profile_error is not None:
+    faults = durable_faults(values["OCTRA_DATA_DIR"], state.get("head_epoch"))
+    action = "leave_running" if starting else "upgrade_local_journal" if replay else (
+        "recover" if need is not None else ("upgrade" if upgrade else "none"))
+    if faults:
+        action = "do_not_delete"
+    elif profile_error is not None:
         action = "review_signed_release"
+    elif restart_error:
+        action = "review_unit_restart_policy"
     emit(
         event="upgrade_check",
         **git,
@@ -1030,10 +1118,9 @@ def diagnose(root, sup, values, release):
         release_public=release["public_commit"],
         release_source=release["source_commit"],
         release_published=published,
-        upgrade_available=upgrade,
+        upgrade_available=upgrade and not starting,
         action=action,
     )
-    faults = inspect_pending(values["OCTRA_DATA_DIR"]) + inspect_votes(values["OCTRA_DATA_DIR"])
     for fault in faults:
         emit(fault=fault[0], path=fault[1], detail=fault[2] if len(fault) > 2 else "invalid")
     if profile_error is not None:
@@ -1046,6 +1133,18 @@ def diagnose(root, sup, values, release):
     if not published:
         emit(status="hold", reason="release_target_not_published", action="do_not_apply")
         return 2
+    if faults:
+        emit(status="hold", reason="durable_record_requires_review", action="do_not_delete")
+        return 2
+    if restart_error:
+        emit(status = "hold", reason = "unit_restart_75_required",
+            action = "review_unit_restart_policy", unit = sup["name"])
+        return 2
+    if starting:
+        emit(status = "recovering", reason = ("snapshot_verification" if resumed else "journal_verification")
+            if state.get("rpc") == "ready"
+            else "startup_verification", action = "leave_running")
+        return 2
     if need is not None:
         emit(
             event="sync_recovery",
@@ -1055,13 +1154,11 @@ def diagnose(root, sup, values, release):
             head=need.head,
             action="apply",
         )
-        emit(status="hold", reason="signed_snapshot_required", action="apply_upgrade")
-        return 2
-    if faults:
-        emit(status="hold", reason="durable_record_requires_review", action="do_not_delete")
+        emit(status="hold", reason="local_journal_check" if replay else "signed_snapshot_required",
+            action="apply_upgrade")
         return 2
     if join_pending(values["OCTRA_OPERATOR_ROLE"], state):
-        emit(event="validator_admission", status="pending", action="leave_running")
+        emit(event = "validator_entry", status = "pending", action = "leave_running")
     emit(status="pass", gate="upgrade_diagnostic")
     return 0
 
@@ -1081,39 +1178,58 @@ def restore_plan(values, config, plan, min_epoch=None):
 
 def apply(root, sup, values, args, release):
     public, source = release_target(release, args, values)
-    preflight(root, sup, values, args.sudo)
     state = view(values, sup["pid"], release) if sup["pid"] else {}
+    preflight(root, sup, values, args.sudo, head=state.get("head_epoch"))
     marked = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
     require_profile(state, release, allow_missing = marked is not None)
     prior_binary = Path(values["OCTRA_OPERATOR_BINARY"]).expanduser().resolve()
     unit_binary = verify_unit(sup, values)
-    _, _, changed = git_update(root, public, source)
+    repo_head, _, changed = git_update(root, public, source)
     verify_release_tree(root, release)
     if changed:
         reexec(root)
     sync_values = release_sync_values(root, values, release)
     tip = sync_head(sync_values)
-    plan = sync_plan(sync_values, state, sync_target(state, tip))
+    plan = remember_plan(sup["config"], values, state,
+        sync_plan(sync_values, state, sync_target(state, tip)))
     marked = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
     need = choose_need(marked, plan, values["OCTRA_CHAIN_ID"])
+    replay = plan is None and local_journal(values, marked)
+    resumed = need is not None and snapshot_running(values, need, plan)
+    if (need is not None and need.cause in ("root", "range")
+            and sup["kind"] == "systemd" and not restart_ready(sup.get("restart", {}))):
+        raise ValidatorError("unit does not restart on exit 75; node was not stopped; review unit restart policy")
+    if (need is None or replay or resumed) and (startup_running(sup, values, state, release, repo_head)
+            or ((replay or resumed) and matches(state))):
+        emit(event = "upgrade_resume", status = "recovering",
+            reason = ("snapshot_verification" if resumed else "journal_verification")
+                if state.get("rpc") == "ready" else "startup_verification",
+            action = "leave_running", restart = False, build = False)
+        return wait_node(root, sup, values, args, release, prior_binary,
+            journal = need if replay else None, guard = need if resumed and not replay else None)
+    if (need is None and (tip is None or tip["head"] is None) and state.get("process") == "online"
+            and state.get("lag") is None):
+        raise ValidatorError("network head is unavailable; node was not stopped; retry upgrade")
     if need is None and matches(state):
         worker = Path(values.get("OCTRA_PVAC_VERIFY_WORKER", "")).expanduser()
         if worker.is_file() and sha256_file(worker) == values.get("OCTRA_PVAC_VERIFY_WORKER_HASH"):
-            faults = inspect_pending(values["OCTRA_DATA_DIR"]) + inspect_votes(values["OCTRA_DATA_DIR"])
+            faults = durable_faults(values["OCTRA_DATA_DIR"], state.get("head_epoch"))
             if faults:
                 raise ValidatorError("durable record requires review; node was not stopped")
             emit(event="upgrade_resume", action="wait", restart=False, build=False)
             return wait_node(root, sup, values, args, release, prior_binary)
     fresh = (
-        sync_wait(sync_values, need, args.wait_seconds, args.interval)
-        if need is not None
+        sync_wait(sync_values, need, args.wait_seconds, args.interval,
+            min_epoch = max(0, (plan.target or 0) - snapshot_lag(sync_values)) if plan is not None else 0)
+        if need is not None and not replay
         else None
     )
     call(["sh", str(root / "controls/check.sh")], cwd=root, timeout=300)
     call(["sh", str(root / "controls/build.sh")], cwd=root, timeout=3600)
     if sup["pid"]:
         marked = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
-        require_profile(view(values, sup["pid"], release), release,
+        state = view(values, sup["pid"], release)
+        require_profile(state, release,
             allow_missing = marked is not None)
     call([
         "python3",
@@ -1141,19 +1257,21 @@ def apply(root, sup, values, args, release):
         str(sup["config"]),
     ], cwd=root)
     next_binary = Path(values["OCTRA_OPERATOR_BINARY"]).expanduser().resolve()
+    check_built(root, values)
     if unit_binary is not None and next_binary != unit_binary:
         raise ValidatorError("systemd binary path changed during rebind")
     if sup["kind"] == "pm2" and prior_binary.parent != next_binary.parent:
         emit(event = "runtime_path", prior = prior_binary, current = next_binary)
-    faults = inspect_pending(values["OCTRA_DATA_DIR"]) + inspect_votes(values["OCTRA_DATA_DIR"])
-    unsafe = [fault for fault in faults if fault[0].startswith(("pending_", "wal_"))]
-    if unsafe:
-        for fault in unsafe:
+    if sup["pid"]:
+        state = view(values, sup["pid"], release)
+    faults = durable_faults(values["OCTRA_DATA_DIR"], state.get("head_epoch"))
+    if faults:
+        for fault in faults:
             emit(fault=fault[0], path=fault[1], action="do_not_delete")
-        raise ValidatorError("WAL is unreadable; node was not stopped")
+        raise ValidatorError("durable record requires review; node was not stopped")
     if sup["pid"]:
         marked = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
-        require_profile(view(values, sup["pid"], release), release,
+        require_profile(state, release,
             allow_missing = marked is not None)
     stop(sup, args.sudo)
     owners = data_pids(values["OCTRA_DATA_DIR"])
@@ -1162,15 +1280,24 @@ def apply(root, sup, values, args, release):
             "state directory is active after stop: " + ",".join(map(str, owners))
         )
     before = disk_state(values, sup["config"])
-    restored = restore_cycle(
-        root,
-        sup,
-        values,
-        args,
-        before,
-        plan,
-        fresh["required"] if fresh is not None else None,
-    )
+    if replay:
+        current = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
+        if current != need or before.need != need or not local_journal(values, current):
+            raise ValidatorError("local journal changed; state retained; retry upgrade")
+        emit(event = "sync_recovery", status = "checking_local_journal",
+            epoch = need.epoch, head = need.head, action = "start")
+        start(root, sup, sup["config"], args.sudo)
+        restored = None
+    else:
+        restored = restore_cycle(
+            root,
+            sup,
+            values,
+            args,
+            before,
+            plan,
+            fresh["required"] if fresh is not None else None,
+        )
     if restored is not None:
         emit(
             event="sync_recovery",
@@ -1179,12 +1306,20 @@ def apply(root, sup, values, args, release):
             head=restored.head,
             target=restored.target or "none",
         )
-    return wait_node(root, sup, values, args, release, prior_binary)
+    return wait_node(root, sup, values, args, release, prior_binary,
+        journal = need if replay else None,
+        guard = (read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"]) or restored)
+            if restored is not None else None)
 
-def wait_node(root, sup, values, args, release, prior_binary):
+def wait_node(root, sup, values, args, release, prior_binary, *, journal = None, guard = None):
     deadline = time.monotonic() + args.wait_seconds
+    recovering = journal is not None or guard is not None
+    offline_since = None
+    phase = None
+    phase_started = time.monotonic()
     marker = None
     floor_restored = False
+    probe_at = 0.0
     while True:
         entries = pm2_entries()
         names = [(sup["scope"], sup["name"], props(sup["scope"], sup["name"]))] \
@@ -1198,6 +1333,60 @@ def wait_node(root, sup, values, args, release, prior_binary):
         if now != marker:
             emit(event="upgrade_wait", **state)
             marker = now
+        checking = journal if journal is not None else guard
+        if checking is not None:
+            current_need = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
+            if current_need is None:
+                journal = None
+                guard = None
+                deadline = time.monotonic() + args.wait_seconds
+            elif current_need != checking:
+                emit(status = "hold", reason = "local_journal_changed" if journal is not None else "sync_marker_changed",
+                    action = "keep_records_report_node_log",
+                    epoch = current_need.epoch, head = current_need.head, config = sup["config"])
+                return 2
+            else:
+                now = time.monotonic()
+                observed = "process_offline" if state.get("process") != "online" else (
+                    ("journal_verification" if journal is not None else "snapshot_verification")
+                    if state.get("rpc") == "ready" else "startup_verification")
+                if observed != phase:
+                    phase, phase_started = observed, now
+                    emit(status = "recovering", reason = phase,
+                        action = "await_supervisor" if phase == "process_offline" else "leave_running")
+                until = deadline if phase in ("startup_verification", "snapshot_verification") \
+                    else min(deadline, phase_started + 120.0)
+                if now >= until:
+                    reason = {"process_offline": "node_offline", "startup_verification": "startup_deadline",
+                        "journal_verification": "local_journal_unconfirmed",
+                        "snapshot_verification": "snapshot_unconfirmed"}[phase]
+                    emit(status = "hold", reason = reason,
+                        action = "operator_start" if phase == "process_offline" else "keep_records_report_node_log",
+                        epoch = checking.epoch, head = checking.head, config = sup["config"])
+                    return 2
+                time.sleep(min(args.interval, max(0.0, until - now)))
+                continue
+        if recovering and state.get("process") != "online":
+            now = time.monotonic()
+            if offline_since is None:
+                offline_since = now
+            until = min(deadline, offline_since + 120.0)
+            if now >= until:
+                emit(status = "hold", reason = "node_offline", action = "operator_start", config = sup["config"])
+                return 2
+            time.sleep(min(args.interval, max(0.0, until - now)))
+            continue
+        offline_since = None
+        if (state.get("lag") is None and state.get("rpc") == "ready"
+                and values.get("OCTRA_STATE_SYNC_SOURCES") and time.monotonic() >= probe_at):
+            probe_at = time.monotonic() + 30.0
+            tip = sync_head(values)
+            plan = remember_plan(sup["config"], values, state,
+                sync_plan(values, state, sync_target(state, tip)))
+            if plan is not None:
+                emit(status = "hold", reason = "signed_snapshot_required", action = "apply_upgrade",
+                    head = state.get("head_epoch"), target = plan.target, config = sup["config"])
+                return 2
         if state.get("lag") == 0:
             try:
                 require_profile(state, release, allow_missing = True)
@@ -1226,7 +1415,7 @@ def wait_node(root, sup, values, args, release, prior_binary):
         if join_pending(values["OCTRA_OPERATOR_ROLE"], state):
             emit(
                 status="installed",
-                reason="validator_admission_pending",
+                reason = "validator_entry_pending",
                 action="leave_running",
                 **state,
             )
@@ -1253,6 +1442,7 @@ def parser():
     mode = value.add_mutually_exclusive_group()
     mode.add_argument("--apply", action="store_true")
     mode.add_argument("--diagnose", action="store_true")
+    mode.add_argument("--repair-cache", action="store_true")
     value.add_argument("--config")
     value.add_argument("--interval", type=float, default=15.0)
     value.add_argument("--public-commit")
@@ -1276,6 +1466,10 @@ def main():
             raise ValidatorError("--public-commit must be a full commit hash")
         if args.source_commit is not None and not HEX40.fullmatch(args.source_commit):
             raise ValidatorError("--source-commit must be a full commit hash")
+    if args.repair_cache:
+        marker, marker_source = trusted_release(root, repair=True)
+        emit(status="pass", event="release_cache", source=marker_source, sequence=marker["sequence"])
+        return 0
     marker, marker_source = trusted_release(root)
     emit(
         event="release_marker",

@@ -3,7 +3,7 @@
 
 type active = {
   activation_epoch : int;
-  parameters : Validator_admission.parameters;
+  parameters : Validator_entry.parameters;
   snapshot_interval : int64;
   evidence_epochs : int64;
 }
@@ -22,7 +22,7 @@ let evidence_epochs = 86_400L
 let unbonding_epochs = Int64.mul evidence_epochs 2L
 
 let parameters = {
-  Validator_admission.min_bond;
+  Validator_entry.min_bond;
   max_validators;
   activation_delay;
   unbonding_epochs;
@@ -31,7 +31,7 @@ let parameters = {
 let exit_window = 4_096L
 let exit_wait = Int64.mul exit_window 2L
 
-let exit_parameters mode (value : Validator_admission.parameters) =
+let exit_parameters mode (value : Validator_entry.parameters) =
   match mode with
   | Rule_graph.Prior -> value
   | Rule_graph.Active -> { value with unbonding_epochs = exit_wait }
@@ -44,9 +44,9 @@ let evidence_age mode prior =
 let exit_id =
   String.concat ":" [Int64.to_string exit_wait; Int64.to_string exit_window]
 
-let withdraw_epoch ~chain_id ~epoch candidate =
+let withdraw_epoch ~chain_id ~epoch entry =
   let mode = Rule_graph.exit_at ~chain_id ~epoch in
-  Validator_admission.withdraw_epoch (exit_parameters mode parameters) candidate
+  Validator_entry.withdraw_epoch (exit_parameters mode parameters) entry
   |> Result.map (fun due ->
     match mode, Rule_graph.exit_activation_for_chain chain_id with
     | Rule_graph.Active, Some plan -> Int64.max due (Int64.of_int plan.activation_epoch)

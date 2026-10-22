@@ -340,7 +340,7 @@ def validate_network(values, _bundle_dir):
     if not values["OCTRA_CHAIN_ID"].startswith("octra-devnet-"):
         raise ValidatorError("chain id must identify devnet")
     if values["OCTRA_P2P_REQUIRE_BINARY_HASH"] != "0":
-        raise ValidatorError("binary hash admission must be disabled")
+        raise ValidatorError("binary hash check must be disabled")
     if values["OCTRA_FHE_MAX_PER_EPOCH"] != "1":
         raise ValidatorError("first quorum run requires one FHE operation per epoch")
     if values["OCTRA_STEALTH_MAX_PER_EPOCH"] != "1":

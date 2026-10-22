@@ -184,16 +184,16 @@ let test_profile () =
     Contract_vm.LDI (10, Contract_vm.VInt Z.zero);
     Contract_vm.RMSNORM_Q16_INPLACE (8, 9, 10);
   |] in
-  (match Admission.of_code code with
+  (match Code_check.of_code code with
    | Error _ -> Printf.printf "q16_legacy_reject = 1\n%!"
    | Ok _ ->
      Printf.printf "q16_legacy_reject = 0\n%!";
      exit 1);
-  (match Admission.of_program code with
+  (match Code_check.of_program code with
    | Ok _ -> Printf.printf "q16_program_accept = 1\n%!"
    | Error error ->
      Printf.printf "q16_program_accept = 0\n%!";
-     failwith (Admission.error_message error));
+     failwith (Code_check.error_message error));
   let raw = Bytecode.encode [|
     Contract_vm.EXP_Q16 (0, 1);
     Contract_vm.SOFTMAX_Q16_INPLACE (2, 3);

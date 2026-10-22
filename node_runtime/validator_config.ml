@@ -45,7 +45,7 @@ type self_membership =
   | Self_observer of string
   | Self_refused of string
 
-type quorum_admission =
+type quorum_check =
   | Quorum_ok
   | Quorum_refused of string list
   | Quorum_unsafe_allowed of string
@@ -138,13 +138,14 @@ let fingerprint_of_validator_set vs =
   let fingerprint = Octra_core.Validator_set_update.fingerprint entries in
   String.sub fingerprint 0 (min 16 (String.length fingerprint))
 
-let light_scheduled_of_driver ~chain_id = function
+let light_scheduled_of_driver ?policy ~chain_id = function
   | None -> None
   | Some cfg ->
     Some Octra_consensus.C_config.{
       activate_epoch = cfg.Octra_consensus.C_driver.activate_epoch;
       validator_set =
         Octra_consensus.C_types.validator_set_for_epoch
+          ?policy
           ~chain_id
           ~epoch_id:cfg.activate_epoch
           cfg.validator_set;
@@ -211,7 +212,7 @@ let transition_of_persistent ~active_config ~scheduled_config =
     Already_active { activate_epoch = active.Octra_consensus.C_driver.activate_epoch }
   | None, None -> No_transition
 
-let bind_persistent_updates ~chain_id ~consensus_mode ~current_height
+let bind_persistent_updates ?policy ~chain_id ~consensus_mode ~current_height
     ~active_raw ~pending_raw cfg =
   match
     persistent_update "active" active_raw,
@@ -221,7 +222,11 @@ let bind_persistent_updates ~chain_id ~consensus_mode ~current_height
   | _, Error error -> Error error
   | _, Ok (Some pending) when not pending.weighted ->
     Error "manual validator updates are disabled"
-  | Ok None, Ok None -> Ok cfg
+  | Ok None, Ok None ->
+    let policy = Option.value policy ~default:(Octra_consensus.C_quorum_policy.for_chain chain_id) in
+    if Octra_consensus.C_types.weights_valid
+      (Octra_consensus.C_quorum_policy.select policy current_height) cfg.stake_vs then Ok cfg
+    else Error "stake weights are missing"
   | Ok active_update, Ok pending_update ->
     let active_config =
       match active_update with
@@ -253,6 +258,7 @@ let bind_persistent_updates ~chain_id ~consensus_mode ~current_height
             in
             let active_vs =
               Octra_consensus.C_types.validator_set_for_epoch
+                ?policy
                 ~chain_id
                 ~epoch_id:current_height
                 stake_vs
@@ -265,7 +271,7 @@ let bind_persistent_updates ~chain_id ~consensus_mode ~current_height
             in
             let scheduled_driver_config = scheduled_driver_config_raw in
             let light_scheduled_validator_set =
-              light_scheduled_of_driver ~chain_id scheduled_driver_config
+              light_scheduled_of_driver ?policy ~chain_id scheduled_driver_config
             in
             let active_validator_list = active_vs.validators in
             let next_validator_list =
@@ -362,7 +368,7 @@ let scheduled_self_warning ~address ~voting cfg =
       "wallet is not in active validator set yet; running catchup/non-voting until scheduled activation"
   else None
 
-let quorum_admission ~allow_unsafe cfg =
+let quorum_check ~allow_unsafe cfg =
   let vs = cfg.active_vs in
   if vs.n >= 4 then Quorum_ok
   else if allow_unsafe then
@@ -380,7 +386,7 @@ let quorum_admission ~allow_unsafe cfg =
       "env = OCTRA_ALLOW_UNSAFE_QUORUM test_value = 1 production = false";
     ]
 
-let startup_admission ?(permissionless = false) ~address ~voting ~role_label
+let startup_check ?(permissionless = false) ~address ~voting ~role_label
     ~allow_unsafe_quorum ~next_activation_epoch cfg =
   if cfg.identity_errors <> [] then
     [Startup_refuse cfg.identity_errors]
@@ -420,14 +426,14 @@ let startup_admission ?(permissionless = false) ~address ~voting ~role_label
         | Some message -> [Startup_warn message]
       in
       let quorum_events =
-        match quorum_admission ~allow_unsafe:allow_unsafe_quorum cfg with
+        match quorum_check ~allow_unsafe:allow_unsafe_quorum cfg with
         | Quorum_ok -> []
         | Quorum_unsafe_allowed message -> [Startup_warn message]
         | Quorum_refused messages -> [Startup_refuse messages]
       in
       self_events @ scheduled_events @ quorum_events
 
-let node_startup_admission ~getenv ~activation_epoch ~address ~voting
+let node_startup_check ~getenv ~activation_epoch ~address ~voting
     ~role_label cfg =
   match Octra_core.Validator_policy.of_env getenv with
   | Error error -> [Startup_refuse [error]]
@@ -438,7 +444,7 @@ let node_startup_admission ~getenv ~activation_epoch ~address ~voting
       | Already_active { activate_epoch } -> Some activate_epoch
       | No_transition -> activation_epoch ()
     in
-    startup_admission
+    startup_check
       ~permissionless:(Octra_core.Validator_policy.lifecycle_enabled policy)
       ~address
       ~voting

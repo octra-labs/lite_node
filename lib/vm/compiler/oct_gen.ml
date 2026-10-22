@@ -24,6 +24,7 @@ type env = {
   func_labels : (string, int) Hashtbl.t;
   mutable locals : (string * int * typ) list;
   mutable loop_regs : int list;
+  mutable expanding : (string * int * int * (string * int * typ) list * int list) list;
   mutable base_reg : int;
   mutable next_reg : int;
   mutable next_label : int;
@@ -47,6 +48,7 @@ let make_env ~loops syntax declaration structs enums consts state events errors 
   func_labels = Hashtbl.create 16;
   locals = [];
   loop_regs = [];
+  expanding = [];
   base_reg = 1; next_reg = 1; next_label = 10000;
   code = []; seals = []; line = 0; column = 0;
   has_payable = List.exists (fun f -> f.fn_payable) funcs;
@@ -2158,12 +2160,25 @@ and gen_expr env expr =
     let r = alloc_reg env in
     emit env (Contract_vm.BALANCE (r, ra)); r
   | EVar name ->
-    (match find_const env name with
-     | Some c -> gen_expr env c.c_value
-     | None ->
-       (match find_local env name with
+    let outer = env.expanding in
+    let rec expand name =
+      match find_const env name with
+      | Some c ->
+        let key = name, env.base_reg, env.next_reg, env.locals, env.loop_regs in
+        if List.mem key env.expanding then raise Stack_overflow;
+        env.expanding <- key :: env.expanding;
+        begin match c.c_value with
+        | EVar next -> (expand [@tailcall]) next
+        | value -> gen_expr env value
+        end
+      | None ->
+        begin match find_local env name with
         | Some (_, reg, _) -> reg
-        | None -> gerr env.line (Printf.sprintf "undefined variable: %s" name)))
+        | None -> gerr env.line (Printf.sprintf "undefined variable: %s" name)
+        end in
+    let result = expand name in
+    env.expanding <- outer;
+    result
   | EField name ->
     (match find_state env name with
      | Some sf ->

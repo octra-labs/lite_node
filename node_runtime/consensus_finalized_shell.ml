@@ -93,9 +93,12 @@ let run_stashed_plan deps validator_set finalize (header : C_types.epoch_header)
       "directly applying stashed finalized epoch = %d during %s (prev_root matches local HEAD)"
       header_epoch phase_label;
     let* () = deps.apply_finalized ~validator_set finalize in
-    deps.clear_quarantine clear_reason;
+    if deps.committed_head_epoch () >= header_epoch then
+      deps.clear_quarantine clear_reason;
     Lwt.return_unit
   | Flow.Wait_stashed ->
+    deps.queue_catchup_target
+      ~target_epoch:header.C_types.epoch_id ~reason:"finalized_during_catchup";
     Lwt.return_unit
   | Flow.Replay_stashed ->
     deps.replay_stashed_while_safe ~source:"on_finalized_quarantine"

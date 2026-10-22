@@ -600,6 +600,74 @@ let test_invalid_sets () =
           alice, Z.zero;
         ]))
 
+let test_stake_plan () =
+  let module P = C_quorum_policy in
+  let rule epoch_id = P.rule_at ~count_epoch:10L ~stake_epoch:(Some 20L) ~epoch_id in
+  expect "prior rule" (rule 9L = P.Prior);
+  expect "count rule" (rule 10L = P.Capped && rule 19L = P.Capped);
+  expect "stake rule" (rule 20L = P.Stake && rule 21L = P.Stake);
+  List.iter (fun chain_id -> List.iter (fun epoch_id ->
+    let prior = match P.activation_for_chain chain_id with
+      | None -> epoch_id >= 0L
+      | Some activation -> epoch_id >= Int64.of_int activation.activation_epoch in
+    let stake = match P.linear_epoch ~chain_id with
+      | Some start -> epoch_id >= start
+      | None -> false in
+    expect "cap before stake" (P.count_cap_required ~chain_id ~epoch_id = (prior && not stake));
+    expect "stake keeps floor" (P.count_floor_required ~chain_id ~epoch_id = prior);
+    expect "stake selects rule" (P.linear_weight ~chain_id ~epoch_id = stake);
+    expect "stake selects profile"
+      ((P.consensus_id_at ~chain_id ~epoch_id = P.consensus_id ~chain_id) = not stake))
+    [-1L; 0L; 1_306_546L; 1_306_547L; 1_688_733L; 1_688_734L;
+     1_702_237L; 1_702_238L; 1_702_239L;
+     Int64.pred (Option.get (P.linear_epoch ~chain_id:devnet_chain_id));
+     Option.get (P.linear_epoch ~chain_id:devnet_chain_id);
+     Int64.succ (Option.get (P.linear_epoch ~chain_id:devnet_chain_id)); Int64.max_int])
+    [devnet_chain_id; "other-chain"];
+  expect "stake rewind refused"
+    (not (P.rewind_at ~count_epoch:10L ~stake_epoch:(Some 20L)
+      ~from_epoch:20L ~to_epoch:19L));
+  expect "stake rewind same rule"
+    (P.rewind_at ~count_epoch:10L ~stake_epoch:(Some 20L)
+      ~from_epoch:21L ~to_epoch:20L);
+  List.iter (fun stake_epoch ->
+    expect "invalid stake order" (try
+      ignore (P.rule_at ~count_epoch:10L ~stake_epoch ~epoch_id:20L); false
+      with Invalid_argument _ -> true)) [Some 9L; Some 10L];
+  let raw = C_types.validator_set_for_rule P.Stake live_validator_set in
+  let unweighted = C_types.make_validator_set raw.validators in
+  expect "stake requires bonded weights"
+    (not (C_types.has_quorum_for_rule P.Stake unweighted
+      (List.map (fun (member : C_types.validator_info) -> member.address) unweighted.validators)));
+  let policy = P.make ~count_epoch:10L ~stake_epoch:(Some 20L) in
+  expect "unweighted votes cannot finalize" (not (C_types.quorum_reached_at
+    ~policy ~chain_id:devnet_chain_id ~epoch_id:20L unweighted
+    ~signer_count:unweighted.n ~signed_weight:unweighted.total_weight));
+  expect "unweighted votes cannot skip round" (not (C_types.round_skip_reached_at
+    ~policy ~chain_id:devnet_chain_id ~epoch_id:20L unweighted
+    ~signer_count:unweighted.n ~signed_weight:unweighted.total_weight));
+  expect "raw stake hash preserved"
+    (C_config.validator_set_hash raw = C_config.validator_set_hash live_validator_set);
+  expect "raw stake amount preserved" (Z.equal raw.total_weight (Z.of_int 28_000_000));
+  let heavy = "live-1" in
+  let light = ["live-2"; "live-3"; "live-4"; "live-5"; "live-6"; "live-7"] in
+  let accepts = C_types.has_quorum_for_rule P.Stake live_validator_set in
+  expect "weight alone is insufficient" (not (accepts [heavy]));
+  expect "count alone is insufficient" (not (accepts light));
+  expect "both thresholds" (accepts [heavy; "live-2"; "live-3"; "live-4"; "live-5"]);
+  expect "duplicates do not add seats" (not (accepts [heavy; heavy; heavy; heavy; heavy]));
+  expect "unknown signer refused" (not (accepts [heavy; "live-2"; "live-3"; "live-4"; "unknown"]));
+  let decoded = C_codec.decode_validator_set (C_codec.encode_validator_set raw) in
+  expect "stake restore hash" (C_config.validator_set_hash decoded = C_config.validator_set_hash raw);
+  expect "stake restore quorum" (C_types.has_quorum_for_rule P.Stake decoded
+    [heavy; "live-2"; "live-3"; "live-4"; "live-5"]);
+  List.iter (fun epoch ->
+    let selected = C_types.validator_set_for_rule (rule epoch) live_validator_set in
+    let expected = if epoch < 10L || epoch >= 20L then live_validator_set
+      else C_types.count_capped_set live_validator_set in
+    expect "scheduled set hash" (C_config.validator_set_hash selected = C_config.validator_set_hash expected))
+    [9L; 10L; 19L; 20L; 21L]
+
 let test_codec () =
   let encoded = C_codec.encode_validator_set validator_set in
   let decoded = C_codec.decode_validator_set encoded in
@@ -626,5 +694,6 @@ let () =
   test_leader ();
   test_config_binding ();
   test_invalid_sets ();
+  test_stake_plan ();
   test_codec ();
   Printf.printf "status = pass test = weighted_bft\n"

@@ -172,7 +172,7 @@ val submit_batch_decode_error :
   string ->
   Yojson.Safe.t
 
-val admission_fee_check :
+val intake_fee_check :
   min_ou:Z.t ->
   Octra_core.Transaction.t ->
   (unit, string) result
@@ -186,13 +186,13 @@ val semantic_check :
   Octra_core.Transaction.t ->
   (unit, string) result
 
-val staging_submit_admission :
+val staging_submit_check :
   min_ou:Z.t ->
   min_relay_fee:Z.t ->
   Octra_core.Transaction.t ->
   (unit, string) result
 
-val duty_nonce_admission :
+val duty_nonce_check :
   head:int64 option ->
   confirmed_nonce:int ->
   Octra_core.Transaction.t ->
@@ -214,11 +214,11 @@ val staging_submit_effects :
   tx_hash:string ->
   staging_submit_effects
 
-val address_route_admission :
+val address_route_check :
   Octra_core.Transaction.t ->
   (unit, string * string) result
 
-val self_route_admission :
+val self_route_check :
   Octra_core.Transaction.t ->
   (unit, string * string) result
 
@@ -295,17 +295,17 @@ type payload_limits = {
 
 val payload_limits : payload_limits
 
-val payload_size_admission :
+val payload_size_check :
   limits:payload_limits ->
   Octra_core.Transaction.t ->
   (unit, string * string) result
 
-val payload_admission :
+val payload_check :
   limits:payload_limits ->
   Octra_core.Transaction.t ->
   (unit, string * string) result
 
-val bft_op_admission :
+val bft_op_check :
   bft_mode:bool ->
   Octra_core.Transaction.t ->
   (unit, string * string) result
@@ -317,7 +317,7 @@ val duty_retry :
   Octra_core.Transaction.t ->
   bool
 
-val pre_route_admission :
+val pre_route_check :
   ?duty:(int64 * Octra_core.Rule_graph.mode) option ->
   now:float ->
   max_timestamp_drift:float ->
@@ -326,17 +326,17 @@ val pre_route_admission :
   Octra_core.Transaction.t ->
   (unit, string * string) result
 
-val signature_admission :
+val signature_check :
   account_public_key:string option ->
   Octra_core.Transaction.t ->
   (unit, string * string) result
 
-val sender_admission :
+val sender_check :
   sender_exists:bool ->
   Octra_core.Transaction.t ->
   (unit, string * string) result
 
-val submit_pre_signature_admission :
+val submit_pre_signature_check :
   ?duty:(int64 * Octra_core.Rule_graph.mode) option ->
   now:float ->
   max_timestamp_drift:float ->
@@ -372,6 +372,7 @@ val run_preverify_compute :
   ('a, preverify_unavailable) result Lwt.t
 
 val preverify_stealth_ranges :
+  keyed:bool ->
   math:bool ->
   strict:bool ->
   pubkey_blob:string ->
@@ -379,7 +380,7 @@ val preverify_stealth_ranges :
   Octra_core.Crypto.PrivateTransferV4.t ->
   ((bool * bool), preverify_error) result Lwt.t
 
-val post_signature_admission :
+val post_signature_check :
   preverify_has_capacity:bool ->
   preverify_pending:int ->
   preverify_pending_max:int ->
@@ -389,7 +390,7 @@ val post_signature_admission :
   Octra_core.Transaction.t ->
   (unit, string * string) result
 
-val submit_signature_admission :
+val submit_signature_check :
   account_public_key:string option ->
   preverify_has_capacity:bool ->
   preverify_pending:int ->

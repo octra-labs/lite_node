@@ -30,8 +30,8 @@ type trace = {
   confirmed : string list;
   rejections : string list;
   fees : Z.t;
-  candidate_root : string;
-  candidate_fees : Z.t;
+  entry_root : string;
+  entry_fees : Z.t;
 }
 
 let get = function
@@ -197,8 +197,8 @@ let run deps ~cursor ~(prepared : J.prepared) =
     confirmed = confirmed_hashes;
     rejections;
     fees = applied.result.artifacts.confirmed_fees;
-    candidate_root = checked.post_state_root;
-    candidate_fees = checked.artifacts.confirmed_fees;
+    entry_root = checked.post_state_root;
+    entry_fees = checked.artifacts.confirmed_fees;
   }
 
 let equal left right =
@@ -209,5 +209,5 @@ let equal left right =
   && left.confirmed = right.confirmed
   && left.rejections = right.rejections
   && Z.equal left.fees right.fees
-  && left.candidate_root = right.candidate_root
-  && Z.equal left.candidate_fees right.candidate_fees
+  && left.entry_root = right.entry_root
+  && Z.equal left.entry_fees right.entry_fees

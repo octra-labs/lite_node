@@ -7,7 +7,7 @@ let ( let* ) result f =
   Result.bind result f
 
 type t =
-  | Memory of (string, vote) Hashtbl.t
+  | Memory of (string, vote) Hashtbl.t * vote list list ref
   | Disk of string
 
 let max_wire_bytes = 512
@@ -20,7 +20,7 @@ let disk ~data_dir =
   Disk (Filename.concat data_dir "vote_log")
 
 let memory () =
-  Memory (Hashtbl.create 16)
+  Memory (Hashtbl.create 16, ref [])
 
 let vote_type = function
   | Prevote -> "prevote"
@@ -269,7 +269,7 @@ let rec open_staged record attempt =
       open_staged record (attempt + 1)
     | exn -> Error (error exn)
 
-let publish_record path record wire =
+let publish_record ?(sync = sync_directory) path record wire =
   let* staged, fd = open_staged record 0 in
   let renamed = ref false in
   try
@@ -280,7 +280,7 @@ let publish_record path record wire =
         Unix.fsync fd);
     Unix.rename staged record;
     renamed := true;
-    sync_directory path
+    sync path
   with exn ->
     if not !renamed then (try Unix.unlink staged with _ -> ());
     Error (error exn)
@@ -314,6 +314,123 @@ let write_floor path value =
 
 let write_round_mark path epoch_id round =
   publish_record path (round_mark_path path) (round_mark_wire epoch_id round)
+
+let polc_path path = Filename.concat path "polc"
+
+let polc_read store =
+  match store with
+  | Memory (_, proof) -> Ok !proof
+  | Disk path ->
+    let path = polc_path path in
+    try
+      let stat = Unix.lstat path in
+      if stat.Unix.st_kind <> Unix.S_REG || stat.st_size <= 0
+        || stat.st_size > C_codec.max_validators * max_wire_bytes * 6 then
+        Error "vote proof size is invalid"
+      else
+        match Yojson.Safe.from_string (read_all path stat.st_size) with
+        | `List proofs when List.length proofs <= 3 ->
+          let proofs = List.map (function
+            | `List votes when votes <> [] && List.length votes <= C_codec.max_validators ->
+              List.map (function `String wire -> Base64.decode_exn wire |> vote_of_wire
+                |> (function Ok vote -> vote | Error reason -> failwith reason)
+                | _ -> failwith "vote proof entry is not text") votes
+            | _ -> failwith "vote proof list is invalid") proofs in
+          let rounds = List.map (fun (votes : vote list) -> let vote = List.hd votes in
+            vote.chain_id, vote.epoch_id, vote.round) proofs in
+          if List.length (List.sort_uniq compare rounds) <> List.length proofs then
+            Error "vote proof round repeats" else Ok proofs
+        | _ -> Error "vote proof list is invalid"
+    with Unix.Unix_error (Unix.ENOENT, _, _) -> Ok []
+      | exn -> Error (error exn)
+
+let polc_check ?policy ~chain_id ~epoch_id ~validator_set votes =
+  match votes with
+  | [] -> Error "vote proof is empty"
+  | first :: _ ->
+    let addrs = List.map (fun (v : vote) -> v.validator) votes in
+    let fields (v : vote) = v.chain_id = chain_id && v.epoch_id = epoch_id
+      && v.vote_type = Prevote && v.round = first.round
+      && v.proposal_id = first.proposal_id in
+    let valid set =
+      C_types.has_quorum_at ?policy ~chain_id ~epoch_id set addrs
+      && List.for_all (fun (v : vote) -> match C_types.pubkey_of_addr set v.validator with
+        | Some pubkey -> C_hash.verify_vote ~pubkey_raw:pubkey v | None -> false) votes in
+    if first.round < 0 || first.round >= C_codec.max_round
+      || Octra_net.Hash_domain.is_nil first.proposal_id || not (List.for_all fields votes)
+      || not (C_qc.unique addrs) then Error "vote proof statement differs"
+    else if valid validator_set || Option.fold ~none:false ~some:valid
+      (C_types.source_set ~chain_id ~epoch_id validator_set) then Ok ()
+    else Error "vote proof quorum or signature is invalid"
+
+let polc_ready ?policy ~chain_id ~epoch_id ~validator_set votes =
+  let addrs = List.map (fun (vote : vote) -> vote.validator) votes in
+  let enough set = C_types.has_quorum_at ?policy ~chain_id ~epoch_id set addrs in
+  enough validator_set || Option.fold ~none:false ~some:enough
+    (C_types.source_set ~chain_id ~epoch_id validator_set)
+
+let polc_load ?policy store ~chain_id ~epoch_id ~validator_set =
+  let* proofs = polc_read store in
+  List.fold_left (fun result (votes : vote list) ->
+    let* saved = result in
+    match votes with
+    | [] -> Error "vote proof is empty"
+    | first :: _ when first.epoch_id < epoch_id -> Ok saved
+    | _ -> let* () = polc_check ?policy ~chain_id ~epoch_id ~validator_set votes in
+      Ok (saved @ votes)) (Ok []) proofs
+
+type polc_receipt = {
+  chain : string;
+  height : int64;
+  members : validator_set;
+  policy : C_quorum_policy.t option;
+  proofs : vote list list;
+}
+
+let polc_saved receipt ~policy ~chain_id ~epoch_id ~validator_set ~round ~proposal_id =
+  receipt.chain = chain_id && receipt.height = epoch_id
+  && receipt.members = validator_set && receipt.policy = Some policy
+  && List.exists (function
+    | (vote : vote) :: _ -> vote.round = round && vote.proposal_id = proposal_id
+    | [] -> false) receipt.proofs
+
+let polc_save ?policy ?(sync = sync_directory) store ~chain_id ~epoch_id ~validator_set ~locked_round votes =
+  let* () = polc_check ?policy ~chain_id ~epoch_id ~validator_set votes in
+  let first = List.hd votes in
+  let* original = polc_read store in
+  let* prior = List.fold_left (fun result (proof : vote list) ->
+    let* saved = result in
+    match proof with
+    | [] -> Error "vote proof is empty"
+    | old :: _ when old.chain_id <> chain_id || old.epoch_id > epoch_id ->
+      Error "vote proof stored height or chain differs"
+    | old :: _ when old.epoch_id < epoch_id -> Ok saved
+    | old :: _ when old.round = first.round ->
+      if old.proposal_id <> first.proposal_id then Error "vote proof conflicts with stored proof"
+      else Ok saved
+    | _ -> Ok (proof :: saved)) (Ok []) original in
+  let sorted = List.sort (fun (a : vote list) (b : vote list) ->
+    compare (List.hd b).round (List.hd a).round) (votes :: prior) in
+  let newest = (List.hd (List.hd sorted)).round in
+  let proofs = List.filter (fun (proof : vote list) -> let round = (List.hd proof).round in
+    round = newest || round = locked_round || round = first.round) sorted in
+  let* () = List.fold_left (fun result proof ->
+    let* () = result in
+    if proof == votes then Ok () else
+    polc_check ?policy ~chain_id ~epoch_id ~validator_set proof) (Ok ()) proofs in
+  let* () = match store with
+  | Memory (_, proof) -> proof := proofs; Ok ()
+  | Disk path when proofs = original -> sync path
+  | Disk path ->
+    let* () = directory path in
+    let wire = `List (List.map (fun votes -> `List (List.map (fun vote -> `String
+      (C_codec.encode_vote vote |> Base64.encode_exn)) votes)) proofs) |> Yojson.Safe.to_string in
+    publish_record ~sync path (polc_path path) wire in
+  Ok {chain = chain_id; height = epoch_id; members = validator_set; policy; proofs}
+
+let polc_keep ?policy ?sync store ~chain_id ~epoch_id ~validator_set ~locked_round votes =
+  let* _ = polc_save ?policy ?sync store ~chain_id ~epoch_id ~validator_set ~locked_round votes in
+  Ok ()
 
 let set_floor store ~through_epoch =
   match store with
@@ -370,7 +487,7 @@ let check_disk path (vote : vote) =
 
 let check store (vote : vote) =
   match store with
-  | Memory records ->
+  | Memory (records, _) ->
     let id = key vote in
     (match Hashtbl.find_opt records id with
      | None -> Ok ()
@@ -394,7 +511,7 @@ let keep_disk path (vote : vote) =
 
 let keep store (vote : vote) =
   match store with
-  | Memory records ->
+  | Memory (records, _) ->
     let id = key vote in
     (match Hashtbl.find_opt records id with
      | None ->
@@ -421,7 +538,7 @@ let find_statement store ~chain_id ~validator ~epoch_id ~round ~vote_type
     | None -> None
   in
   match store with
-  | Memory records ->
+  | Memory (records, _) ->
     Ok (Hashtbl.find_opt records (key expected) |> exact)
   | Disk path ->
     if not (Sys.file_exists path) then Ok None
@@ -453,7 +570,7 @@ let with_round_mark epoch_id mark rounds =
 
 let max_round store ~chain_id ~validator ~epoch_id =
   match store with
-  | Memory records ->
+  | Memory (records, _) ->
     Hashtbl.to_seq_values records
     |> List.of_seq
     |> List.filter (belongs ~chain_id ~validator ~epoch_id)
@@ -559,17 +676,22 @@ let prune_disk path through_epoch =
             Ok true
           | _ -> Ok false
         in
-        if removed || marked then sync_directory path else Ok ()
+        let* proof = polc_read (Disk path) in
+        let proof_removed = match proof with
+          | (vote :: _) :: _ when vote.epoch_id <= through_epoch -> Unix.unlink (polc_path path); true
+          | _ -> false in
+        if removed || marked || proof_removed then sync_directory path else Ok ()
       with exn ->
         Error (error exn)
 
 let prune store ~through_epoch =
   match store with
-  | Memory records ->
+  | Memory (records, proof) ->
     Hashtbl.filter_map_inplace
       (fun _ (vote : vote) ->
         if Int64.compare vote.epoch_id through_epoch <= 0 then None
         else Some vote)
       records;
+    (match !proof with (vote :: _) :: _ when vote.epoch_id <= through_epoch -> proof := [] | _ -> ());
     Ok ()
   | Disk path -> prune_disk path through_epoch

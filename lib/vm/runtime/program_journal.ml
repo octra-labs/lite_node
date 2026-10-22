@@ -7,7 +7,7 @@ type deploy = {
   bytecode_b64 : string;
   owner : string;
   ctype : string;
-  admission : string;
+  check : string;
   version : string;
   storage : (string, string) Hashtbl.t;
 }
@@ -19,13 +19,14 @@ type upgrade = {
   bytecode_b64 : string;
   owner : string;
   ctype : string;
-  admission : string;
+  check : string;
   version : string;
 }
 
 type snapshot = {
   deploys : deploy list;
   upgrades : upgrade list;
+  records : (string * Octra_core.Store_chaindata.program_record) list;
   storage : (string, (string, string) Hashtbl.t) Hashtbl.t;
   circles : (string, (string, string) Hashtbl.t) Hashtbl.t;
 }
@@ -33,6 +34,7 @@ type snapshot = {
 type t = {
   deploys : deploy list ref;
   upgrades : upgrade list ref;
+  records : (string * Octra_core.Store_chaindata.program_record) list ref;
   storage : (string, (string, string) Hashtbl.t) Hashtbl.t;
   circles : (string, (string, string) Hashtbl.t) Hashtbl.t;
 }
@@ -51,6 +53,7 @@ let create () : t =
   {
     deploys = ref [];
     upgrades = ref [];
+    records = ref [];
     storage = Hashtbl.create 16;
     circles = Hashtbl.create 8;
   }
@@ -95,6 +98,7 @@ let snapshot (journal : t) : snapshot =
   {
     deploys = List.map copy_deploy !(journal.deploys);
     upgrades = !(journal.upgrades);
+    records = !(journal.records);
     storage = copy_storage journal.storage;
     circles = copy_storage journal.circles;
   }
@@ -128,12 +132,14 @@ let restore_storage storage saved =
 let restore (journal : t) (snapshot : snapshot) =
   journal.deploys := List.map copy_deploy snapshot.deploys;
   journal.upgrades := snapshot.upgrades;
+  journal.records := snapshot.records;
   restore_storage journal.storage snapshot.storage;
   restore_storage journal.circles snapshot.circles
 
 let discard (journal : t) =
   journal.deploys := [];
   journal.upgrades := [];
+  journal.records := [];
   Hashtbl.reset journal.storage;
   Hashtbl.reset journal.circles
 
@@ -188,6 +194,13 @@ let deploys (journal : t) =
 
 let upgrades (journal : t) =
   List.rev !(journal.upgrades)
+
+let add_record (journal : t) address record =
+  if List.mem_assoc address !(journal.records) then
+    invalid_arg "program record already staged";
+  journal.records := (address, record) :: !(journal.records)
+
+let records (journal : t) = List.rev !(journal.records)
 
 let storage_entries (journal : t) =
   Hashtbl.fold

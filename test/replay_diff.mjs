@@ -20,7 +20,7 @@ const fields = (value, keys) => {
 const startKeys = ["event", "scope", "manifest", "range_sha256", "environment_sha256",
   "binary_sha256", "worker_sha256", "first_epoch"];
 const epochKeys = ["event", "epoch", "ledger_root", "index_root", "state_root", "confirmed",
-  "rejections", "fees", "candidate_root", "candidate_fees"];
+  "rejections", "fees", "checked_root", "checked_fees"];
 const endKeys = ["event", "epochs", "next_epoch", "state_root"];
 
 const read = path => {
@@ -45,11 +45,11 @@ const read = path => {
     fields(entry, epochKeys);
     requireValue(entry.event === "epoch" && natural(entry.epoch)
       && BigInt(entry.epoch) === BigInt(first.first_epoch) + BigInt(index), "trace epoch gap");
-    requireValue(root(entry.ledger_root) && root(entry.candidate_root)
+    requireValue(root(entry.ledger_root) && root(entry.checked_root)
       && hash(entry.index_root) && hash(entry.state_root), "trace root is invalid");
     requireValue(strings(entry.confirmed) && entry.confirmed.every(hash)
       && new Set(entry.confirmed).size === entry.confirmed.length, "confirmed set is invalid");
-    requireValue(strings(entry.rejections) && natural(entry.fees) && natural(entry.candidate_fees),
+    requireValue(strings(entry.rejections) && natural(entry.fees) && natural(entry.checked_fees),
       "trace outcome is invalid");
   });
   requireValue(BigInt(last.next_epoch) === BigInt(first.first_epoch) + BigInt(epochs.length)
@@ -57,20 +57,24 @@ const read = path => {
   return {first, last, epochs};
 };
 
-const compare = (leftPath, rightPath, buildsPath) => {
+const compare = (leftPath, rightPath, buildsPath, referenceSource) => {
+  requireValue(typeof referenceSource === "string" && /^[0-9a-f]{40}$/.test(referenceSource),
+    "reference source is invalid");
   requireValue(fs.statSync(buildsPath).size <= 4096, "build record exceeds size limit");
   const builds = JSON.parse(fs.readFileSync(buildsPath, "utf8"));
-  fields(builds, ["reference", "candidate"]);
-  for (const build of [builds.reference, builds.candidate]) {
+  fields(builds, ["reference", "checked"]);
+  for (const build of [builds.reference, builds.checked]) {
     fields(build, ["source", "binary_sha256", "worker_sha256"]);
     requireValue(typeof build.source === "string" && /^[0-9a-f]{40}$/.test(build.source)
       && hash(build.binary_sha256) && hash(build.worker_sha256), "build provenance is invalid");
   }
-  requireValue(builds.reference.source === "c54167b827ede56b20d94608f8d3a9f5fa138c09",
-    "reference source is not the published baseline");
+  requireValue(builds.reference.source === referenceSource,
+    "reference source differs from requested source");
+  requireValue(builds.reference.source !== builds.checked.source,
+    "both builds name the same source");
   const left = read(leftPath);
   const right = read(rightPath);
-  for (const [trace, build] of [[left, builds.reference], [right, builds.candidate]]) {
+  for (const [trace, build] of [[left, builds.reference], [right, builds.checked]]) {
     requireValue(trace.first.binary_sha256 === build.binary_sha256
       && trace.first.worker_sha256 === build.worker_sha256, "executable differs from build record");
   }
@@ -93,8 +97,9 @@ const compare = (leftPath, rightPath, buildsPath) => {
 };
 
 try {
-  requireValue(process.argv.length === 5, "usage: replay_diff.mjs REFERENCE CANDIDATE BUILDS");
-  const result = compare(process.argv[2], process.argv[3], process.argv[4]);
+  requireValue(process.argv.length === 6,
+    "usage: replay_diff.mjs REFERENCE CHECKED BUILDS SOURCE");
+  const result = compare(process.argv[2], process.argv[3], process.argv[4], process.argv[5]);
   console.log("event = replay_diff status = pass epochs = " + result.epochs
     + " confirmed = " + result.confirmed + " rejections = " + result.rejections
     + " scope = ledger_execution");

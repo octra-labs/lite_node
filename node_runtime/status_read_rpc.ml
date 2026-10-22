@@ -16,7 +16,7 @@ type enrollment_snapshot = {
   state_root : string;
   chain_id : string;
   config_hash : string;
-  candidate : Octra_core.Validator_admission.candidate option;
+  entry : Octra_core.Validator_entry.entry option;
   duty : Octra_core.Set_fold.receipt option;
   sets : string option * string option;
 }
@@ -239,7 +239,7 @@ let load_validator_enrollment ~store ~head ~validator_address ~chain_id ~config_
                   state_root = head.state_root;
                   chain_id;
                   config_hash;
-                  candidate =
+                  entry =
                     Octra_core.Validator_registry.find
                       validator_address
                       registry;
@@ -309,7 +309,7 @@ let validator_enrollment ~snapshot ~validator_address ~validator_pubkey =
          ~head_epoch:snapshot.head_epoch
          ~address:validator_address
          ~pubkey:validator_pubkey
-         snapshot.candidate)
+         snapshot.entry)
          (function
            | `Assoc fields ->
              Enroll_members.of_values ~head_epoch:(Int64.of_int snapshot.head_epoch)
@@ -334,8 +334,7 @@ let runtime_version ~chain_id ~epoch ~validator_address ~program_trust_hash
       ~validator_set_ref
       ~scheduled_validator_set_ref
   in
-  ok
-    (Status_rpc.runtime_version
+  let json = Status_rpc.runtime_version
        ~source_commit:(release_hash "OCTRA_SOURCE_COMMIT" 40)
        ~binary_hash:(release_hash "OCTRA_BINARY_HASH" 64)
        ~consensus_standard:Consensus_profile.standard
@@ -348,7 +347,20 @@ let runtime_version ~chain_id ~epoch ~validator_address ~program_trust_hash
        ~runtime_profile_hash
        ~config_hash
        ~chain_id
-       ~validator:validator_address)
+       ~validator:validator_address in
+  let profiles = 0 :: Consensus_profile.epochs chain_id
+    |> List.sort_uniq Int.compare
+    |> List.map (fun start -> `Assoc [
+      "from_epoch", `Int start;
+      "hash", `String (Consensus_profile.hash ~chain_id ~epoch:start Sys.getenv_opt
+        |> Text.raw_to_hex);
+    ]) in
+  match json with
+  | `Assoc fields -> ok (`Assoc (fields @ [
+      "profile_epoch", `Int epoch;
+      "runtime_profiles", `List profiles;
+    ]))
+  | _ -> assert false
 
 let consensus_peer_states ~swarm ~driver_ref =
   let now = Unix.gettimeofday () in
@@ -504,16 +516,16 @@ let validator_set_proof_params _params ctx =
     ~scheduled_validator_set_ref:ctx.scheduled_validator_set_ref
 
 let local_control ~data_dir ~(snapshot : enrollment_snapshot) ~address ~pubkey =
-  let state = match snapshot.candidate with
+  let state = match snapshot.entry with
     | None -> Ok None
-    | Some candidate ->
+    | Some entry ->
       Octra_core.Validator_control.status
         (Octra_core.Validator_control.create ~data_dir)
         Octra_core.Validator_intent.{
           chain_id = snapshot.chain_id;
           address;
           pubkey;
-          bonded_epoch = candidate.bonded_epoch;
+          bonded_epoch = entry.bonded_epoch;
         }
   in
   match state with

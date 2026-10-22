@@ -9,7 +9,7 @@ type enrollment_snapshot = {
   state_root : string;
   chain_id : string;
   config_hash : string;
-  candidate : Octra_core.Validator_admission.candidate option;
+  entry : Octra_core.Validator_entry.entry option;
   duty : Octra_core.Set_fold.receipt option;
   sets : string option * string option;
 }

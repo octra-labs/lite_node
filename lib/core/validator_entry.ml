@@ -3,7 +3,7 @@
 
 module String_set = Set.Make (String)
 
-type candidate = {
+type entry = {
   address : string;
   pubkey : string;
   bond : Z.t;
@@ -46,22 +46,22 @@ let validate_parameters (parameters : parameters) =
   else
     Ok ()
 
-let validate_candidate (candidate : candidate) =
-  if candidate.address = "" then
+let validate_entry (entry : entry) =
+  if entry.address = "" then
     Error "validator address is empty"
-  else if String.length candidate.pubkey <> 32 then
+  else if String.length entry.pubkey <> 32 then
     Error "validator public key must contain 32 bytes"
-  else if Z.sign candidate.bond <= 0 then
+  else if Z.sign entry.bond <= 0 then
     Error "validator bond must be positive"
-  else if Int64.compare candidate.bonded_epoch 0L < 0 then
+  else if Int64.compare entry.bonded_epoch 0L < 0 then
     Error "validator bonded epoch is negative"
   else
-    match candidate.ready_epoch, candidate.exit_epoch with
+    match entry.ready_epoch, entry.exit_epoch with
     | Some ready_epoch, _
-      when Int64.compare ready_epoch candidate.bonded_epoch < 0 ->
+      when Int64.compare ready_epoch entry.bonded_epoch < 0 ->
       Error "validator readiness predates bond"
     | _, Some exit_epoch
-      when Int64.compare exit_epoch candidate.bonded_epoch < 0 ->
+      when Int64.compare exit_epoch entry.bonded_epoch < 0 ->
       Error "validator exit predates bond"
     | _ -> Ok ()
 
@@ -71,7 +71,7 @@ let quorum_weight total_weight =
   else
     Ok Z.(add (div (mul total_weight (of_int 2)) (of_int 3)) one)
 
-let compare_candidate (left : candidate) (right : candidate) =
+let compare_entry (left : entry) (right : entry) =
   let by_bond = Z.compare right.bond left.bond in
   if by_bond <> 0 then by_bond
   else
@@ -79,12 +79,12 @@ let compare_candidate (left : candidate) (right : candidate) =
     if by_address <> 0 then by_address
     else String.compare left.pubkey right.pubkey
 
-let compare_selected incumbents (left : candidate) (right : candidate) =
+let compare_selected incumbents (left : entry) (right : entry) =
   match String_set.mem left.address incumbents,
         String_set.mem right.address incumbents with
   | true, false -> -1
   | false, true -> 1
-  | _ -> compare_candidate left right
+  | _ -> compare_entry left right
 
 let rec take count values =
   if count <= 0 then []
@@ -93,33 +93,33 @@ let rec take count values =
     | [] -> []
     | value :: rest -> value :: take (count - 1) rest
 
-let validate_unique (candidates : candidate list) =
-  let addresses = Hashtbl.create (List.length candidates) in
-  let pubkeys = Hashtbl.create (List.length candidates) in
-  let rec loop (remaining : candidate list) =
+let validate_unique (entries : entry list) =
+  let addresses = Hashtbl.create (List.length entries) in
+  let pubkeys = Hashtbl.create (List.length entries) in
+  let rec loop (remaining : entry list) =
     match remaining with
     | [] -> Ok ()
-    | candidate :: rest ->
-      if Hashtbl.mem addresses candidate.address then
+    | entry :: rest ->
+      if Hashtbl.mem addresses entry.address then
         Error "duplicate validator address"
-      else if Hashtbl.mem pubkeys candidate.pubkey then
+      else if Hashtbl.mem pubkeys entry.pubkey then
         Error "duplicate validator public key"
       else begin
-        Hashtbl.add addresses candidate.address ();
-        Hashtbl.add pubkeys candidate.pubkey ();
+        Hashtbl.add addresses entry.address ();
+        Hashtbl.add pubkeys entry.pubkey ();
         loop rest
       end
   in
-  loop candidates
+  loop entries
 
-let eligible ~(parameters : parameters) ~source_epoch (candidate : candidate) =
-  Z.geq candidate.bond parameters.min_bond
-  && Int64.compare candidate.bonded_epoch source_epoch <= 0
+let eligible ~(parameters : parameters) ~source_epoch (entry : entry) =
+  Z.geq entry.bond parameters.min_bond
+  && Int64.compare entry.bonded_epoch source_epoch <= 0
   && Option.fold
        ~none:false
        ~some:(fun ready_epoch -> Int64.compare ready_epoch source_epoch <= 0)
-       candidate.ready_epoch
-  && Option.is_none candidate.exit_epoch
+       entry.ready_epoch
+  && Option.is_none entry.exit_epoch
 
 let put_string buffer value =
   Buffer.add_string buffer (string_of_int (String.length value));
@@ -155,7 +155,7 @@ let source_epoch (parameters : parameters) activate_epoch =
     Ok (Int64.sub activate_epoch parameters.activation_delay)
 
 let snapshot ?(incumbents=[]) (parameters : parameters) ~activate_epoch
-    (candidates : candidate list) =
+    (entries : entry list) =
   match validate_parameters parameters with
   | Error _ as error -> error
   | Ok () ->
@@ -165,19 +165,19 @@ let snapshot ?(incumbents=[]) (parameters : parameters) ~activate_epoch
       | Ok source_epoch ->
         let rec validate_all = function
           | [] -> Ok ()
-          | candidate :: rest ->
+          | entry :: rest ->
             begin
-              match validate_candidate candidate with
+              match validate_entry entry with
               | Error _ as error -> error
               | Ok () -> validate_all rest
             end
         in
         begin
-          match validate_all candidates with
+          match validate_all entries with
           | Error _ as error -> error
           | Ok () ->
             begin
-              match validate_unique candidates with
+              match validate_unique entries with
               | Error _ as error -> error
               | Ok () ->
                 let incumbents =
@@ -187,15 +187,15 @@ let snapshot ?(incumbents=[]) (parameters : parameters) ~activate_epoch
                     incumbents
                 in
                 let validators =
-                  candidates
+                  entries
                   |> List.filter (eligible ~parameters ~source_epoch)
                   |> List.sort (compare_selected incumbents)
                   |> take parameters.max_validators
                   |> List.map
-                    (fun (candidate : candidate) -> {
-                      address = candidate.address;
-                      pubkey = candidate.pubkey;
-                      weight = candidate.bond;
+                    (fun (entry : entry) -> {
+                      address = entry.address;
+                      pubkey = entry.pubkey;
+                      weight = entry.bond;
                     })
                 in
                 if List.length validators < 4 then
@@ -305,21 +305,21 @@ let add_epoch left right =
     else
       Ok result
 
-let withdraw_epoch (parameters : parameters) (candidate : candidate) =
+let withdraw_epoch (parameters : parameters) (entry : entry) =
   match validate_parameters parameters with
   | Error _ as error -> error
   | Ok () ->
     begin
-      match validate_candidate candidate with
+      match validate_entry entry with
       | Error _ as error -> error
       | Ok () ->
-        match candidate.exit_epoch with
+        match entry.exit_epoch with
         | None -> Error "validator exit was not requested"
         | Some exit_epoch -> add_epoch exit_epoch parameters.unbonding_epochs
     end
 
 let can_withdraw (parameters : parameters) ~current_epoch
-    (candidate : candidate) =
-  match withdraw_epoch parameters candidate with
+    (entry : entry) =
+  match withdraw_epoch parameters entry with
   | Error _ as error -> error
   | Ok epoch -> Ok (Int64.compare current_epoch epoch >= 0)

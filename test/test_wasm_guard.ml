@@ -104,6 +104,7 @@ let commit_guard balance before_tbl changed_tbl =
         match
           Lwt_main.run
             (Exec.commit_call_result
+               ~table_mode:Octra_core.Rule_graph.Prior
                ~proof_mode:Octra_core.Rule_graph.Active
                store circle_id (result changed_tbl))
         with
@@ -166,9 +167,9 @@ let () =
   need
     (String.equal Transcript.consensus_id "receipt_mode:amount_link_v1")
     "circle hfhe consensus id changed";
-  let prior_context = Exec.hfhe_context_hash ~math:false ~strict:false [] [] None in
-  let active_context = Exec.hfhe_context_hash ~math:false ~strict:true [] [] None in
-  let float_context = Exec.hfhe_context_hash
+  let prior_context = Exec.hfhe_context_hash ~keyed:false ~math:false ~strict:false [] [] None in
+  let active_context = Exec.hfhe_context_hash ~keyed:false ~math:false ~strict:true [] [] None in
+  let float_context = Exec.hfhe_context_hash ~keyed:false
     ~float_mode:R.Active ~math:false ~strict:true [] [] None in
   need (float_context <> active_context) "WASM float modes share receipt context";
   need

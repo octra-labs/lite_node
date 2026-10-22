@@ -7,6 +7,7 @@ val path : t -> string -> string
 val owns : t -> string -> bool
 val mark_stage : t -> string -> unit
 val marked_stage : t -> string -> bool
+val remove_stage : ?unlink:(string -> unit) -> t -> string -> unit
 val finish_publish : ?sync:(Unix.file_descr -> unit) -> t -> string -> unit
 val publish_stage : ?sync:(Unix.file_descr -> unit) -> t -> string -> unit
 val run : string -> (t -> 'a) -> ('a, string) result

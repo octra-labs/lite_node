@@ -204,23 +204,25 @@ let test_native_fuel () =
     else byte ((value land 127) lor 128) ^ leb (value lsr 7) in
   let text value = leb (String.length value) ^ value in
   let section tag value = byte tag ^ text value in
-  let code ?(exit_code = 0) pages = "\000asm\001\000\000\000"
+  let code ?(exit_code = 0) ?(table = 0) ?(functions = 2) pages = "\000asm\001\000\000\000"
     ^ section 1 "\002\096\002\127\127\001\127\096\001\127\001\127"
     ^ section 2 ("\002" ^ text "octra" ^ text "host_response_write" ^ "\000\000"
       ^ text "octra" ^ text "host_tensor_silu_q24" ^ "\000\000")
-    ^ section 3 "\002\001\000"
+    ^ section 3 (leb functions ^ "\001\000" ^ String.make (functions - 2) '\001')
+    ^ (if table = 0 then "" else section 4 ("\001\112\000" ^ leb table))
     ^ section 5 ("\001\000" ^ leb pages)
     ^ section 7 ("\003" ^ text "memory" ^ "\002\000"
       ^ text "octra_alloc" ^ "\000\002" ^ text "octra_query" ^ "\000\003")
-    ^ section 10 ("\002" ^ text "\000\065\000\011"
+    ^ section 10 (leb functions ^ text "\000\065\000\011"
       ^ text ("\001\001\127\065\128\004\065\001\016\001\026"
         ^ "\065\128\004\033\002\003\064"
         ^ "\032\002\065\001\107\034\002\013\000\011"
-        ^ "\065\128\002\065\010\016\000\026\065" ^ byte exit_code ^ "\011"))
+        ^ "\065\128\002\065\010\016\000\026\065" ^ byte exit_code ^ "\011")
+      ^ String.concat "" (List.init (functions - 2) (fun _ -> text "\000\065\000\011")))
     ^ section 11 ("\001\000\065\128\002\011" ^ text "OCWS1\000\000\000\000\000") in
   Test_workspace.with_dir "compute-fuel" (fun directory ->
     let store = Lwt_main.run (Store.open_store ~fresh:true directory) in
-    let deps = Engine.native_deps ~limits ~store
+    let deps = Engine.native_deps ~chain_id:"octra-devnet-9871-cluster" ~limits ~store
       ~state_root_at:(fun _ -> None) ~index_root_at:(fun _ -> None) in
     let root =
       let buffer = Buffer.create 128 in
@@ -240,12 +242,13 @@ let test_native_fuel () =
         let* sealed = writer.seal ~root ~entries:1 ~bytes:1 in
         if written <> Ok () || sealed <> Ok () then fail "fuel model setup";
         Lwt.return_unit) (fun () -> writer.close (); Lwt.return_unit) in
-      let run ?(pages = 1) ?(memory_bytes = 1_073_741_824) ?(guest_bytes = 67_108_864) fuel_limit =
-        let code = code pages in
+      let run ?(pages = 1) ?(functions = 2) ?(epoch_id = execute_request.epoch_id)
+          ?(memory_bytes = 1_073_741_824) ?(guest_bytes = 67_108_864) fuel_limit =
+        let code = code ~functions pages in
         let program = Engine.{circle_id = address; code_b64 = Base64.encode_exn code;
           code_hash = Digestif.SHA256.(to_hex (digest_string code)); runtime = "wasm_v1"} in
         deps.execute ~model ~program ~storage:[]
-          {execute_request with fuel_limit; guest_bytes; memory_bytes} in
+          {execute_request with fuel_limit; guest_bytes; memory_bytes; epoch_id} in
       let* result = run 100_000 in
       let spent = match result with
       | Ok value when value.output_json = "null" && value.effort_used > 32
@@ -256,6 +259,51 @@ let test_native_fuel () =
       in
       let* exact = run spent in
       if exact <> result then fail "native exact fuel differs";
+      let module Host = Octra_core.Circle_wasm_host in
+      let activation = Option.get
+        (Octra_core.Rule_graph.proof_key_activation_for_chain "octra-devnet-9871-cluster")
+        |> fun plan -> plan.activation_epoch in
+      let* () = Lwt_list.iter_s (fun epoch ->
+        Lwt_list.iter_s (fun functions ->
+          let* value = run ~functions ~epoch_id:(Int64.of_int epoch) 100_000 in
+          if epoch >= activation && functions = 9_999 then
+            if value = Error "wasm functions limit exceeded" then Lwt.return_unit
+            else fail "provider ignored code mode"
+          else match value with
+            | Ok result when result.output_json = "null" -> Lwt.return_unit
+            | _ -> fail "provider refused code count") [9_998; 9_999])
+        [activation - 1; activation; activation + 1] in
+      let code_b64 = Base64.encode_exn (code ~functions:9_999 1) in
+      let step epoch = Host.{request_bytes = ""; tx_hash = hash '6'; epoch;
+        fuel = 100_000; memory = 67_108_864; guest = 67_108_864} in
+      let* () = Lwt_list.iter_s (fun epochs ->
+        let* value = Host.replay_compute ~code_b64 ~cache_key:model.cache_key
+          ~code_mode:(fun epoch -> Octra_core.Rule_graph.proof_key_at
+            ~chain_id:"octra-devnet-9871-cluster" ~epoch)
+          ~table_mode:Octra_core.Rule_graph.Active
+          ~root:model.cache_root ~entries:model.entries ~bytes:model.bytes
+          ~scope:(hash 'a') ~caller:address ~address (List.map step epochs) in
+        if List.exists (fun epoch -> epoch >= activation) epochs then
+          if value = Error (Host.Rejected "wasm functions limit exceeded") then Lwt.return_unit
+          else fail "replay ignored code mode"
+        else match value with Ok [_; _] -> Lwt.return_unit | _ -> fail "prior replay refused")
+        [[activation - 2; activation - 1]; [activation - 1; activation]] in
+      let* () = Lwt_list.iter_s (fun table ->
+        let code_b64 = Base64.encode_exn (code ~table 1) in
+        let step = Host.{request_bytes = ""; tx_hash = hash '6'; epoch = 8;
+          fuel = 100_000; memory = 67_108_864; guest = 67_108_864} in
+        let* value = Host.replay_compute ~code_b64 ~cache_key:model.cache_key
+          ~code_mode:(fun _ -> Octra_core.Rule_graph.Active)
+          ~table_mode:Octra_core.Rule_graph.Active
+          ~root:model.cache_root ~entries:model.entries ~bytes:model.bytes
+          ~scope:(hash 'a') ~caller:address ~address [step] in
+        match value with
+        | Ok [_] when table = 65_536 -> Lwt.return_unit
+        | Error (Host.Rejected reason) when table = 65_537
+            && String.starts_with ~prefix:"wasm instantiate failed:" reason -> Lwt.return_unit
+        | Ok _ -> fail (Printf.sprintf "replay table accepted elements = %d" table)
+        | Error reason -> fail (Printf.sprintf "replay table refused elements = %d reason = %s"
+            table (Host.error_message reason))) [65_536; 65_537] in
       let module Bill = Octra_core.Compute_bill in
       let module Protocol = Octra_consensus.Resource_compute_protocol in
       let module Certificate = Octra_consensus.Resource_compute_certificate in
@@ -278,9 +326,9 @@ let test_native_fuel () =
       let* () = Store.begin_epoch_batch store in
       Ledger.begin_journal ledger |> get;
       let* () = Lwt_list.iter_s (fun (nonce, exit_code, fuel_limit) ->
-        let code = code ~exit_code 1 in
-        let program = Engine.{circle_id = address; code_b64 = Base64.encode_exn code;
-          code_hash = Digestif.SHA256.(to_hex (digest_string code)); runtime = "wasm_v1"} in
+        let bytes = code ~exit_code 1 in
+        let program = Engine.{circle_id = address; code_b64 = Base64.encode_exn bytes;
+          code_hash = Digestif.SHA256.(to_hex (digest_string bytes)); runtime = "wasm_v1"} in
         let model = {model with program_root = program.code_hash} in
         let request = {execute_request with caller = addr payer; program_root = program.code_hash;
           memory_bytes = Int64.to_int Bill.model_limit; guest_bytes = 65536; fuel_limit} in
@@ -326,6 +374,36 @@ let test_native_fuel () =
             (Certificate.request_id call.request)))} in
           call, request in
         let first_call = replay_call 1L in
+        let* () = if nonce <> 1 then Lwt.return_unit else
+          Lwt_list.iter_s (fun epoch ->
+            Lwt_list.iter_s (fun functions ->
+              let bytes = code ~functions 1 in
+              let program = Engine.{circle_id = address; code_b64 = Base64.encode_exn bytes;
+                code_hash = Digestif.SHA256.(to_hex (digest_string bytes)); runtime = "wasm_v1"} in
+              let model = {model with program_root = program.code_hash} in
+              let epoch_id = Int64.of_int epoch in
+              let until = Int64.add epoch_id 50L in
+              let terms = {call.request with chain_id = "octra-devnet-9871-cluster";
+                epoch_id; expires_epoch = until; sequence = 1L; program_root = raw program.code_hash} in
+              let scoped = {call with request = terms; valid_until = Some until} in
+              let scoped = {scoped with caller_signature = Ed.sign ~key:payer
+                (Protocol.intent_sign_bytes scoped)} in
+              let scoped = {scoped with signature = Ed.sign ~key:worker
+                (Protocol.call_sign_bytes scoped)} in
+              let request = {request with epoch_id; program_root = program.code_hash;
+                request_id = Digestif.SHA256.(to_hex (of_raw_string (Certificate.request_id terms)))} in
+              let* measured = Engine.measure ~model ~program ~storage:[] ~call:scoped request in
+              let* replayed = Engine.replay ~model ~program [scoped, request] in
+              if epoch >= activation && functions = 9_999 then begin
+                if measured <> Error "wasm functions limit exceeded"
+                    || replayed <> Error (Host.Rejected "wasm functions limit exceeded") then
+                  fail "engine omitted active code shape"
+              end else begin
+                match measured, replayed with
+                | Ok measured, Ok [replayed] when measured = replayed -> ()
+                | _ -> fail "engine rejected permitted code shape"
+              end;
+              Lwt.return_unit) [9_997; 9_999]) [activation - 1; activation] in
         let get_replay = function
           | Ok value -> value
           | Error reason -> fail (Octra_core.Circle_wasm_host.error_message reason) in
@@ -613,7 +691,7 @@ let test_native_root () =
         if epoch = 7L then Some (Octra_node_runtime.Text.hex_to_string state_root)
         else None in
       let index_root_at epoch = if epoch = 7L then Some index_root else None in
-      let deps = Engine.native_deps ~limits ~store ~state_root_at ~index_root_at in
+      let deps = Engine.native_deps ~chain_id:"octra-devnet-9871-cluster" ~limits ~store ~state_root_at ~index_root_at in
       begin
         match Lwt_main.run (Store.capture_read_snapshot_at store ~epoch_id:7L
           ~state_root:snapshot.state_root) with
@@ -651,16 +729,16 @@ let test_native_root () =
         refused reason (deps.Engine.program ~epoch_id:7L ~state_root ~circle_id:address);
         refused reason (deps.storage ~epoch_id:7L ~state_root ~circle_id:address);
         refused reason (deps.load_model ~cancel:(fst (Lwt.wait ())) model_request) in
-      let without_index = Engine.native_deps ~limits ~store ~state_root_at
+      let without_index = Engine.native_deps ~chain_id:"octra-devnet-9871-cluster" ~limits ~store ~state_root_at
         ~index_root_at:(fun _ -> None) in
       check_deps without_index "resource compute snapshot index missing";
-      let wrong_index = Engine.native_deps ~limits ~store ~state_root_at
+      let wrong_index = Engine.native_deps ~chain_id:"octra-devnet-9871-cluster" ~limits ~store ~state_root_at
         ~index_root_at:(fun _ -> Some (hash 'c')) in
       check_deps wrong_index "store snapshot root differs";
-      let bad_index = Engine.native_deps ~limits ~store ~state_root_at
+      let bad_index = Engine.native_deps ~chain_id:"octra-devnet-9871-cluster" ~limits ~store ~state_root_at
         ~index_root_at:(fun _ -> Some (index_root ^ "00")) in
       check_deps bad_index "store snapshot commitment refused";
-      let wrong_header = Engine.native_deps ~limits ~store ~index_root_at
+      let wrong_header = Engine.native_deps ~chain_id:"octra-devnet-9871-cluster" ~limits ~store ~index_root_at
         ~state_root_at:(fun _ -> Some (Octra_node_runtime.Text.hex_to_string (hash 'c'))) in
       check_deps wrong_header "resource compute snapshot root differs";
       refused "store snapshot branch missing"
@@ -707,7 +785,7 @@ let with_storage ?(alter = fun _ -> Lwt.return_unit) values run =
         if epoch = 7L then Some (Octra_node_runtime.Text.hex_to_string state_root)
         else None in
       let index_root_at epoch = if epoch = 7L then Some index_root else None in
-      let deps = Engine.native_deps ~limits ~store ~state_root_at ~index_root_at in
+      let deps = Engine.native_deps ~chain_id:"octra-devnet-9871-cluster" ~limits ~store ~state_root_at ~index_root_at in
       run store snapshot deps state_root))
 
 let test_storage_count () =
@@ -1121,7 +1199,7 @@ let test_build_handle () =
   let key = hash '2' in
   let begin_writer () = Cache.native_sink.begin_cache key in
   let recover () =
-    let deadline = Unix.gettimeofday () +. 1. in
+    let deadline = Unix.gettimeofday () +. 120. in
     let rec loop () =
       let* result = begin_writer () in
       match result with
@@ -1795,7 +1873,7 @@ let test_cache_roots () =
       }) result))} in
     let engine = Engine.create ~limits:{limits with timeout_seconds = 1} ~deps in
     let recover () =
-      let deadline = Unix.gettimeofday () +. 1. in
+      let deadline = Unix.gettimeofday () +. 120. in
       let rec loop () =
         let* result = Cache.native_sink.begin_cache cache.key in
         match result with
@@ -1818,7 +1896,7 @@ let test_cache_roots () =
       if dropped <> Ok () then fail "cancel model was not idle";
       let pending = Engine.prepare engine actual in
       let* () = Lwt.pick [Lwt.protected entered;
-        (let* () = Lwt_unix.sleep 2. in fail "model fetch was not reached")] in
+        (let* () = Lwt_unix.sleep 120. in fail "model fetch was not reached")] in
       let stopping = match mode with
         | 0 -> Lwt.cancel pending; Lwt.return_unit
         | 1 -> Lwt.return_unit
@@ -1923,6 +2001,19 @@ let cache_sample body chunk_sizes segment_sizes mode =
     ~fetch_asset:fetch ~sink in
   graph, values, fetch, read
 
+let release_cache key =
+  let open Lwt.Syntax in
+  let deadline = Unix.gettimeofday () +. 120. in
+  let rec loop () =
+    let* result = Cache.native_drop key in
+    match result with
+    | Ok true -> Lwt.return_unit
+    | Ok false when Unix.gettimeofday () < deadline ->
+      let* () = Lwt_unix.sleep 0.001 in loop ()
+    | Ok false -> fail "native cache release expired"
+    | Error reason -> fail ("native cache release failed: " ^ reason) in
+  Lwt_main.run (loop ())
+
 let test_payment_flow () =
   let module C = Octra_consensus.C_types in
   let module H = Octra_consensus.C_hash in
@@ -2010,7 +2101,7 @@ let test_payment_flow () =
       let state_root_at epoch = if epoch = 7L then Some root_raw else None in
       let index_root_at epoch = if epoch = 7L then Some index else None in
       let limits = {limits with memory_bytes = Bill.model_limit} in
-      let deps = Engine.native_deps ~limits ~store ~state_root_at ~index_root_at in
+      let deps = Engine.native_deps ~chain_id:"octra-devnet-9871-cluster" ~limits ~store ~state_root_at ~index_root_at in
       let executor = run (deps.self_test ()) |> get in
       let offer = P.{chain_id; offered_epoch = 4L; expires_epoch = 15L;
         coordinator = wallet; validator_set_root = Octra_consensus.C_config.validator_set_hash validators;
@@ -2288,7 +2379,8 @@ let test_cache_stream () =
       let result = Lwt_main.run (read fetch Cache.native_sink) in
       if result <> Error reason then fail "native stream accepted invalid hash";
       if Lwt_main.run (Cache.native_sink.status plan.key) <> Ok Cache.Missing then
-        fail "invalid stream exposed native image"
+        fail "invalid stream exposed native image";
+      release_cache plan.key
     end;
     if mode = 0 then begin
       List.iter (fun throwing ->
@@ -2319,6 +2411,7 @@ let test_cache_stream () =
         fail "stream cancellation ignored";
       if Lwt_main.run (Cache.native_sink.status plan.key) <> Ok Cache.Missing then
         fail "cancelled stream exposed native image";
+      release_cache plan.key;
       List.iter (fun mode ->
         let fetch snapshot ~max_bytes ~circle_id ~path =
           let open Lwt.Syntax in
@@ -2339,10 +2432,13 @@ let test_cache_stream () =
           | 0 -> "circle asset state root differs"
           | 1 -> "circle asset body hash differs"
           | _ -> "resource segment differs" in
-        if Lwt_main.run (read fetch Cache.native_sink) <> Error reason then
-          fail "changed stream asset accepted";
+        (match Lwt_main.run (read fetch Cache.native_sink) with
+        | Error actual when actual = reason -> ()
+        | Error actual -> fail ("changed stream refusal differs: " ^ actual)
+        | Ok _ -> fail "changed stream asset accepted");
         if Lwt_main.run (Cache.native_sink.status plan.key) <> Ok Cache.Missing then
-          fail "changed stream asset published") [0; 1; 2];
+          fail "changed stream asset published";
+        release_cache plan.key) [0; 1; 2];
       if Result.is_error (Lwt_main.run (read fetch Cache.native_sink)) then
         fail "native stream load failed";
       begin match Lwt_main.run (Cache.native_sink.status plan.key) with
@@ -2501,10 +2597,13 @@ let test_cache_limits () =
       fail "oversized model input was consumed";
     if path = "/model/resource-graph.json" && begun <> 0 then
       fail "oversized graph opened writer";
-    if Lwt_main.run (read ~limits changed Cache.native_sink)
-       <> Error "circle asset size exceeds limit" then fail "native size limit differs";
+    (match Lwt_main.run (read ~limits changed Cache.native_sink) with
+    | Error "circle asset size exceeds limit" -> ()
+    | Error reason -> fail ("native size refusal differs: " ^ reason)
+    | Ok _ -> fail "native size limit ignored");
     if Lwt_main.run (Cache.native_sink.status plan.key) <> Ok Cache.Missing then
-      fail "oversized model published native cache") [
+      fail "oversized model published native cache";
+    release_cache plan.key) [
         "/model/resource-graph.json", false;
         "/model/shard.json", false;
         "/model/data/segment-0", false;

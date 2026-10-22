@@ -41,7 +41,7 @@ let run ~command ~root ~validators certificate =
   let args = Array.of_list ([command; "--command"; "assemble-finalized";
     "--draft"; draft; "--finality"; authority; "--exporter-signature"; signature;
     "--output"; output] @ signers "--validator" @ signers "--exporter") in
-  let invoke () =
+  let invoke_args args =
     let descriptor = Unix.openfile log [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_TRUNC] 0o600 in
     Fun.protect ~finally:(fun () -> Unix.close descriptor) (fun () ->
       let pid = Unix.create_process command args Unix.stdin descriptor descriptor in
@@ -49,6 +49,7 @@ let run ~command ~root ~validators certificate =
         try snd (Unix.waitpid [] pid) with
         | Unix.Unix_error (Unix.EINTR, _, _) -> wait () in
       wait ()) in
+  let invoke () = invoke_args args in
   let accept name =
     let status = invoke () in
     check ("cli refused supported authority: " ^ name ^ ": " ^ read log)
@@ -93,4 +94,22 @@ let run ~command ~root ~validators certificate =
   reject reason;
   Manifest.write_json signature (Checkpoint.signature_json exporter);
   accept "retry";
+  let input = Filename.concat root "certificate.json" in
+  Manifest.write_json input (Manifest.certificate_json certificate);
+  let args = Array.of_list ([command; "--command"; "compact"; "--certificate"; input;
+    "--output"; output] @ signers "--validator" @ signers "--exporter") in
+  check "cli compact refused checked input" (invoke_args args = Unix.WEXITED 0);
+  let reduced = Manifest.load_certificate output |> get in
+  ignore (Manifest.verify_certificate ~validator_set:validators ~exporter_set:validators reduced |> get);
+  check "cli compact did not reduce" (String.length (Option.get (Manifest.finality reduced))
+    < String.length encoded);
+  check "cli compact changed signed fields"
+    (reduced.checkpoint = certificate.checkpoint && reduced.manifest = certificate.manifest
+      && reduced.exporter_signatures = certificate.exporter_signatures);
+  let preserved = read output in
+  List.iter (fun invalid ->
+    Manifest.write_json input (Manifest.certificate_json invalid);
+    check "cli compact accepted damaged input" (invoke_args args = Unix.WEXITED 1);
+    check "cli compact changed output on refusal" (read output = preserved))
+    [bad; Manifest.{certificate with authority = Finalized damaged}];
   Printf.printf "event = sync_cli bytes = %d status = pass\n%!" (String.length encoded)

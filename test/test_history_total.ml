@@ -2,7 +2,7 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module R = Octra_core.Pvac_legacy_public_replay
-module A = Octra_core.Pvac_migration_admission
+module A = Octra_core.Pvac_migration_check
 module S = Octra_core.Store_chaindata
 module W = Test_workspace
 

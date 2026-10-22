@@ -187,7 +187,9 @@ let prepare ~chain_id ~config_hash ~trusted_validator_set ~validator_set
           Anchor.compact_lwt ~validator_set:trusted_validator_set anchor
           >|= fun result ->
             let* anchor = result in
-            if C_config.validator_set_hash (Anchor.validator_set anchor)
+            if Anchor.encoded_size anchor > Manifest.manifest_limit then
+              Error "state sync finality path exceeds certificate budget before capture"
+            else if C_config.validator_set_hash (Anchor.validator_set anchor)
                <> C_config.validator_set_hash validator_set then
               Error "state sync validator transition does not reach active set"
             else
@@ -307,7 +309,7 @@ let retain_owned archive root ~retain ~current =
       let id = String.sub name 0 (String.length name - 5) in
       try
         if Archive.marked_stage archive id then begin
-          remove_tree (Archive.path archive id ^ ".next");
+          Archive.remove_stage archive id;
           None
         end else
           Some (name, "state sync stage ownership is unknown")
@@ -381,9 +383,28 @@ let clear_stage archive target =
       | None -> ()
       | Some _ ->
           if Archive.marked_stage archive (Filename.basename target) then
-            remove_tree (target ^ ".next")
+            Archive.remove_stage archive (Filename.basename target)
           else
             failwith "state sync stage ownership is unknown")
+    ()
+
+let clear_incomplete archive root =
+  Lwt_preemptive.detach
+    (fun () ->
+      try
+        Sys.readdir root
+        |> Array.to_list
+        |> List.filter staged_snapshot
+        |> List.filter_map (fun name ->
+        let id = String.sub name 0 (String.length name - 5) in
+        let stage = Archive.path archive id ^ ".next" in
+        try
+          if Archive.marked_stage archive id
+             && lstat (State_sync.snapshot_certificate_path stage) = None then
+            Archive.remove_stage archive id;
+          None
+        with exn -> Some (name, Printexc.to_string exn))
+      with exn -> [root, Printexc.to_string exn])
     ()
 
 let stage_bytes target =
@@ -585,6 +606,12 @@ let publish_owned archive deps ~force exporter_set prepared =
                                 write_certificate
                                   (deps.certificate_path ())
                                   verified >>= fun () ->
+                                Lwt.catch (fun () -> Lwt_preemptive.detach (fun () ->
+                                  Sync_chain.prune_local deps.data_dir
+                                    ~through_epoch:verified.checkpoint.epoch) ())
+                                  (fun exn -> deps.warn (Printf.sprintf
+                                    "event = relief_proof_cleanup_failed reason = %s"
+                                    (Printexc.to_string exn)); Lwt.return_unit) >>= fun () ->
                                 deps.info
                                   (Printf.sprintf
                                      "event = sync_published epoch = %Ld checkpoint = %s files = %d bytes = %Ld"
@@ -600,8 +627,19 @@ let publish_owned archive deps ~force exporter_set prepared =
     (fun exn -> Lwt.return_error (Printexc.to_string exn))
 
 let publish deps ~force exporter_set prepared =
-  Archive.run_lwt (State_sync.snapshot_root deps.data_dir)
-    (fun archive -> publish_owned archive deps ~force exporter_set prepared)
+  let root = State_sync.snapshot_root deps.data_dir in
+  Archive.run_lwt root (fun archive ->
+    let clean () =
+      clear_incomplete archive root >|= List.iter (fun (snapshot, reason) ->
+        deps.warn
+          (Printf.sprintf
+             "event = sync_cleanup_failed snapshot = %s reason = %s"
+             snapshot reason))
+    in
+    clean () >>= fun () ->
+    Lwt.finalize
+      (fun () -> publish_owned archive deps ~force exporter_set prepared)
+      clean)
 
 let load_published deps exporter_set =
   let path = deps.certificate_path () in
@@ -850,7 +888,7 @@ let rec perform deps ~force exporter_set state effects =
 
 let cycle_event ~chain_id ~epoch =
   let minimum =
-    Octra_core.Rule_graph.profile_epochs ~chain_id
+    Consensus_profile.epochs chain_id
     |> List.fold_left (fun prior activation ->
       let activation = Int64.of_int activation in
       if Int64.compare activation epoch <= 0 then Int64.max prior activation

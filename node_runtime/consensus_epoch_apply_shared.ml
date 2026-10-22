@@ -183,6 +183,7 @@ let runtime_shared ?preverify ?save_receipt_raw (runtime : runtime) =
         ~owner_migration_mode:runtime.owner_migration_mode
         ~cipher_mode:runtime.cipher_mode
         ~proof_mode:runtime.proof_mode
+        ~keyed:((Epoch_exec.fold_at (Lazy.force backend) (Lazy.force env).epoch_id).proof_key = Octra_core.Rule_graph.Active)
         ~math:runtime.math
         ~field_policy:runtime.private_field_policy
         ~result_policy:

@@ -15,9 +15,9 @@ type total = private {
   sum : Octra_core.Claim_sum.summary;
 }
 
-val admission :
+val check :
   t -> activation_epoch:int -> total list ->
-  (Octra_core.Pvac_migration_admission.t, string) result
+  (Octra_core.Pvac_migration_check.t, string) result
 
 val total :
   t -> Octra_core.Store_irmin.t -> Octra_core.Store_chaindata.t ->
@@ -36,6 +36,7 @@ val read :
   (t, string) result
 
 val math : t -> epoch:int -> (bool, string) result
+val proof_key : t -> epoch:int -> (bool, string) result
 
 val verify :
   t ->

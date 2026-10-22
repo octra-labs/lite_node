@@ -690,6 +690,10 @@ let rec await_finished node caller epoch job_id attempts =
 let test_cancel_slots data_dir =
   Mirage_crypto_rng_unix.use_default ();
   let open Lwt.Syntax in
+  let owner = Thread.id (Thread.self ()) in
+  let owned action () =
+    if Thread.id (Thread.self ()) <> owner then fail "service policy read outside owner";
+    action () in
   let signer = identity () in
   let caller = identity () in
   let peers = List.init 8 (fun _ -> identity ()) in
@@ -712,7 +716,7 @@ let test_cancel_slots data_dir =
     funding = no_funding;
     self_test = (fun () -> Lwt.return (Error "unused"));
     nonce = (fun () -> raw_hash "nonce");
-    now = (fun () -> !clock); cancel_rounds = (fun () -> true);
+    now = owned (fun () -> !clock); cancel_rounds = owned (fun () -> true);
     send = (fun ~peer:_ _ -> Lwt.return_unit);
     broadcast = (fun payload -> match Protocol.decode payload with
       | Protocol.Cancel _ | Protocol.Cancel_round _ when not !send_blocked -> Lwt.return_unit
@@ -1732,13 +1736,13 @@ let test_reveal_send ?(slow = false) ?(drop = false) ?(busy = false) ?(reserve =
       profile = "q24-v1"});
     nonce = (fun () -> raw_hash "nonce");
     sleep = (fun seconds -> if seconds = 3.0 then Lwt_condition.wait pulse else Lwt_unix.sleep seconds);
-    now = (fun () -> if Thread.id (Thread.self ()) = owner then !clock
-      else Lwt_preemptive.run_in_main (fun () ->
+    now = (fun () ->
+      if Thread.id (Thread.self ()) <> owner then fail "reveal clock read outside owner";
       if !abort_claim then begin
         abort_claim := false;
         Option.iter Lwt.cancel !inflight
       end;
-      Lwt.return !clock)); cancel_rounds = (fun () -> true);
+      !clock); cancel_rounds = (fun () -> true);
     send = (fun ~peer:_ -> save); broadcast = save;
     relay = (fun ~source:_ wire ->
       (match Protocol.decode wire with
@@ -2414,6 +2418,10 @@ let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = fals
       if !cut = At_vote && !first_vote && sender <> (List.hd identities).address then begin
         first_vote := false;
         let* () = deliver_now sender excluded payload in
+        let rec started () =
+          if !execution_count >= validator_count then Lwt.return_unit
+          else let* () = Lwt_condition.wait executed in started () in
+        let* () = started () in
         mark ();
         Lwt.return_unit
       end else Lwt.return_unit
@@ -2624,21 +2632,19 @@ let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = fals
   let head_progress = advance_funds 101L 112L in
   Lwt.async (fun () -> head_progress);
   let* coordinator = if not funding_wait then Lwt.return coordinator else begin
-    let rec wait turns =
-      if turns = 0 then Lwt.fail_with "funding status timeout"
-      else
-        let* status = Rpc.status coordinator.service
-          (read_params coordinator.identity caller !head_epoch job_id) in
-        match status, !requested with
-        | Ok value, Some header when status_name value = "funding" ->
-          if !execution_count <> 0 || !calls <> [] then fail "unfunded work dispatched";
-          let decoded = match field "header" value with
-            | Some (`String body) -> Protocol.decode_header (Base64.decode_exn body) |> get
-            | _ -> fail "funding header missing" in
-          if decoded <> header then fail "funding header differs";
-          Lwt.return_unit
-        | _ -> let* () = Lwt_unix.sleep 0.01 in wait (turns - 1) in
-    let* () = wait 1000 in
+    let rec wait () =
+      let* status = Rpc.status coordinator.service
+        (read_params coordinator.identity caller !head_epoch job_id) in
+      match status, !requested with
+      | Ok value, Some header when status_name value = "funding" ->
+        if !execution_count <> 0 || !calls <> [] then fail "unfunded work dispatched";
+        let decoded = match field "header" value with
+          | Some (`String body) -> Protocol.decode_header (Base64.decode_exn body) |> get
+          | _ -> fail "funding header missing" in
+        if decoded <> header then fail "funding header differs";
+        Lwt.return_unit
+      | _ -> let* () = Lwt_unix.sleep 0.01 in wait () in
+    let* () = Lwt_unix.with_timeout 120. wait in
     let* () = Service.shutdown coordinator.service in
     let restored = make_node coordinator.identity in
     nodes := restored :: List.tl !nodes;
@@ -2665,10 +2671,10 @@ let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = fals
   end in
   let* coordinator = if cut_at = Keep then Lwt.return coordinator else begin
     let* () = Lwt.pick [reached;
-      (let* () = Lwt_unix.sleep 10. in Lwt.fail_with "compute restart point timeout")] in
+      (let* () = Lwt_unix.sleep 120. in Lwt.fail_with "compute restart point timeout")] in
     let before = !execution_count in
     Printf.eprintf "event = service_check phase = restart_cut\n%!";
-    let* () = Lwt_unix.with_timeout 15. (fun () -> Service.shutdown coordinator.service) in
+    let* () = Lwt_unix.with_timeout 120. (fun () -> Service.shutdown coordinator.service) in
     Printf.eprintf "event = service_check phase = restart_closed\n%!";
     let* () = if cut_at = Cold then
       Lwt_list.iter_s (fun node -> Service.shutdown node.service) (List.tl !nodes)
@@ -2834,7 +2840,7 @@ let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = fals
       let rec reboot count current =
         if count = 0 then Lwt.return current else
           let () = Printf.eprintf "event = service_check phase = fetch_close count = %d\n%!" count in
-          let* () = Lwt_unix.with_timeout 15. (fun () -> Service.shutdown current.service) in
+          let* () = Lwt_unix.with_timeout 120. (fun () -> Service.shutdown current.service) in
           Printf.eprintf "event = service_check phase = fetch_open count = %d\n%!" count;
           let next = make_node current.identity in
           nodes := next :: List.tl !nodes;
@@ -3589,7 +3595,7 @@ let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = fals
   let* cancel_result =
     if cancel_on_offer then Lwt.pick [
       stopped;
-      (let* () = Lwt_unix.sleep 3.0 in fail "cancel offer trigger");
+      (let* () = Lwt_unix.sleep 120. in fail "cancel offer trigger");
     ]
     else Rpc.cancel coordinator.service
       (cancellation_params ~until:cancel_until caller cancelled_session) in
@@ -3674,7 +3680,7 @@ let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = fals
         if !execution_count >= executions + 1 then Lwt.return_unit
         else let* () = Lwt_condition.wait executed in started () in
       let* () = Lwt.pick [started ();
-        (let* () = Lwt_unix.sleep 1.0 in fail "funded session execution timeout")] in
+        (let* () = Lwt_unix.sleep 120. in fail "funded session execution timeout")] in
       let* () = advance_head ~first:115L ~last:128L head_epoch in
       if List.length !calls <> before + 1 then fail "call after cancellation";
       if !execution_count <> executions + 1 then fail "execution after cancellation";

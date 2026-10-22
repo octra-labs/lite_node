@@ -182,7 +182,9 @@ let validator_set_proof proof =
            (validator ~weighted:proof.weighted)
            proof.validators);
     "scheduled", scheduled_validator proof.scheduled;
-  ] @ profile)
+  ] @ profile @ Option.fold ~none:[] ~some:(fun (height, entries) ->
+    ["authors", `Assoc ["height", `String (Int64.to_string height);
+      "validators", `List (List.map (validator ~weighted:true) entries)]]) proof.authors)
 
 let light_epoch (p : Octra_consensus.C_light_epoch.t) =
   `Assoc [
@@ -203,7 +205,14 @@ let epoch_proof proof =
 
 let public_message ~decode_message op message =
   match op with
-  | Transaction.CircleProgramUpdate -> `Null
+  | Transaction.CircleProgramUpdate
+  | Transaction.CircleAssetPutEncrypted
+  | Transaction.CircleSealedSlotPut
+  | Transaction.CircleBalanceCellPut
+  | Transaction.CircleRegisterCellPut
+  | Transaction.CircleCall
+  | Transaction.StealthOp
+  | Transaction.ClaimOp -> `Null
   | Transaction.CircleDeploy ->
     let decoded = decode_message message in
     let is_public =
@@ -226,10 +235,14 @@ let public_tx_data raw =
       let values key = List.filter_map
         (fun (name, value) -> if name = key then Some value else None) fields in
       let ops = values "op_type" in
-      let has_code = List.exists (function
-        | `String ("deploy_circle" | "circle_program_update") -> true
+      let hidden = List.exists (function
+        | `String ("deploy_circle" | "circle_program_update"
+          | "circle_asset_put_encrypted" | "circle_sealed_slot_put"
+          | "circle_balance_cell_put" | "circle_register_cell_put"
+          | "circle_call"
+          | "stealth" | "claim") -> true
         | _ -> false) ops in
-      if not has_code then `String raw
+      if not hidden then `String raw
       else
         begin match ops, values "message" with
         | [`String "deploy_circle"], [`String message] ->
@@ -516,9 +529,9 @@ let pvac_status ~addr (status : Pvac_registry.status) =
     "pubkey_format", opt_string status.pubkey_format;
   ]
 
-let pvac_migration_status ~addr ~cipher ~epoch ~math ~owner_migration_mode ~cipher_mode ~proof_mode
+let pvac_migration_status ~keyed ~addr ~cipher ~epoch ~math ~owner_migration_mode ~cipher_mode ~proof_mode
     (status : Pvac_migration.status) records =
-  let module Records = Octra_core.Pvac_migration_admission in
+  let module Records = Octra_core.Pvac_migration_check in
   let history = Pvac_migration.history_route
     ~active:(cipher_mode = Rule_graph.Active && proof_mode = Rule_graph.Active) status in
   let record =
@@ -537,7 +550,7 @@ let pvac_migration_status ~addr ~cipher ~epoch ~math ~owner_migration_mode ~ciph
     | Rule_graph.Active, Pvac_migration.V3, Pvac_migration.Historical,
       Some (Ok entry)
       when
-        entry.Octra_core.Pvac_migration_admission.decision.audit_class
+        entry.Octra_core.Pvac_migration_check.decision.audit_class
         <> Pvac_legacy_public_replay.Poisoned
         && Option.is_some entry.decision.commitment_net ->
       true
@@ -577,7 +590,7 @@ let pvac_migration_status ~addr ~cipher ~epoch ~math ~owner_migration_mode ~ciph
           "reason", `String reason;
         ]
       | Ok entry ->
-        let decision = entry.Octra_core.Pvac_migration_admission.decision in
+        let decision = entry.Octra_core.Pvac_migration_check.decision in
         `Assoc [
           "admission_status", `String "ready";
           "total", `Int entry.total;
@@ -604,6 +617,7 @@ let pvac_migration_status ~addr ~cipher ~epoch ~math ~owner_migration_mode ~ciph
   `Assoc [
     "address", `String addr;
     "proof_math", `String (if math then "wide" else "prior");
+    "proof_key", `Bool keyed;
     "cipher_format", `String (Pvac_migration.format_name status.cipher_class);
     "history_recovery", `Bool history;
     "cipher_class", `String (Pvac_migration.cipher_class_to_string status.cipher_class);
@@ -866,7 +880,12 @@ let peer_score ~now (row : Octra_net.P2p_peer_guard.score_record) =
     "conn_count", `Int row.conn_count;
     "ban_until", `Float row.ban_until;
     "ban_remaining_sec", `Float remaining;
+    "held_s", `Float row.held_s;
+    "pause_until", `Float row.pause_until;
+    "pause_remaining_sec", `Float (max 0. (row.pause_until -. now));
     "last_reason", `String row.last_reason;
+    "drop_count", `Int row.drop_count;
+    "drop_reason", `String row.drop_reason;
     "invalid_frame_count", `Int row.invalid_frame_count;
     "bad_signature_count", `Int row.bad_signature_count;
     "stale_root_count", `Int row.stale_root_count;

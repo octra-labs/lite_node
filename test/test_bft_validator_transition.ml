@@ -443,7 +443,7 @@ let check_profile_plan () =
   run [first; second] true;
   run [first] false
 
-let make_activation_driver ~chain_id ~my_addr ~initial_vs ~target_vs ~activate_epoch =
+let make_policy_driver policy ~chain_id ~my_addr ~initial_vs ~target_vs ~activate_epoch =
   let cfg = Driver.{
     activate_epoch;
     validator_set = target_vs;
@@ -474,7 +474,7 @@ let make_activation_driver ~chain_id ~my_addr ~initial_vs ~target_vs ~activate_e
     load_scheduled_validator_set_config = (fun () -> Lwt.return_none);
     resource_committee_config = None;
   } in
-  Driver.create
+  Driver.create_for_policy policy
     ~config
     ~validator_set:initial_vs
     ~swarm:(make_swarm ~chain_id ~addr:my_addr)
@@ -482,6 +482,88 @@ let make_activation_driver ~chain_id ~my_addr ~initial_vs ~target_vs ~activate_e
     ~sync_log:(C_sync_log.memory ())
     ~relief_log:(C_relief_log.memory ())
     ~vote_log:(C_vote_log.memory ())
+
+let make_activation_driver ~chain_id ~my_addr ~initial_vs ~target_vs ~activate_epoch =
+  make_policy_driver (C_quorum_policy.for_chain chain_id)
+    ~chain_id ~my_addr ~initial_vs ~target_vs ~activate_epoch
+
+let check_stake_transition () =
+  let chain_id = "stake-transition" in
+  let policy = C_quorum_policy.make ~count_epoch:0L ~stake_epoch:(Some 30L) in
+  let members = List.init 7 (fun index -> C_types.{
+    address = "octStake" ^ string_of_int index;
+    pubkey = String.make 32 (Char.chr (index + 1))}) in
+  let set amount = List.mapi (fun index member ->
+    member, Z.of_int (if index = 0 then amount else 2_000_000)) members
+    |> C_types.make_weighted_validator_set |> Result.get_ok in
+  let first, next = set 16_000_000, set 20_000_000 in
+  let hash = C_config.validator_set_hash in
+  assert_msg (hash (C_types.count_capped_set first) = hash (C_types.count_capped_set next))
+    "test requires equal capped sets";
+  let driver = make_policy_driver policy ~chain_id ~my_addr:(List.hd members).address
+    ~initial_vs:first ~target_vs:next ~activate_epoch:20L in
+  let calls = ref 0 in
+  Driver.set_validator_set_activation_handler driver (fun _ _ -> incr calls; Lwt.return_unit);
+  Lwt_main.run (Driver.maybe_activate_scheduled_validator_set driver ~target_epoch:20L);
+  assert_msg (!calls = 0) "raw update changed callback before stake";
+  assert_msg (hash driver.Driver.stake_vs = hash next) "raw update lost";
+  C_engine.start_height driver.engine 30L;
+  Lwt_main.run (Driver.maybe_activate_quorum_policy driver ~target_epoch:30L);
+  assert_msg (hash driver.engine.vs = hash next) "stake switch kept cap";
+  let restarted = Driver.create_for_policy policy ~config:driver.config ~validator_set:next
+    ~swarm:(make_swarm ~chain_id ~addr:(List.hd members).address) ~start_height:30L
+    ~sync_log:(C_sync_log.memory ()) ~relief_log:(C_relief_log.memory ())
+    ~vote_log:(C_vote_log.memory ()) in
+  assert_msg (hash restarted.engine.vs = hash driver.engine.vs) "restart changed stake";
+  assert_msg (hash restarted.stake_vs = hash next) "restart lost raw set";
+  let heavy = set 100_000_000 in
+  let plan = Driver.{activate_epoch = 30L; validator_set = heavy; fingerprint = "stake-plan"} in
+  let selected = Driver.planned_set restarted ~epoch:30L (Some plan) in
+  assert_msg (hash selected = hash heavy) "catchup plan capped raw stake";
+  assert_msg (Z.equal (C_types.round_skip_weight selected) (Z.of_int 37_333_334))
+    "catchup plan weight threshold changed";
+  assert_msg (not (Driver.catchup_source_agreement_reached selected ~signer_count:3
+    ~signed_weight:(Z.of_int 6_000_000))) "small responders formed stake agreement";
+  let repair = Driver.create_for_policy policy
+    ~config:{driver.config with local_head_epoch = (fun () -> 29L)}
+    ~validator_set:next ~swarm:(make_swarm ~chain_id ~addr:(List.hd members).address)
+    ~start_height:30L ~sync_log:(C_sync_log.memory ()) ~relief_log:(C_relief_log.memory ())
+    ~vote_log:(C_vote_log.memory ()) in
+  let old = C_types.count_capped_set first in
+  let seen = ref false in
+  let check set _ =
+    assert_msg (hash set = hash old) "historical repair used current stake";
+    seen := true;
+    Error "test stops before replacement" in
+  Driver.set_finality_proof_handler repair ~needed:true ~check
+    ~resolve:(fun epoch -> assert_msg (epoch = 29L) "historical epoch changed"; Ok old)
+    (fun _ _ -> failwith "test must not replace finality");
+  let proof = header ~chain_id ~epoch_id:29L ~creator_addr:(List.hd members).address
+    |> make_finalize in
+  let prior = Driver.create_for_policy policy
+    ~config:{driver.config with local_head_epoch = (fun () -> 28L)}
+    ~validator_set:next ~swarm:(make_swarm ~chain_id ~addr:(List.hd members).address)
+    ~start_height:29L ~sync_log:(C_sync_log.memory ()) ~relief_log:(C_relief_log.memory ())
+    ~vote_log:(C_vote_log.memory ()) in
+  let prior_seen = ref false in
+  Driver.set_finality_proof_handler prior ~needed:true
+    ~check:(fun set _ -> prior_seen := true;
+      assert_msg (hash set = hash prior.engine.vs) "prior repair changed set";
+      Error "test stops before replacement")
+    ~resolve:(fun _ -> failwith "prior repair invoked historical resolver")
+    (fun _ _ -> failwith "test must not replace prior finality");
+  let prior_proof = header ~chain_id ~epoch_id:28L ~creator_addr:(List.hd members).address
+    |> make_finalize in
+  Lwt_main.run (Driver.accept_finality_proof prior prior_proof);
+  assert_msg !prior_seen "prior repair was not checked";
+  Lwt_main.run (Driver.accept_finality_proof repair proof);
+  assert_msg !seen "historical repair resolver unused";
+  seen := false;
+  Driver.set_finality_proof_handler repair ~needed:true ~check
+    ~resolve:(fun _ -> Error "missing historical set")
+    (fun _ _ -> failwith "missing set must not replace finality");
+  Lwt_main.run (Driver.accept_finality_proof repair proof);
+  assert_msg (not !seen) "missing historical set reached repair"
 
 let check_activation_restart () =
   let chain_id = "transition-driver-test" in
@@ -866,4 +948,5 @@ let () =
   check_marked_set_repairs_runtime ();
   check_fold_finalized_parent ();
   check_strict_quorum_history ();
+  check_stake_transition ();
   Printf.printf "status = pass test = bft_validator_transition\n%!"

@@ -3,6 +3,8 @@
 
 type rpc_result = (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result Lwt.t
 
+val compile_rpc : ('a -> rpc_result) -> 'a -> rpc_result
+
 val compile_at :
   chain_id:string -> epoch:int ->
   (compiler:Octra_vm.Program_package.compiler ->

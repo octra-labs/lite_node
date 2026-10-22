@@ -134,7 +134,7 @@ let replacement tx =
       begin match List.assoc_opt "new_pubkey" fields with
       | Some (`String encoded) ->
         let* blob = K.register_blob_of_b64 encoded in
-        let* blob = K.canonicalize_blob blob in
+        let* blob = K.key_blob ~keyed:false blob in
         Ok (K.full_key_hash blob, blob)
       | _ -> Error "history key switch key missing"
       end
@@ -169,7 +169,7 @@ let cipher_at store pin address =
       end
   with exn -> Error ("history account read failed: " ^ Printexc.to_string exn)
 
-let key value ~address ~index ~math =
+let key value ~address ~index ~keyed ~math =
   try
     let* _ = entry value index in
     let* initial = key_hash value.before address in
@@ -182,7 +182,7 @@ let key value ~address ~index ~math =
         let* () = require (Option.map fst current = final)
           "history key transitions differ from checkpoint" in
         begin match selected with
-        | Some (hash, blob) -> Ok H.{hash; blob; math}
+        | Some (hash, blob) -> Ok H.{hash; blob; math; keyed}
         | None -> Error "history transaction key unavailable"
         end
       | ((item : H.entry), tx) :: rest ->
@@ -218,17 +218,17 @@ let source value index =
     Ok (epoch, hash)
   with exn -> Error ("history source read failed: " ^ Printexc.to_string exn)
 
-let sent value ~index ~math =
+let sent value ~index ~keyed ~math =
   let* item, tx = entry value index in
-  let* key = key value ~address:tx.T.from ~index ~math in
+  let* key = key value ~address:tx.T.from ~index ~keyed ~math in
   H.sent item key
 
-let verify ~send ~claim ~send_index ~claim_index ~sender_math ~receiver_math =
+let verify ~send ~claim ~send_index ~claim_index ~sender_keyed ~receiver_keyed ~sender_math ~receiver_math =
   try
     let* send_entry, send_tx = entry send send_index in
     let* claim_entry, claim_tx = entry claim claim_index in
-    let* sender_key = key send ~address:send_tx.from ~index:send_index ~math:sender_math in
-    let* receiver_key = key claim ~address:claim_tx.from ~index:claim_index ~math:receiver_math in
+    let* sender_key = key send ~address:send_tx.from ~index:send_index ~keyed:sender_keyed ~math:sender_math in
+    let* receiver_key = key claim ~address:claim_tx.from ~index:claim_index ~keyed:receiver_keyed ~math:receiver_math in
     let* id, before_claim, output = output claim claim_index in
     let before_send = Lwt_main.run
       (S.read_snapshot send.before ["stealth"; string_of_int id])

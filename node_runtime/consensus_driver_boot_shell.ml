@@ -102,6 +102,7 @@ type deps = {
   now : unit -> float;
   require_sync : Sync_need.t -> unit;
   exit_error : unit -> unit;
+  exit_refused : unit -> unit;
 }
 
 let make_install (deps : deps) =
@@ -316,8 +317,14 @@ let startup_backlog_anchor (deps : deps) pending =
       (fun root -> Int64.of_int head, root)
       (current_committed_root deps)
 
-let startup_backlog (deps : deps) pending =
+let startup_backlog ?genesis (deps : deps) pending =
   match startup_backlog_anchor deps pending with
+  | None when pending = Consensus_finality_journal.Missing
+      && deps.cached_head () = None
+      && Option.fold ~none:false ~some:(fun value ->
+        Genesis_start.consume value ~data_dir:deps.data_dir ~chain:deps.chain_id
+          ~epoch:!(deps.current_epoch) ~head:(deps.committed_head_epoch ())) genesis ->
+    Consensus_finality_backlog.Clean
   | None ->
     deps.mark_quarantine "finality_backlog_head_root_missing";
     Consensus_finality_backlog.Blocked
@@ -347,7 +354,7 @@ let startup_backlog (deps : deps) pending =
         mark_quarantine = deps.mark_quarantine;
       }
 
-let startup_recovery (deps : deps) =
+let startup_recovery ?genesis (deps : deps) =
   let pending = startup_pending deps in
   match startup_journal deps pending, pending with
   | Consensus_finality_journal_recovery.Blocked, _
@@ -355,7 +362,7 @@ let startup_recovery (deps : deps) =
     Consensus_finality_journal_recovery.Blocked
   | pending_outcome, Ok pending ->
     begin
-      match startup_backlog deps pending with
+      match startup_backlog ?genesis deps pending with
       | Consensus_finality_backlog.Blocked ->
         Consensus_finality_journal_recovery.Blocked
       | Consensus_finality_backlog.Armed ->
@@ -364,6 +371,45 @@ let startup_recovery (deps : deps) =
         pending_outcome
     end
 
+let replay_applied_pending (deps : deps) () =
+  if Consensus_finality_journal.pending deps.data_dir then
+    match startup_pending deps with
+    | Ok (Consensus_finality_journal.Valid record)
+      when record.finalize.Octra_consensus.C_types.epoch_id
+        <= Int64.of_int (deps.committed_head_epoch ()) ->
+      let outcome = startup_journal deps
+        (Ok (Consensus_finality_journal.Valid record)) in
+      let result = match outcome with
+        | Consensus_finality_journal_recovery.Continue -> "continue"
+        | Consensus_finality_journal_recovery.Armed -> "armed"
+        | Consensus_finality_journal_recovery.Blocked -> "blocked" in
+      Octra_log.info "consensus"
+        "event = finality_journal_recovery action = replay_pending epoch = %Ld result = %s"
+        record.finalize.epoch_id result
+    | Error (Consensus_finality_journal.Read_record reason
+      | Consensus_finality_journal.Read_bundle reason) ->
+      raise (Consensus_pending_commit_recovery.Store_fault reason)
+    | _ -> ()
+
+let finality_set (deps : deps) epoch =
+  if epoch < 0L || epoch = Int64.max_int then Error "historical finality epoch is invalid"
+  else
+    Result.bind (Consensus_parent_commit.create ~chain_id:deps.chain_id
+      ~data_dir:deps.data_dir ~chaindata:deps.chaindata deps.env) (fun source ->
+      Result.bind (Consensus_parent_commit.load source ~epoch_id:(Int64.succ epoch)) (function
+        | Some parent -> Ok parent.Octra_consensus.C_types.validator_set
+        | None -> Error "historical validator set is missing"))
+
+let repair_set ?policy (deps : deps) epoch =
+  let policy = Option.value policy
+    ~default:(Octra_consensus.C_quorum_policy.for_chain deps.chain_id) in
+  let current = match !(deps.driver_ref) with
+    | Some driver -> Octra_consensus.C_driver.current_height driver
+    | None -> Int64.max epoch (Int64.of_int !(deps.current_epoch)) in
+  if Octra_consensus.C_quorum_policy.select policy current = Octra_consensus.C_quorum_policy.Stake
+  then finality_set deps epoch
+  else Consensus_validator_anchor.expected_set (validator_anchor deps) ~epoch
+
 let attest_committed (deps : deps) validator_set =
   check_conflict deps;
   let head = deps.committed_head_epoch () in
@@ -371,14 +417,18 @@ let attest_committed (deps : deps) validator_set =
         current_committed_root deps with
   | Some entry, Some root ->
     begin
-      match
+      let selected =
+        if Octra_consensus.C_quorum_policy.linear_weight
+          ~chain_id:deps.chain_id ~epoch_id:(Int64.of_int head)
+        then finality_set deps (Int64.of_int head) else Ok validator_set in
+      match Result.bind selected (fun validator_set ->
         Consensus_finality_journal.attested_root
           ~chain_id:deps.chain_id
           ~validator_set
           ~head
           ~root
           ~entry
-          deps.data_dir
+          deps.data_dir)
       with
       | Ok root ->
         deps.set_state_attested ~head ~root;
@@ -413,6 +463,15 @@ let rebind_committed (deps : deps) validator_set =
     | None ->
       false
     | Some entry ->
+      let selected =
+        if Octra_consensus.C_quorum_policy.linear_weight
+          ~chain_id:deps.chain_id ~epoch_id:(Int64.of_int entry.height)
+        then finality_set deps (Int64.of_int entry.height) else Ok validator_set in
+      match selected with
+      | Error reason ->
+        Log.warn "finality" "event = finality_journal_rebind status = held reason = %s" reason;
+        true
+      | Ok validator_set ->
       let proof_needed =
         Consensus_finality_journal.proof_needed
           ~chain_id:deps.chain_id
@@ -494,10 +553,22 @@ let check_finality_proof (deps : deps) validator_set finalize =
       deps.data_dir
 
 let finality_runtime (deps : deps) =
-  Consensus_finality_runtime.create_node_runtime
+  let keep validator_set finalize =
+    if validator_set.Octra_consensus.C_types.authors = None then Lwt.return_unit
+    else
+      let chain = Sync_chain.{data_dir = deps.data_dir; chain_id = deps.chain_id;
+        store = deps.store; chaindata = deps.chaindata;
+        read_finality = (fun epoch -> Consensus_finality_journal.read_committed_epoch
+          ~chain_id:deps.chain_id ~epoch deps.data_dir);
+        certificate_path = (fun () -> State_sync_http.certificate_path ~data_dir:deps.data_dir)} in
+      let open Lwt.Syntax in
+      let* saved = Sync_chain.keep_relief chain validator_set finalize in
+      match saved with Ok () -> Lwt.return_unit | Error reason -> Lwt.fail_with reason in
+  Consensus_finality_runtime.create_node_runtime ~before_apply:keep
     Consensus_finality_runtime.{
       data_dir = deps.data_dir;
       bundles = deps.bundle_runtime;
+      committed_epoch_root_raw = committed_root_at_epoch deps;
       driver_ref = deps.driver_ref;
       proposal_state = deps.proposal_state;
       catchup_queue = deps.catchup_queue;
@@ -511,6 +582,8 @@ let finality_runtime (deps : deps) =
       apply_timeout_seconds =
         float_of_int
           (max 1 (deps.env_int "OCTRA_BFT_APPLY_TIMEOUT_SEC" 300));
+      stall_timeout_seconds =
+        Consensus_post_finalize.stall_seconds (deps.env_int "OCTRA_BFT_APPLY_STALL_SEC" 600);
       require_sync = deps.require_sync;
       fatal_exit = deps.exit_error;
       catchup_active = deps.catchup_active;
@@ -590,10 +663,10 @@ let run_catchup_to_target (deps : deps) normalize finality_runtime =
       mark_quarantine = deps.mark_quarantine;
       observer = deps.observer;
       drain_pending_finalized = drain_pending;
-      http_range =
-        Consensus_join_rpc.http_range
+      http_range = (fun ~budget ->
+        Consensus_join_rpc.http_range ~budget
           ~fetch_json:Consensus_join_rpc.http_get_json
-          deps.env;
+          deps.env);
     }
 
 let driver_gates (deps : deps) (p2p : Startup_p2p_shell.node_view) =
@@ -694,7 +767,7 @@ let driver_config (deps : deps) p2p_start p2p gates run_catchup_to_target
     current_round = deps.current_round;
     committed_head_epoch = deps.committed_head_epoch;
     load_parent_commit =
-      Consensus_parent_commit.load parent_commit_source;
+      Consensus_parent_commit.proposal parent_commit_source;
     verify_parent_commit =
       Consensus_parent_commit.verify parent_commit_source;
     finality = deps.finality;
@@ -732,9 +805,41 @@ let driver_config (deps : deps) p2p_start p2p gates run_catchup_to_target
 let health (deps : deps) normalize finality_runtime fork_repair_runtime
     run_catchup_to_target =
   let drain_pending =
-    finality_runtime.Consensus_finality_runtime.drain_pending
+    (fun () -> finality_runtime.Consensus_finality_runtime.replay_stashed_while_safe
+      ~source:"probe")
   in
   Consensus_health_wiring.{
+    probe_range = (fun driver ->
+      let module S = Consensus_catchup_shell in
+      let head = deps.committed_head_epoch () in
+      let allowed () =
+        not !(deps.catchup_active) && deps.state_readable ()
+        && (not (Consensus_runtime_state.quarantine_active deps.runtime_state)
+          || Consensus_runtime_state.root_attestation_recovers
+            (Consensus_runtime_state.quarantine_reason deps.runtime_state)) in
+      let epoch_time = Option.map (fun header -> header.Octra_core.Epochlog.finalized_at)
+        (Octra_core.Store_chaindata.get_epoch_header deps.chaindata head) in
+      if not (allowed ()) || Option.fold ~none:false
+          ~some:(fun ts -> ts >= deps.now () -. 60.) epoch_time then Lwt.return_unit
+      else
+        let io = S.driver_io_of_driver driver in
+        let anchor = validator_anchor deps in
+        let query = S.{
+          env_timeout = (fun () -> Some "8");
+          read_query_root = deps.read_local_root_raw;
+          range_query = { io.range_query with http_range =
+            (fun ~budget ~from_epoch ~max_epochs ~validate ->
+              Consensus_join_rpc.http_range ~budget:(min 8. budget)
+                deps.env ~from_epoch ~max_epochs ~validate) };
+          verify_http = S.check_qcs ~chain_id:deps.chain_id
+            ~expected_validator_set_hash:(fun epoch ->
+              Result.map Octra_consensus.C_config.validator_set_hash
+                (Consensus_validator_anchor.expected_set anchor ~epoch))
+            ~start_txid:(deps.next_txid ());
+        } in
+        S.probe_range query ~now:deps.now ~head:(Int64.of_int head)
+          ~current_head:(fun () -> Int64.of_int (deps.committed_head_epoch ()))
+          ~allowed ~run_catchup:(run_catchup_to_target driver));
     env_int = deps.env_int;
     getenv = deps.env;
     soft_catchup_max_lag = deps.soft_catchup_max_lag;
@@ -917,7 +1022,7 @@ let run_driver (deps : deps) p2p_start p2p normalize finality_runtime
    | Ok () -> ()
    | Error reason -> refuse reason);
   let p2p = {p2p with Startup_p2p_shell.stake_vs = stake_set; active_vs = start_set} in
-  ignore (Consensus_driver_launch_shell.run
+  ignore (Consensus_driver_launch_shell.run ~resolve:(repair_set deps)
     Consensus_driver_launch_shell.{
       driver_config =
         driver_config deps p2p_start p2p gates run_catchup_to_target
@@ -944,6 +1049,7 @@ let run_driver (deps : deps) p2p_start p2p normalize finality_runtime
         | Error reason -> refuse reason);
       recovery_pending = (fun () ->
         Consensus_finality_journal.pending deps.data_dir);
+      replay_pending = replay_applied_pending deps;
       poll_interval = deps.quarantine_poll_sec;
       pending_delay = 12.0;
       role_label = deps.role_label;
@@ -952,17 +1058,58 @@ let run_driver (deps : deps) p2p_start p2p normalize finality_runtime
 let enabled consensus_port =
   consensus_port > 0
 
-let sync_plan ~head state =
+let sync_plan ~head ~limit state =
   match Sync_mark.need state with
   | Error _ as error -> error
   | Ok (Some need)
     when need.Sync_need.cause = Sync_need.Conflict
-         || (need.cause = Sync_need.Root && head < need.epoch)
+         || (need.cause = Sync_need.Root && not (Sync_need.snapshot_ready ~head ~limit need))
+         || (need.cause = Sync_need.Range
+             && not (Sync_need.range_ready ~head ~limit need))
          || (need.cause = Sync_need.Journal && head < need.head) ->
       Ok (Some need)
   | Ok _ -> Ok None
 
-let start (deps : deps) =
+let root_replay (deps : deps) need =
+  let head = deps.committed_head_epoch () in
+  if not (Sync_need.valid need) || need.Sync_need.cause <> Sync_need.Root
+     || need.target <> None || need.head <> head
+     || not deps.consensus_mode || not (enabled deps.consensus_port)
+     || deps.voting || not deps.observer then Ok false
+  else
+    let ( let* ) = Result.bind in
+    let* manifest = match deps.cached_head () with
+      | Some manifest when manifest.Octra_core.Head_manifest.epoch_id = head -> Ok manifest
+      | _ -> Error "recovery head is missing" in
+    if not (deps.state_readable ()) then Error "recovery state is being applied" else
+    let commit, root, epoch = Lwt_main.run (
+      let open Lwt.Syntax in
+      let* commit = Octra_core.Store_irmin.get_commit_hash deps.store in
+      let* root = Octra_core.Store_irmin.get_head_hash deps.store in
+      let* epoch = Octra_core.Store_irmin.get_meta deps.store "last_epoch" in
+      Lwt.return (commit, root, epoch)) in
+    let* root = match root with
+      | Some root when commit <> None && commit = manifest.irmin_commit
+          && Some root = manifest.ledger_state_root
+          && epoch = Some (string_of_int head) -> Ok root
+      | _ -> Error "recovery store differs from head" in
+    let* () = Octra_core.Store_irmin.snapshot_matches
+      ?index_root:manifest.epoch_index_root ~state_root:manifest.state_root root in
+    let* record = match selected_pending deps with
+      | Ok (Consensus_finality_journal.Valid record) -> Ok record
+      | Ok Consensus_finality_journal.Missing -> Error "recovery certificate is missing"
+      | Ok (Consensus_finality_journal.Invalid reason)
+      | Error (Consensus_finality_journal.Read_set reason
+          | Consensus_finality_journal.Read_record reason
+          | Consensus_finality_journal.Read_bundle reason) -> Error reason in
+    let* record = Consensus_finality_journal.replayable record in
+    let finalize = record.Consensus_finality_journal.finalize in
+    if finalize.epoch_id <> Int64.of_int need.epoch
+       || finalize.header.prev_state_root <> deps.root_to_raw32 manifest.state_root
+    then Error "recovery certificate does not extend head"
+    else Ok true
+
+let start ?genesis (deps : deps) =
   let () = resume_fork deps in
   if not (enabled deps.consensus_port) then
     Log.info "init" "event = consensus_p2p_disabled reason = no_port"
@@ -977,7 +1124,7 @@ let start (deps : deps) =
       let normalize =
         Consensus_startup_finality.node_normalizer startup
       in
-      let recovery = startup_recovery deps in
+      let recovery = startup_recovery ?genesis deps in
       check_conflict deps;
       (match recovery with
        | Consensus_finality_journal_recovery.Continue ->
@@ -999,21 +1146,36 @@ let start (deps : deps) =
         run_catchup_to_target
         finality_proof_needed
 
-let run (deps : deps) =
+let run ?genesis (deps : deps) =
+  try
   let head = deps.committed_head_epoch () in
   match
     sync_plan ~head
+      ~limit:(Consensus_health_wiring.snapshot_policy_threshold ~getenv:deps.env)
       (Sync_mark.read ~data_dir:deps.data_dir ~chain:deps.chain_id)
   with
-  | Ok None -> start deps
+  | Ok None -> start ?genesis deps
   | Ok (Some need) ->
       deps.clear_state_attested ();
       deps.mark_quarantine
         (Printf.sprintf "signed_snapshot_required epoch = %d head = %d"
           need.Sync_need.epoch head);
-      Log.warn "init"
-        "event = sync_recovery status = waiting cause = %s epoch = %d head = %d action = recover.sh"
-        (Sync_need.label need.cause) need.epoch head
+      let replay = try root_replay deps need with error -> Error (Printexc.to_string error) in
+      (match replay with
+       | Ok true ->
+         Log.warn "init"
+           "event = sync_recovery status = replay cause = root epoch = %d head = %d"
+           need.epoch head;
+         start ?genesis deps
+       | Ok false | Error _ ->
+         let reason = match replay with Error reason -> reason | _ -> "snapshot required" in
+         Log.warn "init"
+           "event = sync_recovery status = waiting cause = %s epoch = %d head = %d action = recover.sh reason = %s"
+           (Sync_need.label need.cause) need.epoch head reason)
   | Error reason ->
       Log.fatal "init" "event = sync_recovery status = rejected reason = %s" reason;
       deps.exit_error ()
+  with Consensus_pending_commit_recovery.Store_fault reason as error ->
+    Fun.protect ~finally:deps.exit_refused (fun () ->
+      Log.fatal "init" "event = startup_store_fault reason = %s action = exit code = 78" reason);
+    raise error

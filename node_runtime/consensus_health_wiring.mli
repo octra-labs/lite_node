@@ -4,7 +4,6 @@
 type deps = {
   sleep : float -> unit Lwt.t;
   catchup_active : unit -> bool;
-  set_catchup_active : bool -> unit;
   quarantine_active : unit -> bool;
   replay_stashed : source:string -> unit Lwt.t;
   probe_health : unit -> unit Lwt.t;
@@ -71,6 +70,7 @@ type fork_repair_runtime = {
 }
 
 type driver_probe_deps = {
+  probe_range : Octra_consensus.C_driver.t -> unit Lwt.t;
   env_int : string -> int -> int;
   getenv : string -> string option;
   soft_catchup_max_lag : int;
@@ -83,7 +83,7 @@ type driver_probe_deps = {
   catchup_next_target : unit -> int64 option;
   attested_head : int -> bool;
   clear_state_attested : unit -> unit;
-  set_catchup_in_progress : bool -> unit;
+  catchup_active : unit -> bool;
   set_state_attested : head:int -> root:string -> unit;
   clear_quarantine : string -> unit;
   mark_quarantine : string -> unit;
@@ -114,6 +114,7 @@ type node_fork_repair_runtime = {
 }
 
 type node_driver_probe_runtime = {
+  probe_range : Octra_consensus.C_driver.t -> unit Lwt.t;
   env_int : string -> int -> int;
   getenv : string -> string option;
   soft_catchup_max_lag : int;
@@ -175,6 +176,7 @@ type node_liveness_deps = {
 }
 
 type node_driver_health_runtime = {
+  probe_range : Octra_consensus.C_driver.t -> unit Lwt.t;
   env_int : string -> int -> int;
   getenv : string -> string option;
   soft_catchup_max_lag : int;

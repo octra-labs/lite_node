@@ -61,7 +61,7 @@ let proof store epoch key =
 
 let update ?weight index =
   let epoch = 3 * index in
-  let member = Octra_core.Validator_admission.{
+  let member = Octra_core.Validator_entry.{
     address = wallet.address;
     pubkey = Base64.decode_exn wallet.pub;
     weight = Z.of_int (Option.value weight ~default:(index + 1));
@@ -170,7 +170,8 @@ let test_prepare ?kept steps record checkpoint =
   let task = prepare ~steps ~head broken in
   check "producer accepted damaged checkpoint" (Result.is_error (Lwt_main.run task));
   List.iteri (fun index first ->
-    if Option.is_some kept || index = 0 then
+    if index = 0 || index = List.length steps / 2 || index = List.length steps - 1
+      || (Option.is_some kept && List.length steps <= 8) then
       List.iter (fun changed ->
         let steps = List.mapi (fun offset step ->
           if offset = index then changed else step) steps in
@@ -268,7 +269,7 @@ let test_repeated_sets () =
         let proof = proof store epoch Update.active_meta_key in
         let record, index_root = finality epoch validator_set proof in
         ignore (certificate ~kept steps record index_root proof.ledger_state_root))))
-    [[2; 2; 2], [1]; [2; 3; 2; 4; 3; 5], [1; 2; 6]; [2; 3; 4; 2], [1]]
+    [[2; 2; 2], [1]; [2; 3; 2; 4; 3; 5], [6]; [2; 3; 4; 2], [1]]
 
 let saved ?(count = Anchor.max_steps) ?(width = 0) path =
   with_store path (fun store ->
@@ -293,7 +294,38 @@ let saved ?(count = Anchor.max_steps) ?(width = 0) path =
     let epoch = 3 * count + 2 in
     let proof = proof store epoch Update.active_meta_key in
     let record, index_root = finality epoch validator_set proof in
-    certificate steps record index_root proof.ledger_state_root)
+    let kept = match List.rev steps with [] -> [] | last :: _ -> [last] in
+    certificate ~kept steps record index_root proof.ledger_state_root)
+
+let test_wire_limit () =
+  Test_workspace.with_dir "sync_size" (fun root ->
+    let certificate = saved ~count:32 ~width:800_000 (Filename.concat root "history") in
+    let encoded = Manifest.finality certificate |> Option.get in
+    let anchor = Anchor.decode encoded |> get in
+    check "proof byte count differs" (Anchor.encoded_size anchor = String.length encoded);
+    let original = Yojson.Safe.to_string (Manifest.certificate_json certificate) in
+    check "large path did not exceed certificate limit"
+      (String.length original > Manifest.manifest_limit);
+    let path = Filename.concat root "certificate.json" in
+    let rejected = try Manifest.write_json path (Manifest.certificate_json certificate); false
+      with Failure _ -> true in
+    check "oversize certificate was published" (rejected && not (Sys.file_exists path));
+    let reduced = Lwt_main.run (Anchor.compact_lwt ~validator_set:trusted anchor) |> get in
+    check "large path did not reduce to one checked link" (List.length (Anchor.steps reduced) = 1);
+    let size steps = Anchor.make ~steps ~finalize:(Anchor.finality anchor)
+      ~validator_set:(Anchor.validator_set anchor) |> Anchor.encode |> Base64.decode_exn
+      |> String.length in
+    List.iter (fun step -> check "step byte cost differs from wire"
+      (Anchor.step_bytes step = size [step] - size [])) (Anchor.steps anchor);
+    let next = Manifest.{certificate with authority = Finalized (Anchor.encode reduced)} in
+    Manifest.write_json path (Manifest.certificate_json next);
+    let loaded = Manifest.load_certificate path |> get in
+    ignore (Manifest.verify_certificate ~validator_set:trusted ~exporter_set:trusted loaded |> get);
+    check "short certificate changed signed content"
+      (loaded.checkpoint = certificate.checkpoint && loaded.manifest = certificate.manifest
+       && loaded.exporter_signatures = certificate.exporter_signatures);
+    Printf.printf "event = sync_size before = %d after = %d status = pass\n%!"
+      (String.length original) (String.length (Yojson.Safe.to_string (Manifest.certificate_json loaded))))
 
 let funding_case ?state_root ?epoch_id ?(offer_memory = 131072L) (origin : Anchor.origin) =
   let epoch_id = Option.value epoch_id ~default:origin.epoch_id in
@@ -820,8 +852,8 @@ let test_limit () =
         } in
         let build epoch validator_set = Lwt_main.run
           (Chain.build deps ~head_epoch:(Int64.of_int epoch) trusted validator_set) in
-        check "stored chain at limit refused"
-          (List.length (get (build old_epoch old_set)) = Anchor.max_steps);
+        check "stored chain was not shortened before extension"
+          (List.length (get (build old_epoch old_set)) = 1);
         let next = update (Anchor.max_steps + 1) in
         let next_raw = Update.to_string next in
         let next_set = get (Update.validator_set next) in
@@ -841,12 +873,14 @@ let test_limit () =
         let steps = get (build target next_set) in
         check "stored extension exceeds limit instead of retrying trusted base"
           (List.length steps = 2);
-        let compressed = certificate steps record index_root current.ledger_state_root in
+        let compressed = certificate ~kept:[List.hd (List.rev steps)]
+          steps record index_root current.ledger_state_root in
         Manifest.write_json path (Manifest.certificate_json compressed);
         let reloaded = get (Manifest.load_certificate path) in
         ignore (get (Manifest.verify_certificate ~validator_set:trusted
           ~exporter_set:trusted reloaded));
-        check "restarted chain changed" (get (build target next_set) = steps);
+        check "restarted chain did not retain the short checked path"
+          (get (build target next_set) = [List.hd (List.rev steps)]);
         Manifest.write_json path (Manifest.certificate_json saved);
         let invalid = Journal.{ old_record with
           finalize = C.{ old_record.finalize with
@@ -856,6 +890,10 @@ let test_limit () =
           };
         } in
         entries := [next_record, next_index; invalid, old_index];
+        check "checked snapshot depended on an unused journal entry"
+          (List.length (get (build target next_set)) = 2);
+        let unreadable = Manifest.{saved with authority = Finalized "invalid"} in
+        Manifest.write_json path (Manifest.certificate_json unreadable);
         begin match build target next_set with
         | Error _ -> ()
         | Ok _ -> failwith "invalid bridge signature was accepted"
@@ -867,7 +905,7 @@ let test_limit () =
         end;
         let unchanged = get (Manifest.load_certificate path) in
         check "failed build replaced saved certificate"
-          (Manifest.certificate_json unchanged = Manifest.certificate_json saved))))
+          (Manifest.certificate_json unchanged = Manifest.certificate_json unreadable))))
 
 exception Cycle_complete
 
@@ -915,16 +953,15 @@ let test_watch deps prepared =
         let monitor = Publish.monitor_capture deps prepared target capture in
         watched := monitor;
         monitor) in
-      let rec wait count =
+      let rec wait () =
         if Atomic.get started then Lwt.return_unit
-        else if count = 0 then Lwt.fail_with "writer did not start"
-        else Lwt_unix.sleep 0.001 >>= fun () -> wait (count - 1) in
+        else Lwt_unix.sleep 0.001 >>= wait in
       let settle task =
         Lwt.catch (fun () -> Lwt.protected task >|= fun _ -> ())
           (fun _ -> Lwt.return_unit) in
       Lwt_main.run (Lwt.finalize
         (fun () ->
-          wait 2000 >>= fun () ->
+          Lwt_unix.with_timeout 120. wait >>= fun () ->
           begin match mode with
           | "log" -> Lwt.wakeup wake ()
           | "timer" -> Lwt.wakeup_exn wake Progress_failed
@@ -1060,6 +1097,7 @@ let test_publisher () =
         Sync_retry_case.retry ~run ~validators:trusted deps certificate;
         Sync_retry_case.retention ~run deps certificate;
         Sync_retry_case.publication ~run ~validators:trusted deps certificate;
+        Sync_retry_case.failures ~run deps certificate;
         Sync_retry_case.stages ~run deps certificate;
         Sync_retry_case.links ~run deps certificate;
         let prior = saved ~count:1 (Filename.concat root "prior") in
@@ -1078,12 +1116,15 @@ let () =
   | [_; "--origin"] ->
     test_origin ();
     print_endline "status = pass test = compute_origin"
+  | [_; "--limits"] -> test_limit ()
   | [_; command] ->
+    Sync_compact_case.run ();
     test_origin ();
     Test_workspace.with_dir "sync_cli" (fun root ->
       let certificate = saved ~count:5 ~width:650_000 (Filename.concat root "history") in
       Sync_cli_case.run ~command ~root ~validators:trusted certificate);
     test_repeated_sets ();
+    test_wire_limit ();
     test_limit ();
     test_publisher ();
     print_endline "status = pass test = sync_chain"

@@ -95,6 +95,7 @@ let deps (context : context) ~(cursor : R.J.cursor)
     select context.rules ~epoch |> Result.map_error G.fault_message |> R.get
   in
   let circle_mode = rule G.circle in
+  let ordered = rule G.circle_batch = G.Active in
   let wasm_compute_mode = rule G.wasm_compute in
   let object_cost = rule G.object_cost = G.Active in
   let owner_migration_mode = rule G.owner_migration in
@@ -103,6 +104,7 @@ let deps (context : context) ~(cursor : R.J.cursor)
   in
   let key_pool =
     N.Consensus_key_switch_preverify.create
+      ~keyed:(fun () -> rule G.proof_key = G.Active)
       ~cipher_mode:(fun () -> rule G.cipher_migration)
       ~field_policy:(fun () -> field_policy)
       ~strict:(fun () -> proof_mode = G.Active)
@@ -111,6 +113,7 @@ let deps (context : context) ~(cursor : R.J.cursor)
   in
   let private_pool =
     N.Consensus_private_preverify.create
+      ~keyed:(fun () -> rule G.proof_key = G.Active)
       ~field_policy:(fun () -> field_policy)
       ~strict:(fun () -> proof_mode = G.Active)
       ~math:(fun () -> math)
@@ -189,7 +192,9 @@ let deps (context : context) ~(cursor : R.J.cursor)
               env = preverify_env;
             } in
             let* batch =
-              R.W.run_many
+              N.Consensus_proposal.precheck ~ordered ~run_many:(fun txs ->
+                R.W.run_many
+                ~keyed:(rule G.proof_key = G.Active)
                 ~math
                 ~cipher_mode:(rule G.cipher_migration)
                 ~prepared:(fun tx ->
@@ -203,11 +208,24 @@ let deps (context : context) ~(cursor : R.J.cursor)
                 ~circle_preverify:(N.Consensus_circle_preverify.run circle)
                 ~circle_cell_preverify:(N.Consensus_circle_cell_preverify.run cell)
                 ~legacy_replay:(context.legacy_replay ~epoch)
-                txs
+                txs) txs
             in
             Lwt.return_ok batch)
       in
-      Lwt.return (R.get batch));
+      let batch = R.get batch in
+      if not ordered || batch.R.W.skipped <> [] then Lwt.return batch
+      else
+        let preverify = R.G.create (R.W.receipts_for_hashes batch.ready (R.hashes txs)) in
+        let* captured = preview.prepare
+          ~epoch_id:epoch
+          ~proposal_id:"replay-prepare"
+          ~expected_prev_root:(Some root)
+          ~preverify
+          ~parent_commit
+          ~reward:prepared.reward
+          ~env
+          ~txs in
+        Lwt.return (N.Consensus_proposal.prepared_batch txs (R.get captured)));
     preview = (fun preverify txs ->
       let* root = head () in
       preview.run
@@ -241,7 +259,7 @@ let deps (context : context) ~(cursor : R.J.cursor)
         X.make_live_backend ~proof_mode ~math ~fold context.store context.ledger
       in
       let private_transition =
-        Octra_core.Private_transition.create ~math
+        Octra_core.Private_transition.create ~keyed:(policy.X.proof_key = G.Active) ~math
           ~preverify:(Some preverify)
           ~legacy_replay:context.legacy_replay
           ~ledger:context.ledger

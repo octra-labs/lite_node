@@ -49,7 +49,7 @@ type state = {
   last_id : int64;
   active : job option;
   queued : job list;
-  cache : cache option;
+  cache : cache list;
 }
 
 type message =
@@ -64,6 +64,14 @@ type effect = Run of job | Interrupt of int64 | Reply of int64 * reply
 let capacity = 4
 let lifetime = 15.
 let retention = 60.
+let cache_bytes = 64 * 1024 * 1024
+
+let rec trim count bytes = function
+  | [] -> []
+  | entry :: rest ->
+    let size = Parts.size entry.encoded in
+    if count = 0 || size > bytes then []
+    else entry :: trim (count - 1) (bytes - size) rest
 
 let empty = {
   open_ = true;
@@ -71,12 +79,11 @@ let empty = {
   last_id = 0L;
   active = None;
   queued = [];
-  cache = None;
+  cache = [];
 }
 
 let expire now state =
-  let cache = Option.bind state.cache (fun entry ->
-    if now < entry.expires then Some entry else None) in
+  let cache = List.filter (fun entry -> now < entry.expires) state.cache in
   let state = { state with cache } in
   let expired, queued = List.partition (fun job -> now >= job.deadline) state.queued in
   let effects = List.map (fun job -> Reply (job.id, Error Expired)) expired in
@@ -89,11 +96,10 @@ let expire now state =
 let advance state =
   match state.active, state.queued with
   | None, job :: rest ->
-    let cached = Option.bind state.cache (fun entry ->
-      if job.query.part <> None && entry.from_epoch = job.query.from_epoch
+    let cached = List.find_opt (fun entry ->
+      job.query.part <> None && entry.from_epoch = job.query.from_epoch
         && entry.max_epochs = job.query.max_epochs
-        && (job.query.hash = None || job.query.hash = Parts.digest entry.encoded)
-      then Some entry else None) in
+        && (job.query.hash = None || job.query.hash = Parts.digest entry.encoded)) state.cache in
     let job = { job with cached } in
     { state with active = Some job; queued = rest }, [Run job]
   | _ -> state, []
@@ -122,8 +128,12 @@ let delta state = function
       let cache = match reply, job.listener with
         | Ok { encoded = Some encoded; status; records; _ }, Waiting
             when Parts.digest encoded <> None ->
-          Some { from_epoch = job.query.from_epoch; max_epochs = job.query.max_epochs;
-            encoded; status; records; expires = now +. retention }
+          let entry = { from_epoch = job.query.from_epoch; max_epochs = job.query.max_epochs;
+            encoded; status; records; expires = now +. retention } in
+          let rest = List.filter (fun row ->
+            row.from_epoch <> entry.from_epoch || row.max_epochs <> entry.max_epochs
+            || Parts.digest row.encoded <> Parts.digest encoded) state.cache in
+          trim 4 cache_bytes (entry :: rest)
         | _ -> state.cache in
       let state, effects = advance { state with active = None; cache } in
       let replies = if job.listener = Waiting then [Reply (id, reply)] else [] in

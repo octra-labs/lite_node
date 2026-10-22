@@ -19,6 +19,7 @@ type circle_cell = {
 
 type request =
   | Math of request
+  | Proof_key of request
   | Ping
   | Groth16 of {
       key : string;
@@ -42,6 +43,13 @@ type request =
       strict : bool;
     }
   | Key_switch_claim of {
+      pubkey : string;
+      cipher : string;
+      proof : string;
+      commitment : string;
+      strict : bool;
+    }
+  | Stored_key_claim of {
       pubkey : string;
       cipher : string;
       proof : string;
@@ -170,7 +178,10 @@ let rec request_fields request =
   in
   match request with
   | Math (Math _) -> invalid_arg "nested math request"
+  | Math (Proof_key value) -> request_fields (Proof_key (Math value))
   | Math value -> request_fields value @ ["math", `Bool true]
+  | Proof_key (Proof_key _) -> invalid_arg "nested proof key request"
+  | Proof_key value -> request_fields value @ ["proof_key", `Bool true]
   | Groth16 value ->
     [
       "schema", `String schema;
@@ -200,6 +211,12 @@ let rec request_fields request =
     ] @ strict value.strict
   | Key_switch_claim value ->
     common "key_switch_claim" value.pubkey @ [
+      "cipher", `String value.cipher;
+      "proof", `String value.proof;
+      "commitment", `String value.commitment;
+    ] @ strict value.strict
+  | Stored_key_claim value ->
+    common "stored_key_claim" value.pubkey @ [
       "cipher", `String value.cipher;
       "proof", `String value.proof;
       "commitment", `String value.commitment;
@@ -318,6 +335,21 @@ let call_of_json = function
                  commitment;
                  strict;
                })))))))
+        | "stored_key_claim" ->
+          bind (string_field "pubkey" fields) (fun encoded_pubkey ->
+          bind (decode_pubkey encoded_pubkey) (fun pubkey ->
+          bind (parse_value "cipher" fields) (fun cipher ->
+          bind (parse_value "proof" fields) (fun proof ->
+          bind (parse_value "commitment" fields) (fun commitment ->
+          bind (strict_field fields) (fun strict ->
+            Ok
+              (Stored_key_claim {
+                 pubkey;
+                 cipher;
+                 proof;
+                 commitment;
+                 strict;
+               })))))))
         | "historical_migration_claim" ->
           bind (string_field "pubkey" fields) (fun encoded_pubkey ->
           bind (decode_pubkey encoded_pubkey) (fun pubkey ->
@@ -386,11 +418,16 @@ let call_of_json = function
 
 let request_of_json json =
   bind (call_of_json json) (fun request ->
+    let keyed request fields =
+      match List.filter (fun (name, _) -> String.equal name "proof_key") fields with
+      | [] | ["proof_key", `Bool false] -> Ok request
+      | ["proof_key", `Bool true] -> Ok (Proof_key request)
+      | _ -> Error "proof_key_invalid" in
     match json with
     | `Assoc fields ->
       begin match List.filter (fun (name, _) -> String.equal name "math") fields with
-      | [] | ["math", `Bool false] -> Ok request
-      | ["math", `Bool true] -> Ok (Math request)
+      | [] | ["math", `Bool false] -> keyed request fields
+      | ["math", `Bool true] -> keyed (Math request) fields
       | _ -> Error "math_invalid"
       end
     | _ -> Error "request_invalid")

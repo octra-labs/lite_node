@@ -147,10 +147,21 @@ let seed ~data_dir ~chain_id ~floor ~head ~root:local_root ~txid
                 |> map_root
               in
               let anchor_set = Anchor.validator_set anchor in
+              let* relief = Anchor.relief anchor |> map_root in
+              let source_matches = Option.fold ~none:false ~some:(fun mark ->
+                C_config.validator_set_hash active = mark.Octra_consensus.C_relief.source_hash)
+                relief in
               if C_config.validator_set_hash anchor_set
-                 <> C_config.validator_set_hash active then
+                 <> C_config.validator_set_hash active && not source_matches then
                 root "state sync active validator set mismatch"
               else
+                let* () = match relief with
+                  | None -> Ok ()
+                  | Some mark ->
+                    Octra_consensus.C_relief_log.keep
+                      (Octra_consensus.C_relief_log.disk ~data_dir) mark
+                    |> Result.map (fun _ -> ()) |> map_root in
+                let active = anchor_set in
                 let finalize = Anchor.finality anchor in
                 let finalize =
                   match Journal.read_committed_epoch_validated ~chain_id

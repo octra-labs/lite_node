@@ -38,7 +38,7 @@ let stage_deploy store (deploy : Program_journal.deploy) =
        ~version:deploy.version
        ~owner:deploy.owner
        ~ctype:deploy.ctype
-       ~admission:deploy.admission
+       ~check:deploy.check
        ~bytecode_b64:deploy.bytecode_b64);
   run
     (Octra_core.Store_irmin.save_contract_abi
@@ -61,7 +61,7 @@ let stage_upgrade store (upgrade : Program_journal.upgrade) =
          ~version:upgrade.version
          ~owner:upgrade.owner
          ~ctype:upgrade.ctype
-         ~admission:upgrade.admission
+         ~check:upgrade.check
          ~bytecode_b64:upgrade.bytecode_b64)
   with
   | Error error -> failwith error
@@ -82,4 +82,5 @@ let stage_storage store (address, storage) =
 let stage store journal =
   Program_journal.deploys journal |> List.iter (stage_deploy store);
   Program_journal.upgrades journal |> List.iter (stage_upgrade store);
+  Program_journal.records journal |> List.iter (fun record -> run (Program_record.stage store record));
   Program_journal.storage_entries journal |> List.iter (stage_storage store)

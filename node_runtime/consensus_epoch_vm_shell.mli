@@ -44,6 +44,7 @@ type ('value_snapshot, 'program_snapshot) deps = {
   int_work : Octra_vm.Int_work.mode;
   fhe_work : Octra_core.Rule_graph.mode;
   proof_exec : Octra_core.Rule_graph.mode;
+  proof_key : Octra_core.Rule_graph.mode;
   wasm_float : Octra_core.Rule_graph.mode;
   current_epoch : int;
   epoch_time_ms : int64;
@@ -169,7 +170,7 @@ type vm_tx_deps = {
   deploy_balance : Transaction.t -> Z.t option;
   deploy_and_save :
     Transaction.t ->
-    admitted:Octra_vm.Admission.t option ->
+    admitted:Octra_vm.Code_check.t option ->
     params:Yojson.Safe.t list ->
     bytecode:ContractVM.instr array ->
     bytecode_raw:string ->
@@ -177,6 +178,7 @@ type vm_tx_deps = {
   program_prepare :
     Transaction.t ->
     (Octra_vm.Program_package.admitted, string) result Lwt.t;
+  program_record : Transaction.t -> Octra_vm.Program_package.admitted -> (unit, string) result;
   ensure_account : string -> unit;
   circle_exec :
     Transaction.t ->
@@ -237,6 +239,7 @@ type vm_tx_deps = {
 val prepare_program_package :
   ?preview:Octra_core.Rule_graph.mode ->
   ?proof_exec:Octra_core.Rule_graph.mode ->
+  ?records:Octra_core.Rule_graph.mode ->
   overlap:bool ->
   program_mode:Octra_core.Rule_graph.mode ->
   point_ops:bool ->
@@ -286,6 +289,7 @@ type live_contract_ctx_args = {
   proof_mode : Octra_core.Rule_graph.mode;
   fhe_work : Octra_core.Rule_graph.mode;
   proof_exec : Octra_core.Rule_graph.mode;
+  proof_key : Octra_core.Rule_graph.mode;
   vm_bytes : Octra_core.Rule_graph.mode;
   wasm_float : Octra_core.Rule_graph.mode;
   math : bool;
@@ -326,7 +330,9 @@ type live_sender_vm_tx_args = {
   proof_mode : Octra_core.Rule_graph.mode;
   fhe_work : Octra_core.Rule_graph.mode;
   proof_exec : Octra_core.Rule_graph.mode;
+  proof_key : Octra_core.Rule_graph.mode;
   vm_bytes : Octra_core.Rule_graph.mode;
+  program_records : Octra_core.Rule_graph.mode;
   wasm_float : Octra_core.Rule_graph.mode;
   program_mode : Octra_core.Rule_graph.mode;
   program_overlap : bool;
@@ -347,8 +353,14 @@ type live_sender_vm_tx_args = {
 
 val make_live_vm_tx_deps :
   ?inspect_mode:Octra_core.Rule_graph.mode ->
+  ?records:Octra_core.Rule_graph.mode ->
   live_vm_tx_args ->
   vm_tx_deps
+
+val stage_program_record :
+  mode:Octra_core.Rule_graph.mode ->
+  journal:Program_journal.t ->
+  Transaction.t -> Octra_vm.Program_package.admitted -> (unit, string) result
 
 val make_live_call_runtime :
   live_call_runtime_args ->
@@ -415,6 +427,7 @@ val run_program_call_tx :
   unit Lwt.t
 
 val run_program_upgrade_tx :
+  ?records:Octra_core.Rule_graph.mode ->
   call_runtime ->
   trusted_program_keys:Octra_vm.Program_trust.t ->
   program_journal:Program_journal.t ->

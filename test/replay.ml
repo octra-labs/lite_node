@@ -15,7 +15,7 @@ module Manifest = Octra_bootstrap.State_sync_manifest
 module Anchor = Octra_bootstrap.Sync_anchor
 module Roots = Octra_bootstrap.Root_win
 module Verify = Octra_bootstrap.State_sync_verify
-module Migration = Octra_core.Pvac_migration_admission
+module Migration = Octra_core.Pvac_migration_check
 
 let read path limit =
   let input = open_in_bin path in
@@ -93,8 +93,8 @@ let trace_json (trace : R.trace) =
     "confirmed", strings trace.confirmed;
     "rejections", strings trace.rejections;
     "fees", `String (Z.to_string trace.fees);
-    "candidate_root", `String trace.candidate_root;
-    "candidate_fees", `String (Z.to_string trace.candidate_fees);
+    "checked_root", `String trace.entry_root;
+    "checked_fees", `String (Z.to_string trace.entry_fees);
   ]
 
 let write output value =

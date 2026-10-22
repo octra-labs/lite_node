@@ -41,7 +41,7 @@ val validator_enrollment :
   head_epoch:int ->
   address:string ->
   pubkey:string ->
-  Octra_core.Validator_admission.candidate option ->
+  Octra_core.Validator_entry.entry option ->
   (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result
 
 val consensus_peer_states :

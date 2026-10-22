@@ -7,6 +7,14 @@ module VM = Octra_vm.Contract_vm
 let expect ok = if not ok then failwith "proof reply lifecycle differs"
 
 let () =
+  List.iter (fun view_seconds ->
+    let state = VM.create_state ~is_view:true ~ctx:VM.default_ctx
+      ~caller:"caller" ~origin:"caller" ~address:"program" ~value:Z.zero
+      ~storage:(Hashtbl.create 1) () in
+    let invalid = try
+      ignore (Lwt_main.run (VM.run_async ~view_seconds state [|VM.STOP|])); false
+    with Invalid_argument _ -> true in
+    expect invalid) [0.; -1.; Float.nan; Float.infinity];
   let name = "OCTRA_TEST_PROOF_TIMEOUT" in
   List.iter (fun raw ->
     Unix.putenv name raw;

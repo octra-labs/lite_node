@@ -1,7 +1,16 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-module Join = Octra_node_runtime.Consensus_join_rpc
+module Rpc = Octra_node_runtime.Consensus_join_rpc
+module Join = struct
+  include Rpc
+  let http_range ?fetch_json ?timeout ?budget env ~from_epoch ~max_epochs ~validate =
+    Rpc.http_range ~health:(Octra_node_runtime.Sync_sources.create ())
+      ?fetch_json ?timeout ?budget env ~from_epoch ~max_epochs ~validate
+  let http_head ?fetch_json ?timeout ?budget env ~chain_id ~validator_hash ~after =
+    Rpc.http_head ~health:(Octra_node_runtime.Sync_sources.create ())
+      ?fetch_json ?timeout ?budget env ~chain_id ~validator_hash ~after
+end
 module Transaction = Octra_core.Transaction
 
 let () =
@@ -57,6 +66,7 @@ let trusted_validator_set_hash =
 
 let finality_json
     ?(round = 4)
+    ?parent
     ~epoch
     ~proto_version
     ~prev
@@ -73,7 +83,7 @@ let finality_json
         (String.concat "" tx_hashes);
     receipt_root = Octra_consensus.C_hash.receipt_root [];
     proposed_state_root = state;
-    parent_commit_hash = Octra_net.Hash_domain.nil_hash;
+    parent_commit_hash = Octra_consensus.C_hash.parent_commit_hash_opt parent;
     creator_addr = "oct_creator";
     txid_hi = 8L;
     ts = 120.25;
@@ -102,7 +112,7 @@ let finality_json
     header;
     proposal_id;
     precommits = [vote];
-    parent_commit = None;
+    parent_commit = parent;
   } in
   `Assoc [
     "finalize",
@@ -144,13 +154,14 @@ let legacy_reward_source =
 
 let record_json
     ?(round = 4)
+    ?parent
     ?(epoch = 12L)
     ?(prev = raw 'p')
     ?(state = raw 's')
     ?tx_hashes
     ?txs_json
-    ?(source = reward_source)
-    ?(proto_version = Octra_consensus.C_types.proto_version_current)
+    ?(source = legacy_reward_source)
+    ?(proto_version = Octra_consensus.C_types.proto_version_parent_legacy)
     () =
   let txs_json, tx_hashes =
     match tx_hashes, txs_json with
@@ -173,7 +184,7 @@ let record_json
     "commit_round", `Int round;
     "reward_source",
       Octra_consensus.C_reward_source.to_yojson source;
-    "finality", finality_json ~round ~epoch ~proto_version ~prev ~state ~tx_hashes ();
+    "finality", finality_json ~round ?parent ~epoch ~proto_version ~prev ~state ~tx_hashes ();
   ]
 
 let cursor () =
@@ -275,10 +286,68 @@ let with_http_response ?(delay = 0.0) response f =
 
 let test_http_cancel () =
   for _ = 1 to 4 do
-    Lwt_main.run (Lwt_unix.with_timeout 5. (fun () ->
+    Lwt_main.run (Lwt_unix.with_timeout 120. (fun () ->
       with_http_response "" (fun _ -> Lwt.return_unit)));
     Lwt_main.run (Lwt.pause ())
   done
+
+let test_http_release () =
+  List.iter (fun (body_started, total) ->
+    let open Lwt.Syntax in
+    let released = Lwt_main.run (Lwt_unix.with_timeout 120. (fun () ->
+      let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+      let* () = Lwt_unix.bind socket (Unix.ADDR_INET (Unix.inet_addr_loopback, 0)) in
+      Lwt_unix.listen socket 1;
+      let port = match Lwt_unix.getsockname socket with
+        | Unix.ADDR_INET (_, port) -> port
+        | _ -> fail "socket address" in
+      let ready, wake = Lwt.wait () in
+      let server =
+        let* fd, _ = Lwt_unix.accept socket in
+        let close () = Lwt.return_unit in
+        let ic = Lwt_io.of_fd ~close ~mode:Lwt_io.input fd in
+        let oc = Lwt_io.of_fd ~close ~mode:Lwt_io.output fd in
+        let rec headers () =
+          let* line = Lwt_io.read_line_opt ic in
+          match line with None | Some "" -> Lwt.return_unit | _ -> headers () in
+        Lwt.finalize
+          (fun () ->
+            let* () = headers () in
+            let* () = if not body_started then Lwt.return_unit else
+              Lwt_io.write oc "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n{" in
+            let* () = Lwt_io.flush oc in
+            Lwt.wakeup_later wake ();
+            let* value = Lwt_io.read_char_opt ic in
+            Lwt.return (value = None))
+          (fun () ->
+            let* () = Lwt_io.abort ic in
+            let* () = Lwt_io.abort oc in
+            Lwt_unix.close fd) in
+      Lwt.finalize
+        (fun () ->
+          let base = Printf.sprintf "http://127.0.0.1:%d" port in
+          let client =
+            if total then
+              Join.http_range ~budget:0.5
+                (function "OCTRA_STATE_SYNC_SOURCES" -> Some base | _ -> None)
+                ~from_epoch:12L ~max_epochs:1
+                ~validate:(fun _ -> fail "unfinished HTTP response accepted")
+              |> Lwt.map Option.is_none
+            else
+              Lwt.catch
+                (fun () -> Lwt.map (fun _ -> false)
+                  (Join.http_get_json ~timeout:0.5 base))
+                (function Lwt_unix.Timeout -> Lwt.return_true | exn -> Lwt.fail exn) in
+          let* () = ready in
+          let* expired = client in
+          expect "HTTP deadline reached" expired;
+          server)
+        (fun () ->
+          Lwt.cancel server;
+          let* () = Lwt.catch (fun () -> Lwt.map ignore server) (fun _ -> Lwt.return_unit) in
+          Lwt_unix.close socket))) in
+    expect (if body_started then "body timeout closes socket" else "header timeout closes socket")
+      released) [false, false; true, false; false, true; true, true]
 
 let test_http_get_json () =
   let ok_response =
@@ -329,6 +398,60 @@ let test_http_get_json () =
         (String.starts_with ~prefix:"GET " msg
          && String.ends_with ~suffix:"Invalid token 'bad'\")" msg)
   end
+
+let test_http_connect_refused () =
+  let open Lwt.Syntax in
+  let timing = Array.mem "--timing" Sys.argv in
+  let refused = Lwt_main.run (
+    let socket = Lwt_unix.socket Unix.PF_INET Unix.SOCK_STREAM 0 in
+    let* () = Lwt_unix.bind socket
+      (Unix.ADDR_INET (Unix.inet_addr_loopback, 0)) in
+    let port = match Lwt_unix.getsockname socket with
+      | Unix.ADDR_INET (_, port) -> port
+      | _ -> fail "socket address" in
+    let* () = Lwt_unix.close socket in
+    let url = Printf.sprintf "http://127.0.0.1:%d" port in
+    let request = Lwt.catch
+      (fun () -> Lwt.map (fun _ -> false)
+        (Join.http_get_json ~timeout:(if timing then 4. else 120.) url))
+      (function Lwt_unix.Timeout -> Lwt.return_false | _ -> Lwt.return_true) in
+    if timing then Lwt.pick [request; Lwt.map (fun () -> false) (Lwt_unix.sleep 1.0)]
+    else request) in
+  expect "refused HTTP connect returns promptly" refused
+
+let test_http_source_share () =
+  let open Lwt.Syntax in
+  let valid = `Assoc [
+    "status", `String "ok";
+    "records", `List [record_json ()];
+  ] in
+  let env = function
+    | "OCTRA_JOIN_RPC" -> Some "http://primary,http://secondary"
+    | _ -> None in
+  let seen, wake = Lwt.wait () in
+  let fetch_json url =
+    if String.starts_with ~prefix:"http://primary/" url then
+      let* () = Lwt_unix.sleep 10.0 in
+      Lwt.return valid
+    else begin
+      if Lwt.is_sleeping seen then Lwt.wakeup_later wake ();
+      Lwt.return valid
+    end
+  in
+  let early, result = Lwt_main.run (
+    let request = Join.http_range ~fetch_json ~timeout:0.6 ~budget:0.8
+      env ~from_epoch:12L ~max_epochs:1 ~validate:(fun _ -> true) in
+    let* early = Lwt.choose [
+      Lwt.map (fun () -> true) seen;
+      Lwt.map (fun () -> false) (Lwt_unix.sleep 0.55);
+    ] in
+    let* result = request in
+    Lwt.return (early, result)) in
+  expect "secondary starts within share" early;
+  expect "secondary range selected"
+    (Option.map (fun (response : Octra_consensus.C_driver.catchup_range_response_record) ->
+      response.responder_addr)
+      result = Some "http://secondary")
 
 let test_retry_delay () =
   expect "retry negative" (Join.retry_delay (-1) = 1.0);
@@ -414,6 +537,48 @@ let test_sync_plan () =
    | Join.Fetch_range from_epoch -> expect "fetch epoch" (from_epoch = 11L)
    | _ -> fail "fetch plan expected")
 
+let test_join_reward () =
+  let json = record_json
+    ~source:reward_source
+    ~proto_version:Octra_consensus.C_types.proto_version_current () in
+  let range = `Assoc ["status", `String "ok"; "records", `List [json]] in
+  let record = match Join.parse_range ~from_epoch:12L range with
+    | Join.Records [record] -> record
+    | _ -> fail "reward record missing" in
+  let rejected =
+    try
+      ignore (Join.prepare_record
+        ~chain_id:"octra-test"
+        ~expected_validator_set_hash:trusted_validator_set_hash
+        ~cursor:(cursor ()) record);
+      false
+    with Failure error ->
+      error = "join reward binding: reward proof is missing" in
+  expect "join rejects unproved reward" rejected
+
+let test_join_parent () =
+  let module Types = Octra_consensus.C_types in
+  let json = finality_json ~epoch:11L ~proto_version:Types.proto_version_parent_legacy
+    ~prev:(raw 'o') ~state:(raw 'p') ~tx_hashes:[] () in
+  let certificate = Yojson.Safe.Util.(json |> member "finalize" |> to_string)
+    |> Base64.decode_exn |> Octra_consensus.C_codec.decode_finalize
+    |> Types.certificate_of_finalize in
+  let parent = Types.{ validator_set = finality_validator_set; certificate } in
+  let read source =
+    let json = record_json ~parent ~source ~proto_version:Types.proto_version_current () in
+    let range = `Assoc ["status", `String "ok"; "records", `List [json]] in
+    let record = match Join.parse_range ~from_epoch:12L range with
+      | Join.Records [record] -> record
+      | _ -> fail "parent record missing" in
+    Join.prepare_record ~chain_id:"octra-test"
+      ~expected_validator_set_hash:trusted_validator_set_hash ~cursor:(cursor ()) record in
+  let prepared = read legacy_reward_source in
+  expect "parent reward proved" (prepared.reward.proposer_addr = "oct_creator");
+  let refused =
+    try ignore (read reward_source); false with
+    | Failure message -> message = "join reward binding: reward source does not match parent commit" in
+  expect "parent reward changed" refused
+
 let test_prepare_record () =
   match Join.parse_range
           ~from_epoch:12L
@@ -433,8 +598,8 @@ let test_prepare_record () =
     expect "proposer"
       (prepared.proposer_info =
        Some { Octra_core.Epochlog.creator_addr = "oct_creator"; commit_round = 4 });
-    expect "parent reward proposer"
-      (prepared.reward.proposer_addr = "oct_parent");
+    expect "proved reward proposer"
+      (prepared.reward.proposer_addr = "oct_creator");
     let entry = Join.finality_entry ~chain_id:"octra-test" prepared in
     expect "entry height" (entry.height = 12);
     expect "entry round" (entry.round = 4);
@@ -855,8 +1020,10 @@ let test_http_range_sources () =
         range_query = {
           sleep = (fun _ -> Lwt.return_unit);
           query_range = (fun ~from_epoch:_ ~max_epochs:_ ~timeout_seconds:_
-              ~validate:_ -> Lwt.return_none);
-          http_range = Join.http_range ~fetch_json http_env;
+              ~validate:_ ~prove:_ -> Lwt.return_none);
+          http_range = (fun ~budget ->
+            expect "early HTTP did not pass its deadline" (budget <= 1.);
+            Join.http_range ~fetch_json ~budget http_env);
         };
       } in
       let result =
@@ -873,8 +1040,8 @@ let test_http_range_sources () =
       end;
       expect "range source order"
         (List.rev !calls =
-         [Join.range_url "http://primary" ~from_epoch:12L ~max_epochs:16;
-          Join.range_url "http://secondary" ~from_epoch:12L ~max_epochs:16]))
+         [Join.range_url "http://primary" ~from_epoch:12L ~max_epochs:2;
+          Join.range_url "http://secondary" ~from_epoch:12L ~max_epochs:2]))
     [
       (fun () -> Lwt.return (`Assoc ["status", `String "not_found"]));
       (fun () -> Lwt.return (range_json []));
@@ -936,6 +1103,11 @@ let test_http_parts () =
          ~max_epochs:1 ~validate:(fun _ -> true))
   in
   expect "each part has its own deadline" (Option.is_some result && !calls = 3);
+  calls := 0;
+  let limited = Lwt_main.run
+    (Join.http_range ~fetch_json ~timeout:0.3 ~budget:0.3 http_env
+       ~from_epoch:12L ~max_epochs:1 ~validate:(fun _ -> true)) in
+  expect "multipart request shares one deadline" (limited = None && !calls < 3);
   List.iter (fun (key, value) ->
     let changed = match second with
       | `Assoc fields -> `Assoc ((key, value) :: List.remove_assoc key fields)
@@ -978,6 +1150,59 @@ let test_http_parts () =
   in
   expect "part count checked before collection"
     (Option.is_some result && !calls = 2)
+
+let test_head_budget () =
+  let closed = ref false in
+  let fetch_json url =
+    if String.starts_with ~prefix:"http://secondary/" url then begin
+      let pending, _ = Lwt.task () in
+      Lwt.on_cancel pending (fun () -> closed := true);
+      pending
+    end else if String.ends_with ~suffix:"/head" url then
+      Lwt.return (head_json ~epoch:40L ~root:(hex_of_raw (raw 's')))
+    else Lwt.return (range_json [record_json ~epoch:40L ()]) in
+  let result = Lwt_main.run (Join.http_head ~fetch_json ~budget:0.01 http_env
+    ~chain_id:"octra-test" ~validator_hash:(fun _ -> trusted_validator_set_hash)
+    ~after:0L) in
+  expect "proved head kept at deadline" (result = Some 40L);
+  expect "other head canceled at deadline" !closed
+
+let test_http_budget () =
+  List.iter (fun head_only ->
+    let canceled = ref 0 in
+    let fetch_json url =
+      let job =
+        let open Lwt.Syntax in
+        let* () = Lwt_unix.sleep 0.2 in
+        if head_only && String.ends_with ~suffix:"/head" url then
+          Lwt.return (head_json ~epoch:40L ~root:(hex_of_raw (raw 's')))
+        else if head_only then Lwt.return (range_json [record_json ~epoch:40L ()])
+        else if String.starts_with ~prefix:"http://primary/" url then
+          Lwt.fail (Failure "source offline")
+        else Lwt.return (range_json [record_json ()]) in
+      Lwt.on_cancel job (fun () -> incr canceled);
+      job in
+    let result =
+      if head_only then
+        Lwt.map Option.is_none (Join.http_head ~fetch_json ~timeout:0.3 ~budget:0.3
+          http_env ~chain_id:"octra-test"
+          ~validator_hash:(fun _ -> trusted_validator_set_hash) ~after:0L)
+      else
+        Lwt.map Option.is_none (Join.http_range ~fetch_json ~timeout:0.3 ~budget:0.3
+          http_env ~from_epoch:12L ~max_epochs:1 ~validate:(fun _ -> true)) in
+    expect "whole HTTP request expires" (Lwt_main.run result);
+    expect "expired HTTP work canceled" (!canceled > 0)
+  ) [false; true];
+  let calls = ref 0 and checked = ref 0 in
+  let pending, wake = Lwt.wait () in
+  let result = Lwt_main.run
+    (Join.http_range ~fetch_json:(fun _ -> incr calls; pending) ~budget:0.01
+      http_env ~from_epoch:12L ~max_epochs:1
+      ~validate:(fun _ -> incr checked; true)) in
+  expect "unresponsive read expires" (result = None);
+  Lwt.wakeup_later wake (range_json [record_json ()]);
+  Lwt_main.run (Lwt.pause ());
+  expect "late read has no effects" (!calls >= 1 && !checked = 0)
 
 let test_http_deadlines () =
   let run head_only =
@@ -1217,6 +1442,73 @@ let test_run_node_catchup_ready () =
     (!fetched = ["http://leader/state-sync/head"]);
   expect "node ready not written" (!ready = None)
 
+let test_join_budget () =
+  let module Parts = Octra_bootstrap.Range_part in
+  let payload = match range_json [record_json ()] with
+    | `Assoc fields ->
+      `Assoc (("padding", `String (String.make (Parts.body_max + 2_000_000) 'x')) :: fields)
+    | _ -> fail "range shape" in
+  let part index = match Parts.reply ~index payload with
+    | Ok json -> json
+    | Error error -> fail error in
+  let first = part 0 and second = part 1 and third = part 2 in
+  let canceled = ref 0 and reads = ref 0 and writes = ref 0 in
+  let fetch_json url =
+    if String.ends_with ~suffix:"/head" url then
+      Lwt.return (head_json ~epoch:12L ~root:(hex_of_raw (raw 's')))
+    else begin
+      incr reads;
+      let index = Uri.get_query_param (Uri.of_string url) "part" in
+      let json = match index with
+        | None -> first | Some "1" -> second | Some "2" -> third
+        | _ -> fail "unexpected part" in
+      let job = Lwt.map (fun () -> json) (Lwt_unix.sleep 0.2) in
+      Lwt.on_cancel job (fun () -> incr canceled);
+      job
+    end in
+  let deps = Join.{
+    chain_id = "octra-test";
+    expected_validator_set_hash = (fun _ -> Ok trusted_validator_set_hash);
+    fetch_json;
+    current_epoch = (fun () -> 12);
+    local_root = (fun () -> hex_of_raw (raw 'p'));
+    base_eic_root = (fun () -> Octra_core.Epoch_index_commitment.genesis_root);
+    next_txid = (fun () -> 7L);
+    put_proposer = (fun _ _ -> incr writes);
+    put_root = (fun _ _ -> incr writes);
+    stage_finality = (fun _ -> incr writes; fail "expired join reached apply");
+    promote_finality = (fun () -> incr writes);
+    apply = (fun ~txs:_ ~receipts_json:_ ~proposer_info:_ ~reward:_ ~epoch_ts:_
+        ~validator_set:_ ~parent_commit:_ -> incr writes; Lwt.return_unit);
+    local_eic = (fun () -> None);
+    write_ready = (fun ~base:_ ~ready_epoch:_ ~state_root:_ ~records_verified:_ -> incr writes);
+    sleep = (fun _ -> Lwt.return_unit);
+    now = (fun () -> 10.0);
+  } in
+  let result = Lwt_main.run (Join.run_node_catchup ~budget:0.3 deps "http://leader") in
+  expect "join multipart deadline"
+    (match result with
+     | Join.Source_unavailable { phase = "range"; error = "HTTP request expired" } -> true
+     | _ -> false);
+  expect "join expiration has no writes" (!writes = 0);
+  expect "join cancels each expired read" (!canceled = 3 && !reads = 6);
+  let pending = ref [] in
+  let deps = { deps with fetch_json = (fun _ ->
+    let job, wake = Lwt.wait () in
+    pending := wake :: !pending;
+    job) } in
+  let result = Lwt_main.run (Lwt_unix.with_timeout 120. (fun () ->
+    Join.run_node_catchup ~budget:0.01 deps "http://leader")) in
+  expect "join head deadline"
+    (match result with
+     | Join.Source_unavailable { phase = "head"; error = "HTTP request expired" } -> true
+     | _ -> false);
+  expect "join head attempts are finite" (List.length !pending = 3);
+  List.iter (fun wake ->
+    Lwt.wakeup_later wake (head_json ~epoch:12L ~root:(hex_of_raw (raw 's')))) !pending;
+  Lwt_main.run (Lwt.pause ());
+  expect "late join has no writes" (!writes = 0)
+
 let test_node_catchup_apply () =
   let local_next = ref 12 in
   let local_root = ref (hex_of_raw (raw 'p')) in
@@ -1267,7 +1559,7 @@ let test_node_catchup_apply () =
       in
       eic := Some prepared.expected_eic;
       events := "apply" :: !events;
-      Lwt.return_unit);
+      Lwt_unix.sleep 0.05);
     local_eic = (fun () -> !eic);
     write_ready = (fun ~base ~ready_epoch ~state_root ~records_verified ->
       ready := Some (base, ready_epoch, state_root, records_verified));
@@ -1275,7 +1567,7 @@ let test_node_catchup_apply () =
     now = (fun () -> 10.0);
   } in
   expect "node apply outcome"
-    (synced (Lwt_main.run (Join.run_node_catchup deps "http://leader")));
+    (synced (Lwt_main.run (Join.run_node_catchup ~budget:0.01 deps "http://leader")));
   expect "node fetched head/range/head"
     (!fetched = [
       "http://leader/state-sync/head";
@@ -1663,8 +1955,8 @@ let test_ready_params () =
     config_hash;
     duty = Some Octra_core.Set_fold.{ marked = []; pulse = Some 1_503_090L };
     sets = None, None;
-    candidate = Some {
-      Octra_core.Validator_admission.address = "oct_test";
+    entry = Some {
+      Octra_core.Validator_entry.address = "oct_test";
       pubkey = raw 'p';
       bond = Z.of_int 1_000_000;
       bonded_epoch = 1_501_965L;
@@ -1722,18 +2014,47 @@ let test_ready_params () =
     (Result.is_error (P.validate ~runtime:{ chain_id; config_hash }
        ~head_epoch:1_503_094L claim));
   expect "ready params no snapshot" (Result.is_error (read (Error "head missing")));
-  let other = Option.map (fun (entry : Octra_core.Validator_admission.candidate) ->
-    { entry with Octra_core.Validator_admission.pubkey = raw 'q' }) snapshot.candidate in
-  expect "ready params identity" (Result.is_error (read (Ok { snapshot with candidate = other })))
+  let other = Option.map (fun (entry : Octra_core.Validator_entry.entry) ->
+    { entry with Octra_core.Validator_entry.pubkey = raw 'q' }) snapshot.entry in
+  expect "ready params identity" (Result.is_error (read (Ok { snapshot with entry = other })))
+
+let test_source_health () =
+  let module S = Octra_node_runtime.Sync_sources in
+  let now = ref 0. in
+  let state = S.create ~now:(fun () -> !now) ~jitter:(fun () -> 1.) () in
+  let sources = ["a"; "b"] in
+  let a = S.start state Range "a" in
+  S.finish state a Failed;
+  expect "failed range paused" (S.plan state Range sources = (["b"], ["a"]));
+  expect "range fault changed head" (S.plan state Head sources = (sources, []));
+  let b = S.start state Range "b" in
+  S.finish state b Busy;
+  expect "all paused has one probe" (S.plan state Range sources = ([], ["a"]));
+  now := 1.;
+  expect "retry expiry" (S.plan state Range sources = (["a"], ["b"]));
+  let older = S.start state Range "a" in
+  let newer = S.start state Range "a" in
+  S.finish state newer Good;
+  S.finish state newer Failed;
+  S.finish state older Failed;
+  expect "late error changed source" (S.plan state Range sources = (["a"], ["b"]));
+  expect "busy response" (S.error "HTTP 429 state_sync_busy" = Busy);
+  expect "missing response" (S.error "HTTP 404" = Neutral)
 
 let () =
+  test_source_health ();
   test_pending_start ();
   test_http_pending ();
   test_join_conflict ();
   test_ready_params ();
   test_normalize_base ();
   test_http_cancel ();
+  test_http_budget ();
+  test_head_budget ();
+  test_http_release ();
   test_http_get_json ();
+  test_http_connect_refused ();
+  if Array.mem "--timing" Sys.argv then test_http_source_share ();
   test_retry_delay ();
   test_head_roots ();
   test_parse_head ();
@@ -1745,6 +2066,8 @@ let () =
   test_http_parts ();
   test_http_deadlines ();
   test_sync_plan ();
+  test_join_reward ();
+  test_join_parent ();
   test_prepare_record ();
   test_prepare_hash_mismatch ();
   test_prepare_binds_legacy_reward ();
@@ -1756,6 +2079,7 @@ let () =
   test_catchup_retry_apply_ready ();
   test_run_catchup_transport_retry ();
   test_run_node_catchup_ready ();
+  test_join_budget ();
   test_node_catchup_apply ();
   test_node_deps_head_roots ();
   test_node_deps_finality ();

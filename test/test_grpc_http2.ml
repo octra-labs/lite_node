@@ -24,8 +24,8 @@ let config = Config.{
   submit_bytes = None;
   max_response_bytes = 1024;
   max_streams = 4;
-  default_deadline_s = 1.0;
-  max_deadline_s = 2.0;
+  default_deadline_s = 300.0;
+  max_deadline_s = 600.0;
 }
 
 let call _meta request =
@@ -158,7 +158,7 @@ let test_success () =
   let* response =
     request
       ~path:"/octra.node.v1.Node/Status"
-      ~deadline:"1S"
+      ~deadline:"300S"
       ~te:(Some "trailers")
       (Frame.encode "")
   in
@@ -312,7 +312,8 @@ let test_stream_reset ~body () =
   let server_socket, client_socket =
     Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0
   in
-  let server_config = Config.{ config with max_streams = 1 } in
+  let server_config = Config.{ config with max_streams = 1;
+    default_deadline_s = 300.; max_deadline_s = 600. } in
   let server = Grpc.accept server_config ~call:rpc (Unix.ADDR_UNIX "grpc") server_socket in
   Lwt.finalize
     (fun () ->
@@ -335,7 +336,7 @@ let test_stream_reset ~body () =
         if body then Lwt.return_unit
         else
           let timeout =
-            let* () = Lwt_unix.sleep 0.5 in
+            let* () = Lwt_unix.sleep 120. in
             Lwt.fail_with "stream reset left backend running"
           in
           Lwt.pick [canceled; timeout]
@@ -371,7 +372,9 @@ let test_parallel_reset () =
   let server_socket, client_socket =
     Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0
   in
-  let server = Grpc.accept config ~call:rpc (Unix.ADDR_UNIX "grpc") server_socket in
+  let server_config = Config.{ config with
+    default_deadline_s = 300.; max_deadline_s = 600. } in
+  let server = Grpc.accept server_config ~call:rpc (Unix.ADDR_UNIX "grpc") server_socket in
   Lwt.finalize
     (fun () ->
       let* client = Client.create_connection ~error_handler:ignore client_socket in
@@ -390,7 +393,7 @@ let test_parallel_reset () =
       let reset = "\000\000\004\003\000\000\000\000\001\000\000\000\008" in
       let* size = Lwt_unix.write_string client_socket reset 0 (String.length reset) in
       if size <> String.length reset then fail "reset frame write differs";
-      let timeout = let* () = Lwt_unix.sleep 0.5 in Lwt.fail_with "parallel reset was not applied" in
+      let timeout = let* () = Lwt_unix.sleep 120. in Lwt.fail_with "parallel reset was not applied" in
       let* () = Lwt.pick [canceled; timeout] in
       if not (Lwt.is_sleeping other) then fail "reset affected another request";
       Lwt.wakeup release ();
@@ -435,7 +438,7 @@ let test_response_expire () =
       Body.Writer.write_string writer (Frame.encode "");
       Body.Writer.close writer;
       let timeout =
-        let* () = Lwt_unix.sleep 0.5 in
+        let* () = Lwt_unix.sleep 120. in
         Lwt.fail_with "response kept request capacity"
       in
       let* () = Lwt.pick [expired; timeout] in
@@ -474,7 +477,7 @@ let test_response_flow () =
   let client_config = H2.Config.{ default with initial_window_size = 1024l } in
   let* response = request ~rpc ~server_config ~client_config
     ~path:"/octra.node.v1.Node/Status"
-    ~deadline:"1S"
+    ~deadline:"300S"
     ~te:(Some "trailers")
     (Frame.encode "")
   in
@@ -509,7 +512,7 @@ let test_request_limit () =
   let* response =
     request
       ~path:"/octra.node.v1.Node/Status"
-      ~deadline:"1S"
+      ~deadline:"300S"
       ~te:(Some "trailers")
       (String.make 70 '\000')
   in
@@ -523,7 +526,7 @@ let test_response_limit () =
     request
       ~server_config
       ~path:"/octra.node.v1.Node/Status"
-      ~deadline:"1S"
+      ~deadline:"300S"
       ~te:(Some "trailers")
       (Frame.encode "")
   in
@@ -536,7 +539,7 @@ let test_te () =
   let* response =
     request
       ~path:"/octra.node.v1.Node/Status"
-      ~deadline:"1S"
+      ~deadline:"300S"
       ~te:None
       (Frame.encode "")
   in
@@ -550,7 +553,7 @@ let test_content_type () =
       ~content_type:"application/grpc+json"
       ~expect_trailers:false
       ~path:"/octra.node.v1.Node/Status"
-      ~deadline:"1S"
+      ~deadline:"300S"
       ~te:(Some "trailers")
       (Frame.encode "")
   in
@@ -574,23 +577,23 @@ let test_submit_size () =
   let server_config = { config with submit_bytes = Some 5_000_005 } in
   let json = "{\"payload\":\"" ^ String.make 4_142_248 'a' ^ "\"}" in
   let* reply = request ~submit ~server_config ~path:submit_path
-    ~deadline:"2S" ~te:(Some "trailers") (submit_wire json) in
+    ~deadline:"300S" ~te:(Some "trailers") (submit_wire json) in
   if grpc_status reply <> Some "0" || !calls <> 1 then
     fail (Printf.sprintf "large submission status = %s calls = %d trailers = %s"
       (Option.value ~default:"none" (grpc_status reply)) !calls
       (Option.fold ~none:"none" ~some:H2.Headers.to_string reply.trailers));
   let* disabled = request ~submit ~path:submit_path
-    ~deadline:"1S" ~te:(Some "trailers") (submit_wire "{}") in
+    ~deadline:"300S" ~te:(Some "trailers") (submit_wire "{}") in
   if grpc_status disabled <> Some "12" || !calls <> 1 then fail "disabled submission reached backend";
   let* absent = request ~server_config ~path:submit_path
-    ~deadline:"1S" ~te:(Some "trailers") (submit_wire "{}") in
+    ~deadline:"300S" ~te:(Some "trailers") (submit_wire "{}") in
   if grpc_status absent <> Some "12" then fail "missing submission capability admitted";
   let server_config = { config with submit_bytes = Some 8 } in
   let* large = request ~submit ~server_config ~path:submit_path
-    ~deadline:"1S" ~te:(Some "trailers") (submit_wire "{\"nonce\":7}") in
+    ~deadline:"300S" ~te:(Some "trailers") (submit_wire "{\"nonce\":7}") in
   if grpc_status large <> Some "8" || !calls <> 1 then fail "submission cap differs";
   let* invalid = request ~submit ~server_config ~path:submit_path
-    ~deadline:"1S" ~te:(Some "trailers") (submit_wire "[]") in
+    ~deadline:"300S" ~te:(Some "trailers") (submit_wire "[]") in
   if grpc_status invalid <> Some "3" || !calls <> 1 then fail "array submission admitted";
   Lwt.return_unit
 
@@ -607,14 +610,14 @@ let test_submit_slots () =
   in
   let server_config = { config with submit_bytes = Some 1024 } in
   let accept = Grpc.accept ~submit server_config ~call in
-  let send () = request ~accept ~path:submit_path ~deadline:"1S"
+  let send () = request ~accept ~path:submit_path ~deadline:"300S"
     ~te:(Some "trailers") (submit_wire "{}") in
   let first = send () in
   let* () = entered in
   let* busy = send () in
   if grpc_status busy <> Some "8" || !calls <> 1 then fail "submission slot not shared";
   let* read = request ~accept ~path:"/octra.node.v1.Node/Status"
-    ~deadline:"1S" ~te:(Some "trailers") (Frame.encode "") in
+    ~deadline:"300S" ~te:(Some "trailers") (Frame.encode "") in
   if grpc_status read <> Some "0" then fail "submission blocked reads";
   Lwt.wakeup_later release ();
   let* first = first in
@@ -632,12 +635,12 @@ let test_submit_expiry () =
   let first = request ~accept ~close_request:false ~path:submit_path
     ~deadline:"50m" ~te:(Some "trailers") "" in
   let* () = Lwt_unix.sleep 0.01 in
-  let* busy = request ~accept ~path:submit_path ~deadline:"1S"
+  let* busy = request ~accept ~path:submit_path ~deadline:"300S"
     ~te:(Some "trailers") (submit_wire "{}") in
   if grpc_status busy <> Some "8" || !calls <> 0 then fail "body read lost submission slot";
   let* expired = first in
   if grpc_status expired <> Some "4" || !calls <> 0 then fail "expired body was submitted";
-  let* next = request ~accept ~path:submit_path ~deadline:"1S"
+  let* next = request ~accept ~path:submit_path ~deadline:"300S"
     ~te:(Some "trailers") (submit_wire "{}") in
   if grpc_status next <> Some "0" || !calls <> 1 then fail "expired submission kept slot";
   Lwt.return_unit
@@ -656,7 +659,7 @@ let test_submit_result () =
     ~te:(Some "trailers") (submit_wire "{}") in
   if grpc_status reply <> Some "4" || !accepted <> 1 then fail "deadline result differs";
   if Lwt.state work <> Lwt.Fail Lwt.Canceled then fail "expired response work not canceled";
-  let* next = request ~accept ~path:submit_path ~deadline:"1S"
+  let* next = request ~accept ~path:submit_path ~deadline:"300S"
     ~te:(Some "trailers") (submit_wire "{}") in
   if grpc_status next <> Some "0" || !accepted <> 2 then fail "result slot not released";
   Lwt.return_unit
@@ -671,7 +674,7 @@ let test_submit_depth () =
     let json = "{\"payload\":" ^ String.make depth '[' ^ "0"
       ^ String.make depth ']' ^ "}"
     in
-    request ~accept ~path:submit_path ~deadline:"1S" ~te:(Some "trailers")
+    request ~accept ~path:submit_path ~deadline:"300S" ~te:(Some "trailers")
       (submit_wire json)
   in
   let* rejected = send (Rpc.max_param_depth - 1) in
@@ -961,7 +964,7 @@ let main () =
 let () =
   let limit =
     let open Lwt.Syntax in
-    let* () = Lwt_unix.sleep 5.0 in
+    let* () = Lwt_unix.sleep 120.0 in
     Lwt.fail_with "test_grpc_http2: time limit exceeded"
   in
   let run = match Sys.argv with

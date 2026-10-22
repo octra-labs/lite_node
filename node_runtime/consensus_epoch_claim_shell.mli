@@ -60,6 +60,7 @@ type live_ledger_tx_args = {
   field_policy : Private_ledger.field_policy;
   strict : bool;
   math : bool;
+  keyed : bool;
   current_epoch : unit -> int;
   private_result_policy :
     int ->

@@ -17,6 +17,7 @@ type deps = {
 }
 
 type node_deps = {
+  finish_applied : Octra_consensus.C_types.finalize -> bool;
   check_finality : Octra_consensus.C_types.finalize -> unit;
   write_finality : Octra_consensus.C_types.finalize -> unit;
   persist_finality_certificate :
@@ -54,8 +55,10 @@ type node_deps = {
   remove_pending_finalized : epoch:int -> unit;
   set_state_attested : head:int -> root:string -> unit;
   apply_timeout_seconds : float;
+  stall_timeout_seconds : float;
+  defer_apply : epoch:int -> reason:string -> unit;
+  recover_apply : epoch:int -> reason:string -> unit;
   bundle_wait_expired : epoch_id:int64 -> unit;
-  bundle_wait_recovered : epoch_id:int64 -> unit;
   require_sync : Sync_need.t -> unit;
   fatal_exit : unit -> unit;
   catchup_active : unit -> bool;
@@ -64,6 +67,7 @@ type node_deps = {
 }
 
 type node_runtime = {
+  committed_epoch_root_raw : int -> string option;
   data_dir : string;
   bundles : Consensus_bundle_cache.node_runtime;
   driver_ref : Octra_consensus.C_driver.t option ref;
@@ -77,6 +81,7 @@ type node_runtime = {
   read_commit_root : unit -> string option Lwt.t;
   read_local_root_raw : unit -> string Lwt.t;
   apply_timeout_seconds : float;
+  stall_timeout_seconds : float;
   require_sync : Sync_need.t -> unit;
   fatal_exit : unit -> unit;
   catchup_active : bool ref;
@@ -94,10 +99,12 @@ type t = {
   replay_stashed_while_safe : source:string -> unit Lwt.t;
 }
 
-let create_with_failure deps on_failure =
+let create_with_failure ?(before_apply = fun _ _ -> Lwt.return_unit)
+    deps on_failure on_deferred on_recovered =
   let apply_deps = Consensus_finalized_apply.node_deps deps.apply in
   let active_apply = ref None in
-  let rec apply_finalized ~validator_set finalize =
+  let jobs = ref Lwt.return_unit in
+  let rec apply_next ~validator_set finalize =
     let epoch = finalize.Octra_consensus.C_types.epoch_id in
     let validator_set_hash =
       Octra_consensus.C_config.validator_set_hash validator_set
@@ -121,13 +128,19 @@ let create_with_failure deps on_failure =
       else
         let open Lwt.Syntax in
         let* () = pending in
-        apply_finalized ~validator_set finalize
+        apply_next ~validator_set finalize
     | None ->
+      let epoch_id = Int64.to_int epoch in
+      let prior_error = deps.replay.finality.apply_error epoch_id in
+      deps.replay.finality.clear_apply ~epoch:epoch_id;
       let pending, resolver = Lwt.wait () in
       active_apply := Some (finalize, validator_set_hash, pending);
       let running =
         Lwt.catch
           (fun () ->
+            let open Lwt.Syntax in
+            let* () = if apply_deps.finish_applied finalize then Lwt.return_unit
+              else before_apply validator_set finalize in
             Consensus_finalized_apply.run
               apply_deps
               ~validator_set
@@ -136,13 +149,32 @@ let create_with_failure deps on_failure =
       in
       Lwt.on_any
         running
-        (fun () ->
+        (fun result ->
           active_apply := None;
+          (match result, prior_error with
+           | Consensus_post_finalize.Applied, Some reason ->
+             on_recovered ~epoch:epoch_id ~reason
+           | Deferred reason, _ -> on_deferred ~epoch:epoch_id ~reason
+           | _ -> ());
           Lwt.wakeup_later resolver ())
         (fun exn ->
           active_apply := None;
           Lwt.wakeup_later_exn resolver exn);
       pending
+  in
+  let apply_finalized ~validator_set finalize =
+    let work = apply_next ~validator_set finalize in
+    let group = Lwt.join [!jobs; work] in
+    jobs := group;
+    let release _ = if !jobs == group then jobs := Lwt.return_unit in
+    Lwt.on_any group release release;
+    Lwt.protected work
+  in
+  let rec await_jobs () =
+    let open Lwt.Syntax in
+    let pending = !jobs in
+    let* () = Lwt.protected pending in
+    if pending == !jobs then Lwt.return_unit else await_jobs ()
   in
   let replay =
     Consensus_finalized_replay.node_runner
@@ -157,23 +189,30 @@ let create_with_failure deps on_failure =
   in
   {
     apply_finalized;
-    drain_pending = replay.drain_pending;
+    drain_pending = (fun () ->
+      let open Lwt.Syntax in
+      let* () = await_jobs () in
+      replay.drain_pending ());
     replay_stashed_while_safe = replay.replay_stashed_while_safe;
   }
 
 let create deps =
   create_with_failure deps (fun _ exn -> Lwt.fail exn)
+    (fun ~epoch:_ ~reason:_ -> ())
+    (fun ~epoch:_ ~reason:_ -> ())
 
 let stop_after_fatal () =
   let pending, _ = Lwt.wait () in
   pending
 
-let create_node deps =
+let create_node ?before_apply deps =
   create_with_failure
+    ?before_apply
     {
       apply =
         {
           check_finality = deps.check_finality;
+          finish_applied = deps.finish_applied;
           write_finality = deps.write_finality;
           persist_finality_certificate = deps.persist_finality_certificate;
           store_proposer = (fun finalize ->
@@ -198,13 +237,13 @@ let create_node deps =
           sleep = deps.sleep;
           bundle_wait_timeout_seconds = deps.apply_timeout_seconds;
           bundle_wait_expired = deps.bundle_wait_expired;
-          bundle_wait_recovered = deps.bundle_wait_recovered;
           post_finalize = (fun ~epoch_id ~proposed_root ->
             Consensus_post_finalize.run
               {
                 deactivate_gap = deps.deactivate_gap;
                 set_consensus_finalized = deps.set_consensus_finalized;
                 committed_head_epoch = deps.committed_head_epoch;
+                apply_error = deps.finality.apply_error;
                 sleep = deps.sleep;
                 read_pre_finalize_root = deps.read_pre_finalize_root;
                 read_commit_root = deps.read_commit_root;
@@ -212,7 +251,7 @@ let create_node deps =
                 commit_finality_journal = deps.commit_finality_journal;
                 remove_pending_finalized = deps.remove_pending_finalized;
                 set_state_attested = deps.set_state_attested;
-                apply_timeout_seconds = deps.apply_timeout_seconds;
+                apply_timeout_seconds = deps.stall_timeout_seconds /. 2.;
                 fatal_exit = deps.fatal_exit;
               }
               ~epoch_id
@@ -251,6 +290,8 @@ let create_node deps =
         | _ -> deps.fatal_exit ()
       end;
       stop_after_fatal ())
+    deps.defer_apply
+    deps.recover_apply
 
 let node_deps_of_runtime runtime =
   let bundle_wait_reason epoch_id =
@@ -262,6 +303,19 @@ let node_deps_of_runtime runtime =
         Octra_consensus.Finality_log.check_write
           runtime.data_dir
           (Octra_consensus.Finality_log.of_finalize finalize)));
+    finish_applied = (fun finalize ->
+      let module J = Consensus_finality_journal in
+      let epoch = Int64.to_int finalize.Octra_consensus.C_types.epoch_id in
+      if runtime.committed_head_epoch () < epoch then false
+      else match J.read_committed_epoch ~chain_id:finalize.chain_id
+          ~epoch:finalize.epoch_id runtime.data_dir with
+      | J.Valid record when J.same_block record.finalize finalize ->
+        (match runtime.committed_epoch_root_raw epoch with
+        | Some root when root = finalize.header.proposed_state_root ->
+          runtime.finality.remove_finalized ~epoch;
+          true
+        | _ -> false)
+      | _ -> false);
     write_finality = (fun finalize ->
       Consensus_finality_journal.guard runtime.data_dir finalize (fun () ->
         Octra_consensus.Finality_log.write runtime.data_dir
@@ -299,23 +353,28 @@ let node_deps_of_runtime runtime =
     commit_finality_journal = (fun () ->
       Consensus_finality_journal.promote runtime.data_dir);
     apply_timeout_seconds = runtime.apply_timeout_seconds;
+    stall_timeout_seconds = runtime.stall_timeout_seconds;
+    defer_apply = (fun ~epoch ~reason ->
+      runtime.finality.defer_apply ~epoch ~reason;
+      ignore (Consensus_runtime_state.enter_quarantine
+        runtime.runtime_state ~epoch ~reason);
+      ignore (Consensus_catchup_queue.queue_gap runtime.catchup_queue
+        ~target_epoch:(Int64.of_int epoch) ~reason));
+    recover_apply = (fun ~epoch ~reason ->
+      let state = runtime.runtime_state in
+      if Consensus_runtime_state.quarantine_since_epoch state = epoch
+         && Consensus_runtime_state.quarantine_reason state = reason
+         && Consensus_runtime_state.attested_head state epoch
+         && runtime.committed_head_epoch () >= epoch then
+        match Consensus_runtime_state.clear_quarantine state ~evidence:reason with
+        | Cleared -> Log.info "consensus" "event = finalized_apply_recovered epoch = %d" epoch
+        | Inactive | Refused _ -> ());
     bundle_wait_expired = (fun ~epoch_id ->
       ignore
         (Consensus_runtime_state.enter_quarantine
            runtime.runtime_state
            ~epoch:(Int64.to_int epoch_id)
            ~reason:(bundle_wait_reason epoch_id)));
-    bundle_wait_recovered = (fun ~epoch_id ->
-      if
-        Consensus_runtime_state.quarantine_active runtime.runtime_state
-        && String.equal
-             (Consensus_runtime_state.quarantine_reason runtime.runtime_state)
-             (bundle_wait_reason epoch_id)
-      then
-        ignore
-          (Consensus_runtime_state.clear_quarantine
-             runtime.runtime_state
-             ~evidence:(bundle_wait_reason epoch_id)));
     remove_pending_finalized = runtime.finality.remove_finalized;
     set_state_attested = runtime.set_state_attested;
     require_sync = runtime.require_sync;
@@ -326,5 +385,5 @@ let node_deps_of_runtime runtime =
     finality = runtime.finality;
   }
 
-let create_node_runtime runtime =
-  create_node (node_deps_of_runtime runtime)
+let create_node_runtime ?before_apply runtime =
+  create_node ?before_apply (node_deps_of_runtime runtime)

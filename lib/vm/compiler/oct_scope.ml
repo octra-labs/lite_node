@@ -5,6 +5,50 @@ open Oct_lang
 
 module Names = Set.Make (String)
 
+let check_const_refs definitions =
+  let edges = Hashtbl.create (List.length definitions) in
+  List.iter (fun (name, refs) ->
+    if not (Hashtbl.mem edges name) then Hashtbl.add edges name refs) definitions;
+  let rec visit done_ active = function
+    | [] -> Ok ()
+    | (name, true) :: rest -> visit (Names.add name done_) (Names.remove name active) rest
+    | (name, false) :: rest when Names.mem name done_ -> visit done_ active rest
+    | (name, false) :: _ when Names.mem name active -> Error "constant dependency is cyclic"
+    | (name, false) :: rest ->
+      let pending = Names.fold (fun child out -> (child, false) :: out)
+        (Hashtbl.find edges name) ((name, true) :: rest) in
+      visit done_ (Names.add name active) pending
+  in
+  visit Names.empty Names.empty (List.map (fun (name, _) -> name, false) definitions)
+
+let check_consts program =
+  let names = Names.of_list (List.map (fun item -> item.c_name) program.consts) in
+  let rec references found = function
+    | [] -> found
+    | value :: rest ->
+      let add values = List.rev_append values rest in
+      begin match value with
+      | EVar name when Names.mem name names ->
+        references (Names.add name found) rest
+      | EIndex (_, values) | ECall (_, values) | EArray values | ETuple values
+      | EStoragePath (_, values, _) | EIndexField (_, values, _) -> references found (add values)
+      | EBinop (_, left, right) | EEqual (_, left, right) -> references found (add [left; right])
+      | EUnop (_, value) | EBalance value | EAction (_, value) -> references found (add [value])
+      | ETernary (guard, yes, no) -> references found (add [guard; yes; no])
+      | ELet (_, _, _, input, body) | ESplit (input, _, _, body) ->
+        references found (input :: body :: rest)
+      | EOrbit (_, turns, seed, _, body) ->
+        references found (body :: add (seed :: Option.to_list turns))
+      | EUse value ->
+        references found (value.ux_body :: add (value.ux_arg :: value.ux_caps))
+      | EInt _ | EBool _ | EString _ | EVar _ | EField _ | ECaller | EOrigin | ESelfAddr
+      | EEpoch | EEpochTime | EValue | ETreeHash | ENodeId | ETxHash | EFieldProp _
+      | EEnumVariant _ -> references found rest
+      end
+  in
+  check_const_refs (List.map (fun item -> item.c_name,
+    references Names.empty [item.c_value]) program.consts)
+
 let check_loops program =
   let ( let* ) = Result.bind in
   let rec block names line column = function

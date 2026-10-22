@@ -7,6 +7,7 @@ type t = {
     (int, Octra_consensus.C_types.validator_set) Hashtbl.t;
   proposers : (int, Octra_core.Epochlog.proposer_info) Hashtbl.t;
   expected_roots : (int, string) Hashtbl.t;
+  mutable apply_error : (int * string) option;
 }
 
 type callbacks = {
@@ -28,6 +29,9 @@ type callbacks = {
   remove_finalized : epoch:int -> unit;
   remove_proposer : epoch:int -> unit;
   prune_after_epoch : int -> unit;
+  defer_apply : epoch:int -> reason:string -> unit;
+  clear_apply : epoch:int -> unit;
+  apply_error : int -> string option;
 }
 
 let create () = {
@@ -35,7 +39,21 @@ let create () = {
   finalized_sets = Hashtbl.create 16;
   proposers = Hashtbl.create 16;
   expected_roots = Hashtbl.create 16;
+  apply_error = None;
 }
+
+let defer_apply (t : t) ~epoch ~reason =
+  t.apply_error <- Some (epoch, reason)
+
+let clear_apply (t : t) ~epoch =
+  match t.apply_error with
+  | Some (at, _) when at = epoch -> t.apply_error <- None
+  | _ -> ()
+
+let apply_error (t : t) epoch =
+  match t.apply_error with
+  | Some (at, reason) when at = epoch -> Some reason
+  | _ -> None
 
 let find_finalized t epoch =
   Hashtbl.find_opt t.finalized epoch
@@ -64,6 +82,7 @@ let store_finalized_with_set t epoch validator_set finalize =
   Hashtbl.replace t.finalized_sets epoch validator_set
 
 let remove_finalized t epoch =
+  clear_apply t ~epoch;
   Hashtbl.remove t.finalized epoch;
   Hashtbl.remove t.finalized_sets epoch
 
@@ -110,7 +129,10 @@ let prune_after table epoch =
     if key > epoch then None else Some value
   ) table
 
-let prune_after_epoch t epoch =
+let prune_after_epoch (t : t) epoch =
+  (match t.apply_error with
+   | Some (at, _) when at > epoch -> t.apply_error <- None
+   | _ -> ());
   prune_after t.finalized epoch;
   prune_after t.finalized_sets epoch;
   prune_after t.proposers epoch;
@@ -132,4 +154,7 @@ let callbacks t =
     remove_finalized = (fun ~epoch -> remove_finalized t epoch);
     remove_proposer = (fun ~epoch -> remove_proposer t epoch);
     prune_after_epoch = prune_after_epoch t;
+    defer_apply = defer_apply t;
+    clear_apply = clear_apply t;
+    apply_error = apply_error t;
   }

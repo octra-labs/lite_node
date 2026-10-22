@@ -313,7 +313,7 @@ let make_weighted ~source_epoch ~activate_epoch members =
   else
     let entries =
       List.map
-        (fun (member : Validator_admission.member) ->
+        (fun (member : Validator_entry.member) ->
           {
             address = member.address;
             pubkey_b64 = Base64.encode_exn member.pubkey;

@@ -92,6 +92,15 @@ val program_source : t -> epoch:int -> (mode, fault) result
 val program_overlap_epochs : int
 val program_overlap : t -> epoch:int -> (bool, fault) result
 val program_source_at : chain_id:string -> epoch:int -> mode
+val stake_activation_for_chain : string -> activation option
+val stake : t -> epoch:int -> (mode, fault) result
+val program_records_activation_for_chain : string -> activation option
+val program_records : t -> epoch:int -> (mode, fault) result
+val program_records_at : chain_id:string -> epoch:int -> mode
+
+val duty_marks_activation_for_chain : string -> activation option
+val duty_marks : t -> epoch:int -> (mode, fault) result
+val duty_marks_at : chain_id:string -> epoch:int -> mode
 val ready_config_hash : t -> string option
 
 val consensus_id : chain_id:string -> epoch:int -> string
@@ -202,3 +211,7 @@ val fault_message : fault -> string
 val cipher_migration : t -> epoch:int -> (mode, fault) result
 val cipher_activation_for_chain : string -> activation option
 val cipher_migration_at : chain_id:string -> epoch:int -> mode
+
+val proof_key_activation_for_chain : string -> activation option
+val proof_key : t -> epoch:int -> (mode, fault) result
+val proof_key_at : chain_id:string -> epoch:int -> mode

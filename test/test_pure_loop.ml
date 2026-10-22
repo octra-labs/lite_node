@@ -123,8 +123,8 @@ let check_rpc () =
     (rpc_cases "      let j = i + 1")
 
 let run_image ?(value = 7) image =
-  let code = match Octra_vm.Admission.decode_program_source ~point_ops:true image with
-    | Ok value -> Octra_vm.Admission.code value
+  let code = match Octra_vm.Code_check.decode_program_source ~point_ops:true image with
+    | Ok value -> Octra_vm.Code_check.code value
     | Error _ -> failwith "program decode failed"
   in
   let state = Octra_vm.Contract.setup_call_state ~caller:"caller" ~address:"program"
@@ -215,7 +215,7 @@ program Loop {
         let meta = Octra_core.Store_irmin.{
           address = "program";
           code_hash = Digestif.SHA256.(digest_string compiled.envelope |> to_hex);
-          version = "1"; owner = "owner"; ctype = "CUSTOM"; admission = "source";
+          version = "1"; owner = "owner"; ctype = "CUSTOM"; check = "source";
         } in
         begin match Octra_vm.Contract_rpc.verify_compilation ~main:"entry.aml"
             ~meta:(Some meta) ~source:body ~files_json:None with

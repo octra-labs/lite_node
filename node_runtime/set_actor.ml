@@ -4,7 +4,7 @@
 module String_map = Map.Make (String)
 module Int64_set = Set.Make (Int64)
 
-type admission =
+type check =
   | Accepted
   | Busy
   | Stopped
@@ -12,6 +12,7 @@ type admission =
 type action =
   | Pulse
   | Appeal of Octra_core.Set_fold.proof
+  | Appeals of Octra_core.Set_fold.proof list
 
 type sample = {
   epoch : int64;
@@ -102,6 +103,7 @@ type command = {
 
 type t = {
   deps : deps;
+  batch : unit -> bool;
   observe : observation -> unit;
   mutable state : state;
   stream : command Queue.t;
@@ -246,11 +248,20 @@ let acknowledge epoch (receipt : Octra_core.Set_fold.receipt) state =
   in
   { state with appeals }
 
-let decide (sample : sample) (receipt : Octra_core.Set_fold.receipt) state =
+let decide ?(batch = false) (sample : sample) (receipt : Octra_core.Set_fold.receipt) state =
   if sample.bonded <> Ok true || state.last_send = Some sample.epoch then None
   else if not sample.active then
     if pulse_due sample.epoch receipt.pulse then Some Pulse else None
   else
+    if batch then
+      let proofs = String_map.bindings state.appeals
+        |> List.filter_map (fun (_, (appeal : appeal)) ->
+          if sample.epoch >= appeal.ready && sample.epoch <= appeal.expires then
+            Some appeal.proof else None)
+        |> List.sort (fun (left : Octra_core.Set_fold.proof) right ->
+          Int64.compare left.vote.epoch_id right.vote.epoch_id) in
+      if proofs = [] then None else Some (Appeals proofs)
+    else
     match ready_appeal sample.epoch state.appeals with
     | Some (_, appeal) -> Some (Appeal appeal.proof)
     | None -> None
@@ -331,7 +342,7 @@ let handle_notice t notice =
       settle_read (Some (sample.epoch, receipt.marked))
         (acknowledge current.epoch receipt t.state);
       if current.epoch <> sample.epoch || not allowed then Lwt.return_unit else
-      match decide current receipt t.state with
+      match decide ~batch:(t.batch ()) current receipt t.state with
       | None -> Lwt.return_unit
       | Some _ when t.deps.peers () <= 0 ->
         report t Transport "validator set fold transport has no peers";
@@ -340,6 +351,7 @@ let handle_notice t notice =
         begin match action with
         | Pulse -> ()
         | Appeal proof -> observe t Attempt current.epoch proof
+        | Appeals proofs -> List.iter (observe t Attempt current.epoch) proofs
         end;
         let* result = t.deps.send ~epoch:current.epoch action in
         begin
@@ -432,9 +444,10 @@ let notify t ~epoch event =
 let wake t ~head =
   notify t ~epoch:(Int64.succ (Int64.of_int head)) None
 
-let create ?(observe = fun _ -> ()) deps =
+let create ?(observe = fun _ -> ()) ?(batch = fun () -> false) deps =
   let t = {
     deps;
+    batch;
     observe;
     state = empty;
     stream = Queue.create ();

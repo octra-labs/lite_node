@@ -332,10 +332,10 @@ fn top1_i64(
                 sum + i64::from(*weight as i8) * *value
             });
             let score = scaled_sum(i128::from(sum), scale, "top1 accumulator overflow")?;
-            let candidate = (row_start + local_index, score);
+            let entry = (row_start + local_index, score);
             Ok::<_, &'static str>(match best {
                 Some((_, best_score)) if best_score >= score => best,
-                _ => Some(candidate),
+                _ => Some(entry),
             })
         })?
         .ok_or("empty top1 tensor")
@@ -355,10 +355,10 @@ fn top1_i128(
                 sum + i128::from(*weight as i8) * i128::from(*value)
             });
             let score = scaled_sum(sum, scale, "top1 accumulator overflow")?;
-            let candidate = (row_start + local_index, score);
+            let entry = (row_start + local_index, score);
             Ok::<_, &'static str>(match best {
                 Some((_, best_score)) if best_score >= score => best,
-                _ => Some(candidate),
+                _ => Some(entry),
             })
         })?
         .ok_or("empty top1 tensor")
@@ -389,9 +389,9 @@ fn parallel_top1(
     })?;
     results
         .into_iter()
-        .reduce(|best, candidate| {
-            if candidate.1 > best.1 {
-                candidate
+        .reduce(|best, entry| {
+            if entry.1 > best.1 {
+                entry
             } else {
                 best
             }
@@ -1011,9 +1011,9 @@ mod tests {
             })
             .collect::<Result<Vec<_>, &'static str>>()?
             .into_iter()
-            .reduce(|best, candidate| {
-                if candidate.1 > best.1 {
-                    candidate
+            .reduce(|best, entry| {
+                if entry.1 > best.1 {
+                    entry
                 } else {
                     best
                 }

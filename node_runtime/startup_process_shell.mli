@@ -15,7 +15,7 @@ type network_config = {
   chain_id : string;
 }
 
-type local_wallet_admission =
+type local_wallet_check =
   | Wallet_admitted
   | Missing_voting_validator
   | Missing_non_voting_validator
@@ -87,7 +87,7 @@ val validator_pubkeys_boot :
   fallback:(string * string) list ->
   (string * string) list
 
-val local_wallet_admission :
+val local_wallet_check :
   permissionless:bool ->
   validator_env_present:bool ->
   validators:(string * string) list ->
@@ -95,7 +95,7 @@ val local_wallet_admission :
   wallet_pub:string ->
   voting_consensus_mode:bool ->
   consensus_mode:bool ->
-  local_wallet_admission
+  local_wallet_check
 
 val admit_local_wallet :
   permissionless:bool ->

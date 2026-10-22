@@ -48,5 +48,14 @@ val consume_root :
   data_dir:string ->
   chain:string ->
   verified_head:int ->
+  limit:int ->
+  Sync_need.t ->
+  (unit, string) result
+
+val consume_range :
+  data_dir:string ->
+  chain:string ->
+  verified_head:int ->
+  limit:int ->
   Sync_need.t ->
   (unit, string) result

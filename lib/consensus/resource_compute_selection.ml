@@ -6,7 +6,7 @@ module NodeMap = Map.Make (String)
 let max_chain_id_bytes = 128
 let max_node_id_bytes = 128
 let max_nonce_bytes = 128
-let max_candidates = 256
+let max_entries = 256
 let max_committee_size = 64
 
 type commitment = {
@@ -377,8 +377,8 @@ let select
     || not (bounded_non_empty max_chain_id_bytes chain_id)
     || not (hash32 offer_id)
     || not (hash32 challenge)
-    || List.length commitments > max_candidates
-    || List.length reveals > max_candidates
+    || List.length commitments > max_entries
+    || List.length reveals > max_entries
   then
     invalid_arg "resource compute selection parameters";
   let members =

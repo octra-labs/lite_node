@@ -48,7 +48,7 @@ type build_preverify = {
   skipped_sample : string;
 }
 
-type proposal_admission_result =
+type proposal_check_result =
   | Proposal_admit
   | Proposal_defer
 
@@ -127,7 +127,7 @@ type proposal_roots = {
   prev_state_root : string;
 }
 
-type tx_hash_admission =
+type tx_hash_check =
   | Tx_hash_ok of string list
   | Tx_hash_mismatch
 
@@ -348,7 +348,7 @@ type verification_deps = {
 
 type validator_pubkeys = (string * string) list
 
-type admission_plan =
+type check_plan =
   | Proceed
   | Defer_state_not_attested
   | Defer_quarantine of {
@@ -375,6 +375,14 @@ val within_limits : limits:limits -> Transaction.t list -> bool
 
 val cap : limits:limits -> Transaction.t list -> capped
 
+val precheck :
+  ordered:bool ->
+  run_many:(Transaction.t list -> Octra_core.Preverify_worker.batch Lwt.t) ->
+  Transaction.t list ->
+  Octra_core.Preverify_worker.batch Lwt.t
+
+val prepared_batch : Transaction.t list -> prepared -> Octra_core.Preverify_worker.batch
+
 val local_preverify_bundle :
   run_many:(Transaction.t list -> Octra_core.Preverify_worker.batch Lwt.t) ->
   tx_hashes:string list ->
@@ -394,14 +402,14 @@ val build_preverify :
   Transaction.t list ->
   build_preverify Lwt.t
 
-val handle_proposal_admission :
+val handle_proposal_check :
   start_height:(int64 -> unit Lwt.t) ->
   epoch_id:int64 ->
   current_epoch:int ->
   state_attested:bool ->
   quarantine_active:bool ->
   quarantine_reason:string ->
-  proposal_admission_result Lwt.t
+  proposal_check_result Lwt.t
 
 val verify_bundle :
   verification_deps ->
@@ -467,6 +475,7 @@ val proposal_roots :
   proposal_roots
 
 val prev_root_decision :
+  certified_root:string option ->
   epoch_id:int64 ->
   target_root:string ->
   current_root:string ->
@@ -581,10 +590,10 @@ val log_build_preverify :
 
 val tx_list_hash : string list -> string
 
-val tx_hash_admission :
+val tx_hash_check :
   expected_tx_list_hash:string ->
   tx_hashes:string list ->
-  tx_hash_admission
+  tx_hash_check
 
 val build_header :
   chain_id:string ->
@@ -675,10 +684,10 @@ val handle_before_precommit :
   vote_wire:string ->
   bool
 
-val admission_plan :
+val check_plan :
   epoch_id:int64 ->
   current_epoch:int ->
   state_attested:bool ->
   quarantine_active:bool ->
   quarantine_reason:string ->
-  admission_plan
+  check_plan

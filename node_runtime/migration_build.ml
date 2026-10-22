@@ -57,7 +57,7 @@ let read request =
       let archive = Archive.open_chaindata ~readonly:true (path "chaindata") in
       Fun.protect ~finally:(fun () -> Archive.close archive) (fun () ->
         let rec collect totals = function
-          | [] -> Chain.admission chain ~activation_epoch:request.activation_epoch (List.rev totals)
+          | [] -> Chain.check chain ~activation_epoch:request.activation_epoch (List.rev totals)
           | address :: rest ->
             let* total = Chain.total chain store archive ~address
               ~first_epoch:request.first_epoch ~last_epoch:(Int64.to_int checkpoint.epoch)

@@ -28,6 +28,7 @@ type tx_context = {
 
 type rejected_record = {
   hash : string;
+  op_type : Transaction.op_type;
   from_addr : string;
   to_addr : string;
   amount : string;
@@ -145,6 +146,7 @@ let rejected_line ~hash ~error_type ~reason =
 let rejected_record ~epoch_id ~ts ~error_type ~reason (tx : Transaction.t) =
   {
     hash = Transaction.hash tx;
+    op_type = tx.op_type;
     from_addr = tx.from;
     to_addr = tx.to_;
     amount = Z.to_string tx.amount;
@@ -213,6 +215,7 @@ let live_tx_sink deps =
       epoch = deps.current_epoch;
       save_rejected = (fun rejected ->
         Octra_core.Store_chaindata.save_rejected deps.chaindata
+          ~op_type:rejected.op_type
           ~hash:rejected.hash
           ~from_addr:rejected.from_addr
           ~to_addr:rejected.to_addr
@@ -279,6 +282,7 @@ let save_live_rejections ~chaindata ~epoch_id ~ts ~processed_hashes
     {
       save_rejected = (fun rejected ->
         Octra_core.Store_chaindata.save_rejected chaindata
+          ~op_type:rejected.op_type
           ~hash:rejected.hash
           ~from_addr:rejected.from_addr
           ~to_addr:rejected.to_addr

@@ -173,6 +173,141 @@ let test_rotate_readonly dir =
     expect "read-only rotation wrote a segment"
       (not (Sys.file_exists (Txlog.seg_path dir 1))))
 
+let parallel jobs =
+  let work = List.map (fun run ->
+    let result = ref None in
+    let thread = Thread.create (fun () ->
+      try run () with error -> result := Some error) () in
+    thread, result) jobs in
+  List.iter (fun (thread, _) -> Thread.join thread) work;
+  List.iter (fun (_, result) -> Option.iter raise !result) work
+
+let test_epoch_read dir =
+  let log = Epochlog.open_log (Filename.concat dir "epochs.dat") in
+  Fun.protect ~finally:(fun () -> Epochlog.close log) (fun () ->
+    let header id = { Epochlog.empty_epoch_header with id;
+      state_root = String.make 65536 (if id = 1 then 'a' else 'b') } in
+    List.iter (fun id -> Epochlog.append log (header id)) [1; 2];
+    ignore (Unix.lseek log.fd 5 Unix.SEEK_SET);
+    let check id =
+      expect "epoch read changed record" (Epochlog.get log id = Some (header id));
+      expect "epoch byte read changed record"
+        (Epochlog.read_entry log ~max_bytes:100000 id
+         = Ok (Some (Epochlog.epoch_to_json (header id))));
+      expect "epoch position is missing" (Option.is_some (Epochlog.offset_after log id)) in
+    check 1;
+    ignore (Epochlog.current_offset log);
+    ignore (Epochlog.read_all log);
+    expect "epoch scan failed" (Result.is_ok (Epochlog.read_all_strict log));
+    expect "epoch read moved file cursor" (Unix.lseek log.fd 0 Unix.SEEK_CUR = 5);
+    parallel [
+      (fun () -> for _ = 1 to 2000 do check 1 done);
+      (fun () -> for _ = 1 to 2000 do check 2 done);
+      (fun () -> for id = 3 to 66 do
+        Epochlog.append log { Epochlog.empty_epoch_header with id }
+      done)];
+    expect "epoch append lost a record" (List.length (Epochlog.read_all log) = 66);
+    expect "parallel reads moved append cursor"
+      (Unix.lseek log.fd 0 Unix.SEEK_CUR = (Unix.fstat log.fd).Unix.st_size))
+
+let test_tx_read dir =
+  let log = Txlog.open_log dir in
+  Fun.protect ~finally:(fun () -> Txlog.close log) (fun () ->
+    let payload id = String.make 65536 (if id = 1 then 'a' else 'b') in
+    let records = List.map (fun id ->
+      id, Txlog.append log ~epoch_id:id ~payload:(payload id)) [1; 2] in
+    ignore (Unix.lseek log.current_fd 5 Unix.SEEK_SET);
+    let check (id, (seg_id, offset, len)) =
+      expect "transaction read changed record"
+        (Txlog.read_record log ~seg_id ~offset ~len = (id, payload id)) in
+    List.iter check records;
+    expect "transaction read moved file cursor"
+      (Unix.lseek log.current_fd 0 Unix.SEEK_CUR = 5);
+    parallel (List.map (fun record () ->
+      for _ = 1 to 2000 do check record done) records))
+
+let test_epoch_damage dir =
+  let path = Filename.concat dir "epochs.dat" in
+  let log = Epochlog.open_log path in
+  Fun.protect ~finally:(fun () -> Epochlog.close log) (fun () ->
+    Epochlog.append log { Epochlog.empty_epoch_header with id = 1 };
+    let offset = Hashtbl.find log.offsets 1 in
+    let fd = Unix.openfile path [Unix.O_WRONLY; Unix.O_CLOEXEC] 0 in
+    Fun.protect ~finally:(fun () -> Unix.close fd) (fun () ->
+      ignore (Unix.lseek fd (offset + 8) Unix.SEEK_SET);
+      ignore (Unix.write fd (Bytes.of_string "x") 0 1));
+    let errors = ref [] in
+    let on_error error = errors := error :: !errors in
+    expect "damaged epoch was accepted" (Epochlog.get ~on_error log 1 = None);
+    expect "checksum reason missing" (!errors = [Epochlog.Log_checksum_mismatch offset]);
+    expect "damaged epoch bytes were accepted"
+      (Epochlog.read_entry log ~max_bytes:100000 1 = Error `Invalid);
+    expect "damaged epoch position accepted" (Epochlog.offset_after log 1 = None))
+
+let test_epoch_identity dir =
+  let log = Epochlog.open_log (Filename.concat dir "epochs.dat") in
+  Fun.protect ~finally:(fun () -> Epochlog.close log) (fun () ->
+    List.iter (fun id -> Epochlog.append log
+      { Epochlog.empty_epoch_header with id }) [1; 2];
+    let errors = ref [] in
+    let on_error error = errors := error :: !errors in
+    expect "missing epoch was accepted" (Epochlog.get ~on_error log 3 = None);
+    expect "missing offset reason" (!errors = [Epochlog.Log_epoch_missing 3]);
+    errors := [];
+    Hashtbl.replace log.offsets 1 (Hashtbl.find log.offsets 2);
+    expect "different epoch accepted" (Epochlog.get ~on_error log 1 = None);
+    expect "different epoch reason"
+      (!errors = [Epochlog.Log_epoch_identity (Hashtbl.find log.offsets 2, 1, 2)]);
+    expect "different epoch bytes accepted"
+      (Epochlog.read_entry log ~max_bytes:100000 1 = Error `Invalid);
+    expect "different epoch position accepted" (Epochlog.offset_after log 1 = None);
+    expect "other epoch was changed" (Option.is_some (Epochlog.get log 2)))
+
+let with_store dir run =
+  let module Store = Octra_core.Store_chaindata in
+  let store = Store.open_chaindata dir in
+  Fun.protect ~finally:(fun () -> Store.close store) (fun () ->
+    Store.begin_batch store;
+    List.iter (fun id -> Store.set_epoch store
+      { Epochlog.empty_epoch_header with id }) [1; 2];
+    Store.commit_batch store;
+    run store)
+
+let test_store_read dir =
+  let module Store = Octra_core.Store_chaindata in
+  with_store dir (fun store ->
+    let read id () =
+      for _ = 1 to 2000 do
+        expect "shared store read lost epoch"
+          (match Store.get_bound_epoch_header store id with
+           | Ok header -> header.Epochlog.id = id
+           | Error _ -> false)
+      done in
+    parallel [read 1; read 2; read 1];
+    expect "missing store epoch was accepted"
+      (Store.get_bound_epoch_header store 3 = Error "epoch not found"))
+
+let test_store_index dir =
+  let module Store = Octra_core.Store_chaindata in
+  with_store dir (fun store ->
+    Store.begin_batch store;
+    Octra_core.Chaindata_index.buffer_epoch (Store.index store) 1 "{";
+    Store.commit_batch store;
+    expect "invalid index was treated as missing"
+      (Store.get_bound_epoch_header store 1 = Error "epoch index header invalid");
+    expect "invalid index changed another epoch"
+      (Result.is_ok (Store.get_bound_epoch_header store 2)))
+
+let test_store_io dir =
+  let module Store = Octra_core.Store_chaindata in
+  with_store dir (fun store ->
+    let fd = store.Store.epochlog.Epochlog.fd in
+    let saved = Unix.dup fd in
+    Unix.close fd;
+    Fun.protect ~finally:(fun () -> Unix.dup2 saved fd; Unix.close saved) (fun () ->
+      expect "epoch IO failure escaped the reader"
+        (Store.get_bound_epoch_header store 1 = Error "epoch log read failed")))
+
 let run root =
   let failures = ref 0 in
   List.iter (fun (name, test) ->
@@ -196,7 +331,11 @@ let run root =
      "rotate_kill_before", (fun dir -> test_rotate_kill dir false);
      "rotate_kill_after", (fun dir -> test_rotate_kill dir true);
      "read_append", test_read_append;
-     "rotate_readonly", test_rotate_readonly];
+     "rotate_readonly", test_rotate_readonly;
+     "epoch_read", test_epoch_read; "tx_read", test_tx_read;
+     "epoch_damage", test_epoch_damage; "epoch_identity", test_epoch_identity;
+     "store_read", test_store_read; "store_index", test_store_index;
+     "store_io", test_store_io];
   if !failures <> 0 then exit 1
 
 let () = Test_workspace.with_dir "journal_io" run

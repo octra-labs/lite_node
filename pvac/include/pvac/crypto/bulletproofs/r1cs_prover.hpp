@@ -327,7 +327,7 @@ private:
         for (size_t i=0;i<N;i++) { sc.push_back(a[i]); pt.push_back(gen.G(i)); }
         for (size_t i=0;i<N;i++) { sc.push_back(b[i]); pt.push_back(gen.H(i)); }
         sc.push_back(blind); pt.push_back(pedersen_B_blinding());
-        return multi_scalar_mul(sc, pt);
+        return prover_msm(sc, pt);
     }
 
     RistrettoPoint msm_G_blind(
@@ -338,7 +338,7 @@ private:
         sc.reserve(N+1); pt.reserve(N+1);
         for (size_t i=0;i<N;i++) { sc.push_back(a[i]); pt.push_back(gen.G(i)); }
         sc.push_back(blind); pt.push_back(pedersen_B_blinding());
-        return multi_scalar_mul(sc, pt);
+        return prover_msm(sc, pt);
     }
 };
 

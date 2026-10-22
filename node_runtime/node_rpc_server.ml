@@ -44,7 +44,7 @@ type config = {
   validator_view_sk : string;
   validator_view_pub : string;
   program_trust : Octra_vm.Program_trust.t;
-  migration_admissions : Octra_core.Pvac_migration_admission.t;
+  migration_checks : Octra_core.Pvac_migration_check.t;
   rules : Octra_core.Rule_graph.t;
   chaindata : Store_chaindata.t;
   consensus_driver_ref : Octra_consensus.C_driver.t option ref;
@@ -69,7 +69,7 @@ type ctx = {
   validator_view_sk : string;
   validator_view_pub : string;
   program_trust : Octra_vm.Program_trust.t;
-  migration_admissions : Octra_core.Pvac_migration_admission.t;
+  migration_checks : Octra_core.Pvac_migration_check.t;
   rules : Octra_core.Rule_graph.t;
   consensus_driver_ref : Octra_consensus.C_driver.t option ref;
   resource_compute : Resource_compute_service.t;
@@ -349,29 +349,34 @@ let octra_register_public_key params ctx =
     ~register:(Ledger.register_public_key ctx.ledger)
     params
 
+let migration_policy rules ~epoch =
+  match
+    Octra_core.Rule_graph.owner_migration rules ~epoch,
+    Octra_core.Rule_graph.cipher_migration rules ~epoch,
+    Octra_core.Rule_graph.standard rules ~epoch,
+    Octra_core.Rule_graph.math rules ~epoch,
+    Octra_core.Rule_graph.proof_key rules ~epoch
+  with
+  | Error fault, _, _, _, _ | _, Error fault, _, _, _ | _, _, Error fault, _, _
+  | _, _, _, Error fault, _ | _, _, _, _, Error fault -> Error fault
+  | Ok owner, Ok cipher, Ok proof, Ok math, Ok key -> Ok (owner, cipher, proof, math, key)
+
 let octra_pvac_migration_status params ctx =
   let epoch = !(ctx.current_epoch) in
-  match
-    Octra_core.Rule_graph.owner_migration
-      ctx.rules
-      ~epoch,
-    Octra_core.Rule_graph.cipher_migration ctx.rules ~epoch,
-    Octra_core.Rule_graph.standard ctx.rules ~epoch,
-    Octra_core.Rule_graph.math ctx.rules ~epoch
-  with
-  | Error fault, _, _, _ | _, Error fault, _, _ | _, _, Error fault, _
-  | _, _, _, Error fault ->
+  match migration_policy ctx.rules ~epoch with
+  | Error fault ->
     Lwt.return_error
       (Rpc.err
          (-32005)
          (Octra_core.Rule_graph.fault_message fault)
          None)
-  | Ok owner_migration_mode, Ok cipher_mode, Ok proof_mode, Ok math ->
+  | Ok (owner_migration_mode, cipher_mode, proof_mode, math, proof_key) ->
     with_account params ctx (fun addr account ->
       Account_read_rpc.pvac_migration_status
+        ~keyed:(proof_key = Octra_core.Rule_graph.Active)
         ctx.pvac_status
         ctx.store
-        ctx.migration_admissions
+        ctx.migration_checks
         ~epoch
         ~math:(math = Octra_core.Rule_graph.Active)
         ~owner_migration_mode
@@ -539,8 +544,7 @@ let state_sensitive_http req =
   match Cohttp.Request.meth req, Uri.path (Cohttp.Request.uri req) with
   | `GET, "/"
   | `GET, "/status"
-  | `GET, "/state-sync/head"
-  | `GET, "/state-sync/range" -> true
+  | `GET, "/state-sync/head" -> true
   | _ -> false
 
 let start (cfg : config) =
@@ -573,7 +577,7 @@ let start (cfg : config) =
     validator_view_sk = cfg.validator_view_sk;
     validator_view_pub = cfg.validator_view_pub;
     program_trust = cfg.program_trust;
-    migration_admissions = cfg.migration_admissions;
+    migration_checks = cfg.migration_checks;
     rules = cfg.rules;
     consensus_driver_ref = cfg.consensus_driver_ref;
     resource_compute = cfg.resource_compute;
@@ -605,7 +609,15 @@ let start (cfg : config) =
       body
   in
   let state_http_handler req body =
-    if state_sensitive_http req then
+    if Cohttp.Request.meth req = `GET
+        && Uri.path (Cohttp.Request.uri req) = "/state-sync/range" then
+      let open Lwt.Syntax in
+      let* stable = Epoch_visibility.read cfg.epoch_visibility (fun () -> Lwt.return_unit) in
+      match stable with
+      | Some () -> state_http req body
+      | None -> Cohttp_lwt_unix.Server.respond_string
+        ~status:`Service_unavailable ~body:"committed state changed during read; retry" ()
+    else if state_sensitive_http req then
       stable_http cfg.epoch_visibility state_http req body
     else
       state_http req body

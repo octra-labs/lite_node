@@ -15,18 +15,19 @@ const sample = binary => [
     binary_sha256: digest(binary), worker_sha256: digest(binary), first_epoch: "1"},
   {event: "epoch", epoch: "1", ledger_root: digest("a"), index_root: digest("b"),
     state_root: digest("c"), confirmed: [digest("d")], rejections: ["first", "second"],
-    fees: "1", candidate_root: digest("e"), candidate_fees: "2"},
+    fees: "1", checked_root: digest("e"), checked_fees: "2"},
   {event: "epoch", epoch: "2", ledger_root: digest("a"), index_root: digest("b"),
     state_root: digest("d"), confirmed: [], rejections: [], fees: "0",
-    candidate_root: digest("e"), candidate_fees: "0"},
+    checked_root: digest("e"), checked_fees: "0"},
   {event: "complete", epochs: 2, next_epoch: "3", state_root: digest("d")},
 ];
 const encode = records => records.map(record => JSON.stringify(record)).join("\n") + "\n";
 const builds = {
   reference: {source: "c54167b827ede56b20d94608f8d3a9f5fa138c09",
     binary_sha256: digest("e"), worker_sha256: digest("e")},
-  candidate: {source: "1".repeat(40), binary_sha256: digest("f"), worker_sha256: digest("f")},
+  checked: {source: "1".repeat(40), binary_sha256: digest("f"), worker_sha256: digest("f")},
 };
+const source = builds.reference.source;
 const cases = [
   ["matching", records => records, true],
   ["completion key order", records => {
@@ -45,9 +46,9 @@ const cases = [
   ["final root", records => { records[3].state_root = digest("f"); return records; }, false],
   ["ledger", records => { records[1].ledger_root = digest("f"); return records; }, false],
   ["index", records => { records[1].index_root = digest("f"); return records; }, false],
-  ["candidate root", records => { records[1].candidate_root = digest("f"); return records; }, false],
+  ["checked root", records => { records[1].checked_root = digest("f"); return records; }, false],
   ["fee", records => { records[1].fees = "2"; return records; }, false],
-  ["candidate fee", records => { records[1].candidate_fees = "3"; return records; }, false],
+  ["checked fee", records => { records[1].checked_fees = "3"; return records; }, false],
   ["negative fee", records => { records[1].fees = "-1"; return records; }, false],
   ["fee encoding", records => { records[1].fees = "01"; return records; }, false],
   ["duplicate", records => { records[1].confirmed.push(digest("d")); return records; }, false],
@@ -59,14 +60,15 @@ const cases = [
 fs.mkdirSync(work, {recursive: true});
 try {
   const left = path.join(work, "reference.jsonl");
-  const right = path.join(work, "candidate.jsonl");
+  const right = path.join(work, "checked.jsonl");
   const pins = path.join(work, "builds.json");
   fs.writeFileSync(pins, JSON.stringify(builds));
   fs.writeFileSync(left, encode(sample("e")));
   for (const [name, change, expected] of cases) {
     const changed = change(sample("f"));
     fs.writeFileSync(right, typeof changed === "string" ? changed : encode(changed));
-    const run = spawnSync(process.execPath, [path.join(root, "test", "replay_diff.mjs"), left, right, pins],
+    const run = spawnSync(process.execPath,
+      [path.join(root, "test", "replay_diff.mjs"), left, right, pins, source],
       {encoding: "utf8", timeout: 5000});
     if (run.error || (run.status === 0) !== expected) {
       throw new Error("case = " + name + " status = " + run.status);
@@ -79,7 +81,7 @@ try {
   matchingEmpty[1].confirmed = [];
   fs.writeFileSync(right, encode(matchingEmpty));
   const empty = spawnSync(process.execPath,
-    [path.join(root, "test", "replay_diff.mjs"), left, right, pins],
+    [path.join(root, "test", "replay_diff.mjs"), left, right, pins, source],
     {encoding: "utf8", timeout: 5000});
   if (empty.error || empty.status === 0
     || !empty.stderr.includes("trace has no confirmed transactions")) {
@@ -89,10 +91,28 @@ try {
   fs.writeFileSync(right, encode(sample("f")));
   const wrong = {...builds, reference: {...builds.reference, source: "2".repeat(40)}};
   fs.writeFileSync(pins, JSON.stringify(wrong));
-  const rejected = spawnSync(process.execPath, [path.join(root, "test", "replay_diff.mjs"), left, right, pins],
+  const rejected = spawnSync(process.execPath,
+    [path.join(root, "test", "replay_diff.mjs"), left, right, pins, source],
     {encoding: "utf8", timeout: 5000});
   if (rejected.error || rejected.status === 0) throw new Error("wrong reference source accepted");
-  console.log("event = replay_diff_checks status = pass cases = " + (cases.length + 2)
+  fs.writeFileSync(pins, JSON.stringify(builds));
+  const mismatch = spawnSync(process.execPath,
+    [path.join(root, "test", "replay_diff.mjs"), left, right, pins, "2".repeat(40)],
+    {encoding: "utf8", timeout: 5000});
+  if (mismatch.error || mismatch.status === 0) throw new Error("wrong source request accepted");
+  const next = {...builds, reference: {...builds.reference, source: "2".repeat(40)}};
+  fs.writeFileSync(pins, JSON.stringify(next));
+  const accepted = spawnSync(process.execPath,
+    [path.join(root, "test", "replay_diff.mjs"), left, right, pins, next.reference.source],
+    {encoding: "utf8", timeout: 5000});
+  if (accepted.error || accepted.status !== 0) throw new Error("declared source refused");
+  const duplicate = {...builds, checked: {...builds.checked, source}};
+  fs.writeFileSync(pins, JSON.stringify(duplicate));
+  const sameSource = spawnSync(process.execPath,
+    [path.join(root, "test", "replay_diff.mjs"), left, right, pins, source],
+    {encoding: "utf8", timeout: 5000});
+  if (sameSource.error || sameSource.status === 0) throw new Error("same source accepted");
+  console.log("event = replay_diff_checks status = pass cases = " + (cases.length + 5)
     + " execution = sample");
 } finally {
   fs.rmSync(work, {recursive: true});

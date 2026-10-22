@@ -22,6 +22,7 @@ type t = {
   cipher_mode : Rule_graph.mode;
   proof_mode : Rule_graph.mode;
   math : bool;
+  keyed : bool;
   field_policy : P.field_policy;
   result_policy : Private_result_policy.t;
   limits : limits;
@@ -44,6 +45,7 @@ let create
     ~owner_migration_mode
     ~cipher_mode
     ~proof_mode
+    ~keyed
     ~math
     ~field_policy
     ~result_policy
@@ -55,6 +57,7 @@ let create
     cipher_mode;
     proof_mode;
     math;
+    keyed;
     field_policy;
     result_policy;
     limits;
@@ -179,7 +182,7 @@ let verify_private t tx project verify =
     | None -> Lwt.return_none
     | Some artifact ->
       let* binding =
-        P.bind_private_artifact ~math:t.math
+        P.bind_private_artifact ~keyed:t.keyed ~math:t.math
           ~field_policy:t.field_policy
           ~strict:true
           ~result_policy:t.result_policy
@@ -236,7 +239,7 @@ let encrypt t tx =
               t
               check
               ~verify:(fun () -> verify_balance t tx (fun () ->
-                P.encrypt_plan ~math:t.math
+                P.encrypt_plan ~keyed:t.keyed ~math:t.math
                   ~field_policy:t.field_policy
                   ~strict:(t.proof_mode = Rule_graph.Active)
                   ~result_policy:t.result_policy
@@ -293,7 +296,7 @@ let decrypt t tx =
               t
               check
               ~verify:(fun () -> verify_balance t tx (fun () ->
-                P.decrypt_plan ~math:t.math
+                P.decrypt_plan ~keyed:t.keyed ~math:t.math
                   ~field_policy:t.field_policy
                   ~strict:(t.proof_mode = Rule_graph.Active)
                   ~result_policy:t.result_policy
@@ -341,7 +344,7 @@ let verify_key t tx replay =
     | None -> Lwt.return_none
     | Some artifact ->
       let* binding =
-        P.bind_key_switch_artifact ~math:t.math ~cipher_mode:t.cipher_mode
+        P.bind_key_switch_artifact ~keyed:t.keyed ~math:t.math ~cipher_mode:t.cipher_mode
           ~field_policy:t.field_policy
           ~strict:true
           t.ledger
@@ -356,7 +359,7 @@ let verify_key t tx replay =
   match plan with
   | Some plan -> Lwt.return_ok plan
   | None ->
-    P.key_switch_plan ~math:t.math ~cipher_mode:t.cipher_mode
+    P.key_switch_plan ~keyed:t.keyed ~math:t.math ~cipher_mode:t.cipher_mode
       ~field_policy:t.field_policy
       ~strict:(t.proof_mode = Rule_graph.Active)
       ?legacy_public_replay:replay
@@ -411,7 +414,7 @@ let key_switch t tx =
           check
           ~verify:(fun () -> verify_key t tx replay)
           ~prepare:(fun () ->
-            P.prepare_key_switch_plan ~math:t.math ~cipher_mode:t.cipher_mode
+            P.prepare_key_switch_plan ~keyed:t.keyed ~math:t.math ~cipher_mode:t.cipher_mode
               ~field_policy:t.field_policy
               ~cap:(t.proof_mode = Rule_graph.Active)
               t.ledger
@@ -472,7 +475,7 @@ let compute_stealth_plan t tx =
       | Error e -> Lwt.return (failure t e)
       | Ok plan ->
         let* range =
-          P.stealth_inline_range ~math:t.math
+          P.stealth_inline_range ~keyed:t.keyed ~math:t.math
             ~strict:(t.proof_mode = Rule_graph.Active)
             t.ledger
             tx
@@ -487,7 +490,7 @@ let compute_stealth_plan t tx =
               | Error e -> Lwt.return (failure t e)
               | Ok () ->
                 let* binding =
-                  P.stealth_binding ~math:t.math
+                  P.stealth_binding ~keyed:t.keyed ~math:t.math
                     ~field_policy:t.field_policy
                     ~strict:(t.proof_mode = Rule_graph.Active)
                     t.ledger
@@ -591,7 +594,7 @@ let compute_claim_plan t tx =
     let* claim =
       match check with
       | Verify_proof _ ->
-        P.claim_plan ~math:t.math
+        P.claim_plan ~keyed:t.keyed ~math:t.math
           ~field_policy:t.field_policy
           ~strict:(t.proof_mode = Rule_graph.Active)
           t.ledger

@@ -1,7 +1,7 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-module A = Octra_core.Pvac_migration_admission
+module A = Octra_core.Pvac_migration_check
 module M = Octra_core.Pvac_migration
 module R = Octra_core.Pvac_legacy_public_replay
 module V = Octra_node_runtime.Rpc_view
@@ -40,7 +40,7 @@ let entry verdict = A.{
   decision = verdict;
 }
 
-let admission entries =
+let records entries =
   A.create ~chain_id ~snapshot_epoch:10 ~state_root:(String.make 64 'a')
     ~activation_epoch:20 entries |> unwrap
 
@@ -48,9 +48,9 @@ let view ?(epoch = 20) ?(cipher = cipher) ?(mode = Octra_core.Rule_graph.Active)
     ?(math = true)
     ?(cipher_mode = Octra_core.Rule_graph.Prior)
     ?(proof_mode = Octra_core.Rule_graph.Active)
-    ?(status = M.status_of_classes M.V3 M.Historical) admissions =
-  V.pvac_migration_status ~addr:address ~cipher ~epoch
-    ~math ~owner_migration_mode:mode ~cipher_mode ~proof_mode status admissions
+    ?(status = M.status_of_classes M.V3 M.Historical) checks =
+  V.pvac_migration_status ~keyed:false ~addr:address ~cipher ~epoch
+    ~math ~owner_migration_mode:mode ~cipher_mode ~proof_mode status checks
 
 let check_missing name reason response =
   let replay = field "legacy_public_replay" response in
@@ -65,7 +65,7 @@ let check_missing name reason response =
   check "no commitment" (field "commitment_net" replay = `Null)
 
 let check_errors () =
-  let enabled = admission [entry clean] in
+  let enabled = records [entry clean] in
   check "wide arithmetic visible" (field "proof_math" (view enabled) = `String "wide");
   check "prior arithmetic visible" (field "proof_math" (view ~math:false enabled) = `String "prior");
   let cases = [
@@ -73,21 +73,21 @@ let check_errors () =
       "migration entitlement artifact unavailable";
     "not_active", "migration records not active", enabled, 19, cipher,
       "migration entitlement is not active";
-    "not_found", "migration record not found", admission [], 20, cipher,
+    "not_found", "migration record not found", records [], 20, cipher,
       "migration entitlement not found";
     "cipher_mismatch", "migration record ciphertext mismatch", enabled, 20, cipher ^ "changed",
       "migration entitlement source ciphertext mismatch";
   ] in
-  List.iter (fun (name, note, admissions, epoch, cipher, reason) ->
-    let response = view ~epoch ~cipher admissions in
+  List.iter (fun (name, note, checks, epoch, cipher, reason) ->
+    let response = view ~epoch ~cipher checks in
     check_missing name note response;
     let record = field "migration_record" response in
     check "record status" (field "status" record = `String name);
-    check "record count" (field "count" record = `Int (A.entry_count admissions));
+    check "record count" (field "count" record = `Int (A.entry_count checks));
     check "record root compatibility" (field "root" record = field "entitlement_root" response);
     check "find compatibility"
-      (A.find admissions ~epoch ~address ~cipher = Error reason);
-    let denied = A.decision admissions ~epoch ~address ~cipher in
+      (A.find checks ~epoch ~address ~cipher = Error reason);
+    let denied = A.decision checks ~epoch ~address ~cipher in
     check "execution remains refused"
       (denied.audit_class = R.Poisoned && not denied.can_public_migrate
        && denied.commitment_net = None && denied.reason = reason)
@@ -102,7 +102,7 @@ let check_entries () =
     reason = "history is incomplete";
   } in
   List.iter (fun decision ->
-    let response = view (admission [entry decision]) in
+    let response = view (records [entry decision]) in
     let replay = field "legacy_public_replay" response in
     check "admission found" (field "admission_status" replay = `String "ready");
     check "complete decision" (field "complete" replay = `Bool true);
@@ -128,7 +128,7 @@ let check_owner () =
   } in
   List.iter (fun mode ->
     List.iter (fun verdict ->
-      let response = view ~mode (admission [entry verdict]) in
+      let response = view ~mode (records [entry verdict]) in
       let expected = mode = Octra_core.Rule_graph.Active
         && verdict.R.audit_class <> R.Poisoned in
       check "owner admission rule preserved"
@@ -160,7 +160,7 @@ let check_cipher () =
 
 let check_recovery () =
   let open Octra_core.Rule_graph in
-  let records = admission [entry clean] in
+  let records = records [entry clean] in
   List.iter (fun mode ->
     let status = M.status_of_classes M.V3 M.Missing in
     let result = view ~cipher_mode:mode ~status records in
@@ -178,7 +178,31 @@ let check_recovery () =
     check "invalid source cannot recover" (field "history_recovery" result = `Bool false)
   ) [M.Empty; M.Foreign; M.Malformed "invalid"]
 
+let check_key_policy () =
+  let module G = Octra_core.Rule_graph in
+  let module Rpc = Octra_node_runtime.Node_rpc_server in
+  let chain_id = "octra-devnet-9871-cluster" in
+  let plan = G.proof_key_activation_for_chain chain_id |> Option.get in
+  let read bad epoch =
+    if epoch = plan.anchor_epoch then bad
+    else match G.root_after_floor ~chain_id ~floor_epoch:max_int ~epoch with
+      | Some root -> G.Root root
+      | None -> G.Missing in
+  List.iter (fun epoch ->
+    let current = epoch >= plan.activation_epoch in
+    let good = G.create ~chain_id ~root_at:(read (G.Root plan.anchor_state_root)) in
+    check "RPC key policy differs" (match Rpc.migration_policy good ~epoch with
+      | Ok (_, _, _, _, key) -> key = if current then G.Active else G.Prior
+      | Error _ -> false);
+    List.iter (fun bad ->
+      let graph = G.create ~chain_id ~root_at:(read bad) in
+      check "RPC ignored key anchor"
+        (Result.is_error (Rpc.migration_policy graph ~epoch) = current))
+      [G.Missing; G.Unreadable "test"; G.Root (String.make 64 '0')])
+    [plan.activation_epoch - 1; plan.activation_epoch; plan.activation_epoch + 1]
+
 let () =
+  check_key_policy ();
   check_errors ();
   check_entries ();
   check_owner ();

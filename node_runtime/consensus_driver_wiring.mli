@@ -107,7 +107,6 @@ type standard_adapters = {
   current_tx_hashes : unit -> string list;
   mark_unsynced : unit -> unit;
   write_pending : Octra_core.Wal.pending_commit -> unit;
-  set_catchup_active : bool -> unit;
 }
 
 type 'a proposal_preview_runtime = {
@@ -190,7 +189,6 @@ type deps = {
     target_epoch:int64 ->
     reason:string ->
     unit Lwt.t;
-  set_catchup_active : bool -> unit;
   apply_finalized :
     validator_set:Octra_consensus.C_types.validator_set ->
     Octra_consensus.C_types.finalize ->

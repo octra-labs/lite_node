@@ -50,6 +50,7 @@ let deps ~state ~pending ~call ~deploy =
     int_work = Octra_vm.Int_work.Prior;
     fhe_work = Octra_core.Rule_graph.Prior;
     proof_exec = Octra_core.Rule_graph.Prior;
+    proof_key = Octra_core.Rule_graph.Prior;
     wasm_float = Octra_core.Rule_graph.Prior;
   }
 
@@ -794,6 +795,7 @@ let vm_tx_deps events =
            (String.length bytecode_raw));
       Lwt.return { contract_addr = "octDeploy"; receipt = receipt () });
     program_prepare = (fun _ -> Lwt.return_error "not expected");
+    program_record = (fun _ _ -> Ok ());
     ensure_account = (fun addr -> push ("ensure:" ^ addr));
     circle_exec = (fun _ ~ctx:_ call ->
       push ("circle_exec:" ^ call.Call_plan.method_name);

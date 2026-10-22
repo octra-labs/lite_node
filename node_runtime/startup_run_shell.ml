@@ -186,6 +186,7 @@ let run_join ~log ~tasks ~exit_fatal ~exit_refused =
     (fun () -> Lwt.pick tasks)
     (fun e ->
       let exit = match e with
+        | Consensus_pending_commit_recovery.Store_fault _ -> exit_refused
         | Octra_core.Private_ledger.Worker_stopped _ -> exit_refused
         | _ -> exit_fatal in
       Fun.protect ~finally:exit (fun () ->

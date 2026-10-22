@@ -16,4 +16,4 @@ type request = {
   max_records : int;
 }
 
-val read : request -> (Octra_core.Pvac_migration_admission.t, string) result
+val read : request -> (Octra_core.Pvac_migration_check.t, string) result

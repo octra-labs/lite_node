@@ -6,7 +6,6 @@ module Log = Octra_log
 type deps = {
   sleep : float -> unit Lwt.t;
   catchup_active : unit -> bool;
-  set_catchup_active : bool -> unit;
   quarantine_active : unit -> bool;
   replay_stashed : source:string -> unit Lwt.t;
   probe_health : unit -> unit Lwt.t;
@@ -73,6 +72,7 @@ type fork_repair_runtime = {
 }
 
 type driver_probe_deps = {
+  probe_range : Octra_consensus.C_driver.t -> unit Lwt.t;
   env_int : string -> int -> int;
   getenv : string -> string option;
   soft_catchup_max_lag : int;
@@ -85,7 +85,7 @@ type driver_probe_deps = {
   catchup_next_target : unit -> int64 option;
   attested_head : int -> bool;
   clear_state_attested : unit -> unit;
-  set_catchup_in_progress : bool -> unit;
+  catchup_active : unit -> bool;
   set_state_attested : head:int -> root:string -> unit;
   clear_quarantine : string -> unit;
   mark_quarantine : string -> unit;
@@ -116,6 +116,7 @@ type node_fork_repair_runtime = {
 }
 
 type node_driver_probe_runtime = {
+  probe_range : Octra_consensus.C_driver.t -> unit Lwt.t;
   env_int : string -> int -> int;
   getenv : string -> string option;
   soft_catchup_max_lag : int;
@@ -177,6 +178,7 @@ type node_liveness_deps = {
 }
 
 type node_driver_health_runtime = {
+  probe_range : Octra_consensus.C_driver.t -> unit Lwt.t;
   env_int : string -> int -> int;
   getenv : string -> string option;
   soft_catchup_max_lag : int;
@@ -362,12 +364,7 @@ let snapshot_policy_threshold ~getenv =
     Consensus_finality_journal.history_limit
     |> Int64.to_int
   in
-  let configured =
-    match getenv "OCTRA_CATCHUP_MAX_LAG" with
-    | Some s -> (try int_of_string s with _ -> retained)
-    | None -> retained
-  in
-  min retained (max 1 configured)
+  Sync_need.history_limit ~retained (getenv "OCTRA_CATCHUP_MAX_LAG")
 
 let peer_state_label (record : Octra_consensus.C_driver.peer_state_record) =
   let root =
@@ -477,6 +474,7 @@ let repair_empty_fork (runtime : fork_repair_runtime)
 
 let node_driver_probe_deps (runtime : node_driver_probe_runtime) =
   {
+    probe_range = runtime.probe_range;
     env_int = runtime.env_int;
     getenv = runtime.getenv;
     soft_catchup_max_lag = runtime.soft_catchup_max_lag;
@@ -495,8 +493,7 @@ let node_driver_probe_deps (runtime : node_driver_probe_runtime) =
     attested_head = Consensus_runtime_state.attested_head runtime.runtime_state;
     clear_state_attested = (fun () ->
       Consensus_runtime_state.clear_state_attested runtime.runtime_state);
-    set_catchup_in_progress = (fun active ->
-      runtime.catchup_active := active);
+    catchup_active = (fun () -> !(runtime.catchup_active));
     set_state_attested = runtime.set_state_attested;
     clear_quarantine = runtime.clear_quarantine;
     mark_quarantine = runtime.mark_quarantine;
@@ -522,6 +519,7 @@ let node_driver_health_deps (runtime : node_driver_health_runtime) =
     probe =
       node_driver_probe_deps
         ({
+          probe_range = runtime.probe_range;
           env_int = runtime.env_int;
           getenv = runtime.getenv;
           soft_catchup_max_lag = runtime.soft_catchup_max_lag;
@@ -591,7 +589,7 @@ let driver_probe_deps (deps : driver_probe_deps) driver =
     catchup_next_target = deps.catchup_next_target;
     attested_head = deps.attested_head;
     clear_state_attested = deps.clear_state_attested;
-    set_catchup_in_progress = deps.set_catchup_in_progress;
+    catchup_active = deps.catchup_active;
     set_state_attested = deps.set_state_attested;
     clear_quarantine = deps.clear_quarantine;
     mark_quarantine = deps.mark_quarantine;
@@ -627,7 +625,7 @@ let driver_probe_deps (deps : driver_probe_deps) driver =
 let run_driver_probe (deps : driver_probe_deps) driver =
   let open Lwt.Syntax in
   let module D = Octra_consensus.C_driver in
-  Consensus_health_shell.run
+  let* () = Consensus_health_shell.run
     ~repair:(repair_empty_fork deps.fork_repair)
     ~http_target:(fun () ->
       let* plan = D.load_validator_set_plan driver in
@@ -640,13 +638,14 @@ let run_driver_probe (deps : driver_probe_deps) driver =
       Consensus_join_rpc.http_head deps.getenv ~chain_id ~validator_hash
         ~after:(Int64.of_int (deps.committed_head_epoch ())))
     (driver_probe_config deps driver)
-    (driver_probe_deps deps driver)
+    (driver_probe_deps deps driver) in
+  if deps.catchup_active () then Lwt.return_unit else deps.probe_range driver
 
 let startup_probe ?(delay = 5.0) (deps : deps) =
   let open Lwt.Syntax in
-  deps.set_catchup_active true;
+  if deps.catchup_active () then Lwt.return_unit else
   let* () = deps.sleep delay in
-  deps.set_catchup_active false;
+  if deps.catchup_active () then Lwt.return_unit else
   let* () = deps.probe_health () in
   deps.reset_liveness ~source:"startup_probe"
 
@@ -655,13 +654,22 @@ let after (deps : deps) ~delay f =
   let* () = deps.sleep delay in
   f ()
 
-let rec await_pending_recovery (deps : deps) ~delay recover =
+let await_pending_recovery (deps : deps) ~delay recover =
   let open Lwt.Syntax in
-  let* ready = recover () in
-  if ready then Lwt.return_true
-  else
-    let* () = deps.sleep delay in
-    await_pending_recovery deps ~delay recover
+  let rec loop iterations =
+    let* ready = recover () in
+    if ready then Lwt.return_true
+    else begin
+      let iterations = iterations + 1 in
+      if iterations >= 75 then
+        Log.warn "consensus"
+          "event = startup_hold iterations = %d action = retry"
+          iterations;
+      let* () = deps.sleep delay in
+      loop (if iterations >= 75 then 0 else iterations)
+    end
+  in
+  loop 0
 
 let poll_once (deps : deps) =
   let open Lwt.Syntax in
@@ -674,6 +682,7 @@ let poll_once (deps : deps) =
       else
         Lwt.return_unit
     in
+    if deps.catchup_active () then Lwt.return_unit else
     let* () = deps.probe_health () in
     deps.reset_liveness ~source:"health_poll"
 
@@ -723,7 +732,6 @@ let health_deps_of_driver (deps : 'driver driver_deps) driver =
   {
     sleep = deps.sleep;
     catchup_active = (fun () -> !(deps.state.catchup));
-    set_catchup_active = (fun active -> deps.state.catchup := active);
     quarantine_active = (fun () -> !(deps.state.quarantine));
     replay_stashed = deps.replay_stashed;
     probe_health = (fun () -> deps.probe_health driver);

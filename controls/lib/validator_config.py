@@ -7,7 +7,9 @@ import importlib.util
 import json
 import os
 import pwd
+import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -34,7 +36,11 @@ from validator_common import validate_checkpoint
 from validator_common import validate_network_binding
 from validator_common import validator_entries
 from validator_common import write_env
+from validator_common import write_private_json
 from validator_enroll import membership
+from validator_exit import ControlMismatch, restore_control, sync_directory
+from sync_need import snapshot_lag
+from sync_tip import head_routes, sync_head, sync_issue
 
 SOURCE = Path(__file__).resolve()
 ROOT = SOURCE.parents[2] if SOURCE.parents[1].name == "controls" else SOURCE.parents[3]
@@ -72,6 +78,14 @@ DEFAULT_CONFIG = ROOT / ".keys/validator/node.env"
 DEFAULT_DATA = ROOT / "data"
 IDENTITY_WALLET = ROOT / ".keys/validator/wallet.json"
 RUST_TOOLCHAIN = "1.88.0"
+RUST_COMMIT = "6b00bc3880198600130e1cf62b8f8a93494488cc"
+RUSTUP_RELEASE = "1.28.2"
+RUSTUP_HASHES = {
+    ("Linux", "x86_64"): ("x86_64-unknown-linux-gnu", "20a06e644b0d9bd2fbdbfd52d42540bdde820ea7df86e92e533c073da0cdd43c"),
+    ("Linux", "aarch64"): ("aarch64-unknown-linux-gnu", "e3853c5a252fca15252d07cb23a1bdd9377a8c6f3efa01531109281ae47f841c"),
+    ("Darwin", "arm64"): ("aarch64-apple-darwin", "20ef5516c31b1ac2290084199ba77dbbcaa1406c45c1d978ca68558ef5964ef5"),
+    ("Darwin", "x86_64"): ("x86_64-apple-darwin", "9c331076f62b4d0edeae63d9d1c9442d5fe39b37b05025ec8d41c5ed35486496"),
+}
 TOOLCHAIN_ROOT = ROOT / "runtime_data/toolchains"
 BUILD_WORK = TOOLCHAIN_ROOT / "build"
 CARGO_HOME = TOOLCHAIN_ROOT / "cargo"
@@ -205,8 +219,23 @@ def ask_bool(label, default):
         return False
     raise ValidatorError(f"invalid yes or no answer: {value}")
 
-def run(command, cwd=ROOT, env=None, timeout=None):
+def run(command, cwd = ROOT, env = None, timeout = None, interruptible = False):
     emit(event="run", command=command[0])
+    if interruptible:
+        with subprocess.Popen(command, cwd = cwd, env = env, start_new_session = True) as process:
+            try:
+                code = process.wait(timeout = timeout)
+                if code:
+                    raise subprocess.CalledProcessError(code, command)
+            except BaseException:
+                if process.poll() is None:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                process.wait()
+                raise
+        return
     try:
         subprocess.run(command, cwd=cwd, check=True, env=env, timeout=timeout)
     except subprocess.TimeoutExpired as error:
@@ -316,8 +345,8 @@ def rust_version(environment):
     if rustc is None:
         return None
     rustup = CARGO_HOME / "bin/rustup"
-    command = [str(rustup), "run", RUST_TOOLCHAIN, "rustc", "--version"] \
-        if rustup.is_file() else [rustc, "--version"]
+    command = [str(rustup), "run", RUST_TOOLCHAIN, "rustc", "--version", "--verbose"] \
+        if rustup.is_file() else [rustc, "--version", "--verbose"]
     try:
         probe = subprocess.run(
             command,
@@ -329,12 +358,17 @@ def rust_version(environment):
         )
     except subprocess.TimeoutExpired as error:
         raise ValidatorError("Rust compiler check timed out") from error
-    return tool_version(probe.stdout) if probe.returncode == 0 else None
+    if probe.returncode != 0:
+        return None
+    version = tool_version(probe.stdout)
+    if version == (1, 88, 0) and f"commit-hash: {RUST_COMMIT}" not in probe.stdout.splitlines():
+        return None
+    return version
 
 def install_rust_toolchain():
     environment = rust_environment()
     version = rust_version(environment)
-    if version is not None and version >= (1, 88, 0):
+    if version == (1, 88, 0):
         return
     rustup = CARGO_HOME / "bin/rustup"
     if rustup.is_file():
@@ -342,38 +376,35 @@ def install_rust_toolchain():
              "--profile", "minimal"], env=environment, timeout=900)
         return
     stage = ROOT / "runtime_data/rustup"
-    stage.mkdir(parents=True, exist_ok=True)
-    installer = stage / "rustup-init.sh"
-    run([
-        "curl",
-        "--proto",
-        "=https",
-        "--tlsv1.2",
-        "--fail",
-        "--location",
-        "--silent",
-        "--show-error",
-        "--connect-timeout", "15",
-        "--max-time", "300",
-        "https://sh.rustup.rs",
-        "--output",
-        str(installer),
-    ], env=environment, timeout=330)
-    run([
-        "sh",
-        str(installer),
-        "-y",
-        "--no-modify-path",
-        "--profile",
-        "minimal",
-        "--default-toolchain",
-        RUST_TOOLCHAIN,
-    ], env=environment, timeout=900)
+    stage.mkdir(mode=0o700, parents=True, exist_ok=True)
+    host = os.uname()
+    target = RUSTUP_HASHES.get((host.sysname, host.machine))
+    if target is None:
+        raise ValidatorError("Rust installer platform is unsupported")
+    triple, digest = target
+    installer = stage / f"rustup-init.{os.getpid()}.staged"
+    descriptor = os.open(installer, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    os.close(descriptor)
+    try:
+        run([
+            "curl", "--proto", "=https", "--tlsv1.2", "--fail",
+            "--silent", "--show-error", "--connect-timeout", "15",
+            "--max-time", "300",
+            f"https://static.rust-lang.org/rustup/archive/{RUSTUP_RELEASE}/{triple}/rustup-init",
+            "--output", str(installer),
+        ], env=environment, timeout=330)
+        if sha256_file(installer) != digest:
+            raise ValidatorError("Rust installer digest differs")
+        installer.chmod(0o700)
+        run([str(installer), "-y", "--no-modify-path", "--profile", "minimal",
+            "--default-toolchain", RUST_TOOLCHAIN], env=environment, timeout=900)
+    finally:
+        installer.unlink()
 
 def ensure_build_toolchain():
     environment = rust_environment()
     version = rust_version(environment)
-    if version is None or version < (1, 88, 0):
+    if version != (1, 88, 0):
         install_rust_toolchain()
         environment = rust_environment()
     commands = ["cargo", "g++", "make", "opam", "rustc"]
@@ -385,8 +416,8 @@ def ensure_build_toolchain():
     if missing:
         raise ValidatorError("missing build tools: " + ",".join(missing))
     version = rust_version(environment)
-    if version is None or version < (1, 88, 0):
-        raise ValidatorError("source build requires rustc 1.88 or newer")
+    if version != (1, 88, 0):
+        raise ValidatorError("source build requires rustc 1.88.0 at the pinned commit")
     return environment
 
 def bind_build_toolchains(environment, switch):
@@ -629,7 +660,7 @@ def validate_sync_layout(stage, data_dir):
     if stage.stat().st_dev != target.parent.stat().st_dev:
         raise ValidatorError("state sync stage and data directory must share a filesystem")
 
-def install_verified_snapshot(snapshot, data_dir):
+def install_verified_snapshot(snapshot, data_dir, guard = None, prior = None, identity = None):
     source = snapshot / "data"
     target = Path(data_dir)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -641,10 +672,41 @@ def install_verified_snapshot(snapshot, data_dir):
         target.rmdir()
     if source.stat().st_dev != target.parent.stat().st_dev:
         raise ValidatorError("state sync stage and data directory must share a filesystem")
+    if prior is None and os.path.lexists(source / "validator-control"):
+        raise ValidatorError("snapshot contains validator control state")
+    if prior is not None:
+        try:
+            restore_control(prior, source, resume = True)
+        except ControlMismatch as error:
+            raise ValidatorError(
+                f"state sync stage control records differ: path = {source / 'validator-control'}; "
+                "select a new OCTRA_OPERATOR_SYNC_STAGE after reviewing the retained records"
+            ) from error
+    if identity is not None:
+        identity_path, expected = identity
+        wallet = source / "wallet.json"
+        if os.path.lexists(wallet) and load_wallet(wallet) != expected:
+            raise ValidatorError(f"state sync stage identity differs: path = {wallet}")
+        copy_private(identity_path, wallet)
+        if load_wallet(wallet) != expected:
+            raise ValidatorError("state sync copied identity differs")
+    if guard is not None:
+        recovery = source / "recovery"
+        write_private_json(recovery / "sync_need.json", {
+            "schema": "octra_sync_need_v2", "chain_id": guard.chain,
+            "cause": guard.cause, "epoch": guard.epoch, "head": guard.head,
+            "target": guard.target,
+        })
+        sync_directory(recovery)
     evidence = source / ".state_sync"
-    evidence.mkdir(mode=0o700)
+    evidence.mkdir(mode = 0o700, exist_ok = True)
+    info = evidence.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValidatorError("snapshot evidence directory is not private")
     copy_private(snapshot / "snapshot_verified.json", evidence / "snapshot_verified.json")
     copy_private(snapshot / "certificate.json", evidence / "certificate.json")
+    sync_directory(evidence)
+    sync_directory(source)
     os.replace(source, target)
     descriptor = os.open(target.parent, os.O_RDONLY)
     try:
@@ -698,7 +760,12 @@ def sync_snapshot(
     concurrency,
     source_concurrency,
     min_epoch=None,
+    guard = None,
+    prior = None,
+    identity = None,
 ):
+    if guard is not None and guard.chain != values["OCTRA_CHAIN_ID"]:
+        raise ValidatorError("recovery guard chain differs")
     floor = int(values["OCTRA_CHECKPOINT_EPOCH"])
     if min_epoch is not None:
         floor = max(floor, int(min_epoch))
@@ -712,13 +779,13 @@ def sync_snapshot(
         source_concurrency,
         min_epoch=floor,
     )
-    run(command)
+    run(command, interruptible = True)
     with sync_lock(stage):
         snapshot = load_verified_snapshot(stage, values)
         head = validate_checkpoint(snapshot / "data", values, allow_progress=True)
         if head["epoch"] < floor:
             raise ValidatorError("signed snapshot is below required epoch")
-        install_verified_snapshot(snapshot, data_path)
+        install_verified_snapshot(snapshot, data_path, guard = guard, prior = prior, identity = identity)
         if not state_ready(data_path):
             raise ValidatorError("state sync completed without a valid checkpoint")
         validate_checkpoint(data_path, values, allow_progress=True)
@@ -767,6 +834,8 @@ def sync_client_command(
     return command
 
 def check_sync_sources(sync_binary, stage, values, sources):
+    if not head_routes(values, sources):
+        raise ValidatorError("state sync configuration error: configure OCTRA_JOIN_RPC with a route outside OCTRA_STATE_SYNC_SOURCES")
     expected = "error = snapshot exceeds configured byte limit"
     for position, source in enumerate(sources, 1):
         command = sync_client_command(
@@ -822,7 +891,12 @@ def maybe_sync(args, data_dir, values):
         validate_checkpoint(data_dir, values, allow_progress=True)
         emit(event="checkpoint", status="ready", path=data_dir)
         return
-    data_path = Path(data_dir)
+    data_path = Path(data_dir).expanduser().resolve()
+    if data_path.parent.exists() and any(
+        re.fullmatch(re.escape(data_path.name) + r"\.prior-[0-9]+(?:-[0-9]+)?", saved.name)
+        for saved in data_path.parent.iterdir()
+    ):
+        raise ValidatorError("preserved state requires recovery with --prior")
     if data_path.exists() and any(data_path.iterdir()):
         raise ValidatorError("data directory is nonempty without a valid checkpoint")
     should_sync = args.sync or args.yes
@@ -841,6 +915,12 @@ def maybe_sync(args, data_dir, values):
         sources = state_sync_sources(entered)
     elif args.sync_url:
         sources = state_sync_sources(",".join(args.sync_url))
+    tip = sync_head(values | {"OCTRA_STATE_SYNC_SOURCES": ",".join(sources)})
+    floor = max(int(values["OCTRA_CHECKPOINT_EPOCH"]),
+        tip["head"] - snapshot_lag(values) if tip is not None and tip["head"] is not None else 0)
+    issue = sync_issue(tip, floor)
+    if issue is not None:
+        raise ValidatorError(issue)
     stage = resolve_sync_stage(args.sync_stage, data_path)
     sync_snapshot(
         sync_binary,
@@ -850,6 +930,7 @@ def maybe_sync(args, data_dir, values):
         sources,
         args.sync_concurrency,
         args.sync_source_concurrency,
+        min_epoch = floor,
     )
 
 def parser():
@@ -868,6 +949,7 @@ def parser():
     value.add_argument("--data-dir", default=str(DEFAULT_DATA))
     value.add_argument("--identity-only", action="store_true")
     value.add_argument("--install", action="store_true")
+    value.add_argument("--install-rust", action="store_true")
     value.add_argument("--name")
     value.add_argument("--network")
     value.add_argument("--network-sha")
@@ -893,9 +975,13 @@ def main():
         args.check_runtime,
         args.check_sync,
         args.rebind_runtime,
+        args.install_rust,
     ]
     if sum(bool(mode) for mode in modes) > 1:
         raise ValidatorError("command modes are mutually exclusive")
+    if args.install_rust:
+        install_rust_toolchain()
+        return
     if args.build_only:
         build_node()
         emit(event="source_build", status="ready")

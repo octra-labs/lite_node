@@ -12,6 +12,7 @@ type key = {
   blob : string;
   hash : string;
   math : bool;
+  keyed : bool;
 }
 
 type checked = private {

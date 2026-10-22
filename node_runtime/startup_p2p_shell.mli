@@ -52,7 +52,7 @@ type node_request = {
   pub_b64 : string;
 }
 
-type admission_deps = {
+type check_deps = {
   getenv : string -> string option;
   activation_epoch : unit -> int64 option;
   info : string -> unit;
@@ -170,7 +170,7 @@ val request_of_runtime :
   node_request
 
 val admit_validator_startup :
-  admission_deps ->
+  check_deps ->
   address:string ->
   voting:bool ->
   role_label:string ->
@@ -181,9 +181,9 @@ val load_persistent_update :
   persistent_update_deps ->
   Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t
 
-val admission_deps_of_runtime :
+val check_deps_of_runtime :
   node_start_runtime ->
-  admission_deps
+  check_deps
 
 val persistent_update_deps_of_runtime :
   node_start_runtime ->

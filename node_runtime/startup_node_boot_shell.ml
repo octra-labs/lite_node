@@ -321,8 +321,11 @@ let run_node deps =
     run_history deps;
     check_supply deps;
     check_emission deps;
-    run_account deps;
+    let created = run_account deps in
     let epoch = run_epoch deps in
     if not skip_recovery then
       Octra_core.Epoch_commit_marker.clear_recovery deps.data_dir;
-    epoch
+    let genesis = Genesis_start.finish ~created ~data_dir:deps.data_dir
+      ~chain:(Startup_process_shell.network_config ~env:deps.env).chain_id
+      ~epoch ~store:deps.store ~chaindata:deps.chaindata in
+    epoch, genesis

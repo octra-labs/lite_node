@@ -359,6 +359,15 @@ Fixpoint replay (state : State) (inputs : list Item) (receipts : list Stamp)
     else replay (step state item) rest receipts
   end.
 
+Theorem state_matches_fold : forall inputs state,
+  fst (prepare state inputs) = fold_left step inputs state.
+Proof.
+  induction inputs as [|item rest ih]; intros state; simpl; [reflexivity|].
+  specialize (ih (step state item)).
+  destruct (prepare (step state item) rest) as [final receipts].
+  exact ih.
+Qed.
+
 Theorem prepared_replays : forall inputs state,
   replay state inputs (snd (prepare state inputs)) = Some (fst (prepare state inputs)).
 Proof.
@@ -434,6 +443,15 @@ Proof.
   apply replay_exact in checked. rewrite checked in changed. simpl in changed.
   contradiction.
 Qed.
+
+Theorem accepted_matches_fold : forall inputs state receipts final,
+  replay state inputs receipts = Some final -> final = fold_left step inputs state.
+Proof.
+  intros inputs state receipts final accepted.
+  apply replay_exact in accepted.
+  pose proof (state_matches_fold inputs state) as complete.
+  rewrite accepted in complete. exact complete.
+Qed.
 End Execution.
 
 Definition add (state : nat) (item : bool * nat) : nat := state + snd item.
@@ -448,4 +466,9 @@ Proof. reflexivity. Qed.
 
 Example first_state_refused : check 0 [(false, 3); (true, 4); (true, 5)] [3; 3] = None.
 Proof. reflexivity. Qed.
+
+Example same_receipts_different_state :
+  snd (trace 0 [(true, 4); (false, 3)]) = snd (trace 0 [(true, 4)]) /\
+  fst (trace 0 [(true, 4); (false, 3)]) <> fst (trace 0 [(true, 4)]).
+Proof. split; [reflexivity|discriminate]. Qed.
 End Ordered.

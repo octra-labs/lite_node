@@ -43,7 +43,7 @@ let check_record base chain validator_set =
   | Journal.Invalid reason -> failwith reason
   | _ -> failwith "record unavailable"
 
-let check_refetch base validator_set (cert : Types.finalize) bundle =
+let check_refetch ?(via_range = false) base validator_set (cert : Types.finalize) bundle =
   let module Apply = Octra_node_runtime.Consensus_finalized_apply in
   let stored = ref None in
   let queries = ref 0 in
@@ -53,6 +53,7 @@ let check_refetch base validator_set (cert : Types.finalize) bundle =
     txs_json = List.map (fun tx -> Yojson.Safe.to_string (Tx.to_yojson tx)) bundle.txs;
     receipts_json = bundle.receipts_json} in
   let deps = Apply.{
+    finish_applied = (fun _ -> false);
     check_finality = (fun value -> Log.check_write base (Log.of_finalize value));
     write_finality = (fun value -> Log.write base (Log.of_finalize value));
     persist_finality_certificate = (fun ~validator_set value ->
@@ -73,22 +74,89 @@ let check_refetch base validator_set (cert : Types.finalize) bundle =
       expect "bad peer bundle refused"
         (not (validate {response with tx_hashes = []}));
       expect "peer bundle accepted" (validate response);
-      Lwt.return_some response);
+      Lwt.return (if via_range then None else Some response));
     store_accepted_bundle = (fun ~proposal_id:_ accepted ->
       let decoded = accepted.Octra_node_runtime.Consensus_bundle_fetch.bundle in
       stored := Some (decoded.tx_hashes, decoded.txs, decoded.receipts_json));
     sleep = (fun _ -> failwith "unexpected bundle wait");
+    range_bundle = (fun header ~timeout ->
+      expect "range within remaining budget" (timeout > 0. && timeout <= 1.);
+      expect "range requested after bundle miss" (via_range && !queries = 1);
+      let record = Octra_consensus.C_codec.{
+        epoch_id = cert.epoch_id; prev_state_root = header.prev_state_root;
+        state_root = header.proposed_state_root; tx_list_hash = header.tx_list_hash;
+        tx_hashes = response.tx_hashes; txs_json = response.txs_json;
+        receipt_root = header.receipt_root; receipts_json = response.receipts_json;
+        epoch_ts = header.ts; creator_addr = header.creator_addr;
+        commit_round = cert.commit_round; reward_source = None; finality = None;
+      } in
+      let reply = Octra_consensus.C_driver.{
+        responder_addr = "range"; request_id = "range"; status = "ok";
+        records = [record]; next_epoch = None;
+      } in
+      expect "range wrong epoch accepted"
+        (Apply.range_payload ~header { reply with records = [{record with epoch_id = 0L}] } = None);
+      expect "range wrong payload accepted"
+        (Apply.range_payload ~header { reply with records = [{record with txs_json = []}] } = None);
+      Lwt.return (Apply.range_payload ~header reply));
     bundle_wait_timeout_seconds = 1.;
     bundle_wait_expired = (fun ~epoch_id:_ -> failwith "unexpected expiry");
-    bundle_wait_recovered = (fun ~epoch_id:_ -> ());
     post_finalize = (fun ~epoch_id ~proposed_root ->
       expect "release checks committed inputs"
         (epoch_id = cert.epoch_id && proposed_root = cert.header.proposed_state_root);
       check_record base cert.chain_id validator_set;
       released := true;
-      Lwt.return_unit)} in
-  Lwt_main.run (Apply.run deps ~validator_set cert);
+      Lwt.return Octra_node_runtime.Consensus_post_finalize.Applied)} in
+  ignore (Lwt_main.run (Apply.run deps ~validator_set cert));
   expect "refetch releases only durable bundle" (!released && !queries = 1)
+
+let check_bundle_deadline ?(done_early = false) validator_set (cert : Types.finalize) =
+  let module Apply = Octra_node_runtime.Consensus_finalized_apply in
+  let queries = ref 0 in
+  let expired = ref 0 in
+  let finished = ref false and canceled = ref false in
+  let deps = Apply.{
+    finish_applied = (fun _ -> !finished);
+    check_finality = ignore;
+    write_finality = ignore;
+    persist_finality_certificate = (fun ~validator_set:_ value -> value);
+    store_proposer = ignore;
+    persist_finality_bundle = (fun _ _ -> ());
+    chaos_after_finality_log = (fun () -> ());
+    cached_bundle = (fun ~proposal_id:_ -> false);
+    cached_bundle_data = (fun ~proposal_id:_ -> None);
+    cached_bundle_len = (fun ~proposal_id:_ -> 0);
+    header_has_empty_bundle = (fun _ -> false);
+    store_empty_bundle = (fun _ -> failwith "unexpected empty bundle");
+    query_bundle = (fun ~epoch_id:_ ~proposal_id:_ ~validate:_ ->
+      incr queries;
+      finished := done_early;
+      let open Lwt.Syntax in
+      let wait = Lwt_unix.sleep 0.02 in
+      Lwt.on_cancel wait (fun () -> canceled := true);
+      let* () = wait in
+      Lwt.return_none);
+    store_accepted_bundle = (fun ~proposal_id:_ _ ->
+      failwith "unexpected bundle");
+    sleep = Lwt_unix.sleep;
+    range_bundle = (fun _ ~timeout:_ -> Lwt.return_none);
+    bundle_wait_timeout_seconds = 0.01;
+    bundle_wait_expired = (fun ~epoch_id:_ -> incr expired);
+    post_finalize = (fun ~epoch_id:_ ~proposed_root:_ ->
+      failwith "unexpected apply");
+  } in
+  let result = Lwt_main.run (Apply.run deps ~validator_set cert) in
+  if done_early then begin
+    expect "completed epoch kept fetching" (!queries = 1 && !canceled);
+    expect "completed epoch was not acknowledged"
+      (result = Octra_node_runtime.Consensus_post_finalize.Applied && !expired = 0)
+  end else begin
+  expect "bundle deadline did not defer"
+    (match result with Octra_node_runtime.Consensus_post_finalize.Deferred _ -> true
+      | _ -> false);
+  expect "bundle deadline restarted a slow request" (!queries = 1);
+  expect "bundle deadline was not recorded" (!expired = 1)
+  end
 
 let check_set_drop validator_set (cert : Types.finalize) bundle =
   let base = Test_workspace.unique_dir "journal-set" in
@@ -553,7 +621,7 @@ let check_stage_order validator_set (cert : Types.finalize) changed bundle =
      && Mark.read ~data_dir:base ~chain:cert.chain_id = Mark.Missing)
 
 let check_live_round ?(reverse = false) ?(worker = false)
-    validator_set (cert : Types.finalize) later bundle =
+    validator_set (cert : Types.finalize) later next bundle =
   let module R = Octra_node_runtime.Consensus_finality_runtime in
   let module S = Octra_node_runtime.Consensus_finalized_shell in
   let module State = Octra_node_runtime.Consensus_finality_state in
@@ -566,10 +634,12 @@ let check_live_round ?(reverse = false) ?(worker = false)
   let epoch = Int64.to_int cert.epoch_id in
   let head = ref (epoch - 1) in
   let pause, resume = Lwt.wait () in
+  let saved_root = ref (Some cert.header.proposed_state_root) in
   let cache = Cache.create ~cap:4 in
   ignore (Cache.store cache ~pid:cert.proposal_id ~tx_hashes:(List.map Tx.hash bundle.txs)
     ~txs:bundle.txs ~receipts_json:bundle.receipts_json);
-  let runtime = R.create_node (R.node_deps_of_runtime R.{
+  let node_deps = R.node_deps_of_runtime R.{
+    committed_epoch_root_raw = (fun _ -> !saved_root);
     data_dir = base;
     bundles = Cache.node_runtime cache;
     driver_ref = ref None;
@@ -585,13 +655,16 @@ let check_live_round ?(reverse = false) ?(worker = false)
     read_commit_root = (fun () -> Lwt.return (Some cert.header.proposed_state_root));
     read_local_root_raw = (fun () -> Lwt.return cert.header.proposed_state_root);
     apply_timeout_seconds = 1.;
+    stall_timeout_seconds = 2.;
     require_sync = (fun _ -> failwith "unexpected live sync");
     fatal_exit = (fun () -> failwith "unexpected live exit");
     catchup_active = ref false;
     runtime_state = Octra_node_runtime.Consensus_runtime_state.create ();
     set_state_attested = (fun ~head:_ ~root:_ -> ());
     finality;
-  }) in
+  } in
+  let runtime = R.create_node node_deps in
+  expect "pending certificate treated as committed" (not (node_deps.finish_applied cert));
   let deps = S.{
     prune_frozen = (fun ~finalized_epoch:_ -> ());
     store_expected_root = finality.store_expected_root;
@@ -629,6 +702,17 @@ let check_live_round ?(reverse = false) ?(worker = false)
   head := epoch;
   Lwt.wakeup resume ();
   Lwt_main.run (Lwt.join [first; second]);
+  expect "committed certificate did not end wait" (node_deps.finish_applied cert);
+  saved_root := Some "wrong root";
+  expect "different applied root ended wait" (not (node_deps.finish_applied cert));
+  saved_root := None;
+  expect "missing applied root ended wait" (not (node_deps.finish_applied cert));
+  saved_root := Some cert.header.proposed_state_root;
+  head := epoch - 1;
+  expect "certificate ahead of state ended wait" (not (node_deps.finish_applied cert));
+  head := epoch;
+  expect "different block ended wait" (not (node_deps.finish_applied
+    {cert with header = {cert.header with proposed_state_root = String.make 32 'x'}}));
   let saved = match Journal.read_committed_epoch ~chain_id:cert.chain_id ~epoch:cert.epoch_id base with
     | Journal.Valid record -> record
     | _ -> failwith "live certificate missing" in
@@ -652,7 +736,285 @@ let check_live_round ?(reverse = false) ?(worker = false)
       ~chain_id:cert.chain_id
       ~expected_validator_set_hash:(Octra_consensus.C_config.validator_set_hash validator_set)
       ~expected_txid:(Int64.succ cert.header.txid_hi) ~record));
+  let module Apply = Octra_node_runtime.Consensus_finalized_apply in
+  let module Fetch = Octra_node_runtime.Consensus_bundle_fetch in
+  head := epoch - 1;
+  let query, _ = Lwt.task () in
+  let ready, _ = Lwt.task () in
+  let node = node_deps in
+  let apply = Apply.{
+    check_finality = node.check_finality;
+    finish_applied = node.finish_applied;
+    write_finality = node.write_finality;
+    persist_finality_certificate = node.persist_finality_certificate;
+    persist_finality_bundle = node.persist_finality_bundle;
+    store_proposer = ignore;
+    chaos_after_finality_log = (fun () -> ());
+    cached_bundle = (fun ~proposal_id:_ -> false);
+    cached_bundle_data = (fun ~proposal_id:_ -> None);
+    cached_bundle_len = (fun ~proposal_id:_ -> 0);
+    header_has_empty_bundle = (fun _ -> false);
+    store_empty_bundle = (fun _ -> failwith "unexpected empty data");
+    query_bundle = (fun ~epoch_id:_ ~proposal_id:_ ~validate:_ -> Fetch.join ~ready query);
+    store_accepted_bundle = (fun ~proposal_id:_ _ -> failwith "unexpected late data");
+    sleep = Lwt_unix.sleep;
+    range_bundle = (fun _ ~timeout:_ -> failwith "unexpected range");
+    bundle_wait_timeout_seconds = 5.;
+    bundle_wait_expired = (fun ~epoch_id:_ -> failwith "completed epoch expired");
+    post_finalize = (fun ~epoch_id:_ ~proposed_root:_ -> failwith "repeated apply");
+  } in
+  let waiting = Apply.run apply ~validator_set cert in
+  expect "journal wait did not start" (Lwt.is_sleeping waiting);
+  Journal.persist_bundle base cert bundle;
+  Journal.promote_applied base ~epoch:cert.epoch_id ~state_root:cert.header.proposed_state_root;
+  head := epoch;
+  Journal.persist_certificate base ~validator_set next;
+  let path = Filename.concat base "finality/pending_finalized.json" in
+  let bytes = read_file path in
+  let result = Lwt_main.run (Lwt_unix.with_timeout 120. (fun () -> waiting)) in
+  expect "next pending journal blocked completion"
+    (result = Octra_node_runtime.Consensus_post_finalize.Applied);
+  expect "completion changed next journal" (read_file path = bytes);
+  expect "completion retained network query"
+    (match Lwt.state query with Lwt.Fail Lwt.Canceled -> true | _ -> false);
+  expect "completion retained cache waiter"
+    (match Lwt.state ready with Lwt.Fail Lwt.Canceled -> true | _ -> false);
+  expect "next pending journal rejected prior certificate" (node_deps.finish_applied cert);
   end
+
+let check_apply_retry ?(foreign = false) ?(missing = false)
+    validator_set (cert : Types.finalize) bundle =
+  let module R = Octra_node_runtime.Consensus_finality_runtime in
+  let module State = Octra_node_runtime.Consensus_finality_state in
+  let module Checked = Octra_node_runtime.Consensus_epoch_apply_checked in
+  let module Queue = Octra_node_runtime.Consensus_catchup_queue in
+  let module Runtime = Octra_node_runtime.Consensus_runtime_state in
+  let base = Test_workspace.unique_dir "apply-retry" in
+  let finality = State.callbacks (State.create ()) in
+  let epoch = Int64.to_int cert.epoch_id in
+  finality.store_finalized_with_set ~epoch ~validator_set cert;
+  let queue = Queue.create () in
+  let state = Runtime.create () in
+  let head = ref (epoch - 1) in
+  let blocked = ref true in
+  let applies = ref 0 and attested = ref 0 in
+  let cache = Cache.create ~cap:4 in
+  let store_bundle () =
+    ignore (Cache.store cache ~pid:cert.proposal_id ~tx_hashes:(List.map Tx.hash bundle.Journal.txs)
+      ~txs:bundle.txs ~receipts_json:bundle.receipts_json) in
+  if not missing then store_bundle ();
+  let tick () =
+    if missing && !blocked then Lwt.return_unit
+    else Checked.run Checked.{
+      head = (fun () -> !head);
+      set_current_epoch = ignore;
+      catchup_active = (fun () -> false);
+      queue_gap = (fun ~active:_ ~target_epoch:_ ~reason:_ -> failwith "unexpected gap");
+      clear_state_attested = (fun () -> ());
+      log_already = (fun ~current_epoch:_ ~head:_ -> ());
+      log_defer = (fun _ _ -> ());
+      preflight = (fun () -> if !blocked then Error "anchor read failed" else Ok ());
+      defer = (fun reason -> finality.defer_apply ~epoch ~reason);
+      apply = (fun () -> incr applies; head := epoch; Lwt.return Checked.Apply_done);
+      retry = (fun () -> failwith "unexpected busy retry");
+    } ~consensus_mode:true ~current_epoch:epoch in
+  let saved = ref 0 in
+  let before_apply set value =
+    expect "apply proof set differs" (set = validator_set);
+    expect "apply proof block differs" (value = cert);
+    incr saved;
+    Lwt.return_unit in
+  let runtime = R.create_node ~before_apply (R.node_deps_of_runtime R.{
+    committed_epoch_root_raw = (fun requested ->
+      if requested = epoch && !head >= epoch then Some cert.header.proposed_state_root else None);
+    data_dir = base; bundles = Cache.node_runtime cache; driver_ref = ref None;
+    proposal_state = Octra_node_runtime.Consensus_proposal_state.create ();
+    catchup_queue = queue; consensus_finalized = ref false; current_epoch = ref epoch;
+    committed_head_epoch = (fun () -> !head);
+    sleep = (fun _ -> Lwt.bind (Lwt.pause ()) tick);
+    read_pre_finalize_root = (fun () -> Some cert.header.prev_state_root);
+    read_commit_root = (fun () -> Lwt.return (Some cert.header.proposed_state_root));
+    read_local_root_raw = (fun () -> Lwt.return
+      (if !head = epoch then cert.header.proposed_state_root else cert.header.prev_state_root));
+    apply_timeout_seconds = 0.1;
+    stall_timeout_seconds = 0.2;
+    require_sync = (fun _ -> failwith "unexpected sync replacement");
+    fatal_exit = (fun () -> failwith "unexpected retry exit");
+    catchup_active = ref false; runtime_state = state;
+    set_state_attested = (fun ~head ~root ->
+      incr attested; Runtime.set_state_attested state ~head ~root);
+    finality;
+  }) in
+  let complete work =
+    let finished = Lwt_main.run (Lwt.pick [
+      Lwt.map (fun () -> true) work;
+      Lwt.map (fun () -> false) (Lwt_unix.sleep 120.)]) in
+    expect "deferred apply holds recovery loop" finished in
+  complete (runtime.apply_finalized ~validator_set cert);
+  expect "apply skipped proof save" (!saved = 1);
+  expect "deferred apply advanced state" (!head = epoch - 1 && !applies = 0);
+  expect "deferred apply published attestation" (!attested = 0);
+  expect "deferred apply lost certificate" (Journal.pending base);
+  expect "deferred apply did not quarantine" (Runtime.quarantine_active state);
+  complete (runtime.replay_stashed_while_safe ~source:"test_retry");
+  expect "failed retry cleared certificate" (Journal.pending base && !applies = 0);
+  if foreign then begin
+    ignore (Runtime.clear_quarantine state ~evidence:(Runtime.quarantine_reason state));
+    ignore (Runtime.enter_quarantine state ~epoch ~reason:"operator hold")
+  end;
+  if missing then store_bundle ();
+  blocked := false;
+  let before_retry = !saved in
+  complete (runtime.replay_stashed_while_safe ~source:"test_recovered");
+  expect "retry skipped proof save" (!saved = before_retry + 1);
+  expect "recovered apply did not advance exactly once" (!head = epoch && !applies = 1);
+  expect "recovered apply did not attest root" (!attested = 1);
+  expect "recovered apply changed another quarantine"
+    (Runtime.quarantine_active state = foreign);
+  expect "recovered apply kept pending certificate" (not (Journal.pending base));
+  expect "recovered apply lost history"
+    (match Journal.read_committed_epoch ~chain_id:cert.chain_id ~epoch:cert.epoch_id base with
+     | Journal.Valid record -> record.finalize.proposal_id = cert.proposal_id
+     | _ -> false);
+  complete (runtime.replay_stashed_while_safe ~source:"test_repeat");
+  expect "completed block applied twice" (!applies = 1);
+  let saved_once = !saved in
+  complete (runtime.apply_finalized ~validator_set cert);
+  expect "completed block required proof again" (!saved = saved_once)
+
+let check_apply_root (cert : Types.finalize) =
+  let module Post = Octra_node_runtime.Consensus_post_finalize in
+  let published = ref 0 and exits = ref 0 in
+  let publish () = incr published in
+  let deps = Post.{
+    deactivate_gap = (fun () -> ()); set_consensus_finalized = ignore;
+    committed_head_epoch = (fun () -> Int64.to_int cert.epoch_id);
+    apply_error = (fun _ -> None); sleep = (fun _ -> Lwt.return_unit);
+    read_pre_finalize_root = (fun () -> Some cert.header.prev_state_root);
+    read_commit_root = (fun () -> Lwt.return (Some "changed"));
+    read_local_root_raw = (fun () -> Lwt.return "wrong root");
+    commit_finality_journal = publish;
+    remove_pending_finalized = (fun ~epoch:_ -> publish ());
+    set_state_attested = (fun ~head:_ ~root:_ -> publish ());
+    apply_timeout_seconds = 1.; fatal_exit = (fun () -> incr exits);
+  } in
+  expect "wrong root accepted after retry"
+    (try ignore (Lwt_main.run (Post.run deps ~epoch_id:cert.epoch_id
+      ~proposed_root:cert.header.proposed_state_root)); false
+     with Failure reason -> reason = "post-finalize root mismatch");
+  expect "wrong root published or did not stop" (!published = 0 && !exits = 1)
+
+let check_apply_wait (cert : Types.finalize) =
+  let module Post = Octra_node_runtime.Consensus_post_finalize in
+  List.iter (fun completes ->
+    let now = ref 0. and published = ref 0 and exits = ref 0 in
+    let epoch = Int64.to_int cert.epoch_id in
+    let deps = Post.{
+      deactivate_gap = (fun () -> ()); set_consensus_finalized = ignore;
+      committed_head_epoch = (fun () -> if completes && !now >= 0.15 then epoch else epoch - 1);
+      apply_error = (fun _ -> None);
+      sleep = (fun delay -> now := !now +. delay; Lwt.return_unit);
+      read_pre_finalize_root = (fun () -> Some cert.header.prev_state_root);
+      read_commit_root = (fun () -> Lwt.return_some cert.header.proposed_state_root);
+      read_local_root_raw = (fun () -> Lwt.return cert.header.proposed_state_root);
+      commit_finality_journal = (fun () -> incr published);
+      remove_pending_finalized = (fun ~epoch:_ -> incr published);
+      set_state_attested = (fun ~head:_ ~root:_ -> incr published);
+      apply_timeout_seconds = 0.1; fatal_exit = (fun () -> incr exits);
+    } in
+    let result = try
+      Some (Lwt_main.run (Post.run ~now:(fun () -> !now) deps
+        ~epoch_id:cert.epoch_id ~proposed_root:cert.header.proposed_state_root))
+      with Failure reason when reason = "finalized apply made no progress" -> None in
+    expect "apply deadline released writer" (result <> Some (Post.Deferred "finalized apply deadline"));
+    if completes then
+      expect "slow successful writer was stopped" (result = Some Post.Applied && !exits = 0 && !published = 3)
+    else
+      expect "stalled writer published state" (result = None && !exits = 1 && !published = 0))
+    [false; true]
+
+let check_slow_apply validator_set (cert : Types.finalize) next bundle =
+  let module R = Octra_node_runtime.Consensus_finality_runtime in
+  let module State = Octra_node_runtime.Consensus_finality_state in
+  let module Runtime = Octra_node_runtime.Consensus_runtime_state in
+  let base = Test_workspace.unique_dir "slow-apply" in
+  let finality = State.callbacks (State.create ()) in
+  let epoch = Int64.to_int cert.epoch_id in
+  let head = ref (epoch - 1) in
+  let ticks = ref 0 and applies = ref 0 and exits = ref 0 and attested = ref 0 in
+  let committing, commit_seen = Lwt.wait () in
+  let release, commit_done = Lwt.wait () in
+  let queued_commit, queued_seen = Lwt.wait () in
+  let queued_release, queued_done = Lwt.wait () in
+  let await label signal =
+    let seen = Lwt_main.run (Lwt.pick [
+      Lwt.map (fun () -> true) (Lwt.protected signal);
+      Lwt.map (fun () -> false) (Lwt_unix.sleep 120.);
+    ]) in
+    expect label seen in
+  let cache = Cache.create ~cap:4 in
+  List.iter (fun (value : Types.finalize) ->
+    if value.epoch_id = cert.epoch_id then
+      finality.store_finalized_with_set ~epoch:(Int64.to_int value.epoch_id) ~validator_set value;
+    ignore (Cache.store cache ~pid:value.proposal_id ~tx_hashes:(List.map Tx.hash bundle.Journal.txs)
+      ~txs:bundle.txs ~receipts_json:bundle.receipts_json)) [cert; next];
+  let root () = if !head < epoch then cert.header.prev_state_root
+    else if !head = epoch then cert.header.proposed_state_root
+    else next.header.proposed_state_root in
+  let state = Runtime.create () in
+  let runtime = R.create_node (R.node_deps_of_runtime R.{
+    committed_epoch_root_raw = (fun _ -> None);
+    data_dir = base; bundles = Cache.node_runtime cache; driver_ref = ref None;
+    proposal_state = Octra_node_runtime.Consensus_proposal_state.create ();
+    catchup_queue = Octra_node_runtime.Consensus_catchup_queue.create ();
+    consensus_finalized = ref false; current_epoch = ref epoch;
+    committed_head_epoch = (fun () -> !head);
+    sleep = (fun _ ->
+      incr ticks;
+      if !ticks mod 8 = 0 then begin incr applies; incr head end;
+      Lwt.pause ());
+    read_pre_finalize_root = (fun () -> Some (root ()));
+    read_commit_root = (fun () ->
+      if !head = epoch then begin
+        if Lwt.is_sleeping committing then Lwt.wakeup_later commit_seen ();
+        Lwt.map (fun () -> Some (root ())) release
+      end else if !head = epoch + 1 then begin
+        if Lwt.is_sleeping queued_commit then Lwt.wakeup_later queued_seen ();
+        Lwt.map (fun () -> Some (root ())) queued_release
+      end else Lwt.return (Some (root ())));
+    read_local_root_raw = (fun () -> Lwt.return (root ()));
+    apply_timeout_seconds = 0.1;
+    stall_timeout_seconds = 0.2;
+    require_sync = (fun _ -> failwith "slow apply requested replacement");
+    fatal_exit = (fun () -> incr exits);
+    catchup_active = ref false; runtime_state = state;
+    set_state_attested = (fun ~head ~root ->
+      incr attested; Runtime.set_state_attested state ~head ~root);
+    finality;
+  }) in
+  let first = runtime.apply_finalized ~validator_set cert in
+  let second = runtime.apply_finalized ~validator_set next in
+  await "active commit did not start" committing;
+  let drain = runtime.drain_pending () in
+  expect "drain did not join active commit" (Lwt.is_sleeping drain);
+  Lwt.wakeup_later commit_done ();
+  await "queued commit did not start" queued_commit;
+  expect "drain skipped queued commit" (Lwt.is_sleeping drain);
+  Lwt.wakeup_later queued_done ();
+  let completed = Lwt_main.run (Lwt.pick [
+    Lwt.map (fun _ -> true) (Lwt.join [first; second; drain]);
+    Lwt.map (fun () -> false) (Lwt_unix.sleep 120.)]) in
+  expect "slow apply did not finish both heights" completed;
+  expect "slow apply released its height early" (!head = epoch + 1 && !applies = 2);
+  expect "slow apply caused a journal conflict" (!exits = 0);
+  expect "slow apply skipped root checks" (!attested = 2);
+  expect "slow apply kept pending journal" (not (Journal.pending base));
+  expect "slow apply was treated as refusal" (not (Runtime.quarantine_active state));
+  List.iter (fun (value : Types.finalize) ->
+    expect "slow apply lost history" (match Journal.read_committed_epoch
+      ~chain_id:value.chain_id ~epoch:value.epoch_id base with
+      | Journal.Valid saved -> saved.finalize.proposal_id = value.proposal_id
+      | _ -> false)) [cert; next]
 
 let check_hashes () =
   Mirage_crypto_rng_unix.use_default ();
@@ -685,14 +1047,28 @@ let check_hashes () =
   in
   let finalize = signed header in
   let bundle = Journal.{ tx_hashes = [raw]; txs = [tx]; receipts_json = [] } in
+  check_refetch ~via_range:true (Test_workspace.unique_dir "range-bundle")
+    validator_set finalize bundle;
   check_set_drop validator_set finalize bundle;
   check_bad_drop validator_set finalize;
   check_rebind validator_set finalize (signed ~round:1 header) bundle;
   check_stage_order validator_set finalize
     (signed { header with proposed_state_root = String.make 32 'c' }) bundle;
-  check_live_round validator_set finalize (signed ~round:1 header) bundle;
-  check_live_round ~worker:true validator_set finalize (signed ~round:1 header) bundle;
-  check_live_round ~reverse:true validator_set finalize (signed ~round:1 header) bundle;
+  let next = signed { header with epoch_id = 13L; txid_hi = 2L;
+    prev_state_root = header.proposed_state_root; proposed_state_root = String.make 32 'd' } in
+  check_live_round validator_set finalize (signed ~round:1 header) next bundle;
+  check_live_round ~worker:true validator_set finalize (signed ~round:1 header) next bundle;
+  check_live_round ~reverse:true validator_set finalize (signed ~round:1 header) next bundle;
+  check_apply_retry validator_set finalize bundle;
+  check_apply_retry ~foreign:true validator_set finalize bundle;
+  check_apply_retry ~missing:true validator_set finalize bundle;
+  check_slow_apply validator_set finalize
+    (signed { header with epoch_id = 13L; txid_hi = 2L;
+      prev_state_root = header.proposed_state_root; proposed_state_root = String.make 32 'd' }) bundle;
+  check_apply_root finalize;
+  check_apply_wait finalize;
+  check_bundle_deadline validator_set finalize;
+  check_bundle_deadline ~done_early:true validator_set finalize;
   check_pending validator_set finalize
     (signed { header with epoch_id = 13L; prev_state_root = header.proposed_state_root }) bundle;
   check_quorum validator_set finalize (signed ~round:1 header) bundle;
@@ -752,8 +1128,43 @@ let check_saved record anchor =
   check_finish base validator_set cert;
   Printf.printf "status = pass epoch = %Ld gate = journal_record\n%!" cert.epoch_id
 
+let check_apply_recovery () =
+  let module Runtime = Octra_node_runtime.Consensus_runtime_state in
+  let evidence = "direct_finalized_apply:root_verified" in
+  let check reason ~needs_attestation =
+    let state = Runtime.create () in
+    ignore (Runtime.enter_quarantine state ~epoch:42 ~reason);
+    expect "unproved report keeps quarantine"
+      (match Runtime.clear_quarantine state ~evidence:"rpc_read" with
+       | Runtime.Refused _ -> true
+       | _ -> false);
+    if needs_attestation then
+      Runtime.set_state_attested state ~head:42 ~root:"root";
+    expect "proved apply clears quarantine"
+      (Runtime.clear_quarantine state ~evidence = Runtime.Cleared)
+  in
+  check "catchup_failed:root" ~needs_attestation:false;
+  check "catchup_apply_failed:root" ~needs_attestation:false;
+  check "finalized_bundle_unavailable:42" ~needs_attestation:true;
+  let state = Runtime.create () in
+  ignore (Runtime.enter_quarantine state ~epoch:42
+    ~reason:"finalized_bundle_unavailable:43");
+  Runtime.set_state_attested state ~head:42 ~root:"root";
+  expect "earlier attestation keeps quarantine"
+    (match Runtime.clear_quarantine state ~evidence with
+     | Runtime.Refused _ -> true
+     | _ -> false);
+  let held = Runtime.create () in
+  ignore (Runtime.enter_quarantine held ~epoch:42 ~reason:"operator hold");
+  Runtime.set_state_attested held ~head:42 ~root:"root";
+  expect "operator hold survives direct apply"
+    (match Runtime.clear_quarantine held ~evidence with
+     | Runtime.Refused _ -> true
+     | _ -> false)
+
 let () =
   check_hashes ();
+  check_apply_recovery ();
   begin match Array.to_list Sys.argv with
   | [_] -> ()
   | [_; record; anchor] -> check_saved record anchor

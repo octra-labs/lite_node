@@ -449,6 +449,42 @@ let test_parent_suffix () =
          = Error "parent finality entry is behind");
       expect "missing parent refused"
         (Result.is_error (Source.verify source ~epoch_id:8193L None));
+      let legacy =
+        Source.create ~chain_id:"parent-test" ~data_dir:base ~chaindata
+          (function
+            | "OCTRA_PROPOSAL_PROTOCOL_ACTIVATION_EPOCH" -> Some "8194"
+            | _ -> None)
+        |> Result.get_ok
+      in
+      expect "legacy proposal without parent refused"
+        (Source.verify legacy ~epoch_id:8193L None = Ok ());
+      expect "legacy proposal loaded parent"
+        (Source.proposal legacy ~epoch_id:8193L = Ok None);
+      expect "legacy proposal accepted parent"
+        (Result.is_error (Source.verify legacy ~epoch_id:8193L (Some value)));
+      expect "legacy history lost parent"
+        (Source.load legacy ~epoch_id:8193L = Ok (Some value));
+      expect "genesis proposal without parent refused"
+        (Source.verify source ~epoch_id:0L None = Ok ());
+      expect "genesis accepted parent"
+        (Result.is_error (Source.verify source ~epoch_id:0L (Some value)));
+      expect "negative proposal epoch accepted"
+        (Result.is_error (Source.verify legacy ~epoch_id:(-1L) None));
+      expect "activation accepted missing history"
+        (Result.is_error (Source.verify legacy ~epoch_id:8194L None));
+      let cutover =
+        Source.create ~chain_id:"parent-test" ~data_dir:base ~chaindata
+          (function
+            | "OCTRA_PROPOSAL_PROTOCOL_ACTIVATION_EPOCH" -> Some "8193"
+            | _ -> None)
+        |> Result.get_ok
+      in
+      expect "activation lost parent"
+        (Source.proposal cutover ~epoch_id:8193L = Ok (Some value));
+      expect "activation refused verified parent"
+        (Source.verify cutover ~epoch_id:8193L (Some value) = Ok ());
+      expect "activation accepted absent parent"
+        (Result.is_error (Source.verify cutover ~epoch_id:8193L None));
       let output =
         open_out_gen [Open_wronly; Open_append; Open_binary] 0o600 (Log.path base)
       in
@@ -456,6 +492,8 @@ let test_parent_suffix () =
         (fun () -> output_string output "{\"height\":");
       expect "incomplete suffix refused"
         (try ignore (Source.load source ~epoch_id:8193L); false with _ -> true);
+      expect "incomplete proposal history refused"
+        (try ignore (Source.proposal source ~epoch_id:8193L); false with _ -> true);
       Printf.printf "event = parent_suffix reads = 8 allocated_bytes = %.0f\n" allocated)
 
 let () =

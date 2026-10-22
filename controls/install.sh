@@ -88,33 +88,7 @@ run_operator() {
 }
 
 install_rust_toolchain() {
-  RUSTUP="$CARGO_HOME/bin/rustup"
-  if [ ! -x "$RUSTUP" ]; then
-    run_operator mkdir -p "$TOOLCHAIN_ROOT"
-    run_operator curl \
-      --proto '=https' \
-      --tlsv1.2 \
-      --fail \
-      --location \
-      --silent \
-      --show-error \
-      --connect-timeout 15 \
-      --max-time 300 \
-      https://sh.rustup.rs \
-      --output "$TOOLCHAIN_ROOT/rustup-init.sh"
-    run_operator env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
-      timeout 900 sh "$TOOLCHAIN_ROOT/rustup-init.sh" \
-      -y \
-      --no-modify-path \
-      --profile minimal \
-      --default-toolchain "$RUST_TOOLCHAIN"
-  fi
-  run_operator env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
-    "$RUSTUP" set profile minimal
-  run_operator env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
-    timeout 900 "$RUSTUP" toolchain install "$RUST_TOOLCHAIN"
-  run_operator env CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
-    "$RUSTUP" default "$RUST_TOOLCHAIN"
+  run_operator python3 "$ROOT/controls/lib/validator_config.py" --install-rust
 }
 
 install_ocaml_toolchain() {

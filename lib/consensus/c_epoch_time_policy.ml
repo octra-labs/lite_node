@@ -21,8 +21,8 @@ let historical_activations = [devnet_chain_id, devnet_activation]
 
 let activation_for_chain chain_id =
   historical_activations
-  |> List.find_map (fun (candidate, activation) ->
-       if String.equal chain_id candidate then Some activation else None)
+  |> List.find_map (fun (entry, activation) ->
+       if String.equal chain_id entry then Some activation else None)
 
 let rule_for_epoch ~chain_id ~epoch_id =
   match activation_for_chain chain_id with

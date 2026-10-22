@@ -77,8 +77,10 @@ type query_deps = {
     max_epochs:int ->
     timeout_seconds:float ->
     validate:(C_driver.catchup_range_response_record -> bool) ->
+    prove:(C_driver.catchup_range_response_record -> bool) ->
     C_driver.catchup_range_response_record option Lwt.t;
   http_range :
+    budget:float ->
     from_epoch:int64 ->
     max_epochs:int ->
     validate:(C_driver.catchup_range_response_record -> bool) ->
@@ -268,6 +270,7 @@ type driver_runner_wiring = {
   observer : bool;
   drain_pending_finalized : unit -> unit Lwt.t;
   http_range :
+    budget:float ->
     from_epoch:int64 ->
     max_epochs:int ->
     validate:(C_driver.catchup_range_response_record -> bool) ->
@@ -296,6 +299,7 @@ type driver_runner_node_wiring = {
   observer : bool;
   drain_pending_finalized : unit -> unit Lwt.t;
   http_range :
+    budget:float ->
     from_epoch:int64 ->
     max_epochs:int ->
     validate:(C_driver.catchup_range_response_record -> bool) ->
@@ -322,17 +326,17 @@ let range_plan ~env_timeout ~from_epoch ~target_epoch =
   let remain = Int64.to_int (Int64.sub target_epoch from_epoch) + 1 in
   {
     remain;
-    max_epochs = min range_cap remain;
+    max_epochs = min range_cap (max 0 remain);
     timeout_seconds = timeout_of_env ~remain env_timeout;
     log_progress = Int64.to_int from_epoch mod 100 = 0;
   }
 
 let query_range deps ~attempts ~retry_delay ~from_epoch ~max_epochs
-    ~timeout_seconds ~reason ~validate =
+    ~timeout_seconds ~reason ~validate ~prove =
   let open Lwt.Syntax in
   let rec loop attempts =
     let* result =
-      deps.query_range ~from_epoch ~max_epochs ~timeout_seconds ~validate
+      deps.query_range ~from_epoch ~max_epochs ~timeout_seconds ~validate ~prove
     in
     match result with
     | Some _ ->
@@ -347,6 +351,43 @@ let query_range deps ~attempts ~retry_delay ~from_epoch ~max_epochs
       Lwt.return_none
   in
   loop attempts
+
+let cancel_and_wait ~sleep task =
+  let open Lwt.Syntax in
+  Lwt.cancel task;
+  let settled =
+    Lwt.catch
+      (fun () ->
+        let+ _ = task in
+        true)
+      (fun _ -> Lwt.return_true)
+  in
+  let expired =
+    let* () = Lwt.pause () in
+    let+ () = sleep 0.5 in
+    false
+  in
+  Lwt.pick [settled; expired]
+
+let first_success ~sleep tasks =
+  let open Lwt.Syntax in
+  let rec await pending =
+    match pending with
+    | [] -> Lwt.return_none
+    | _ ->
+      let* finished, waiting = Lwt.nchoose_split pending in
+      match List.find_opt Option.is_some finished with
+      | Some found -> Lwt.return found
+      | None -> await waiting
+  in
+  Lwt.finalize
+    (fun () -> await tasks)
+    (fun () ->
+      Lwt_list.iter_p
+        (fun task ->
+          let+ _ = cancel_and_wait ~sleep task in
+          ())
+        tasks)
 
 let parse_record_txs record =
   try
@@ -429,7 +470,16 @@ let check_qcs ~chain_id ~expected_validator_set_hash ~start_txid records =
                   ~expected_txid:next_txid
                   ~record with
           | Error error -> stop checked error
-          | Ok _ -> check next_txid (record :: checked) rest
+          | Ok finality ->
+            let reward = match record.reward_source with
+              | None -> Error "catchup reward source is missing"
+              | Some source ->
+                Result.bind (Consensus_reward_attribution.of_source source)
+                  (Consensus_reward_attribution.prove_finality
+                    ~validator_set:finality.validator_set finality.finalize) in
+            match reward with
+            | Error error -> stop checked error
+            | Ok _ -> check next_txid (record :: checked) rest
   in
   match records with
   | [] -> Error "catchup range is empty"
@@ -479,6 +529,26 @@ let query_chunk (deps : chunk_query_deps) ~target_epoch ~from_epoch ~reason =
         | Ok () -> true
         | Error error -> reject r ("continuity: " ^ error)
   in
+  let prove r =
+    let checked =
+      try deps.verify_http r.C_driver.records with
+      | Out_of_memory | Stack_overflow | Sys.Break | Lwt.Canceled as exn ->
+        raise exn
+      | exn -> Error (Printexc.to_string exn)
+    in
+    match checked with
+    | Ok records when List.length records = List.length r.records -> true
+    | Ok records ->
+      Log.warn "catchup"
+        "event = range_proof_prefix from = %Ld checked = %d received = %d"
+        from_epoch (List.length records) (List.length r.records);
+      false
+    | Error error ->
+      Log.warn "catchup"
+        "event = range_proof_failed from = %Ld reason = %s"
+        from_epoch error;
+      false
+  in
   let peer attempts =
     query_range
       deps.range_query
@@ -489,8 +559,9 @@ let query_chunk (deps : chunk_query_deps) ~target_epoch ~from_epoch ~reason =
       ~timeout_seconds:range_plan.timeout_seconds
       ~reason
       ~validate
+      ~prove
   in
-  let http () =
+  let http ?(budget = 25.0) () =
     let checked = ref None in
     let check response =
       let verified =
@@ -528,8 +599,9 @@ let query_chunk (deps : chunk_query_deps) ~target_epoch ~from_epoch ~reason =
     in
     let* response =
       deps.range_query.http_range
+        ~budget
         ~from_epoch
-        ~max_epochs:range_cap
+        ~max_epochs:range_plan.max_epochs
         ~validate:check
     in
     let verified =
@@ -558,27 +630,28 @@ let query_chunk (deps : chunk_query_deps) ~target_epoch ~from_epoch ~reason =
       Lwt.return_none
     | None, None -> Lwt.return_none
   in
-  let* first = peer 1 in
+  let first_peer = peer 1 in
+  let early_http =
+    let* () = deps.range_query.sleep 1.0 in
+    Lwt.catch
+      (fun () -> Lwt_unix.with_timeout range_plan.timeout_seconds
+        (http ~budget:range_plan.timeout_seconds))
+      (function
+        | Lwt_unix.Timeout -> Lwt.return_none
+        | exn -> Lwt.fail exn)
+  in
+  let* first =
+    first_success ~sleep:deps.range_query.sleep [first_peer; early_http]
+  in
   let* result =
     match first with
     | Some _ -> Lwt.return first
     | None ->
-      let* early =
-        Lwt.catch
-          (fun () ->
-            Lwt_unix.with_timeout range_plan.timeout_seconds http)
-          (function
-            | Lwt_unix.Timeout -> Lwt.return_none
-            | exn -> Lwt.fail exn)
-      in
-      match early with
-      | Some _ -> Lwt.return early
-      | None ->
-        let* () = deps.range_query.sleep 2.0 in
-        let* retried = peer 2 in
-        match retried with
-        | Some _ -> Lwt.return retried
-        | None -> http ()
+      let* () = deps.range_query.sleep 2.0 in
+      let* retried = peer 2 in
+      match retried with
+      | Some _ -> Lwt.return retried
+      | None -> http ()
   in
   match result with
   | Some chunk ->
@@ -1102,23 +1175,6 @@ let rec wait_for_local_apply (deps : target_deps) ~from_epoch =
     let* () = Lwt.pause () in
     wait_for_local_apply deps ~from_epoch
 
-let cancel_and_wait ~sleep task =
-  let open Lwt.Syntax in
-  Lwt.cancel task;
-  let settled =
-    Lwt.catch
-      (fun () ->
-        let+ _ = task in
-        true)
-      (fun _ -> Lwt.return_true)
-  in
-  let expired =
-    let* () = Lwt.pause () in
-    let+ () = sleep 0.5 in
-    false
-  in
-  Lwt.pick [settled; expired]
-
 let query_or_local_apply deps ~target_epoch ~from_epoch ~reason =
   let open Lwt.Syntax in
   let range_step =
@@ -1150,14 +1206,58 @@ let query_or_local_apply deps ~target_epoch ~from_epoch ~reason =
       let* _ = cancel local_step in
       Lwt.fail exn)
 
-let run_target (deps : target_deps) ~target_epoch ~reason ~finish_success
+let grows reason =
+  List.mem reason ["lagging"; "attestation_secondary"; "verified_lag"]
+
+let probe_target ~now ~head ~current ~allowed records =
+  if not allowed || current < head then None
+  else match List.rev records with
+    | last :: _ when last.Octra_consensus.C_codec.epoch_id >= Int64.add current 2L
+        || (last.epoch_id = Int64.succ current && last.epoch_ts < now -. 60.) ->
+      Some last.epoch_id
+    | _ -> None
+
+let probe_range query ~now ~head ~current_head ~allowed ~run_catchup =
+  let open Lwt.Syntax in
+  let* found = Lwt.catch
+    (fun () -> Lwt_unix.with_timeout 8. (fun () ->
+      query_chunk query ~target_epoch:(Int64.add head 16L)
+        ~from_epoch:(Int64.succ head) ~reason:"verified_lag"))
+    (function Lwt_unix.Timeout -> Lwt.return (Query_failed "range wait")
+      | exn -> Lwt.fail exn) in
+  match found with
+  | Query_chunk response ->
+    begin match probe_target ~now:(now ()) ~head ~current:(current_head ())
+        ~allowed:(allowed ()) response.records with
+    | Some target_epoch -> run_catchup ~target_epoch ~reason:"verified_lag"
+    | None -> Lwt.return_unit
+    end
+  | Query_failed _ -> Lwt.return_unit
+
+let next_window ~extended ~target ~next ~count =
+  extended || next > target, count < range_cap
+
+let next_target ~now ~reason ~initial ~target ~epoch ~epoch_ts =
+  if not (grows reason) || epoch < initial then target
+  else if epoch_ts >= now -. 60. then epoch
+  else if epoch >= target then Int64.add epoch (Int64.of_int range_cap)
+  else target
+
+let run_target ?(now = Unix.gettimeofday) (deps : target_deps) ~target_epoch ~reason ~finish_success
     ~fail_catchup =
   let open Lwt.Syntax in
+  let initial = target_epoch in
+  let target = ref target_epoch in
+  let extended = ref false in
+  let short = ref false in
+  let verified = ref None in
+  let root_checked () = !verified = Some (Int64.of_int (deps.head_epoch ())) in
   let rec run () =
     deps.normalize ~source:("catchup:" ^ reason);
     let our_head_int = deps.head_epoch () in
     let our_head = Int64.of_int our_head_int in
     let rec loop ~from_epoch ~root_verified =
+      let target_epoch = !target in
       let* () = deps.apply.record_apply.advance_height from_epoch in
       if Int64.compare from_epoch target_epoch > 0 then begin
         Log.info "catchup"
@@ -1169,7 +1269,13 @@ let run_target (deps : target_deps) ~target_epoch ~reason ~finish_success
            else finish_unverified reason)
       end else
         let* query_step =
-          query_or_local_apply deps ~target_epoch ~from_epoch ~reason
+          if !extended && !short then
+            Lwt.catch
+              (fun () -> Lwt_unix.with_timeout 10. (fun () ->
+                query_or_local_apply deps ~target_epoch ~from_epoch ~reason))
+              (function Lwt_unix.Timeout -> Lwt.return (Range_step (Query_failed reason))
+                | exn -> Lwt.fail exn)
+          else query_or_local_apply deps ~target_epoch ~from_epoch ~reason
         in
         match query_step with
         | Local_apply ->
@@ -1178,7 +1284,9 @@ let run_target (deps : target_deps) ~target_epoch ~reason ~finish_success
             from_epoch (deps.head_epoch ()) reason;
           run ()
         | Range_step (Query_failed tag) ->
-          fail_catchup tag
+          if !extended then
+            finish_success (if root_checked () then finish_verified reason else finish_unverified reason)
+          else fail_catchup tag
         | Range_step (Query_chunk chunk) ->
           let* step =
             apply_chunk_gate
@@ -1197,16 +1305,26 @@ let run_target (deps : target_deps) ~target_epoch ~reason ~finish_success
           | Chunk_fail tag ->
             fail_catchup tag
           | Chunk_continue applied_chunk ->
+            let last = List.hd (List.rev applied_chunk.C_driver.records) in
+            verified := Some last.epoch_id;
+            let next = next_target ~now:(now ()) ~reason ~initial ~target:!target
+              ~epoch:last.epoch_id ~epoch_ts:last.epoch_ts in
+            let more, brief = next_window ~extended:!extended ~target:!target
+              ~next ~count:(List.length applied_chunk.records) in
+            extended := more;
+            short := brief;
+            target := next;
             loop
               ~from_epoch:(Int64.succ (last_applied_epoch applied_chunk))
               ~root_verified:true
     in
-    if Int64.compare target_epoch our_head <= 0 then begin
+    if Int64.compare !target our_head <= 0 then begin
       Log.info "catchup"
         "event = complete status = already_in_sync target = %Ld reason = %s"
         target_epoch
         reason;
-      finish_success (finish_unverified ("already_in_sync:" ^ reason))
+      finish_success (if root_checked () then finish_verified reason
+        else finish_unverified ("already_in_sync:" ^ reason))
     end else begin
       Log.warn "catchup"
         "event = start local = %d target = %Ld lag = %d reason = %s"
@@ -1214,7 +1332,7 @@ let run_target (deps : target_deps) ~target_epoch ~reason ~finish_success
         target_epoch
         (Int64.to_int (Int64.sub target_epoch our_head))
         reason;
-      loop ~from_epoch:(Int64.succ our_head) ~root_verified:false
+      loop ~from_epoch:(Int64.succ our_head) ~root_verified:(root_checked ())
     end
   in
   run ()
@@ -1228,15 +1346,14 @@ let queue_active (deps : deps) ~target_epoch ~reason =
 
 let run (deps : deps) ~run_one ~target_epoch ~reason =
   let open Lwt.Syntax in
+  let wake = ref false in
   let rec finish_success finish =
     let active_reason = finish.tag in
     let next_height = Int64.succ (Int64.of_int (deps.committed_head_epoch ())) in
     let* () = deps.start_height next_height in
-    deps.set_catchup_active false;
     let head = Int64.of_int (deps.committed_head_epoch ()) in
     match deps.take_queued_after ~head with
     | Some queued ->
-      deps.set_catchup_active true;
       Log.warn "catchup"
         "event = continue active_reason = %s next_target = %Ld next_reason = %s head = %Ld"
         active_reason queued.target_epoch queued.reason head;
@@ -1258,10 +1375,16 @@ let run (deps : deps) ~run_one ~target_epoch ~reason =
           Lwt.return_unit
         end
       in
-      if deps.observer then Lwt.return_unit
-      else
-        let* () = deps.drain_pending_finalized () in
-        deps.wake_ready ()
+      let* () =
+        if deps.observer then Lwt.return_unit
+        else deps.drain_pending_finalized () in
+      let head = Int64.of_int (deps.committed_head_epoch ()) in
+      match deps.take_queued_after ~head with
+      | Some queued -> run_queued queued
+      | None ->
+        deps.set_catchup_active false;
+        wake := not deps.observer;
+        Lwt.return_unit
   and fail_catchup quarantine_tag =
     deps.clear_queue ();
     deps.set_catchup_active false;
@@ -1290,7 +1413,14 @@ let run (deps : deps) ~run_one ~target_epoch ~reason =
     queue_active deps ~target_epoch ~reason
   else begin
     deps.set_catchup_active true;
-    run_queued { target_epoch; reason }
+    let* () = run_queued { target_epoch; reason } in
+    if not !wake then Lwt.return_unit else
+    Lwt.catch deps.wake_ready (function
+      | Lwt.Canceled -> Lwt.fail Lwt.Canceled
+      | exn ->
+        Log.error "catchup" "event = wake_failed error = %s"
+          (Printexc.to_string exn);
+        Lwt.return_unit)
   end
 
 let run_with_target deps ~target ~target_epoch ~reason =
@@ -1413,14 +1543,16 @@ let driver_io_of_driver driver =
       C_driver.wake_ready driver);
     range_query = {
       sleep = Lwt_unix.sleep;
-      query_range = (fun ~from_epoch ~max_epochs ~timeout_seconds ~validate ->
+      query_range = (fun ~from_epoch ~max_epochs ~timeout_seconds ~validate
+          ~prove ->
         C_driver.query_catchup_range
           driver
           ~from_epoch
           ~max_epochs
           ~timeout_seconds
-          ~validate);
-      http_range = (fun ~from_epoch:_ ~max_epochs:_ ~validate:_ -> Lwt.return_none);
+          ~validate
+          ~prove);
+      http_range = (fun ~budget:_ ~from_epoch:_ ~max_epochs:_ ~validate:_ -> Lwt.return_none);
     };
   }
 

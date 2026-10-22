@@ -430,7 +430,7 @@ program WorkCase {
 |} in
       expect "work program failed compilation" (code.error = None);
       Lwt_main.run (S.deploy_contract store ~address:program ~owner:caller.address
-        ~ctype:"CUSTOM" ~version:"1" ~admission:"binary"
+        ~ctype:"CUSTOM" ~version:"1" ~check:"binary"
         ~code_hash:(Core.Circles.sha256_hex code.bytecode)
         ~bytecode_b64:(Base64.encode_exn code.bytecode));
       let wasm = install store caller.address ("oct" ^ String.make 44 '3')
@@ -457,7 +457,7 @@ program WorkCase {
         expect "preverify hashes differ from inputs" (tx_hashes = List.map T.hash txs);
         expect "preverify changed root" (state_root = root || state_root = root_raw root);
         batches := txs :: !batches;
-        W.run_many ~field_policy:Core.Private_ledger.Unique_fields ~strict:false ~ledger
+        W.run_many ~keyed:false ~field_policy:Core.Private_ledger.Unique_fields ~strict:false ~ledger
           ~circle_preverify:(Node.Consensus_circle_preverify.run runtime) txs in
       let backend = Node.Consensus_proposal_preview_shell.node_backend
         ~program_trust:Octra_vm.Program_trust.empty ~rules
