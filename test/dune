@@ -894,7 +894,7 @@
 (test
  (name test_polc_cache)
  (modules test_polc_cache)
- (libraries octra_consensus octra_core octra_net octra_test_workspace lwt.unix
+ (libraries octra_consensus octra_core octra_net octra_node_runtime octra_test_workspace lwt.unix
   base64 zarith digestif mirage-crypto-ec))
 
 (test

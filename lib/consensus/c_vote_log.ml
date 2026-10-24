@@ -7,7 +7,7 @@ let ( let* ) result f =
   Result.bind result f
 
 type t =
-  | Memory of (string, vote) Hashtbl.t * vote list list ref
+  | Memory of (string, vote) Hashtbl.t * vote list list ref * string option ref
   | Disk of string
 
 let max_wire_bytes = 512
@@ -20,7 +20,7 @@ let disk ~data_dir =
   Disk (Filename.concat data_dir "vote_log")
 
 let memory () =
-  Memory (Hashtbl.create 16, ref [])
+  Memory (Hashtbl.create 16, ref [], ref None)
 
 let vote_type = function
   | Prevote -> "prevote"
@@ -317,9 +317,31 @@ let write_round_mark path epoch_id round =
 
 let polc_path path = Filename.concat path "polc"
 
+let value_size = 8 * 1024 * 1024
+
+let value_read = function
+  | Memory (_, _, value) -> Ok !value
+  | Disk path ->
+    let path = Filename.concat path "proposal" in
+    try
+      let stat = Unix.lstat path in
+      if stat.Unix.st_kind <> Unix.S_REG || stat.st_size <= 0 || stat.st_size > value_size
+      then Error "stored proposal size is invalid"
+      else Ok (Some (read_all path stat.st_size))
+    with Unix.Unix_error (Unix.ENOENT, _, _) -> Ok None
+      | exn -> Error (error exn)
+
+let value_write ?sync store wire =
+  if String.length wire = 0 || String.length wire > value_size
+  then Error "stored proposal size is invalid"
+  else match store with
+  | Memory (_, _, value) -> value := Some wire; Ok ()
+  | Disk path -> let* () = directory path in
+    publish_record ?sync path (Filename.concat path "proposal") wire
+
 let polc_read store =
   match store with
-  | Memory (_, proof) -> Ok !proof
+  | Memory (_, proof, _) -> Ok !proof
   | Disk path ->
     let path = polc_path path in
     try
@@ -420,7 +442,7 @@ let polc_save ?policy ?(sync = sync_directory) ?(keep_rounds = []) store ~chain_
     if proof == votes then Ok () else
     polc_check ?policy ~chain_id ~epoch_id ~validator_set proof) (Ok ()) proofs in
   let* () = match store with
-  | Memory (_, proof) -> proof := proofs; Ok ()
+  | Memory (_, proof, _) -> proof := proofs; Ok ()
   | Disk path when proofs = original -> sync path
   | Disk path ->
     let* () = directory path in
@@ -490,7 +512,7 @@ let check_disk path (vote : vote) =
 
 let check store (vote : vote) =
   match store with
-  | Memory (records, _) ->
+  | Memory (records, _, _) ->
     let id = key vote in
     (match Hashtbl.find_opt records id with
      | None -> Ok ()
@@ -514,7 +536,7 @@ let keep_disk path (vote : vote) =
 
 let keep store (vote : vote) =
   match store with
-  | Memory (records, _) ->
+  | Memory (records, _, _) ->
     let id = key vote in
     (match Hashtbl.find_opt records id with
      | None ->
@@ -541,7 +563,7 @@ let find_statement store ~chain_id ~validator ~epoch_id ~round ~vote_type
     | None -> None
   in
   match store with
-  | Memory (records, _) ->
+  | Memory (records, _, _) ->
     Ok (Hashtbl.find_opt records (key expected) |> exact)
   | Disk path ->
     if not (Sys.file_exists path) then Ok None
@@ -561,7 +583,7 @@ let round_votes store ~chain_id ~validator ~epoch_id ~round =
     let expected = {chain_id; validator; epoch_id; round; vote_type;
       proposal_id = ""; signature = ""} in
     let* found = match store with
-      | Memory (records, _) -> Ok (Hashtbl.find_opt records (key expected))
+      | Memory (records, _, _) -> Ok (Hashtbl.find_opt records (key expected))
       | Disk path ->
         let file = Filename.concat path (name expected) in
         if not (Sys.file_exists file) then Ok None
@@ -592,7 +614,7 @@ let with_round_mark epoch_id mark rounds =
 
 let max_round store ~chain_id ~validator ~epoch_id =
   match store with
-  | Memory (records, _) ->
+  | Memory (records, _, _) ->
     Hashtbl.to_seq_values records
     |> List.of_seq
     |> List.filter (belongs ~chain_id ~validator ~epoch_id)
@@ -657,6 +679,18 @@ let max_round store ~chain_id ~validator ~epoch_id =
            with exn ->
              Error (error exn))
 
+let value_prunable wire through_epoch =
+  match wire with
+  | Ok None -> false
+  | Error _ -> true
+  | Ok (Some wire) ->
+    try match Yojson.Safe.from_string wire with
+      | `List [`String proposal; `List _] ->
+        let proposal = Base64.decode_exn proposal |> C_codec.decode_propose in
+        proposal.epoch_id <= through_epoch
+      | _ -> true
+    with _ -> true
+
 let prune_disk path through_epoch =
   if not (Sys.file_exists path) then Ok ()
   else
@@ -702,18 +736,27 @@ let prune_disk path through_epoch =
         let proof_removed = match proof with
           | (vote :: _) :: _ when vote.epoch_id <= through_epoch -> Unix.unlink (polc_path path); true
           | _ -> false in
-        if removed || marked || proof_removed then sync_directory path else Ok ()
+        let value_removed = if not (value_prunable (value_read (Disk path)) through_epoch)
+          then false else
+          try Unix.unlink (Filename.concat path "proposal"); true with
+          | Unix.Unix_error (Unix.ENOENT, _, _) -> false
+          | Unix.Unix_error _ as error ->
+            Octra_log.warn "consensus" "event = proposal_record_failed reason = prune_failed detail = %s"
+              (Printexc.to_string error);
+            false in
+        if removed || marked || proof_removed || value_removed then sync_directory path else Ok ()
       with exn ->
         Error (error exn)
 
 let prune store ~through_epoch =
   match store with
-  | Memory (records, proof) ->
+  | Memory (records, proof, value) ->
     Hashtbl.filter_map_inplace
       (fun _ (vote : vote) ->
         if Int64.compare vote.epoch_id through_epoch <= 0 then None
         else Some vote)
       records;
     (match !proof with (vote :: _) :: _ when vote.epoch_id <= through_epoch -> proof := [] | _ -> ());
+    if value_prunable (Ok !value) through_epoch then value := None;
     Ok ()
   | Disk path -> prune_disk path through_epoch

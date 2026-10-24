@@ -255,10 +255,12 @@ let test_restart_split () =
   let module Codec = Octra_consensus.C_codec in
   let module Wal = Octra_core.Wal in
   let module Peer = Octra_net.P2p_conn in
-  let with_peer run =
+  let with_peer ?pubkey run =
     let fd, writer = Lwt_unix.pipe () in
     let conn = Peer.create ~peer_class:Octra_net.P2p_frame_budget.Validator fd
-      ~peer_id:"proof-peer" ~addr:"proof-peer" ~direction:Peer.Inbound in
+      ~peer_id:(Option.fold ~none:"proof-peer"
+        ~some:Octra_net.P2p_handshake.node_id_of_pubkey pubkey)
+      ~addr:"proof-peer" ~direction:Peer.Inbound in
     let sent = ref [] in
     let rec collect () =
       let open Lwt.Syntax in
@@ -387,7 +389,7 @@ let test_restart_split () =
           ~sign_fn:(sign node.config.my_addr);
         check "free node waits for saved proof" (drain node.engine |> List.for_all (function
           | E.SendVote (v, _) -> v.C.proposal_id <> pid | _ -> true));
-        with_peer (fun conn sent ->
+        with_peer ~pubkey:(Option.get (C.pubkey_of_addr selected node.config.my_addr)) (fun conn sent ->
           let open Lwt.Syntax in
           let request = Codec.{chain_id = chain; epoch_id = height; round = 0;
             step = C.PrevoteStep; request = true; validator = node.config.my_addr;

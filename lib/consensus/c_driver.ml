@@ -277,6 +277,11 @@ type t = {
   pending_votes : (string, C_types.vote) Hashtbl.t;
   future_votes : (string, C_types.vote) Hashtbl.t;
   vote_log : C_vote_log.t;
+  mutable saved_value : (C_types.validator_set * C_types.propose) option;
+  mutable value_restore : C_types.propose option;
+  mutable proof_search : C_proof_search.t option;
+  mutable proof_wake : unit Lwt.t option;
+  proof_clock : unit -> int64;
   sync_log : C_sync_log.t;
   relief_log : C_relief_log.t;
   mutable relief_plan : scheduled_validator_set_config option;
@@ -309,6 +314,7 @@ type t = {
   mutable proposal_retry : proposal_build option;
   mutable proposal_verify : proposal_build option;
   mutable proposal_wait : proposal_wait option;
+  mutable past_wait : proposal_wait option;
   mutable round_spread_warned_at : float;
   proposal_work_gate : C_proposal_work_gate.t;
   mutable proposal_slot : (proposal_job, proposal_reply) C_work_slot.t;
@@ -504,6 +510,11 @@ let create_for_policy policy ~config ~validator_set ~swarm ~start_height ~sync_l
     pending_polc = Hashtbl.create 8;
     proof_lock = None;
     saved_polc = None;
+    saved_value = None;
+    value_restore = None;
+    proof_search = None;
+    proof_wake = None;
+    proof_clock = Mtime_clock.elapsed_ns;
     pending_finalizes = Hashtbl.create 16;
     pending_proposals = Hashtbl.create 8;
     deferred_proposals = Hashtbl.create 16;
@@ -525,6 +536,7 @@ let create_for_policy policy ~config ~validator_set ~swarm ~start_height ~sync_l
     proposal_retry = None;
     proposal_verify = None;
     proposal_wait = None;
+    past_wait = None;
     round_spread_warned_at = 0.0;
     proposal_work_gate = C_proposal_work_gate.create ();
     proposal_slot = C_work_slot.empty;
@@ -594,12 +606,12 @@ let bounded_timeout value =
   | FP_nan | FP_infinite -> 0.
   | FP_normal | FP_subnormal | FP_zero -> min 300. (max 0. value)
 
-let deadline_after seconds =
+let deadline_after ?(now = Mtime_clock.elapsed_ns) seconds =
   let ns = Int64.of_float (bounded_timeout seconds *. 1e9) in
-  Int64.add (Mtime_clock.elapsed_ns ()) ns
+  Int64.add (now ()) ns
 
-let deadline_reached deadline =
-  Int64.compare (Mtime_clock.elapsed_ns ()) deadline >= 0
+let deadline_reached ?(now = Mtime_clock.elapsed_ns) deadline =
+  Int64.compare (now ()) deadline >= 0
 
 let same_proposal_build (b : proposal_build) ~gen ~height ~round ~step =
   b.gen = gen
@@ -866,6 +878,7 @@ let proposal_verify_current t (p : C_types.propose) =
         ~current_round:t.engine.state.round
         ~current_step:t.engine.state.step
         ~proposal_round:p.round
+      || C_engine.past_proposal_needed t.engine p
       || (C_quorum_policy.round_wait t.policy t.engine.state.height
           && p.round = t.engine.state.round
           && let pid = C_hash.proposal_id p.header in
@@ -1005,7 +1018,7 @@ let proposal_binds_vote (v : C_types.vote) (p : C_types.propose) =
   && Int64.equal p.header.epoch_id p.epoch_id
   && String.equal (C_hash.proposal_id p.header) v.proposal_id
 
-let keep_polc t round ~required =
+let keep_polc_votes t round ~required =
   if not (C_quorum_policy.linear_weight ~chain_id:t.config.chain_id
     ~epoch_id:t.engine.state.height) then Ok () else
   if not required && (not (t.config.role_can_vote ()) || not (local_validator t))
@@ -1033,6 +1046,27 @@ let keep_polc t round ~required =
     ~locked_round ~keep_rounds votes with
   | Error _ as error -> error
   | Ok receipt -> t.saved_polc <- Some receipt; Ok ()
+
+let keep_polc t round ~required =
+  Result.bind (keep_polc_votes t round ~required) (fun () ->
+    if C_quorum_policy.select t.policy t.engine.state.height <> C_quorum_policy.Stake
+      || not (t.config.role_can_vote ()) || not (local_validator t) then Ok ()
+    else match Hashtbl.find_opt t.engine.polc_by_round round with
+    | None -> Ok ()
+    | Some pid -> match C_engine.find_proposal_message t.engine ~proposal_id:pid ~round with
+      | None -> Ok ()
+      | Some proposal when t.saved_value = Some (t.engine.vs, proposal) -> Ok ()
+      | Some _ when round <> t.engine.state.valid_round -> Ok ()
+      | Some proposal ->
+        let votes = C_engine.polc_votes_for_round t.engine round in
+        if not (C_vote_log.polc_ready ~policy:t.policy ~chain_id:t.config.chain_id
+          ~epoch_id:t.engine.state.height ~validator_set:t.engine.vs votes) then Ok () else
+        (match C_value_log.save t.vote_log ~policy:t.policy ~chain_id:t.config.chain_id
+            ~epoch_id:t.engine.state.height ~validator_set:t.engine.vs {proposal; votes} with
+         | Ok () -> t.saved_value <- Some (t.engine.vs, proposal); Ok ()
+         | Error reason ->
+           warn_node t.config.my_addr "event = proposal_record_failed reason = write_failed detail = %s" reason;
+           Ok ()))
 
 let persist_precommit ?proposal t (v : C_types.vote) =
   let generation = t.engine.generation in
@@ -1563,6 +1597,26 @@ let ask_past t =
 let proposal_fetch_attempts = 4
 let proposal_fetch_interval = 1.05
 
+let proof_search_step t ~now =
+  let state = t.engine.state in
+  let complete = match state.valid_value with
+    | None -> false
+    | Some header -> Option.is_some (C_engine.find_tx_hashes t.engine (C_hash.proposal_id header)) in
+  let enabled = t.running && local_validator t && vote_allowed t
+    && C_quorum_policy.select t.policy state.height = C_quorum_policy.Stake
+    && not (C_quorum_policy.round_wait t.policy state.height)
+    && not complete && C_engine.am_i_leader t.engine in
+  let known = Hashtbl.fold (fun round _ known ->
+    if round >= state.round then known else Some (max round (Option.value ~default:(-1) known)))
+    t.engine.polc_by_round None in
+  let prior = if complete then None else t.proof_search in
+  let search, request = C_proof_search.step ~validators:t.engine.vs.n prior ~height:state.height
+    ~round:state.round ~known ~enabled ~now in
+  t.proof_search <- search;
+  t.engine.proof_search <- if enabled then
+    Option.map (fun search -> search.C_proof_search.target) search else None;
+  request
+
 let proposal_fetch_key fetch =
   Printf.sprintf
     "%d:%Ld:%d:%s"
@@ -1572,6 +1626,7 @@ let proposal_fetch_key fetch =
     (raw_to_hex fetch.proposal_id)
 
 let decide_proposal_fetch
+    ?(proven = false)
     fetch
     ~running
     ~height
@@ -1582,7 +1637,7 @@ let decide_proposal_fetch
   if not running
      || attempts_left <= 0
      || height <> fetch.height
-     || round <> fetch.round
+     || (round <> fetch.round && not (proven && fetch.round < round))
      || generation <> fetch.generation
      || proposal_known
   then
@@ -1616,6 +1671,7 @@ let start_proposal_fetch t ~round ~proposal_id =
         in
         match
           decide_proposal_fetch
+            ~proven:(C_engine.polc_matches t.engine ~round:fetch.round ~proposal_id:fetch.proposal_id)
             fetch
             ~running:t.running
             ~height:t.engine.state.height
@@ -1729,6 +1785,10 @@ let send_round_sync_response t conn ~requested_round ~with_witness =
   let open Lwt.Syntax in
   let generation = t.engine.generation in
   let height = t.engine.state.height in
+  let proven = requested_round < t.engine.state.round
+    && C_vote_log.polc_ready ~policy:t.policy ~chain_id:t.config.chain_id
+      ~epoch_id:height ~validator_set:t.engine.vs
+      (C_engine.polc_votes_for_round t.engine requested_round) in
   let current () = generation = t.engine.generation && height = t.engine.state.height in
   let send frame = if current () then Octra_net.P2p_conn.send conn frame
     else Lwt.return_unit in
@@ -1761,7 +1821,7 @@ let send_round_sync_response t conn ~requested_round ~with_witness =
     | _, None -> Lwt.return_unit
   in
   let witness =
-    if with_witness then
+    if with_witness && not proven then
       C_round_pool.witness
         t.round_pool
         ~chain_id:t.config.chain_id
@@ -1780,7 +1840,7 @@ let send_round_sync_response t conn ~requested_round ~with_witness =
       witness
   in
   let* () =
-    match local_round_proposal t with
+    match if proven then None else local_round_proposal t with
     | None -> Lwt.return_unit
     | Some proposal ->
       send
@@ -1790,9 +1850,9 @@ let send_round_sync_response t conn ~requested_round ~with_witness =
         }
   in
   let* () =
-    Lwt_list.iter_s send_vote (current_round_votes t)
+    Lwt_list.iter_s send_vote (if proven then [] else current_round_votes t)
   in
-  if not (current ()) then Lwt.return_unit
+  let* () = if not (current ()) then Lwt.return_unit
   else if requested_round < t.engine.state.round
      && C_quorum_policy.round_wait t.policy t.engine.state.height then
     let recorded = if t.vote_log_issue <> None || !(t.finality_proof_needed) then []
@@ -1817,7 +1877,15 @@ let send_round_sync_response t conn ~requested_round ~with_witness =
   else if requested_round < t.engine.state.round then
     Lwt_list.iter_s send_vote
       (C_engine.polc_votes_for_round t.engine requested_round)
-  else Lwt.return_unit
+  else Lwt.return_unit in
+  if not (current ()) || requested_round >= t.engine.state.round then Lwt.return_unit
+  else match Hashtbl.find_opt t.engine.polc_by_round requested_round with
+  | None -> Lwt.return_unit
+  | Some proposal_id ->
+    match C_engine.find_proposal_message t.engine ~proposal_id ~round:requested_round with
+    | None -> Lwt.return_unit
+    | Some proposal -> send {Frame.msg_type = Frame.msg_cons_propose;
+        payload = C_codec.encode_propose proposal}
 
 let round_step_rank = function
   | C_types.ProposeStep -> 1
@@ -2065,8 +2133,9 @@ let round_sync_response_allowed_at t (sync : C_codec.round_sync) now =
   end else
     false
 
-let round_sync_response_allowed t sync =
-  round_sync_response_allowed_at t sync (Mtime_clock.elapsed_ns ())
+let round_sync_response_allowed t conn sync =
+  round_sync_source_matches t conn sync
+  && round_sync_response_allowed_at t sync (t.proof_clock ())
 
 let round_fetch_valid t (fetch : C_codec.round_fetch) =
   let state = t.engine.state in
@@ -2228,6 +2297,9 @@ let clear_round_sync_jump t ~height ~round =
   (match t.proposal_wait with
    | Some wait when wait.proposal.epoch_id = height
                     && wait.proposal.round >= round -> ()
+   | Some wait when C_engine.past_proposal_needed t.engine wait.proposal ->
+     t.past_wait <- Some wait;
+     t.proposal_wait <- None
    | Some _
    | None -> t.proposal_wait <- None);
   Hashtbl.filter_map_inplace
@@ -2298,11 +2370,7 @@ let historical_vote_replay_needed t payload =
     && vote.vote_type = C_types.Prevote
     && vote.round < t.engine.state.round
     && C_engine.polc_request_pending t.engine vote.round
-    && not
-         (C_engine.historical_prevote_known
-            t.engine
-            ~round:vote.round
-            ~validator:vote.validator)
+    && C_engine.historical_prevote_needed t.engine vote
     && C_seen.remember
          t.historical_replays
          (msg_id t Frame.msg_cons_vote payload)
@@ -2324,6 +2392,16 @@ let historical_replay_needed t msg_type payload =
     historical_vote_replay_needed t payload
   else if msg_type = Frame.msg_cons_finalize then
     finalize_replay_needed t payload
+  else if msg_type = Frame.msg_cons_propose then
+    (try
+       let proposal = C_codec.decode_propose payload in
+       C_engine.past_proposal_needed t.engine proposal
+       && let request = match t.proof_search with
+          | Some search when search.height = proposal.epoch_id && search.target = proposal.round ->
+            Int64.to_string search.sent_at
+          | _ -> "once" in
+          C_seen.remember t.historical_replays (msg_id t msg_type payload ^ ":" ^ request)
+     with _ -> false)
   else
     false
 
@@ -2535,6 +2613,7 @@ let clear_relief_work t =
   t.proposal_retry <- None;
   t.proposal_verify <- None;
   t.proposal_wait <- None;
+  t.past_wait <- None;
   t.past_round <- None;
   Hashtbl.clear t.pending_votes;
   Hashtbl.clear t.future_votes;
@@ -2706,7 +2785,22 @@ let restore_polc t =
     List.iter (fun (vote : C_types.vote) ->
       C_engine.record_polc t.engine vote.round vote.proposal_id;
       C_engine.record_historical_prevote t.engine vote) votes;
-    Ok ()
+    (match C_value_log.load t.vote_log ~policy:t.policy ~chain_id:t.config.chain_id
+      ~epoch_id:height ~validator_set:t.engine.vs with
+      | Error reason ->
+        warn_node t.config.my_addr "event = ignore_proposal_record reason = invalid_record detail = %s" reason;
+        Ok ()
+      | Ok None -> Ok ()
+      | Ok (Some record) ->
+        let proposal = record.C_value_log.proposal in
+        if proposal.round + next > t.engine.state.round then
+          C_engine.realign_round t.engine (proposal.round + next);
+        List.iter (fun (vote : C_types.vote) ->
+          C_engine.record_polc t.engine vote.round vote.proposal_id;
+          C_engine.record_historical_prevote t.engine vote) record.votes;
+        t.value_restore <- Some proposal;
+        t.saved_value <- Some (t.engine.vs, proposal);
+        Ok ())
 
 let restore_relief t =
   let open Lwt.Syntax in
@@ -3000,19 +3094,31 @@ let proposal_wait_id (p : C_types.propose) =
 
 let clear_proposal_wait t (p : C_types.propose) =
   let pid = proposal_wait_id p in
+  let keep = function
+    | Some wait when wait.pid = pid && wait.proposal.round = p.round -> None
+    | wait -> wait in
+  t.proposal_wait <- keep t.proposal_wait;
+  t.past_wait <- keep t.past_wait
+
+let separate_proposal_wait t =
   match t.proposal_wait with
-  | Some wait when wait.pid = pid && wait.proposal.round = p.round ->
-    t.proposal_wait <- None
-  | Some _
-  | None -> ()
+  | Some wait when wait.proposal.round < t.engine.state.round ->
+    t.proposal_wait <- None;
+    if proposal_verify_current t wait.proposal then
+      (match t.past_wait with
+       | Some prior when prior.proposal.round > wait.proposal.round -> ()
+       | _ -> t.past_wait <- Some wait)
+  | _ -> ()
 
 let retain_proposal_wait ?(initial = false) t ~route (p : C_types.propose) =
+  separate_proposal_wait t;
   let pid = proposal_wait_id p in
-  let prior = t.proposal_wait in
+  let past = p.round < t.engine.state.round in
+  let prior = if past then t.past_wait else t.proposal_wait in
   let keep_prior =
     match prior with
     | Some wait when proposal_verify_current t wait.proposal ->
-      wait.proposal.round < p.round
+      (if past then wait.proposal.round > p.round else wait.proposal.round < p.round)
       || (wait.proposal.round = p.round && (wait.pid <> pid || initial))
     | Some _
     | None -> false
@@ -3037,16 +3143,17 @@ let retain_proposal_wait ?(initial = false) t ~route (p : C_types.propose) =
     in
     let retry_at =
       Int64.add
-        (Mtime_clock.elapsed_ns ())
+        (t.proof_clock ())
         (proposal_wait_delay attempt)
     in
-    t.proposal_wait <- Some {
+    let wait = Some {
       pid;
       proposal = p;
       route;
       attempt;
       retry_at;
-    };
+    } in
+    if past then t.past_wait <- wait else t.proposal_wait <- wait;
     if not initial then log_node t.config.my_addr
       "event = proposal_wait epoch = %Ld round = %d attempt = %d"
       p.epoch_id
@@ -3069,7 +3176,10 @@ let check_proposal_frame t (p : C_types.propose) =
     && C_hash.parent_commit_hash_opt p.parent_commit
        = p.header.parent_commit_hash
   in
-  signature_valid && envelope_valid && proposal_verify_current t p
+  proposal_verify_current t p
+  && ((signature_valid && envelope_valid)
+    || (C_engine.past_proposal_needed t.engine p
+      && C_engine.proof_proposal_valid ~chain_id:t.config.chain_id ~validator_set:t.engine.vs p))
 
 let finish_check t ~route (p : C_types.propose) preview =
   match preview with
@@ -3085,12 +3195,17 @@ let finish_check t ~route (p : C_types.propose) preview =
   | Some verdict ->
     clear_proposal_wait t p;
     let accepted = verdict = Proposal_accept in
-    if accepted && p.round > t.engine.state.round then
-      defer_verified_proposal t p;
-    ignore (C_engine.on_propose t.engine p
-      ~verify_fn:(verify_engine_signature t)
-      ~execute_fn:(fun _ -> accepted) ~sign_fn:t.config.sign_fn);
-    if accepted then queue_verified_proposal t route p;
+    if p.round < t.engine.state.round then
+      ignore (C_engine.learn_past_proposal t.engine p
+        ~execute_fn:(fun _ -> accepted))
+    else begin
+      if accepted && p.round > t.engine.state.round then defer_verified_proposal t p;
+      C_engine.on_propose t.engine p ~verify_fn:(verify_engine_signature t)
+        ~execute_fn:(fun _ -> accepted) ~sign_fn:t.config.sign_fn;
+      if accepted then queue_verified_proposal t route p
+    end;
+    (match keep_polc t p.round ~required:false with
+     | Ok () -> () | Error reason -> hold_vote_log t reason);
     Lwt.return_unit
 
 let check_work t proposal route =
@@ -3104,6 +3219,7 @@ let check_work t proposal route =
   Check_proposal (work, proposal, route)
 
 let waiting_work t =
+  separate_proposal_wait t;
   match t.proposal_wait with
   | Some wait when not (proposal_verify_current t wait.proposal) ->
     t.proposal_wait <- None;
@@ -3113,7 +3229,7 @@ let waiting_work t =
                         (proposal_round_key t.engine.state.height t.engine.state.round) ->
     None
   | Some wait when Int64.compare
-                     (Mtime_clock.elapsed_ns ())
+                     (t.proof_clock ())
                      wait.retry_at >= 0 ->
     if wait.attempt > 0 then log_node t.config.my_addr
       "event = proposal_retry epoch = %Ld round = %d attempt = %d"
@@ -3123,6 +3239,15 @@ let waiting_work t =
     Some (check_work t wait.proposal wait.route)
   | Some _
   | None -> None
+
+let past_work t =
+  match t.past_wait with
+  | Some wait when not (C_engine.past_proposal_needed t.engine wait.proposal) ->
+    t.past_wait <- None;
+    None
+  | Some wait when Int64.compare (t.proof_clock ()) wait.retry_at >= 0 ->
+    Some (check_work t wait.proposal wait.route)
+  | _ -> None
 
 let pending_work t =
   let height = t.engine.state.height in
@@ -3151,7 +3276,9 @@ let next_proposal_work t =
     | None ->
       match pending_work t with
       | Some _ as work -> work
-      | None -> Option.map (fun work -> Build_proposal work) (leader_work t)
+      | None -> match past_work t with
+        | Some _ as work -> work
+        | None -> Option.map (fun work -> Build_proposal work) (leader_work t)
 
 let move_proposal_slot t message =
   let slot, effects = C_work_slot.step t.proposal_slot message in
@@ -3301,6 +3428,19 @@ let notify_fold t ~next_epoch event =
 
 let rec process_outputs_once t =
   let open Lwt.Syntax in
+  (match t.value_restore with
+   | Some proposal ->
+     t.value_restore <- None;
+     if check_proposal_frame t proposal then
+       retain_proposal_wait ~initial:true t ~route:Publish_verified_proposal proposal
+   | None -> ());
+  let search = try proof_search_step t ~now:(t.proof_clock ()) with exn ->
+    hold_vote_log t "proof search transition failed";
+    warn_node t.config.my_addr "event = proof_search_failed error = %s" (Printexc.to_string exn);
+    None in
+  let* () = match search with
+    | None -> Lwt.return_unit
+    | Some round -> broadcast_round_sync_at t ~round in
   C_relay.progress t.proposal_relay ~generation:t.engine.generation;
   let* () = maybe_activate_relief t in
   let* () = Lwt_list.iter_s
@@ -3914,7 +4054,7 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
                           Lwt.return_unit))
                   end;
                   if round_sync_reply_needed t sync
-                     && round_sync_response_allowed t sync then
+                     && round_sync_response_allowed t _conn sync then
                     send_round_sync_response
                       t
                       _conn
@@ -3985,10 +4125,9 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
         | Proposal_current ->
           let* validator_set = validator_set_for_frame t p.epoch_id in
           (match
-             validate_proposal_frame
-               ~chain_id:t.config.chain_id
-               ~validator_set
-               p
+             if C_engine.past_proposal_needed t.engine p
+               && C_engine.proof_proposal_valid ~chain_id:t.config.chain_id ~validator_set p
+             then Ok () else validate_proposal_frame ~chain_id:t.config.chain_id ~validator_set p
            with
            | Error error ->
              warn_node t.config.my_addr
@@ -4923,7 +5062,8 @@ let catchup_query_limit ~from_epoch ~max_epochs = function
   | Some _
   | None -> max_epochs
 
-let query_bundle t ~epoch_id ~proposal_id ~timeout_seconds
+let query_bundle ?(now = Mtime_clock.elapsed_ns) ?(sleep = Lwt_unix.sleep)
+    t ~epoch_id ~proposal_id ~timeout_seconds
     ~(validate : bundle_response_record -> bool) =
   let open Lwt.Syntax in
   Hashtbl.replace t.bundle_responses proposal_id [];
@@ -4949,7 +5089,7 @@ let query_bundle t ~epoch_id ~proposal_id ~timeout_seconds
     ) responses
   in
   let rec wait_valid deadline =
-    if deadline_reached deadline then Lwt.return_none
+    if deadline_reached ~now deadline then Lwt.return_none
     else
       let responses =
         try Hashtbl.find t.bundle_responses proposal_id with Not_found -> []
@@ -4957,10 +5097,10 @@ let query_bundle t ~epoch_id ~proposal_id ~timeout_seconds
       match pick_valid responses with
       | Some r -> Lwt.return_some r
       | None ->
-        let* () = Lwt_unix.sleep 0.1 in
+        let* () = sleep 0.1 in
         wait_valid deadline
   in
-  let deadline = deadline_after timeout_seconds in
+  let deadline = deadline_after ~now timeout_seconds in
   let send_wave peer_ids =
     Lwt_list.iter_p
       (fun peer_id ->
@@ -4969,12 +5109,12 @@ let query_bundle t ~epoch_id ~proposal_id ~timeout_seconds
   in
   let rec query_waves = function
     | [] -> wait_valid deadline
-    | _ when deadline_reached deadline -> Lwt.return_none
+    | _ when deadline_reached ~now deadline -> Lwt.return_none
     | wave :: rest ->
       let* () = send_wave wave in
       let wave_deadline =
         if rest = [] then deadline
-        else min deadline (deadline_after 0.25)
+        else min deadline (deadline_after ~now 0.25)
       in
       let* result = wait_valid wave_deadline in
       (match result with
@@ -5569,6 +5709,7 @@ let clear_local_transients t =
 let clear_height_local_state t =
   clear_local_transients t;
   t.proposal_wait <- None;
+  t.past_wait <- None;
   t.past_round <- None;
   Hashtbl.clear t.round_fetch_replies;
   Hashtbl.clear t.durable_votes;
@@ -5576,6 +5717,7 @@ let clear_height_local_state t =
 
 let clear_round_local_state t ~height ~round =
   clear_local_transients t;
+  separate_proposal_wait t;
   (match t.proposal_wait with
    | Some wait when wait.proposal.epoch_id = height
                     && wait.proposal.round >= round -> ()
@@ -5667,8 +5809,8 @@ let realign_progress_at t ~now ~height ~round =
         log_node t.config.my_addr
           "event = realign_progress height = %Ld old_round = %d new_round = %d"
           height current_round target_round;
-        clear_round_local_state t ~height ~round:target_round;
         C_engine.realign_round t.engine target_round;
+        clear_round_local_state t ~height ~round:target_round;
         process_outputs t
       end
     in
@@ -5677,7 +5819,27 @@ let realign_progress_at t ~now ~height ~round =
 let realign_progress t ~height ~round =
   realign_progress_at t ~now:(Mtime_clock.elapsed_ns ()) ~height ~round
 
-let start t =
+let proof_wake_loop t ~sleep ~drain =
+  let open Lwt.Syntax in
+  let rec wake () =
+    let* () = sleep 1.1 in
+    if not t.running then Lwt.return_unit
+    else
+      let* () = Lwt.catch
+        (fun () ->
+          if C_quorum_policy.select t.policy t.engine.state.height = C_quorum_policy.Stake
+            && not (C_quorum_policy.round_wait t.policy t.engine.state.height)
+            && C_engine.am_i_leader t.engine then Lwt.protected (drain ())
+          else Lwt.return_unit)
+        (function
+          | Lwt.Canceled -> Lwt.fail Lwt.Canceled
+          | exn ->
+            warn_node t.config.my_addr "event = proof_wake_failed error = %s" (Printexc.to_string exn);
+            Lwt.return_unit) in
+      wake () in
+  Lwt.catch wake (function Lwt.Canceled -> Lwt.return_unit | exn -> Lwt.fail exn)
+
+let start ?(sleep = Lwt_unix.sleep) t =
   C_relay.open_ t.proposal_relay ~generation:t.engine.generation;
   ignore (move_proposal_slot t C_work_slot.Open);
   C_engine.set_round_skip_ready
@@ -5711,7 +5873,7 @@ let start t =
       log_node t.config.my_addr
         "event = wait_peers connected = %d validators = %d min = %d"
         pc t.n_validators min_peers;
-      let* () = Lwt_unix.sleep 1.0 in
+      let* () = sleep 1.0 in
       wait_peers (tries - 1)
     end
   in
@@ -5719,7 +5881,7 @@ let start t =
   log_node t.config.my_addr
     "event = start_consensus connected = %d validators = %d min = %d"
     (Octra_net.P2p_swarm.connected_count t.swarm) t.n_validators min_peers;
-  let* () = Lwt_unix.sleep 3.0 in
+  let* () = sleep 3.0 in
   let pristine = C_engine.is_pristine t.engine in
   let* () =
     if pristine then
@@ -5734,10 +5896,19 @@ let start t =
     Lwt.async (fun () ->
       recover_finality_proof t);
   let* () = broadcast_round_sync t ~request:true in
-  process_outputs t
+  let* () = process_outputs t in
+  Option.iter Lwt.cancel t.proof_wake;
+  let wake = proof_wake_loop t ~sleep ~drain:(fun () -> process_outputs t) in
+  t.proof_wake <- Some wake;
+  Lwt.async (fun () -> wake);
+  Lwt.return_unit
 
 let stop t =
   t.running <- false;
+  Option.iter Lwt.cancel t.proof_wake;
+  t.proof_wake <- None;
+  t.proof_search <- None;
+  t.engine.proof_search <- None;
   C_relay.close t.proposal_relay;
   ignore (move_proposal_slot t C_work_slot.Close);
   t.proposal_build <- None;

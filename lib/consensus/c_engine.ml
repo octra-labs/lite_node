@@ -233,6 +233,7 @@ type t = {
   mutable proposal_messages : ((string * int), propose) Hashtbl.t;
   mutable polc_by_round : (int, string) Hashtbl.t;
   mutable polc_requests : (int, int) Hashtbl.t;
+  mutable proof_search : int option;
   mutable higher_round_evidence : (string, int) Hashtbl.t;
   mutable outputs : output list;
   mutable vote_timers : round_step list;
@@ -268,6 +269,7 @@ let create_for_policy policy ~chain_id ~my_addr ~validator_set ~start_height ~ca
     proposal_messages = Hashtbl.create 8;
     polc_by_round = Hashtbl.create 4;
     polc_requests = Hashtbl.create 4;
+    proof_search = None;
     higher_round_evidence = Hashtbl.create 4;
     outputs = [];
     vote_timers = [];
@@ -618,6 +620,7 @@ let round_retained t round =
   || round = t.state.locked_round
   || round = t.state.valid_round
   || Hashtbl.mem t.polc_requests round
+  || t.proof_search = Some round
 
 let oldest_polc_request t =
   Hashtbl.fold
@@ -911,6 +914,7 @@ let start_height t height =
   end;
   t.polc_requests <- Hashtbl.create 4;
   if not same_height then begin
+    t.proof_search <- None;
     t.polc_by_round <- Hashtbl.create 4;
     t.prevotes_by_round <- Hashtbl.create 8;
     t.source_prevotes <- Hashtbl.create 8;
@@ -925,7 +929,30 @@ let polc_matches t ~round ~proposal_id =
   | None -> false
 
 let polc_request_pending t round =
-  Hashtbl.mem t.polc_requests round
+  Hashtbl.mem t.polc_requests round || t.proof_search = Some round
+
+let past_proposal_needed t (p : propose) =
+  p.chain_id = t.chain_id && p.epoch_id = t.state.height
+  && p.round >= 0 && p.round < t.state.round
+  && p.round > max t.state.valid_round t.state.locked_round
+  && polc_matches t ~round:p.round ~proposal_id:(C_hash.proposal_id p.header)
+  && Option.is_none (find_proposal_message t ~proposal_id:(C_hash.proposal_id p.header) ~round:p.round)
+
+let proof_proposal_valid ~chain_id ~validator_set (p : propose) =
+  let check validator_set =
+    proposal_is_well_formed ~chain_id ~validator_set p
+    && Option.fold ~none:false ~some:(fun pubkey_raw -> C_hash.verify_propose ~pubkey_raw p)
+      (pubkey_of_addr validator_set p.proposer) in
+  tx_list_hash_for_header p.tx_hashes = p.header.tx_list_hash
+    && C_hash.parent_commit_hash_opt p.parent_commit = p.header.parent_commit_hash
+    && (check validator_set || Option.fold ~none:false ~some:check
+      (source_set ~chain_id ~epoch_id:p.epoch_id validator_set))
+
+let learn_past_proposal t (p : propose) ~execute_fn =
+  if past_proposal_needed t p
+    && proof_proposal_valid ~chain_id:t.chain_id ~validator_set:t.vs p
+    && execute_fn p
+  then begin cache_proposal_message t p; true end else false
 
 let historical_prevote_known t ~round ~validator =
   List.exists (fun rounds -> match Hashtbl.find_opt rounds round with
@@ -961,6 +988,32 @@ let precommits_for_round t round =
     |> List.sort (fun (left : vote) (right : vote) ->
       String.compare left.validator right.validator)
 
+let prevote_quorum t validator_set votes (vote : vote) =
+  vote.chain_id = t.chain_id && vote.epoch_id = t.state.height
+  && vote.vote_type = Prevote
+  && not (Octra_net.Hash_domain.is_nil vote.proposal_id)
+  && Hashtbl.find_opt votes.votes vote.validator = Some vote
+  && C_types.quorum_reached_at ~policy:t.policy ~chain_id:t.chain_id
+       ~epoch_id:t.state.height validator_set
+       ~signer_count:(count_for_pid votes vote.proposal_id)
+       ~signed_weight:(weight_for_pid votes vote.proposal_id)
+
+let learn_prevote t validator_set votes vote =
+  if prevote_quorum t validator_set votes vote then
+    record_polc t vote.round vote.proposal_id
+
+let historical_prevote_needed t (vote : vote) =
+  let has set rounds =
+    match Hashtbl.find_opt rounds vote.round with
+    | None -> false
+    | Some votes -> prevote_quorum t set votes vote
+  in
+  not (historical_prevote_known t ~round:vote.round ~validator:vote.validator)
+  || (not (polc_matches t ~round:vote.round ~proposal_id:vote.proposal_id)
+      && (has t.vs t.prevotes_by_round
+          || Option.fold ~none:false ~some:(fun source -> has source t.source_prevotes)
+               (C_types.source_set ~chain_id:t.chain_id ~epoch_id:t.state.height t.vs)))
+
 let record_historical_prevote t (vote : vote) =
   if vote.round >= 0
      && (vote.round < t.state.round
@@ -975,9 +1028,8 @@ let record_historical_prevote t (vote : vote) =
          | Some saved -> saved
          | None -> let saved = create_vote_set () in
            Hashtbl.add t.source_prevotes vote.round saved; saved in
-       match add_vote ~policy:t.policy saved vote ~validator_set:source with
-       | `QuorumOf pid -> record_polc t vote.round pid
-       | _ -> ());
+       ignore (add_vote ~policy:t.policy saved vote ~validator_set:source);
+       learn_prevote t source saved vote);
     let vote_set =
       match Hashtbl.find_opt t.prevotes_by_round vote.round with
       | Some value -> value
@@ -986,12 +1038,8 @@ let record_historical_prevote t (vote : vote) =
         Hashtbl.add t.prevotes_by_round vote.round value;
         value
     in
-    match add_vote ~policy:t.policy vote_set vote ~validator_set:t.vs with
-    | `QuorumOf proposal_id -> record_polc t vote.round proposal_id
-    | `Duplicate
-    | `Rejected
-    | `Added
-    | `QuorumAny -> ()
+    ignore (add_vote ~policy:t.policy vote_set vote ~validator_set:t.vs);
+    learn_prevote t t.vs vote_set vote
   end
 
 let restored_precommit_lock t (proposal : propose) =
@@ -1688,6 +1736,7 @@ let on_vote t (v : vote) ~sign_fn =
     (match v.vote_type with
     | Prevote ->
       let result = add_vote ~policy:t.policy t.prevotes v ~validator_set:t.vs in
+      learn_prevote t t.vs t.prevotes v;
       Option.iter
         (fun (round, proposal_id) ->
           emit t (RequestProposal { round; proposal_id }))
@@ -1720,7 +1769,6 @@ let on_vote t (v : vote) ~sign_fn =
           | _ ->
             (match proposal with
              | Some accepted ->
-               record_polc t t.state.round proposal_id;
                t.state <- {
                  t.state with
                  locked_round = t.state.round;

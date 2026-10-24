@@ -15,6 +15,11 @@ val polc_save : ?policy:C_quorum_policy.t -> ?sync:(string -> (unit, string) res
 val disk : data_dir:string -> t
 val memory : unit -> t
 
+val value_read : t -> (string option, string) result
+val value_write : ?sync:(string -> (unit, string) result) -> t -> string -> (unit, string) result
+val polc_check : ?policy:C_quorum_policy.t -> chain_id:string -> epoch_id:int64 ->
+  validator_set:C_types.validator_set -> C_types.vote list -> (unit, string) result
+
 val polc_keep : ?policy:C_quorum_policy.t -> ?sync:(string -> (unit, string) result) ->
   t -> chain_id:string -> epoch_id:int64 ->
   validator_set:C_types.validator_set -> locked_round:int -> C_types.vote list -> (unit, string) result
