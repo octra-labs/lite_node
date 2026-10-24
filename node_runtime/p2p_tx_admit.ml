@@ -20,13 +20,13 @@ let addr_valid tx =
   Octra_core.Crypto.Address.is_valid_address tx.Octra_core.Transaction.from
   && to_valid tx
 
-let sig_valid tx = function
+let sig_valid ~signing tx = function
   | None -> false
   | Some pk ->
     Octra_core.Crypto.Address.verify_address_pubkey tx.Octra_core.Transaction.from pk
-    && Octra_core.Transaction.verify tx pk
+    && Octra_core.Tx_signature.verify signing tx pk
 
-let admit ?(duty = None) ?(bft_mode = false) ~now ~max_drift ~sender_pk tx =
+let admit ?(duty = None) ?(bft_mode = false) ~signing ~now ~max_drift ~sender_pk tx =
   if not (addr_valid tx) then Invalid_address
   else
     match
@@ -40,7 +40,7 @@ let admit ?(duty = None) ?(bft_mode = false) ~now ~max_drift ~sender_pk tx =
       if not (Float.is_finite tx.timestamp && Float.is_finite now)
          || drift > max_drift && not (Tx_view.duty_retry ~now ~duty ~bft_mode tx) then
         Timestamp_drift drift
-      else if not (sig_valid tx sender_pk) then Invalid_signature
+      else if not (sig_valid ~signing tx sender_pk) then Invalid_signature
       else
         match Tx_view.payload_check ~limits:Tx_view.payload_limits tx with
         | Error _ -> Invalid_payload

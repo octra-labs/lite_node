@@ -60,11 +60,11 @@ type network = {
   post : Tx.t -> (unit, Set_post.failure) result Lwt.t;
 }
 
-let sign ~key tx =
+let sign ~signing ~key tx =
   let ( let* ) = Result.bind in
   let* () = Octra_core.Tx_payload.admit tx in
   let tx = {tx with Tx.ou = Tx.ou_cost tx} in
-  Ok (Tx.sign_with_privkey tx key)
+  Ok (Octra_core.Tx_signature.sign signing tx key)
 
 let stage ~bft_mode runtime ledger tx =
   let ( let* ) = Result.bind in

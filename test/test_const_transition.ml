@@ -77,6 +77,31 @@ let outcome = function
   | Error (kind, reason) -> kind, reason
 
 let () =
+  List.iter (fun depth ->
+    let locals = List.init depth (fun i -> Printf.sprintf "let a%d = %s" i
+      (if i = 0 then "1" else Printf.sprintf "(a%d, a%d)" (i - 1) (i - 1)))
+      |> String.concat " " in
+    let body = "program Types { public fn get(): int { " ^ locals ^ " return 1 } }" in
+    let payload = replace body, package.envelope in
+    List.iter (fun epoch ->
+      let live, balance, nonce, stored = apply ~preview:false epoch payload in
+      let preview, other_balance, other_nonce, _ = apply ~preview:true epoch payload in
+      check "shared type preview differs" (outcome live = outcome preview);
+      check "shared type account differs" (balance = other_balance && nonce = other_nonce);
+      check "shared type changed envelope accepted" (not stored);
+      check ("shared type compiler result differs: " ^ snd (outcome live)) (snd (outcome live) =
+        "Program source and envelope mismatch"))
+      [plan.activation_epoch - 1; plan.activation_epoch]) [8; 45];
+  let definitions = List.init 28 (fun i -> Printf.sprintf "const C%d = %s" i
+    (if i = 0 then "1" else Printf.sprintf "C%d + C%d" (i - 1) (i - 1)))
+    |> String.concat " " in
+  let doubling = replace (source definitions "C27"), package.envelope in
+  List.iter (fun epoch -> List.iter (fun preview ->
+    let result, _, _, stored = apply ~preview epoch doubling in
+    check "constant DAG reached deployment" (not stored);
+    check "constant DAG did not reach finite compiler refusal"
+      (snd (outcome result) = "Program compile failed: source = main.aml line 1 column 1: register capacity exceeded maximum = 64")
+  ) [false; true]) [plan.activation_epoch - 1; plan.activation_epoch];
   let valid = compile (source "const A: int = 7" "A") in
   let unused = compile (source "const A: int = A" "7") in
   let used = replace (source "const A: int = 1 + A" "A"), package.envelope in

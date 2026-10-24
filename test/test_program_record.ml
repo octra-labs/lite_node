@@ -177,7 +177,7 @@ let test_publish () =
       let decoded = T.of_yojson (T.to_yojson tx) |> ok in
       expect "transaction encoding changed" (decoded = tx);
       with_cache (Filename.concat dir "cache") (fun chaindata ->
-        let result = run (Rpc.verify ~store ~chaindata ~addr:address ~source ~files_json:None)
+        let result = run (Rpc.verify ~chain_id:"record-test" ~store ~chaindata ~addr:address ~source ~files_json:None)
           |> Result.get_ok in
         expect "RPC claimed chain publication" (field "published" result = `Bool false);
         expect "publication request missing" (field "publication" result <> `Null);
@@ -193,7 +193,7 @@ let test_publish () =
       expect "report missing" (Option.is_some record.report);
       expect "certificate missing" (Option.is_some record.certificate);
       with_cache (Filename.concat dir "before-commit") (fun chaindata ->
-        let checked = run (Rpc.verify ~store ~chaindata ~addr:address
+        let checked = run (Rpc.verify ~chain_id:"record-test" ~store ~chaindata ~addr:address
           ~source ~files_json:None) |> Result.get_ok in
         expect "uncommitted record reported as published"
           (field "published" checked = `Bool false);
@@ -228,7 +228,7 @@ let test_publish () =
             let result = run (Rpc.source ~store:restored ~chaindata ~addr:address) |> Result.get_ok in
             expect "restored source missing" (field "source" result = `String source);
             expect "restored record not committed" (field "committed" result = `Bool true);
-            let verified = run (Rpc.verify ~store:restored ~chaindata ~addr:address
+            let verified = run (Rpc.verify ~chain_id:"record-test" ~store:restored ~chaindata ~addr:address
               ~source ~files_json:None) |> Result.get_ok in
             expect "restored publication missing" (field "published" verified = `Bool true))))
         [Octra_core.Ledger_image.Flat; Octra_core.Ledger_image.Shared]));
@@ -353,6 +353,7 @@ let test_rollback () =
 
 let publish_fields nonce response =
   let publication = field "publication" response in
+  expect "source publication is missing" (match publication with `Assoc _ -> true | _ -> false);
   let text name = field name publication |> Yojson.Safe.Util.to_string in
   T.sign_with_privkey {(request nonce) with
     T.to_ = text "to"; ou = Z.of_string (text "ou");
@@ -383,18 +384,18 @@ let test_history () =
         install_code store ~kind stored;
         let backend = make_backend store Graph.Active in
         with_cache (Filename.concat dir "cache") (fun chaindata ->
-          let verify () = run (Rpc.verify_params ~store ~chaindata
+          let verify () = run (Rpc.verify_params ~chain_id:"record-test" ~store ~chaindata
             (`List [`String address; `Assoc ["main", `String main;
               "files", `List files]])) |> Result.get_ok in
           let response = if main = "main.aml" then
-            run (Rpc.verify ~store ~chaindata ~addr:address ~source ~files_json:None)
+            run (Rpc.verify ~chain_id:"record-test" ~store ~chaindata ~addr:address ~source ~files_json:None)
             |> Result.get_ok else verify () in
           let tx = publish_fields 1 response in
           apply backend tx |> confirmed;
           run (backend.flush_dirty ());
           run (backend.commit_batch ());
           let checked = if main = "main.aml" then
-            run (Rpc.verify ~store ~chaindata ~addr:address ~source ~files_json:None)
+            run (Rpc.verify ~chain_id:"record-test" ~store ~chaindata ~addr:address ~source ~files_json:None)
             |> Result.get_ok else verify () in
           expect "historical publication differs" (field "published" checked = `Bool true);
           expect "historical publication not committed" (field "committed" checked = `Bool true);
@@ -443,6 +444,63 @@ let test_history () =
        bundled.envelope, "source"];
   print_endline "status = pass test = program_record_history"
 
+let test_publication_rule () =
+  let chain_id = "octra-devnet-9871-cluster" in
+  let activation = Octra_consensus.C_quorum_policy.round_epoch ~chain_id
+    |> Option.get |> Int64.to_int in
+  let rows = [
+    "historical", "binary",
+      "contract Old { state { values: map[int]int } fn add(k: int): int { self.values[k] += 1 return self.values[k] } }";
+    "package_historical", "source",
+      "program Old { state { values: map[int]int } public fn add(k: int): int { self.values[k] += 1 return self.values[k] } }"] in
+  List.iter (fun (compiler, kind, body) ->
+    let sources = R.{main = "main.aml"; files = [{path = "main.aml"; body}];
+      compiler; loops = false} in
+    let stored, _ = R.compile ~metered:false sources |> ok in
+    Test_workspace.with_dir "publication-rule" (fun dir ->
+      with_store (Filename.concat dir "state") (fun store ->
+        install_code store ~kind stored;
+        with_cache (Filename.concat dir "cache") (fun chaindata ->
+          List.iter (fun (chain_id, epoch, offered) ->
+            run (S.set_meta store "last_epoch" (string_of_int (epoch - 1)));
+            let response = run (Rpc.verify ~chain_id ~store ~chaindata
+              ~addr:address ~source:body ~files_json:None) |> Result.get_ok in
+            expect "historical verification was lost" (field "verified" response = `Bool true);
+            expect "historical publication rule differs"
+              ((field "publication" response <> `Null) = offered);
+            if offered then begin
+              let _, actual = U.source_request (publish_fields 1 response) |> ok in
+              expect "historical publication profile differs" (actual.compiler = compiler);
+              ignore (R.verify ~metered:false actual ~exact:(kind = "source") ~stored |> ok)
+            end)
+            [chain_id, activation - 1, true; chain_id, activation, false;
+             chain_id, activation + 1, false; "record-test", activation, true])))) rows;
+  print_endline "status = pass test = publication_rule"
+
+let test_publication_wait () =
+  let chain_id = "octra-devnet-9871-cluster" in
+  let activation = Octra_consensus.C_quorum_policy.round_epoch ~chain_id
+    |> Option.get |> Int64.to_int in
+  let body = "program Old { state { values: map[int]int } public fn add(k: int): int { self.values[k] += 1 return self.values[k] } }" in
+  let sources = R.{main = "main.aml"; files = [{path = "main.aml"; body}];
+    compiler = "package_historical"; loops = false} in
+  let stored, _ = R.compile ~metered:false sources |> ok in
+  let record = R.verify ~metered:false sources ~exact:true ~stored |> ok in
+  Test_workspace.with_dir "publication-wait" (fun dir ->
+    with_store (Filename.concat dir "state") (fun store ->
+      install_code store ~kind:"source" stored;
+      run (S.set_meta store "last_epoch" (string_of_int (activation - 2)));
+      let saved, finish = Lwt.wait () in
+      let response = Rpc.publication_response ~chain_id ~store ~addr:address ~record
+        ~sources:(Some sources) ~committed:false saved in
+      expect "publication did not wait for storage" (Lwt.is_sleeping response);
+      run (S.set_meta store "last_epoch" (string_of_int (activation - 1)));
+      Lwt.wakeup_later finish (Ok true);
+      let response = run response |> Result.get_ok in
+      expect "verification lost after publication wait" (field "verified" response = `Bool true);
+      expect "publication used pre-write epoch" (field "publication" response = `Null)));
+  print_endline "status = pass test = publication_wait"
+
 let test_deploy () =
   let source = "program Saved { view fn read(): int { return 73 } }" in
   let package = Octra_vm.Program_package.compile_for ~point_ops:false ~main:"main.aml"
@@ -481,7 +539,7 @@ let test_deploy () =
           run (backend.commit_batch ())
         end;
         if mode = Graph.Active then with_cache (Filename.concat dir "empty") (fun chaindata ->
-          let checked = run (Rpc.verify ~store ~chaindata ~addr:target ~source ~files_json:None)
+          let checked = run (Rpc.verify ~chain_id:"record-test" ~store ~chaindata ~addr:target ~source ~files_json:None)
             |> Result.get_ok in
           if field "published" checked <> `Bool true then
             let meta = run (S.get_contract_meta store target) in
@@ -555,7 +613,7 @@ let check_program source_path code_path =
       run (S.deploy_contract store ~address ~owner ~code_hash ~version:"1.0 Rehovot"
         ~ctype:"CUSTOM" ~check:"binary" ~bytecode_b64:bytes);
       with_cache (Filename.concat dir "cache") (fun chaindata ->
-        let result = run (Rpc.verify ~store ~chaindata ~addr:address ~source ~files_json:None)
+        let result = run (Rpc.verify ~chain_id:"record-test" ~store ~chaindata ~addr:address ~source ~files_json:None)
           |> Result.get_ok in
         expect "program verification failed" (field "verified" result = `Bool true);
         expect "local check claimed publication" (field "published" result = `Bool false);
@@ -565,7 +623,8 @@ let () =
   match Array.to_list Sys.argv with
   | [_] -> test_sources (); test_const_graph (); test_publish (); test_refusals ();
     test_prior (); test_rollback ();
-    test_history (); test_deploy (); test_reads (); test_facts ()
+    test_history (); test_publication_rule (); test_publication_wait ();
+    test_deploy (); test_reads (); test_facts ()
   | [_; "--consts"] -> test_const_graph ()
   | [_; "--facts"] -> test_facts ()
   | [_; source_path; code_path] -> check_program source_path code_path

@@ -11,6 +11,12 @@ type loop =
   | Again
   | Done
 
+type tx_write = {
+  frame : P2p_frame.frame;
+  written : unit Lwt.t;
+  wake : unit Lwt.u;
+}
+
 type t = {
   fd : Lwt_unix.file_descr;
   peer_id : peer_id;
@@ -18,6 +24,15 @@ type t = {
   direction : direction;
   mutable connected : bool;
   write_queue : P2p_frame.frame Lwt_mvar.t;
+  mutable service_write : (P2p_frame.frame * unit Lwt.u) option;
+  mutable service_pending : bool;
+  write_changed : unit Lwt_condition.t;
+  mutable pending_writes : int;
+  mutable writing : bool;
+  mutable tx_writes : tx_write list;
+  mutable tx_bytes : int;
+  mutable tx_batches : int;
+  tx_gate : Lwt_mutex.t;
   closed : unit Lwt.t;
   wake_close : unit Lwt.u;
   mutable msg_count_in : int;
@@ -57,6 +72,15 @@ let create ~peer_class fd ~peer_id ~addr ~direction =
     direction;
     connected = true;
     write_queue = Lwt_mvar.create_empty ();
+    service_write = None;
+    service_pending = false;
+    write_changed = Lwt_condition.create ();
+    pending_writes = 0;
+    writing = false;
+    tx_writes = [];
+    tx_bytes = 0;
+    tx_batches = 0;
+    tx_gate = Lwt_mutex.create ();
     closed;
     wake_close;
     msg_count_in = 0;
@@ -72,6 +96,9 @@ let peer_class t =
   P2p_frame_budget.peer_class t.frame_budget
 
 let is_connected t = t.connected
+
+let write_idle t = t.connected && t.pending_writes = 0 && not t.writing
+  && t.service_write = None && Lwt_mvar.is_empty t.write_queue
 
 let log_conn addr fmt =
   Printf.ksprintf
@@ -101,10 +128,18 @@ let close t =
   if t.connected then begin
     t.connected <- false;
     Lwt.wakeup_later t.wake_close ();
+    t.tx_writes <- [];
+    t.tx_bytes <- 0;
     (try Lwt_unix.shutdown t.fd Lwt_unix.SHUTDOWN_ALL with _ -> ());
-    Lwt.catch
+    Lwt.finalize (fun () -> Lwt.catch
       (fun () -> Lwt_unix.close t.fd)
-      (fun _ -> Lwt.return_unit)
+      (fun _ -> Lwt.return_unit)) (fun () ->
+        let rec drain () = match Lwt_mvar.take_available t.write_queue with
+          | None -> () | Some _ -> drain () in
+        drain ();
+        t.pending_writes <- 0;
+        Lwt_condition.broadcast t.write_changed ();
+        Lwt.return_unit)
   end else
     Lwt.return_unit
 
@@ -115,13 +150,116 @@ let until_closed t wait =
   ]
 
 let enqueue t (frame : P2p_frame.frame) =
-  if t.connected then
-    Lwt.map Option.is_some (until_closed t (Lwt_mvar.put t.write_queue frame))
+  if t.connected then begin
+    t.pending_writes <- t.pending_writes + 1;
+    let transferred = ref false in
+    Lwt.finalize (fun () ->
+      until_closed t (Lwt.map (fun () -> transferred := true)
+        (Lwt_mvar.put t.write_queue frame)) |> Lwt.map Option.is_some)
+      (fun () ->
+        if not !transferred then begin
+          t.pending_writes <- max 0 (t.pending_writes - 1);
+          Lwt_condition.broadcast t.write_changed ()
+        end;
+        Lwt.return_unit)
+  end
   else
     Lwt.return_false
 
 let send t (frame : P2p_frame.frame) =
   Lwt.map (fun _ -> ()) (enqueue t frame)
+
+let await_service ?(wait = fun () -> Lwt_unix.sleep 10.) t =
+  let open Lwt.Syntax in
+  if t.service_pending || t.service_write <> None then Lwt.return_false
+  else if write_idle t then Lwt.return_true
+  else begin
+    t.service_pending <- true;
+    let rec available () =
+      if not t.connected then Lwt.return_false
+      else if write_idle t then Lwt.return_true
+      else let* _ = until_closed t (Lwt_condition.wait t.write_changed) in available () in
+    Lwt.finalize (fun () -> Lwt.pick [available (); (let* () = wait () in Lwt.return_false)])
+      (fun () -> t.service_pending <- false; Lwt.return_unit)
+  end
+
+let send_service ?wait t frame =
+  let open Lwt.Syntax in
+  let* available = await_service ?wait t in
+  if not available then Lwt.return_unit
+  else
+    let frame = {frame with P2p_frame.payload = frame.P2p_frame.payload} in
+    let written, wake = Lwt.wait () in
+    t.service_write <- Some (frame, wake);
+    Lwt.finalize (fun () ->
+      let* queued = enqueue t frame in
+      if queued then Lwt.map (fun _ -> ()) (until_closed t written)
+      else Lwt.return_unit)
+      (fun () ->
+        t.service_write <- None;
+        Lwt_condition.broadcast t.write_changed ();
+        Lwt.return_unit)
+
+let tx_limit = 8 * 1024 * 1024
+
+let release_tx t frame =
+  let retained, released = List.partition (fun item -> item.frame != frame) t.tx_writes in
+  t.tx_writes <- retained;
+  List.iter (fun item ->
+    t.tx_bytes <- t.tx_bytes - String.length item.frame.payload;
+    if Lwt.is_sleeping item.written then Lwt.wakeup_later item.wake ()) released
+
+let send_tx ?(wait = fun () -> Lwt_unix.sleep 10.) t frame =
+  let open Lwt.Syntax in
+  let size = String.length frame.P2p_frame.payload in
+  if not t.connected || List.length t.tx_writes >= 64 || size > tx_limit - t.tx_bytes
+  then Lwt.return_unit else
+  let frame = {frame with P2p_frame.payload = frame.P2p_frame.payload} in
+  let written, wake = Lwt.wait () in
+  t.tx_writes <- {frame; written; wake} :: t.tx_writes;
+  t.tx_bytes <- t.tx_bytes + size;
+  let transferred = ref false in
+  Lwt.finalize (fun () ->
+    let* queued = Lwt.pick [
+      (let* queued = enqueue t frame in transferred := queued; Lwt.return queued);
+      (let* () = wait () in Lwt.return_false)] in
+    if queued then Lwt.map (fun _ -> ()) (until_closed t (Lwt.protected written))
+    else begin
+      err_conn t.addr "event = tx_queue_deadline action = skip";
+      Lwt.return_unit
+    end)
+    (fun () -> if not !transferred then release_tx t frame; Lwt.return_unit)
+
+let send_batch ?(wait = fun () -> Lwt_unix.sleep 10.) t ~msg_type builders =
+  let open Lwt.Syntax in
+  if not t.connected || t.tx_batches >= 4 || List.length builders > 64 then Lwt.return_unit
+  else begin
+    t.tx_batches <- t.tx_batches + 1;
+    let rec drain () =
+      if not t.connected || t.tx_writes = [] then Lwt.return_unit else
+      let* _ = until_closed t
+        (Lwt.join (List.map (fun item -> Lwt.protected item.written) t.tx_writes)) in
+      drain () in
+    Lwt.finalize (fun () -> Lwt_mutex.with_lock t.tx_gate (fun () ->
+      Lwt.catch (fun () ->
+      Lwt_list.iter_s (fun build ->
+        let* () = if t.tx_writes = [] then Lwt.return_unit else
+          Lwt.pick [
+            drain ();
+            (let* () = wait () in Lwt.fail Lwt_unix.Timeout)] in
+        if not t.connected then Lwt.return_unit else
+        match (try build () with Invalid_argument reason ->
+          err_conn t.addr "event = tx_build_refused reason = %s action = skip" reason;
+          None) with
+        | None -> Lwt.return_unit
+        | Some payload -> send_tx ~wait t P2p_frame.{msg_type; payload}) builders)
+      (function
+        | Lwt_unix.Timeout ->
+          err_conn t.addr "event = tx_batch_deadline action = skip";
+          Lwt.return_unit
+        | error -> Lwt.fail error)))
+      (fun () -> t.tx_batches <- t.tx_batches - 1; Lwt.return_unit)
+  end
 
 let rec repeat step =
   let open Lwt.Syntax in
@@ -142,10 +280,14 @@ let write_loop ?idle_s t =
       | None -> Lwt.return Done
       | Some _ when not t.connected -> Lwt.return Done
       | Some frame ->
-        Lwt.catch
+        t.writing <- true;
+        Lwt.finalize (fun () -> Lwt.catch
           (fun () ->
             let* () = P2p_frame.write_frame ?idle_s t.fd frame in
             t.msg_count_out <- t.msg_count_out + 1;
+            (match t.service_write with
+             | Some (sent, wake) when sent == frame -> Lwt.wakeup_later wake ()
+             | _ -> ());
             Lwt.return Again)
           (fun exn ->
             let error = Printexc.to_string exn in
@@ -158,7 +300,12 @@ let write_loop ?idle_s t =
              | _ ->
                err_conn t.addr "event = write_loop_error error = %s" error);
             let* () = close t in
-            Lwt.return Done)
+            Lwt.return Done)) (fun () ->
+              t.writing <- false;
+              t.pending_writes <- max 0 (t.pending_writes - 1);
+              release_tx t frame;
+              Lwt_condition.broadcast t.write_changed ();
+              Lwt.return_unit)
   in
   repeat step
 

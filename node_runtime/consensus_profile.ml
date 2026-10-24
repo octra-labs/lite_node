@@ -372,7 +372,11 @@ let standard_hash ?policy ~chain_id ~epoch getenv =
     begin match Octra_core.Rule_graph.program_records_at ~chain_id ~epoch with
     | Octra_core.Rule_graph.Prior -> ()
     | Octra_core.Rule_graph.Active ->
-      put_standard_component buf "program_records" Octra_vm.Program_record.consensus_id
+      put_standard_component buf "program_records"
+        (if Octra_consensus.C_quorum_policy.round_wait
+            (Option.value policy ~default:(Octra_consensus.C_quorum_policy.for_chain chain_id))
+            (Int64.of_int epoch)
+         then Octra_vm.Program_record.consensus_id else Octra_vm.Program_record.released_id)
     end;
     begin match Octra_core.Rule_graph.proof_key_at ~chain_id ~epoch with
     | Octra_core.Rule_graph.Prior -> ()
@@ -390,10 +394,25 @@ let standard_hash ?policy ~chain_id ~epoch getenv =
     | Octra_core.Rule_graph.Active ->
       put_standard_component buf "duty_marks" Octra_core.Set_fold.marks_id
     end;
-    match Octra_core.Rule_graph.cipher_migration_at ~chain_id ~epoch with
+    begin match Octra_core.Rule_graph.cipher_migration_at ~chain_id ~epoch with
     | Octra_core.Rule_graph.Prior -> ()
     | Octra_core.Rule_graph.Active ->
-      put_standard_component buf "cipher_migration" Octra_core.Private_ledger.cipher_proof_id)
+      put_standard_component buf "cipher_migration" Octra_core.Private_ledger.cipher_proof_id
+    end;
+    begin match Octra_core.Tx_signature.at ~chain_id ~epoch:(Int64.of_int epoch) with
+    | Octra_core.Tx_signature.Historical -> ()
+    | Octra_core.Tx_signature.Network _ ->
+      put_standard_component buf "tx_network" Octra_core.Tx_signature.consensus_id
+    end;
+    begin match Octra_core.Rule_graph.program_inputs_at ~chain_id ~epoch with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      put_standard_component buf "program_inputs" Octra_core.Rule_graph.program_inputs_id
+    end;
+    if Octra_consensus.C_quorum_policy.round_wait
+      (Option.value policy ~default:(Octra_consensus.C_quorum_policy.for_chain chain_id))
+      (Int64.of_int epoch) then
+      put_standard_component buf "round_wait" Octra_consensus.C_quorum_policy.round_wait_id)
 
 let hash ?policy ~chain_id ~epoch getenv =
   match Octra_core.Rule_graph.standard_at ~chain_id ~epoch with

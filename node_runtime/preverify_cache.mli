@@ -24,7 +24,6 @@ type state =
 type gate =
   | Ready_gate
   | Failed_gate of string
-  | Timeout_gate of string
   | Unavailable_gate of {
     next_count : int;
     reason : Tx_view.preverify_unavailable;
@@ -55,13 +54,13 @@ val has_capacity :
   bool
 
 val start_task :
-  keyed:bool -> ?math:bool ->
+  registered:bool -> keyed:bool -> ?math:bool ->
   string ->
   (unit -> task_result Lwt.t) ->
   Preverify_submit.admit
 
 val insert_with_cap :
-  keyed:bool -> ?math:bool ->
+  registered:bool -> keyed:bool -> ?math:bool ->
   string ->
   task_result Lwt.t ->
   unit
@@ -71,7 +70,7 @@ val remove :
   unit
 
 val state :
-  keyed:bool ->
+  registered:bool -> keyed:bool ->
   math:bool ->
   string ->
   state
@@ -83,7 +82,7 @@ val gate :
   gate
 
 val ready_result :
-  keyed:bool -> ?math:bool ->
+  registered:bool -> keyed:bool -> ?math:bool ->
   string ->
   strict:bool ->
   sender_enc_snapshot:string ->

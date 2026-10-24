@@ -17,7 +17,7 @@ type stats = {
 }
 
 type deps = {
-  load_pubkey : addr:string -> string option Lwt.t;
+  load_pubkey : registered:bool -> addr:string -> string option Lwt.t;
   hash_pubkey : string -> string;
   classify_cipher : string -> Migration.cipher_class;
   classify_key : string option -> Migration.key_class;
@@ -34,6 +34,7 @@ type state = {
 }
 
 type query = {
+  registered : bool;
   addr : string;
   key_hash : string option;
   cipher : string;
@@ -161,7 +162,7 @@ let addr_key addr = "a:" ^ addr
 let query_key (query : query) =
   match query.key_hash with
   | Some hash -> hash_key hash
-  | None -> addr_key query.addr
+  | None -> addr_key ((if query.registered then "registered:" else "") ^ query.addr)
 
 let decide_key (query : query) state =
   let cached, state = find_key (query_key query) state in
@@ -195,7 +196,7 @@ let resolve_cached deps (query : query) key_class =
 
 let resolve_loaded t (query : query) =
   let open Lwt.Syntax in
-  let* pubkey = t.deps.load_pubkey ~addr:query.addr in
+  let* pubkey = t.deps.load_pubkey ~registered:query.registered ~addr:query.addr in
   let* classified =
     Lwt_preemptive.detach
       (fun () -> classify_loaded t.deps query pubkey)
@@ -360,8 +361,8 @@ let create deps =
   Lwt.async (fun () -> actor_loop t);
   t
 
-let query t ~addr ~key_hash ~cipher =
-  let message = Query { addr; key_hash; cipher } in
+let query t ~registered ~addr ~key_hash ~cipher =
+  let message = Query { registered; addr; key_hash; cipher } in
   match enqueue t ~control:false message with
   | None -> Lwt.return (Error Busy)
   | Some response ->

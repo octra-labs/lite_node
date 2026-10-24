@@ -318,6 +318,7 @@ type live_value_effect_args = {
 }
 
 type live_sender_vm_tx_args = {
+  program_inputs : bool;
   value_journal : Value_journal.t;
   program_journal : Program_journal.t;
   trusted_program_keys : Program_trust.t;
@@ -644,8 +645,8 @@ let make_live_contract_ctx (args : live_contract_ctx_args) =
   } in
   { ctx with epoch_time_ms = args.epoch_time_ms }
 
-let live_fhe_pubkey store addr =
-  match Node_rest_facade.run_s (Octra_core.Store_irmin.get_pvac_pubkey store addr) with
+let live_fhe_pubkey ?(registered = false) store addr =
+  match Node_rest_facade.run_s (Octra_core.Store_irmin.get_pvac_pubkey ~registered store addr) with
   | None -> None
   | Some blob -> Some (ContractVM.Key_bytes blob)
 
@@ -775,7 +776,7 @@ let run_program_call_tx (deps : program_call_deps) tx =
     ~reject_domain:Call_plan.Program_exec
     tx
 
-let run_program_source_tx (runtime : call_runtime) ~program_journal ~store
+let run_program_source_tx ~metered (runtime : call_runtime) ~program_journal ~store
     (tx : Transaction.t) =
   let open Lwt.Syntax in
   let reject reason = runtime.reject_after_fee tx.ou "program_source_rejected" reason in
@@ -801,7 +802,7 @@ let run_program_source_tx (runtime : call_runtime) ~program_journal ~store
               || Digestif.SHA256.(digest_string stored |> to_hex) <> meta.code_hash ->
             raise (Octra_core.Exec_resource.Unavailable Host)
           | Ok stored ->
-            Program_record.verify sources ~exact:(meta.check = "source") ~stored) () in
+            Program_record.verify ~metered sources ~exact:(meta.check = "source") ~stored) () in
         begin match checked with
         | Error reason -> reject reason
         | Ok record ->
@@ -818,12 +819,12 @@ let run_program_source_tx (runtime : call_runtime) ~program_journal ~store
       end
     end
 
-let run_program_upgrade_tx ?(records = Octra_core.Rule_graph.Prior)
+let run_program_upgrade_tx ?(metered = false) ?(records = Octra_core.Rule_graph.Prior)
     (runtime : call_runtime) ~trusted_program_keys
     ~program_journal ~store (tx : Transaction.t) =
   runtime.with_debited_fee tx.ou (fun () ->
     if records = Octra_core.Rule_graph.Active && Program_upgrade.is_source tx then
-      run_program_source_tx runtime ~program_journal ~store tx
+      run_program_source_tx ~metered runtime ~program_journal ~store tx
     else
     match Program_upgrade.parse tx with
     | Error error ->
@@ -994,7 +995,7 @@ let run_program_deploy_tx (deps : vm_tx_deps) tx =
             runtime.log_constructor_failed result.contract_addr reason;
             runtime.reject_after_fee tx.ou "constructor_failed" reason)
 
-let prepare_program_package ?(preview = Octra_core.Rule_graph.Prior)
+let prepare_program_package ?(metered = false) ?(preview = Octra_core.Rule_graph.Prior)
     ?(proof_exec = Octra_core.Rule_graph.Prior)
     ?(records = Octra_core.Rule_graph.Prior)
     ~overlap ~program_mode ~point_ops (tx : Transaction.t) =
@@ -1006,14 +1007,14 @@ let prepare_program_package ?(preview = Octra_core.Rule_graph.Prior)
     let consts = records = Octra_core.Rule_graph.Active in
     let admit =
       if overlap && compiler = Program_package.Source then
-        Program_package.admit_transition ~point_ops ~loops ~consts
-      else Program_package.admit_base64 ~compiler ~point_ops ~loops ~consts
+        Program_package.admit_transition ~metered ~point_ops ~loops ~consts
+      else Program_package.admit_base64 ~metered ~compiler ~point_ops ~loops ~consts
     in
     Octra_core.Exec_resource.detach
       (fun () ->
         match admit encoded with
         | Ok package when consts && not loops && not (Program_record.scope_matches
-            (Program_record.scope_check ~main:package.main ~files:package.sources)
+            (Program_record.scope_check ~metered ~main:package.main ~files:package.sources)
             package.result.bytecode) -> Error "program source scope differs"
         | Ok package -> Ok package
         | Error error -> Error (Program_package.error_message error))
@@ -1205,7 +1206,7 @@ let stage_program_record ~mode ~journal tx package =
       Program_journal.add_record journal tx.to_ record;
       Ok ()
 
-let make_live_vm_tx_deps ?(inspect_mode = Octra_core.Rule_graph.Prior)
+let make_live_vm_tx_deps ?(metered = false) ?(inspect_mode = Octra_core.Rule_graph.Prior)
     ?(records = Octra_core.Rule_graph.Prior)
     (args : live_vm_tx_args) =
   let save_receipt =
@@ -1235,6 +1236,7 @@ let make_live_vm_tx_deps ?(inspect_mode = Octra_core.Rule_graph.Prior)
       save_receipt ~tx_hash ~contract_addr ~method_name:"constructor" receipt;
       Lwt.return { contract_addr; receipt });
     program_prepare = (fun tx -> prepare_program_package
+      ~metered
       ~records
       ~proof_exec:(args.ctx_for_hash (Transaction.hash tx)).proof_exec
       ~preview:args.preview
@@ -1368,7 +1370,7 @@ let make_live_sender_vm_tx_deps (args : live_sender_vm_tx_args) =
         program_journal = args.program_journal;
         trusted_program_keys = args.trusted_program_keys;
         store = args.store;
-        get_fhe_pubkey = live_fhe_pubkey args.store;
+        get_fhe_pubkey = live_fhe_pubkey ~registered:args.program_inputs args.store;
         proof_mode = args.proof_mode;
         fhe_work = args.fhe_work;
         proof_exec = args.proof_exec;
@@ -1398,7 +1400,7 @@ let make_live_sender_vm_tx_deps (args : live_sender_vm_tx_args) =
       confirm = args.confirm;
     }
   in
-  make_live_vm_tx_deps ~inspect_mode:args.vm_bytes ~records:args.program_records {
+  make_live_vm_tx_deps ~metered:args.program_inputs ~inspect_mode:args.vm_bytes ~records:args.program_records {
     runtime;
     trusted_program_keys = args.trusted_program_keys;
     program_journal = args.program_journal;

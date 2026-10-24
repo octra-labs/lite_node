@@ -207,9 +207,12 @@ let make_validator_set (vals : validator_info list) =
   |> List.map (fun validator -> validator, Z.one)
   |> build_validator_set ~weighted:false
 
+module String_set = Set.Make (String)
+module String_map = Map.Make (String)
+
 let make_weighted_validator_set entries =
   let rec validate addresses pubkeys = function
-    | [] when addresses = [] -> Error "validator set is empty"
+    | [] when String_set.is_empty addresses -> Error "validator set is empty"
     | [] -> Ok ()
     | (validator, weight) :: rest ->
       if validator.address = "" then
@@ -218,24 +221,29 @@ let make_weighted_validator_set entries =
         Error "validator public key must contain 32 bytes"
       else if Z.sign weight <= 0 then
         Error "validator weight must be positive"
-      else if List.mem validator.address addresses then
+      else if String_set.mem validator.address addresses then
         Error "duplicate validator address"
-      else if List.mem validator.pubkey pubkeys then
+      else if String_set.mem validator.pubkey pubkeys then
         Error "duplicate validator public key"
       else
         validate
-          (validator.address :: addresses)
-          (validator.pubkey :: pubkeys)
+          (String_set.add validator.address addresses)
+          (String_set.add validator.pubkey pubkeys)
           rest
   in
-  match validate [] [] entries with
+  match validate String_set.empty String_set.empty entries with
   | Error _ as error -> error
   | Ok () -> Ok (build_validator_set ~weighted:true entries)
 
+let weight_index (vs : validator_set) =
+  List.fold_right (fun (address, weight) index -> String_map.add address weight index)
+    vs.weights String_map.empty
+
 let weights_of_set (vs : validator_set) =
+  let weights = weight_index vs in
   List.map
     (fun validator ->
-      match List.assoc_opt validator.address vs.weights with
+      match String_map.find_opt validator.address weights with
       | Some weight -> validator, weight
       | None -> invalid_arg "validator weight missing")
     vs.validators

@@ -428,10 +428,6 @@ let decode_program ?(trusted = []) ?(point_ops = false) raw =
           (fun program -> { program with compiler_version = Some version })
           (of_program ~point_ops ~facts code)
 
-let decode_deploy ?(trusted = []) ?(point_ops = false) raw =
-  if Program_envelope.is_program raw then decode_program ~trusted ~point_ops raw
-  else decode ~point_ops raw
-
 let decode_program_source ?(point_ops = false) raw =
   match Program_envelope.decode raw with
   | Error error -> Error (Decode_error (Program_envelope.error_message error))
@@ -452,6 +448,48 @@ let decode_program_source ?(point_ops = false) raw =
         Result.map
           (fun program -> { program with compiler_version = Some version })
           (of_program ~point_ops ~facts code)
+
+type saved =
+  | Image of t
+  | Checked of profile * Program_effects.t * string option
+
+let checked : saved Code_cache.t = Code_cache.create ()
+
+let reuse ~mode ~trusted ~point_ops raw compute =
+  let key = Code_cache.key ~mode ~point_ops ~trusted raw in
+  let retain = function
+    | Image image as value when not (Code_cache.fits key value) ->
+      Checked (image.profile, image.admitted_effects, image.compiler_version)
+    | value -> value in
+  match Code_cache.run ~retain checked key (fun () -> Result.map (fun t -> Image t) (compute ())) with
+  | Error _ as error -> error
+  | Ok (Image image) -> Ok image
+  | Ok (Checked (profile, admitted_effects, compiler_version)) ->
+    let code = if mode = 0 then Ok raw
+      else Program_envelope.decode raw
+        |> Result.map (fun envelope -> envelope.Program_envelope.code)
+        |> Result.map_error (fun error -> Decode_error (Program_envelope.error_message error)) in
+    Result.bind code (fun raw ->
+      Decode.code ~active:point_ops raw
+      |> Result.map_error (fun error -> Decode_error error)
+      |> Result.map (fun admitted_code ->
+        {admitted_code; admitted_effects; profile; compiler_version}))
+
+let decode ?(point_ops = false) raw =
+  reuse ~mode:0 ~point_ops ~trusted:[] raw
+    (fun () -> decode ~point_ops raw)
+
+let decode_program ?(trusted = []) ?(point_ops = false) raw =
+  reuse ~mode:1 ~point_ops ~trusted raw
+    (fun () -> decode_program ~trusted ~point_ops raw)
+
+let decode_deploy ?(trusted = []) ?(point_ops = false) raw =
+  if Program_envelope.is_program raw then decode_program ~trusted ~point_ops raw
+  else decode ~point_ops raw
+
+let decode_program_source ?(point_ops = false) raw =
+  reuse ~mode:2 ~point_ops ~trusted:[] raw
+    (fun () -> decode_program_source ~point_ops raw)
 
 let compiler_version program = program.compiler_version
 

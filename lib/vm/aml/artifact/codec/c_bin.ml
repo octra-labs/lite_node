@@ -41,16 +41,16 @@ let same_bits left right =
   loop left right
 
 let put_pos value =
-  let rec loop value out =
-    if Z.equal value Z.one then
-      List.rev (List.rev_append [false; false] out)
-    else
-      let pair =
-        if Z.testbit value 0 then [true; false] else [false; true]
-      in
-      loop (Z.shift_right value 1) (List.rev_append pair out)
-  in
-  if Z.sign value <= 0 then None else Some (loop value [])
+  if Z.sign value <= 0 then None
+  else
+    let bytes = Z.to_bits value in
+    let rec loop bit out =
+      if bit < 0 then out
+      else
+        let set = Char.code bytes.[bit / 8] land (1 lsl (bit mod 8)) <> 0 in
+        loop (bit - 1) (if set then true :: false :: out else false :: true :: out)
+    in
+    Some (loop (Z.numbits value - 2) [false; false])
 
 let put_nat value =
   if Z.sign value < 0 then None
@@ -67,14 +67,21 @@ let put_z value =
     else Some (true :: false :: body)
 
 let get_pos input =
-  let rec loop place value = function
-    | false :: false :: rest -> Some (Z.add value place, rest)
-    | false :: true :: rest -> loop (Z.shift_left place 1) value rest
-    | true :: false :: rest ->
-      loop (Z.shift_left place 1) (Z.add value place) rest
+  let bytes = Buffer.create 32 in
+  let rec loop bit byte = function
+    | false :: false :: rest ->
+      Buffer.add_char bytes (Char.chr (byte lor (1 lsl bit)));
+      Some (Z.of_bits (Buffer.contents bytes), rest)
+    | false :: true :: rest -> next bit byte rest
+    | true :: false :: rest -> next bit (byte lor (1 lsl bit)) rest
     | _ -> None
+  and next bit byte rest =
+    if bit = 7 then begin
+      Buffer.add_char bytes (Char.chr byte);
+      loop 0 0 rest
+    end else loop (bit + 1) byte rest
   in
-  loop Z.one Z.zero input
+  loop 0 0 input
 
 let get_nat = function
   | false :: false :: rest -> Some (Z.zero, rest)

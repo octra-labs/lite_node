@@ -489,7 +489,7 @@ let make_activation_driver ~chain_id ~my_addr ~initial_vs ~target_vs ~activate_e
 
 let check_stake_transition () =
   let chain_id = "stake-transition" in
-  let policy = C_quorum_policy.make ~count_epoch:0L ~stake_epoch:(Some 30L) in
+  let policy = C_quorum_policy.make ~count_epoch:0L ~stake_epoch:(Some 30L) ~round_epoch:(Some 30L) in
   let members = List.init 7 (fun index -> C_types.{
     address = "octStake" ^ string_of_int index;
     pubkey = String.make 32 (Char.chr (index + 1))}) in

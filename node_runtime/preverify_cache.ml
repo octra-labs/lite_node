@@ -24,7 +24,6 @@ type state =
 type gate =
   | Ready_gate
   | Failed_gate of string
-  | Timeout_gate of string
   | Unavailable_gate of {
     next_count : int;
     reason : Tx_view.preverify_unavailable;
@@ -34,7 +33,7 @@ type gate =
     status : string;
   }
 
-type entry = { math : bool;
+type entry = { registered : bool; math : bool;
   keyed : bool; task : task_result Lwt.t }
 
 let cache : (string, entry) Hashtbl.t = Hashtbl.create 100
@@ -43,36 +42,36 @@ let cache_ts : (string, float) Hashtbl.t = Hashtbl.create 100
 
 let pending = ref 0
 
-let float_env name ~fallback ~min_value ~max_value =
+let float_env name ~default ~min_value ~max_value =
   match Sys.getenv_opt name with
-  | None -> fallback
+  | None -> default
   | Some raw ->
     try
       let value = float_of_string raw in
       match classify_float value with
-      | FP_nan | FP_infinite -> fallback
+      | FP_nan | FP_infinite -> default
       | FP_normal | FP_subnormal | FP_zero ->
-        if value < min_value || value > max_value then fallback else value
-    with _ -> fallback
+        if value < min_value || value > max_value then default else value
+    with _ -> default
 
-let int_env name ~fallback ~min_value ~max_value =
+let int_env name ~default ~min_value ~max_value =
   match Sys.getenv_opt name with
-  | None -> fallback
+  | None -> default
   | Some raw ->
     try
       let value = int_of_string raw in
-      if value < min_value || value > max_value then fallback else value
-    with _ -> fallback
+      if value < min_value || value > max_value then default else value
+    with _ -> default
 
 let cache_ttl () =
   float_env "OCTRA_PREVERIFY_CACHE_TTL"
-    ~fallback:45.
+    ~default:45.
     ~min_value:1.
     ~max_value:3_600.
 
 let configured_max_entries () =
   int_env "OCTRA_PREVERIFY_CACHE_MAX"
-    ~fallback:64
+    ~default:64
     ~min_value:1
     ~max_value:4_096
 
@@ -153,7 +152,7 @@ let prune ?(ttl = -1.0) ?(max_entries = -1) () =
       ttl
       (Hashtbl.length cache)
 
-let insert_with_cap ~keyed ?(math=false) hash result_promise =
+let insert_with_cap ~registered ~keyed ?(math = false) hash result_promise =
   let now = now () in
   let max_entries = configured_max_entries () in
   let plan =
@@ -169,11 +168,15 @@ let insert_with_cap ~keyed ?(math=false) hash result_promise =
       plan.hard_cap_requested_drop
       (Hashtbl.length cache_ts)
   end;
-  Hashtbl.replace cache hash { math; keyed; task = result_promise };
+  Hashtbl.replace cache hash { registered; math; keyed; task = result_promise };
   Hashtbl.replace cache_ts hash now
 
-let start_task ~keyed ?(math=false) hash f =
-  if Option.fold ~none:false ~some:(fun entry -> entry.math = math && entry.keyed = keyed)
+let start_task ~registered ~keyed ?(math = false) hash f =
+  if Option.fold ~none:false ~some:(fun entry ->
+      entry.registered = registered && entry.math = math && entry.keyed = keyed &&
+      match Lwt.state entry.task with
+      | Lwt.Sleep | Lwt.Return (Checked _) -> true
+      | Lwt.Fail _ | Lwt.Return (Unavailable _) -> false)
       (Hashtbl.find_opt cache hash) then
     Preverify_submit.Existing
   else if not (has_capacity ()) then
@@ -190,13 +193,13 @@ let start_task ~keyed ?(math=false) hash f =
           if gc_on_finish () then Gc.major ();
           Lwt.return_unit)
     in
-    insert_with_cap ~keyed ~math hash task;
+    insert_with_cap ~registered ~keyed ~math hash task;
     Preverify_submit.Started
   end
 
-let state ~keyed ~math hash =
+let state ~registered ~keyed ~math hash =
   match Hashtbl.find_opt cache hash with
-  | Some entry when entry.math = math && entry.keyed = keyed ->
+  | Some entry when entry.registered = registered && entry.math = math && entry.keyed = keyed ->
     begin
       match Lwt.state entry.task with
       | Lwt.Return (Checked result)
@@ -206,8 +209,11 @@ let state ~keyed ~math hash =
         Missing
       | Lwt.Return (Unavailable reason) ->
         Unavailable_state reason
-      | Lwt.Fail exn ->
-        Failed (Printexc.to_string exn)
+      | Lwt.Fail (Octra_core.Exec_resource.Unavailable resource) ->
+        Unavailable_state (Tx_view.Local_resource resource)
+      | Lwt.Fail Out_of_memory -> Unavailable_state (Tx_view.Local_resource Memory)
+      | Lwt.Fail Stack_overflow -> Unavailable_state (Tx_view.Local_resource Stack)
+      | Lwt.Fail _ -> Unavailable_state (Tx_view.Local_resource Host)
       | Lwt.Sleep ->
         Pending
     end
@@ -220,28 +226,16 @@ let gate ~state ~defer_count ~max_defer =
     Ready_gate
   | Failed reason ->
     Failed_gate reason
-  | Missing | Pending | Unavailable_state _ ->
-    let next_count = defer_count + 1 in
-    if next_count > max_defer then
-      let reason =
-        match state with
-        | Missing -> "task not in cache"
-        | Pending -> "still running"
-        | Unavailable_state reason ->
-          Tx_view.preverify_unavailable_message reason
-        | Ready | Failed _ -> "unexpected cache state"
-      in
-      Timeout_gate reason
-    else
-      match state with
-      | Unavailable_state reason -> Unavailable_gate { next_count; reason }
-      | Missing -> Defer_gate { next_count; status = "missing" }
-      | Pending -> Defer_gate { next_count; status = "pending" }
-      | Ready | Failed _ -> Defer_gate { next_count; status = "unexpected" }
+  | Unavailable_state reason ->
+    Unavailable_gate {next_count = min defer_count max_defer; reason}
+  | Missing | Pending ->
+    let next_count = if defer_count >= max_defer then max_defer else defer_count + 1 in
+    Defer_gate {next_count; status = if state = Missing then "missing" else "pending"}
 
-let ready_result ~keyed ?(math=false) hash ~strict ~sender_enc_snapshot =
-  match find hash with
-  | Some task ->
+let ready_result ~registered ~keyed ?(math = false) hash ~strict ~sender_enc_snapshot =
+  match Hashtbl.find_opt cache hash with
+  | Some entry when entry.registered = registered && entry.math = math && entry.keyed = keyed ->
+    let task = entry.task in
     begin
       match Lwt.state task with
       | Lwt.Return (Checked result)
@@ -251,7 +245,7 @@ let ready_result ~keyed ?(math=false) hash ~strict ~sender_enc_snapshot =
       | _ ->
         None
     end
-  | None ->
+  | Some _ | None ->
     None
 
 let retain keep =

@@ -237,6 +237,7 @@ type vm_tx_deps = {
 }
 
 val prepare_program_package :
+  ?metered:bool ->
   ?preview:Octra_core.Rule_graph.mode ->
   ?proof_exec:Octra_core.Rule_graph.mode ->
   ?records:Octra_core.Rule_graph.mode ->
@@ -319,6 +320,7 @@ type live_value_effect_args = {
 }
 
 type live_sender_vm_tx_args = {
+  program_inputs : bool;
   value_journal : Octra_vm.Value_journal.t;
   program_journal : Program_journal.t;
   trusted_program_keys : Octra_vm.Program_trust.t;
@@ -352,6 +354,7 @@ type live_sender_vm_tx_args = {
 }
 
 val make_live_vm_tx_deps :
+  ?metered:bool ->
   ?inspect_mode:Octra_core.Rule_graph.mode ->
   ?records:Octra_core.Rule_graph.mode ->
   live_vm_tx_args ->
@@ -371,6 +374,7 @@ val make_live_contract_ctx :
   ContractVM.exec_ctx
 
 val live_fhe_pubkey :
+  ?registered:bool ->
   Octra_core.Store_irmin.t ->
   string ->
   ContractVM.fhe_key option
@@ -427,6 +431,7 @@ val run_program_call_tx :
   unit Lwt.t
 
 val run_program_upgrade_tx :
+  ?metered:bool ->
   ?records:Octra_core.Rule_graph.mode ->
   call_runtime ->
   trusted_program_keys:Octra_vm.Program_trust.t ->

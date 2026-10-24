@@ -1004,17 +1004,17 @@ let test_bft_op_check () =
 let test_signature_check () =
   let signed_tx, pub_b64 = signed_sample_tx () in
   expect_payload_ok "signature valid"
-    (Tx_view.signature_check ~account_public_key:None signed_tx);
+    (Tx_view.signature_check ~signing:Octra_core.Tx_signature.Historical ~account_public_key:None signed_tx);
   let wire_pubkey_ignored =
     { signed_tx with Transaction.public_key = Some "not-base64"; }
   in
   expect_payload_ok "signature account pubkey priority"
-    (Tx_view.signature_check
+    (Tx_view.signature_check ~signing:Octra_core.Tx_signature.Historical
        ~account_public_key:(Some pub_b64)
        wire_pubkey_ignored);
   expect_payload_error "signature missing pubkey"
     ("invalid_signature", "no public key available")
-    (Tx_view.signature_check
+    (Tx_view.signature_check ~signing:Octra_core.Tx_signature.Historical
        ~account_public_key:None
        (sample_tx Transaction.Standard));
   let wrong_addr =
@@ -1022,13 +1022,13 @@ let test_signature_check () =
   in
   expect_payload_error "signature address mismatch"
     ("invalid_address", "address does not match public key")
-    (Tx_view.signature_check ~account_public_key:None wrong_addr);
+    (Tx_view.signature_check ~signing:Octra_core.Tx_signature.Historical ~account_public_key:None wrong_addr);
   let wrong_signature =
     { signed_tx with Transaction.signature = Base64.encode_exn (String.make 64 '\000'); }
   in
   expect_payload_error "signature invalid"
     ("invalid_signature", "signature verification failed")
-    (Tx_view.signature_check ~account_public_key:None wrong_signature)
+    (Tx_view.signature_check ~signing:Octra_core.Tx_signature.Historical ~account_public_key:None wrong_signature)
 
 let test_sender_check () =
   expect_payload_ok "sender present"
@@ -1257,12 +1257,12 @@ let test_preverify_saturation () =
       Lwt.return (Preverify_submit.Checked result)
   in
   begin
-    match Preverify_cache.start_task ~keyed:false cache_key compute with
+    match Preverify_cache.start_task ~registered:false ~keyed:false cache_key compute with
     | Preverify_submit.Started -> ()
     | _ -> fail "saturated preverify task was not admitted"
   end;
   begin
-    match Preverify_cache.state ~keyed:false ~math:false cache_key with
+    match Preverify_cache.state ~registered:false ~keyed:false ~math:false cache_key with
     | Preverify_cache.Pending -> ()
     | Preverify_cache.Missing -> fail "saturated preverify task is missing"
     | Preverify_cache.Ready -> fail "saturated preverify completed before capacity release"
@@ -1275,7 +1275,7 @@ let test_preverify_saturation () =
   begin
     match
       Preverify_cache.gate
-        ~state:(Preverify_cache.state ~keyed:false ~math:false cache_key)
+        ~state:(Preverify_cache.state ~registered:false ~keyed:false ~math:false cache_key)
         ~defer_count:0
         ~max_defer:2
     with
@@ -1297,7 +1297,7 @@ let test_preverify_saturation () =
   if result.Preverify_submit.sender_enc_snapshot <> "42" then
     fail "saturated preverify result changed";
   begin
-    match Preverify_cache.state ~keyed:false ~math:false cache_key with
+    match Preverify_cache.state ~registered:false ~keyed:false ~math:false cache_key with
     | Preverify_cache.Ready -> ()
     | _ -> fail "saturated preverify did not become ready"
   end;
@@ -1352,9 +1352,12 @@ let test_preverify_tx_launch () =
   let inserts = ref [] in
   let sender_snapshots = ref [] in
   let launcher : Preverify_submit.launcher = {
-    get_pvac_pubkey = (fun _ -> Lwt.return (Some "pk"));
+    get_pvac_pubkey = (fun ~registered _ ->
+      if not registered then fail "key read lost registered mode";
+      Lwt.return (Some "pk"));
     sender_enc = (fun addr -> "cipher:" ^ addr);
-    start_task = (fun ~keyed:_ ~math:_ hash f ->
+    start_task = (fun ~registered ~keyed:_ ~math:_ hash f ->
+      if not registered then fail "cache lost registered mode";
       incr launches;
       inserts := hash :: !inserts;
       ignore (f ());
@@ -1362,6 +1365,7 @@ let test_preverify_tx_launch () =
     strict = (fun () -> false);
     math = (fun () -> false);
     keyed = (fun () -> false);
+    registered = (fun () -> true);
     verify_ranges = (fun ~keyed:_ ~math:_ ~strict:_ ~pubkey_blob:_ ~sender_enc ptd ->
       sender_snapshots := sender_enc :: !sender_snapshots;
       Lwt.return (Ok (ptd.Octra_core.Crypto.PrivateTransferV4.version = 5, false)));
@@ -1393,7 +1397,7 @@ let test_preverify_tx_launch () =
   if !sender_snapshots <> ["cipher:octfrom"] then fail "stealth preverify sender snapshot mismatch";
   let busy_launcher = {
     launcher with
-    Preverify_submit.start_task = (fun ~keyed:_ ~math:_ _ _ -> Preverify_submit.Busy);
+    Preverify_submit.start_task = (fun ~registered:_ ~keyed:_ ~math:_ _ _ -> Preverify_submit.Busy);
   } in
   match
     Preverify_submit.launch_for_tx
@@ -1496,7 +1500,7 @@ let test_post_signature_check () =
        (sample_tx ~nonce:10 Transaction.Standard))
 
 let submit_signature_ok ?account_public_key tx =
-  Tx_view.submit_signature_check
+  Tx_view.submit_signature_check ~signing:Octra_core.Tx_signature.Historical
     ~account_public_key
     ~preverify_has_capacity:true
     ~preverify_pending:0

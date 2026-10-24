@@ -8,11 +8,13 @@ type tx_deps = {
   sender_pk : Octra_core.Transaction.t -> string option;
   add_tx : Octra_core.Transaction.t -> (string, string) result;
   send_payload : string -> unit;
+  send_batch : (unit -> string option) list -> unit;
   broadcast_payload : string -> unit;
   report_bad_peer : string -> unit;
   close_peer : unit -> unit;
   now : unit -> float;
   max_drift : float;
+  signing : unit -> Octra_core.Tx_signature.t;
 }
 
 type deps = {
@@ -40,6 +42,7 @@ let handle_legacy deps frame =
       row.root
       row.producer
   | Error e ->
+    deps.tx.report_bad_peer "epoch_header_decode";
     Log.warn "consensus"
       "epoch_broadcast = decode_failed reason = %s"
       e
@@ -55,11 +58,13 @@ let handle_tx ~duty_head ?bft_mode deps frame =
     sender_pk = deps.tx.sender_pk;
     add_tx = deps.tx.add_tx;
     send_payload = deps.tx.send_payload;
+    send_batch = deps.tx.send_batch;
     broadcast_payload = deps.tx.broadcast_payload;
     report_bad_peer = deps.tx.report_bad_peer;
     close_peer = deps.tx.close_peer;
     now = deps.tx.now;
     max_drift = deps.tx.max_drift;
+    signing = deps.tx.signing;
   }
 
 let handle_unknown frame t =

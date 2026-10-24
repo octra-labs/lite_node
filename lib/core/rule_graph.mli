@@ -88,6 +88,9 @@ val program_source_activation_for_chain : string -> activation option
 val tx_envelope_activation_for_chain : string -> activation option
 val tx_envelope : t -> epoch:int -> (mode, fault) result
 val tx_envelope_at : chain_id:string -> epoch:int64 -> mode
+val chain_id : t -> string
+val tx_network_activation_for_chain : string -> activation option
+val tx_network : t -> epoch:int -> (mode, fault) result
 val program_source : t -> epoch:int -> (mode, fault) result
 val program_overlap_epochs : int
 val program_overlap : t -> epoch:int -> (bool, fault) result
@@ -97,6 +100,8 @@ val stake : t -> epoch:int -> (mode, fault) result
 val program_records_activation_for_chain : string -> activation option
 val program_records : t -> epoch:int -> (mode, fault) result
 val program_records_at : chain_id:string -> epoch:int -> mode
+val program_inputs_at : chain_id:string -> epoch:int -> mode
+val program_inputs_id : string
 
 val duty_marks_activation_for_chain : string -> activation option
 val duty_marks : t -> epoch:int -> (mode, fault) result

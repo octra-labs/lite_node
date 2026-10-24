@@ -86,6 +86,28 @@
  (libraries octra_node_runtime octra_core octra_consensus octra_net zarith yojson lwt.unix))
 
 (test
+ (name test_receipt_index)
+ (modules test_receipt_index)
+ (libraries octra_node_runtime octra_core octra_consensus octra_net octra_test_workspace zarith yojson digestif lwt.unix))
+
+(rule
+ (alias receipt_checks)
+ (action (run %{exe:test_receipt_index.exe})))
+
+(rule
+ (alias receipt_checks)
+ (action (run %{exe:test_bundle_cache.exe})))
+
+(test
+ (name test_tx_network)
+ (modules test_tx_network)
+ (libraries octra_node_runtime octra_core octra_net zarith base64 mirage-crypto-ec))
+
+(rule
+ (alias tx_network_checks)
+ (action (run %{exe:test_tx_network.exe})))
+
+(test
  (name test_bft_validator_transition)
  (modules test_bft_validator_transition)
  (libraries octra_consensus octra_net lwt lwt.unix mirage-crypto-ec
@@ -104,7 +126,32 @@
 (test
  (name test_bft_ready_replay)
  (modules test_bft_ready_replay)
- (libraries octra_consensus octra_net lwt lwt.unix mirage-crypto-ec mirage-crypto-rng.unix))
+ (libraries octra_consensus octra_net octra_node_runtime lwt lwt.unix mirage-crypto-ec mirage-crypto-rng.unix))
+
+(rule
+ (alias round_checks)
+ (action (progn
+   (run %{exe:test_bft_ready_replay.exe})
+   (run %{exe:test_driver_boot.exe})
+   (run %{exe:test_set_actor.exe})
+   (run %{exe:test_set_fold.exe}))))
+
+(test
+ (name test_round_wait)
+ (modules test_round_wait)
+ (libraries octra_consensus octra_net))
+
+(rule
+ (alias round_wait_checks)
+ (action (run %{exe:test_round_wait.exe})))
+
+(rule
+ (alias round_wait_checks)
+ (action (run %{exe:test_bft_ready_replay.exe})))
+
+(rule
+ (alias round_wait_checks)
+ (action (run %{exe:test_vote_log.exe})))
 
 (test
  (name test_admit)
@@ -353,10 +400,19 @@
 
 (rule
  (alias const_checks)
- (action
-  (progn
-   (run %{exe:test_const_transition.exe})
-   (run %{exe:test_program_compile.exe}))))
+ (action (run %{exe:test_type_graph.exe})))
+
+(rule
+ (alias const_checks)
+ (action (run %{exe:test_const_types.exe})))
+
+(rule
+ (alias const_checks)
+ (action (run %{exe:test_const_transition.exe})))
+
+(rule
+ (alias const_checks)
+ (action (run %{exe:test_program_compile.exe})))
 
 (test
  (name test_pure_loop)
@@ -387,6 +443,38 @@
  (name test_decode_policy)
  (modules test_decode_policy)
  (libraries octra_vm base64 zarith mirage-crypto-ec threads))
+
+(test
+ (name test_literal_codec)
+ (modules test_literal_codec)
+ (libraries octra_vm zarith base64))
+
+(test
+ (name test_check_cache)
+ (modules test_check_cache)
+ (libraries octra_vm octra_circle_runtime base64 zarith))
+
+(test
+ (name test_read_work)
+ (modules test_read_work)
+ (libraries octra_vm octra_node_runtime octra_net octra_core octra_test_workspace
+  digestif base64 lwt.unix yojson))
+
+(rule
+ (alias literal_checks)
+ (action (run %{exe:test_literal_codec.exe})))
+
+(rule
+ (alias checked_checks)
+ (action (run %{exe:test_check_cache.exe})))
+
+(rule
+ (alias abi_checks)
+ (action (run %{exe:test_read_work.exe})))
+
+(alias
+ (name read_checks)
+ (deps (alias literal_checks) (alias checked_checks) (alias abi_checks)))
 
 (test
  (name test_int_text)
@@ -460,7 +548,7 @@
 (test
  (name test_gc_head)
  (modules test_gc_head)
- (libraries octra_core octra_node_runtime lwt.unix))
+ (libraries octra_core octra_node_runtime octra_test_workspace lwt.unix))
 
 (test
  (name test_txlog)
@@ -986,6 +1074,63 @@
   unix lwt.unix base64 digestif zarith))
 
 (test
+ (name test_program_inputs)
+ (modules test_program_inputs)
+ (libraries octra_vm octra_core octra_consensus octra_node_runtime octra_test_workspace
+  pvac_ffi unix lwt.unix base64 digestif zarith))
+
+(test
+ (name test_function_work)
+ (modules test_function_work)
+ (libraries octra_vm))
+
+(test
+ (name test_private_keys)
+ (modules test_private_keys)
+ (libraries octra_node_runtime octra_core octra_test_workspace lwt.unix zarith))
+
+(rule
+ (alias private_key_checks)
+ (action (run %{exe:test_private_keys.exe})))
+
+(test
+ (name test_private_routes)
+ (modules test_private_routes)
+ (deps ../bin/octra_pvac_worker.exe)
+ (action
+  (setenv OCTRA_PVAC_VERIFY_WORKER %{exe:../bin/octra_pvac_worker.exe}
+   (run %{test})))
+ (libraries octra_node_runtime octra_vm octra_consensus octra_core octra_test_workspace
+  pvac_ffi lwt.unix base64 zarith mirage-crypto-ec))
+
+(rule
+ (alias private_key_checks)
+ (deps ../bin/octra_pvac_worker.exe)
+ (action
+  (setenv OCTRA_PVAC_VERIFY_WORKER %{exe:../bin/octra_pvac_worker.exe}
+   (run %{exe:test_private_routes.exe}))))
+
+(rule
+ (alias function_checks)
+ (action (run %{exe:test_function_work.exe})))
+
+(rule
+ (alias function_checks)
+ (action (run %{exe:test_type_graph.exe})))
+
+(rule
+ (alias program_input_checks)
+ (action (run %{exe:test_program_inputs.exe})))
+
+(rule
+ (alias program_input_checks)
+ (action (run %{exe:test_view_root.exe} --keys)))
+
+(alias
+ (name source_checks)
+ (deps (alias program_input_checks)))
+
+(test
  (name test_source_scope)
  (modules test_source_scope)
  (libraries octra_vm octra_core octra_node_runtime octra_test_workspace
@@ -1087,6 +1232,55 @@
  (name test_aml_profile)
  (modules test_aml_profile)
  (libraries octra_vm base64 digestif zarith))
+
+(test
+ (name test_query_work)
+ (modules test_query_work)
+ (libraries octra_consensus octra_net lwt.unix))
+
+(rule
+ (alias query_checks)
+ (action (run %{exe:test_query_work.exe})))
+
+(rule
+ (alias query_checks)
+ (action (run %{exe:test_bft_ready_replay.exe})))
+
+(rule
+ (alias query_checks)
+ (action (run %{exe:test_node_runtime_p2p_tx_handler.exe})))
+
+(rule
+ (alias query_checks)
+ (action (run %{exe:test_rest_admit.exe})))
+
+(test
+ (name test_type_graph)
+ (modules test_type_graph)
+ (libraries octra_vm zarith unix))
+
+(executable
+ (name compat_program)
+ (modules compat_program)
+ (libraries octra_vm yojson base64))
+
+(executable
+ (name compat_round)
+ (modules compat_round)
+ (libraries octra_consensus octra_net octra_log yojson base64))
+
+(rule
+ (alias stage_checks)
+ (action (run %{exe:test_consensus_profile_golden.exe})))
+
+(rule
+ (alias stage_checks)
+ (action (run %{exe:test_round_wait.exe})))
+
+(test
+ (name test_const_types)
+ (modules test_const_types)
+ (libraries octra_vm zarith))
 
 (test
  (name test_aml_program)
@@ -1384,6 +1578,17 @@
  (action
   (with-stdout-to zk_vm_link.sexp
    (bash "if [ \"$(uname -s)\" = Linux ]; then printf '%s\\n' '(-cclib -Wl,--wrap=caml_zk_initialize -cclib -Wl,--wrap=caml_zk_groth16_verify_bn254)'; else printf '%s\\n' '()'; fi"))))
+
+(test
+ (name test_reply_window)
+ (modules test_reply_window)
+ (libraries octra_consensus octra_net digestif))
+
+(rule
+ (alias catchup_reply_checks)
+ (action (progn
+   (run %{exe:test_reply_window.exe})
+   (run %{exe:test_bft_ready_replay.exe}))))
 
 (test
  (name test_zk_golden)

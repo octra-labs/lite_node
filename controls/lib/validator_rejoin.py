@@ -680,7 +680,7 @@ def captured_round(snapshot, head_epoch):
         raise ValidatorError("running node did not report a consensus round")
     if epoch != head_epoch + 1:
         raise ValidatorError("running node round does not match finalized head")
-    return round_id + 1
+    return round_id
 
 def log_round(name, epoch):
     result = subprocess.run(

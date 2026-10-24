@@ -4,6 +4,50 @@
 From Stdlib Require Import Arith Bool List Lia.
 Import ListNotations.
 
+Module Worker.
+Inductive answer := Success (value : nat) | Rejected (reason : nat) | Host_failure.
+Definition receipt answer := match answer with
+  | Success value => Some (inl value)
+  | Rejected reason => Some (inr reason)
+  | Host_failure => None
+  end.
+Fixpoint execute answers :=
+  match answers with
+  | [] => Some []
+  | answer :: rest => match receipt answer, execute rest with
+    | Some value, Some values => Some (value :: values)
+    | _, _ => None
+    end
+  end.
+Definition publish previous answers :=
+  match execute answers with Some values => previous ++ values | None => previous end.
+
+Theorem host_aborts_batch : forall before after,
+  execute (before ++ Host_failure :: after) = None.
+Proof.
+  induction before; intros; simpl; auto. rewrite IHbefore.
+  destruct (receipt a); reflexivity.
+Qed.
+
+Theorem host_preserves_receipts : forall before after previous,
+  publish previous (before ++ Host_failure :: after) = previous.
+Proof. intros. unfold publish. now rewrite host_aborts_batch. Qed.
+
+Theorem completed_batch : forall answers values,
+  execute answers = Some values ->
+  Forall2 (fun answer value => receipt answer = Some value) answers values.
+Proof.
+  induction answers; intros; simpl in H.
+  - inversion H; constructor.
+  - destruct (receipt a) eqn:E; [|discriminate].
+    destruct (execute answers) eqn:R; [|discriminate].
+    inversion H; subst. constructor; auto.
+Qed.
+
+Print Assumptions host_preserves_receipts.
+Print Assumptions completed_batch.
+End Worker.
+
 Inductive phase := Ready | Running | Done.
 Inductive event :=
   | Start

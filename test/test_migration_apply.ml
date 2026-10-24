@@ -73,7 +73,7 @@ let execute ?preverify ?(owner_mode = G.Active) ?(fail_flush = false)
   let backend = if fail_flush then
     {backend with E.flush_dirty = (fun () -> Lwt.fail_with "migration flush interrupted")}
     else backend in
-  let transition = PT.create ~keyed:false ~math ~preverify ~ledger ~epoch_id:epoch
+  let transition = PT.create ~registered:false ~keyed:false ~math ~preverify ~ledger ~epoch_id:epoch
     ~owner_migration_mode:owner_mode ~proof_mode:G.Active ~field_policy:PL.Unique_fields
     ~cipher_mode
     ~result_policy:Octra_core.Private_result_policy.Recoverable
@@ -88,7 +88,7 @@ let execute ?preverify ?(owner_mode = G.Active) ?(fail_flush = false)
   | Some preverify -> run (E.run_checked ~preverify ~backend ~env ~txs:[tx] ~process_tx)
 
 let preverify ?(cipher_mode = G.Prior) ~math ~epoch ledger admitted tx =
-  run (W.run ~keyed:false ~math ~cipher_mode ~field_policy:PL.Unique_fields ~strict:true ~ledger
+  run (W.run ~registered:false ~keyed:false ~math ~cipher_mode ~field_policy:PL.Unique_fields ~strict:true ~ledger
     ~legacy_replay:(A.decision admitted ~epoch) tx)
 
 let refused ?reason ~math ~epoch store ledger admitted name tx =
@@ -376,10 +376,10 @@ let test_zero () =
           ~activation_epoch:1 [entry] |> get in
       let ready = records clean in
       let before = capture store ledger in
-      let checked = run (PL.key_switch_plan ~keyed:false ~math:true ~cipher_mode:prior
+      let checked = run (PL.key_switch_plan ~registered:false ~keyed:false ~math:true ~cipher_mode:prior
         ~field_policy:PL.Unique_fields ~strict:true ledger tx) in
       check "prior zero check" (Result.is_ok checked);
-      let checked = run (PL.key_switch_plan ~keyed:false ~math:true ~cipher_mode:active
+      let checked = run (PL.key_switch_plan ~registered:false ~keyed:false ~math:true ~cipher_mode:active
         ~field_policy:PL.Unique_fields ~strict:true ledger tx) in
       check "prior cache cannot authorize zero reset" (match checked with
         | Error failure -> failure.PL.reason = "zero reset requires verified zero public history"

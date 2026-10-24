@@ -60,7 +60,7 @@ let with_runtime run =
           compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
           settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
           marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
-          queue_head = (fun () -> None);
+          signing = (fun () -> Octra_core.Tx_signature.Historical); queue_head = (fun () -> None);
           duty_head = (fun () -> Some (10L, Octra_core.Rule_graph.Prior));
           preverify_admit = (fun tx -> checked := tx :: !checked; Ok ());
           save_drops = (fun rows -> drops := rows @ !drops);
@@ -145,24 +145,47 @@ let check_selection () =
     expect "saved oversized duty excluded from proposal" (adapters.staging_epoch_txs () = [other]);
     expect "selection preserves queue evidence" (Pool.staging_size () = 3))
 
+let check_http_retry () = with_runtime (fun runtime ledger _ _ ->
+  let tx = signed (pulse "") in
+  Delivery.stage ~bft_mode:true runtime ledger tx |> Result.get_ok |> ignore;
+  let hash = Tx.hash tx in
+  let reply, finish = Lwt.wait () in
+  let frames = ref [] and posts = ref [] in
+  let network = Delivery.{
+    broadcast = (fun frame -> frames := frame :: !frames);
+    post = (fun value -> posts := value :: !posts; reply)} in
+  let pending = Delivery.retry ~bft_mode:true runtime ledger network tx in
+  expect "HTTP wait lost local duty" (Pool.find_by_hash hash = Some tx);
+  expect "HTTP wait delayed peer delivery" (List.length !frames = 1 && !posts = [tx]);
+  expect "HTTP wait did not suspend" (Lwt.is_sleeping pending);
+  let failure = Octra_node_runtime.Set_post.http_failure 429 in
+  Lwt.wakeup finish (Error failure);
+  expect "HTTP capacity refusal is retryable"
+    (match Lwt_main.run pending with Error (Octra_node_runtime.Set_post.Retry _) -> true | _ -> false);
+  expect "HTTP refusal removed staged duty" (Pool.find_by_hash hash = Some tx);
+  let network = {network with Delivery.post = (fun value -> posts := value :: !posts; Lwt.return_ok ())} in
+  expect "HTTP retry failed" (Lwt_main.run (Delivery.retry ~bft_mode:true runtime ledger network tx) = Ok ());
+  expect "retry changed signed duty" (!posts = [tx; tx] && List.length !frames = 2);
+  expect "retry duplicated queue item" (Pool.staging_size () = 1))
+
 let check_sign () =
   let limit = Payload.standard.message_validator_len in
   let oversized = at_size (limit + 1) in
   let refused =
-    try Result.is_error (Delivery.sign ~key:"not a key" {oversized with signature = ""})
+    try Result.is_error (Delivery.sign ~signing:Octra_core.Tx_signature.Historical ~key:"not a key" {oversized with signature = ""})
     with _ -> false in
   expect "oversized message refused before reading key"
     refused;
   let exact = at_size limit in
   let draft = {exact with Tx.signature = ""} in
   let expected = Tx.sign_with_privkey {draft with ou = Tx.ou_cost draft} secret in
-  let actual = Delivery.sign ~key:secret draft |> Result.get_ok in
+  let actual = Delivery.sign ~signing:Octra_core.Tx_signature.Historical ~key:secret draft |> Result.get_ok in
   expect "valid signing bytes unchanged" (actual = expected);
   expect "valid signature verified" (Tx.verify actual public_key)
 
 let () =
   let cases = ["local", check_local; "cleanup", check_cleanup;
-    "retry", check_retry; "selection", check_selection; "sign", check_sign] in
+    "retry", check_retry; "selection", check_selection; "http", check_http_retry; "sign", check_sign] in
   let selected = match Array.to_list Sys.argv with
     | [_] -> cases
     | [_; name] -> [name, List.assoc name cases]

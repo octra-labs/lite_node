@@ -93,7 +93,7 @@ type standard_adapters = {
   layera_meta : string -> string;
   public_key_for_tx : Transaction.t -> string option;
   verify_address_pubkey : addr:string -> pubkey:string -> bool;
-  verify_tx_signature : Transaction.t -> pubkey:string -> bool;
+  verify_tx_signature : signing:Octra_core.Tx_signature.t -> Transaction.t -> pubkey:string -> bool;
   validator_pubkeys_fallback : int64 -> (string * string) list;
   prev_eic_root : unit -> string;
   next_txid : unit -> int64;
@@ -155,7 +155,7 @@ type deps = {
   driver_ref : Octra_consensus.C_driver.t option ref;
   public_key_for_tx : Transaction.t -> string option;
   verify_address_pubkey : addr:string -> pubkey:string -> bool;
-  verify_tx_signature : Transaction.t -> pubkey:string -> bool;
+  verify_tx_signature : signing:Octra_core.Tx_signature.t -> Transaction.t -> pubkey:string -> bool;
   validator_pubkeys_fallback : int64 -> (string * string) list;
   proposal_preview :
     ?catch_exn:bool ->
@@ -409,8 +409,8 @@ let node_standard_adapters
       Tx_sender_key.resolve ~find_account:runtime.find_account tx);
     verify_address_pubkey = (fun ~addr ~pubkey ->
       Address.verify_address_pubkey addr pubkey);
-    verify_tx_signature = (fun tx ~pubkey ->
-      Transaction.verify tx pubkey);
+    verify_tx_signature = (fun ~signing tx ~pubkey ->
+      Octra_core.Tx_signature.verify signing tx pubkey);
     validator_pubkeys_fallback = (fun epoch_id ->
       runtime.validator_pubkeys_for_epoch
         ~wallet_addr:runtime.wallet_addr

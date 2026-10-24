@@ -2,6 +2,7 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type io = {
+  signing : unit -> Octra_core.Tx_signature.t;
   guard : Octra_net.P2p_tx_gossip_guard.t;
   payload : string;
   peer_id : string;
@@ -10,6 +11,7 @@ type io = {
   sender_pk : Octra_core.Transaction.t -> string option;
   add_tx : Octra_core.Transaction.t -> (string, string) result;
   send_payload : string -> unit;
+  send_batch : (unit -> string option) list -> unit;
   broadcast_payload : string -> unit;
   report_bad_peer : string -> unit;
   close_peer : unit -> unit;
@@ -33,7 +35,7 @@ let receive_tx ?duty ?bft_mode io tx =
     else
     let sender_pk = tx.Octra_core.Transaction.public_key in
     let h12 = Text.hash_short tx_hash in
-    match P2p_tx_admit.admit ?duty ?bft_mode ~now ~max_drift:io.max_drift ~sender_pk tx with
+    match P2p_tx_admit.admit ?duty ?bft_mode ~signing:(io.signing ()) ~now ~max_drift:io.max_drift ~sender_pk tx with
     | P2p_tx_admit.Invalid_address ->
       Log.warn "p2p" "tx_gossip rejected: invalid_address hash = %s" h12
     | P2p_tx_admit.Invalid_payload ->
@@ -68,7 +70,7 @@ let handle_tx ?duty ?bft_mode io tx =
 let handle_legacy ?duty ?bft_mode io =
   let c = Octra_net.Oce1.make_cursor io.payload in
   let tx_json = Octra_net.Oce1.get_string c in
-  match Octra_core.Tx_payload.decode_admit (Yojson.Safe.from_string tx_json) with
+  match Octra_core.Tx_payload.decode_admit (Octra_core.Json_tree.read tx_json) with
   | Ok tx -> handle_tx ?duty ?bft_mode io tx
   | Error e -> Log.warn "p2p" "tx_gossip decode failed: %s" e
 
@@ -80,14 +82,20 @@ let handle_plan ?duty ?bft_mode io =
       not (Octra_net.P2p_tx_gossip_guard.recent io.guard ~now hash)) missing in
     if missing <> [] then send_msg io (Octra_net.P2p_tx_gossip.Get missing)
   | P2p_tx_plan.Serve hits ->
-    List.iter
-      (fun hash ->
-        match io.find_tx hash with
-        | None -> ()
+    let find = io.find_tx in
+    io.send_batch (List.map
+      (fun hash () ->
+        match find hash with
+        | None -> None
         | Some tx ->
           let tx_json = Yojson.Safe.to_string (Octra_core.Transaction.to_yojson tx) in
-          send_msg io (Octra_net.P2p_tx_gossip.Tx { hash; tx_json }))
-      hits
+          if String.length tx_json > Octra_net.P2p_tx_gossip.max_tx_json then begin
+            Log.warn "p2p" "event = tx_reply_refused hash = %s reason = json_size bytes = %d"
+              (Text.hash_short hash) (String.length tx_json);
+            None
+          end else
+            Some (Octra_net.P2p_tx_gossip.encode (Octra_net.P2p_tx_gossip.Tx {hash; tx_json})))
+      hits)
   | P2p_tx_plan.Receive { hash; tx_json } ->
     begin
       match P2p_tx_plan.check_tx ~hash ~tx_json with

@@ -273,18 +273,18 @@ let compile_sources_with compile package =
   in
   result, used
 
-let compile_sources ~loops ~compiler ~point_ops package =
+let compile_sources ~metered ~loops ~compiler ~point_ops package =
   let compile =
     match compiler with
-    | Source -> Oct_compile.compile_program_source ~loops
-    | Preview -> Oct_compile.compile_program_preview ~loops
-    | Protocol when point_ops -> Oct_compile.compile_program_multi_first ~loops
+    | Source -> Oct_compile.compile_program_source ~metered ~loops
+    | Preview -> Oct_compile.compile_program_preview ~metered ~loops
+    | Protocol when point_ops -> Oct_compile.compile_program_multi_first ~metered ~loops
     | Protocol -> Prior_compile.compile_program_multi_first
   in
   compile_sources_with compile package
 
-let compile_sources_checked ~loops package =
-  compile_sources_with (Oct_compile.compile_program_described ~loops) package
+let compile_sources_checked ~metered ~loops package =
+  compile_sources_with (Oct_compile.compile_program_described ~metered ~loops) package
 
 let build_with ~point_ops compile package =
   let result, used = compile package in
@@ -308,7 +308,7 @@ let build_with ~point_ops compile package =
           bind (encode { package with envelope }) (fun encoded ->
             Ok { package = encoded; envelope; result }))
 
-let build ?(consts = false) ~loops ~compiler ~point_ops package =
+let build ?(metered = false) ?(consts = false) ~loops ~compiler ~point_ops package =
   let checked = if not consts then Ok () else
     List.fold_left (fun result source ->
       Result.bind result (fun () ->
@@ -317,17 +317,17 @@ let build ?(consts = false) ~loops ~compiler ~point_ops package =
           Error (Printf.sprintf "line %d: %s" line reason))) (Ok ()) package.sources
     |> Result.map_error (fun reason -> Compile_failed reason) in
   bind checked (fun () ->
-    build_with ~point_ops (compile_sources ~loops ~compiler ~point_ops) package)
+    build_with ~point_ops (compile_sources ~metered ~loops ~compiler ~point_ops) package)
 
-let compile_at ~loops ~compiler ~point_ops ~main ~sources =
+let compile_sources_at ~metered ~loops ~compiler ~point_ops ~main ~sources =
   if compiler <> Protocol && not point_ops then Error Bad_compiler_profile
   else
   bind (normalize ~main sources) (fun sources ->
     let compile =
       match compiler with
-      | Source -> compile_sources_with (Oct_compile.compile_program_source ~loops)
-      | Preview -> compile_sources_with (Oct_compile.compile_program_preview ~loops)
-      | Protocol when point_ops -> compile_sources_checked ~loops
+      | Source -> compile_sources_with (Oct_compile.compile_program_source ~metered ~loops)
+      | Preview -> compile_sources_with (Oct_compile.compile_program_preview ~metered ~loops)
+      | Protocol when point_ops -> compile_sources_checked ~metered ~loops
       | Protocol -> compile_sources_with Prior_compile.compile_program_multi
     in
     build_with ~point_ops compile {
@@ -336,6 +336,8 @@ let compile_at ~loops ~compiler ~point_ops ~main ~sources =
       sources;
       envelope = "";
     })
+
+let compile_at = compile_sources_at ~metered:false
 
 let compile_with = compile_at ~loops:false
 
@@ -347,15 +349,15 @@ let compile ~main ~sources =
 let validate_base64 encoded =
   bind (decode_base64 encoded) (fun _ -> Ok ())
 
-let admit_base64 ?(compiler = Protocol) ?(point_ops = false) ?(loops = false)
+let admit_base64 ?(metered = false) ?(compiler = Protocol) ?(point_ops = false) ?(loops = false)
     ?(consts = false) encoded =
   if compiler <> Protocol && not point_ops then Error Bad_compiler_profile
   else
   bind (decode_base64 encoded) (fun package ->
-    let built = build ~consts ~loops ~compiler ~point_ops { package with envelope = "" } in
+    let built = build ~metered ~consts ~loops ~compiler ~point_ops { package with envelope = "" } in
     let built = match compiler, built with
       | Preview, Ok compiled when String.equal compiled.envelope package.envelope -> built
-      | Preview, _ -> build ~consts ~loops ~compiler:Source ~point_ops { package with envelope = "" }
+      | Preview, _ -> build ~metered ~consts ~loops ~compiler:Source ~point_ops { package with envelope = "" }
       | Protocol, _ | Source, _ -> built
     in
     bind built (fun compiled ->
@@ -374,11 +376,11 @@ let admit_base64 ?(compiler = Protocol) ?(point_ops = false) ?(loops = false)
             result = compiled.result;
           }))
 
-let admit_transition ?(loops = false) ?(consts = false) ~point_ops encoded =
+let admit_transition ?(metered = false) ?(loops = false) ?(consts = false) ~point_ops encoded =
   if not point_ops then Error Bad_compiler_profile else
-  match admit_base64 ~compiler:Source ~point_ops ~loops ~consts encoded with
+  match admit_base64 ~metered ~compiler:Source ~point_ops ~loops ~consts encoded with
   | Ok admitted -> Ok admitted
   | Error source_error ->
-    match admit_base64 ~compiler:Protocol ~point_ops ~loops ~consts encoded with
+    match admit_base64 ~metered ~compiler:Protocol ~point_ops ~loops ~consts encoded with
     | Ok admitted -> Ok admitted
     | Error _ -> Error source_error

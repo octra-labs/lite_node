@@ -103,7 +103,7 @@ let deps (context : context) ~(cursor : R.J.cursor)
     Octra_core.Private_ledger.field_policy_of_mode (rule G.private_payload)
   in
   let key_pool =
-    N.Consensus_key_switch_preverify.create
+    N.Consensus_key_switch_preverify.create ~registered:(fun () -> G.program_inputs_at ~chain_id:context.chain_id ~epoch = G.Active)
       ~keyed:(fun () -> rule G.proof_key = G.Active)
       ~cipher_mode:(fun () -> rule G.cipher_migration)
       ~field_policy:(fun () -> field_policy)
@@ -112,7 +112,7 @@ let deps (context : context) ~(cursor : R.J.cursor)
       context.ledger
   in
   let private_pool =
-    N.Consensus_private_preverify.create
+    N.Consensus_private_preverify.create ~registered:(fun () -> G.program_inputs_at ~chain_id:context.chain_id ~epoch = G.Active)
       ~keyed:(fun () -> rule G.proof_key = G.Active)
       ~field_policy:(fun () -> field_policy)
       ~strict:(fun () -> proof_mode = G.Active)
@@ -193,7 +193,7 @@ let deps (context : context) ~(cursor : R.J.cursor)
             } in
             let* batch =
               N.Consensus_proposal.precheck ~ordered ~run_many:(fun txs ->
-                R.W.run_many
+                R.W.run_many ~registered:(G.program_inputs_at ~chain_id:context.chain_id ~epoch = G.Active)
                 ~keyed:(rule G.proof_key = G.Active)
                 ~math
                 ~cipher_mode:(rule G.cipher_migration)
@@ -259,7 +259,7 @@ let deps (context : context) ~(cursor : R.J.cursor)
         X.make_live_backend ~proof_mode ~math ~fold context.store context.ledger
       in
       let private_transition =
-        Octra_core.Private_transition.create ~keyed:(policy.X.proof_key = G.Active) ~math
+        Octra_core.Private_transition.create ~registered:false ~keyed:(policy.X.proof_key = G.Active) ~math
           ~preverify:(Some preverify)
           ~legacy_replay:context.legacy_replay
           ~ledger:context.ledger

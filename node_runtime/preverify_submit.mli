@@ -43,9 +43,10 @@ type io = {
   strict : bool;
   math : bool;
   keyed : bool;
-  get_pvac_pubkey : string -> string option Lwt.t;
+  registered : bool;
+  get_pvac_pubkey : registered:bool -> string -> string option Lwt.t;
   sender_enc : string -> string;
-  start_task : keyed:bool -> math:bool -> string -> (unit -> task_result Lwt.t) -> admit;
+  start_task : registered:bool -> keyed:bool -> math:bool -> string -> (unit -> task_result Lwt.t) -> admit;
   verify_ranges :
     keyed:bool -> math:bool ->
     strict:bool ->
@@ -60,9 +61,10 @@ type launcher = {
   strict : unit -> bool;
   math : unit -> bool;
   keyed : unit -> bool;
-  get_pvac_pubkey : string -> string option Lwt.t;
+  registered : unit -> bool;
+  get_pvac_pubkey : registered:bool -> string -> string option Lwt.t;
   sender_enc : string -> string;
-  start_task : keyed:bool -> math:bool -> string -> (unit -> task_result Lwt.t) -> admit;
+  start_task : registered:bool -> keyed:bool -> math:bool -> string -> (unit -> task_result Lwt.t) -> admit;
   verify_ranges :
     keyed:bool -> math:bool ->
     strict:bool ->

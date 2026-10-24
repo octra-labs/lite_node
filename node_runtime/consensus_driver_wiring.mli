@@ -91,7 +91,7 @@ type standard_adapters = {
   layera_meta : string -> string;
   public_key_for_tx : Octra_core.Transaction.t -> string option;
   verify_address_pubkey : addr:string -> pubkey:string -> bool;
-  verify_tx_signature : Octra_core.Transaction.t -> pubkey:string -> bool;
+  verify_tx_signature : signing:Octra_core.Tx_signature.t -> Octra_core.Transaction.t -> pubkey:string -> bool;
   validator_pubkeys_fallback : int64 -> (string * string) list;
   prev_eic_root : unit -> string;
   next_txid : unit -> int64;
@@ -153,7 +153,7 @@ type deps = {
   driver_ref : Octra_consensus.C_driver.t option ref;
   public_key_for_tx : Transaction.t -> string option;
   verify_address_pubkey : addr:string -> pubkey:string -> bool;
-  verify_tx_signature : Transaction.t -> pubkey:string -> bool;
+  verify_tx_signature : signing:Octra_core.Tx_signature.t -> Transaction.t -> pubkey:string -> bool;
   validator_pubkeys_fallback : int64 -> (string * string) list;
   proposal_preview :
     ?catch_exn:bool ->

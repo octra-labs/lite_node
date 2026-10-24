@@ -8,6 +8,7 @@ val polc_saved : polc_receipt -> policy:C_quorum_policy.t -> chain_id:string ->
   epoch_id:int64 -> validator_set:C_types.validator_set -> round:int -> proposal_id:string -> bool
 
 val polc_save : ?policy:C_quorum_policy.t -> ?sync:(string -> (unit, string) result) ->
+  ?keep_rounds:int list ->
   t -> chain_id:string -> epoch_id:int64 -> validator_set:C_types.validator_set ->
   locked_round:int -> C_types.vote list -> (polc_receipt, string) result
 
@@ -69,6 +70,10 @@ val max_round :
   validator:string ->
   epoch_id:int64 ->
   (int option, string) result
+
+val round_votes :
+  t -> chain_id:string -> validator:string -> epoch_id:int64 -> round:int ->
+  (C_types.vote list, string) result
 
 val prune :
   t ->

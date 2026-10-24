@@ -1537,7 +1537,13 @@ let target_wiring_of_node (wiring : node_target_wiring) =
 
 let driver_io_of_driver driver =
   {
-    start_height = C_driver.start_height driver;
+    start_height = (fun height ->
+      if not (Octra_consensus.C_quorum_policy.round_wait driver.C_driver.policy height)
+      then C_driver.start_height driver height else
+      let open Lwt.Syntax in
+      let* () = C_driver.catchup_height driver height in
+      C_driver.load_round_sync driver;
+      C_driver.process_outputs driver);
     advance_height = C_driver.catchup_height driver;
     wake_ready = (fun () ->
       C_driver.wake_ready driver);

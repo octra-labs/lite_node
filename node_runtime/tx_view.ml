@@ -856,7 +856,7 @@ let zero_proof_payload_ok encoded_proof =
 
 let encrypt_decrypt_payload_ok s =
   try
-    let j = Yojson.Safe.from_string s in
+    let j = Octra_core.Json_tree.read s in
     let str_k k = Yojson.Safe.Util.(member k j |> to_string_option) in
     match str_k "cipher", str_k "amount_commitment", str_k "zero_proof", str_k "blinding" with
     | Some c, Some ac, Some zp, Some bl ->
@@ -869,7 +869,7 @@ let encrypt_decrypt_payload_ok s =
 
 let stealth_payload_ok json =
   try
-    let j = Yojson.Safe.from_string json in
+    let j = Octra_core.Json_tree.read json in
     match Yojson.Safe.Util.(member "version" j |> to_int_option) with
     | Some 5 ->
       begin
@@ -895,7 +895,7 @@ let preverify_stealth_payload tx =
   | Transaction.StealthOp, Some payload ->
     begin
       try
-        match Crypto.PrivateTransferV4.of_json (Yojson.Safe.from_string payload) with
+        match Crypto.PrivateTransferV4.of_json (Octra_core.Json_tree.read payload) with
         | Ok ptd -> Some ptd
         | Error _ -> None
       with _ -> None
@@ -903,6 +903,7 @@ let preverify_stealth_payload tx =
   | _ -> None
 
 type preverify_unavailable =
+  | Local_resource of Octra_core.Exec_resource.resource
   | Compute_queue_busy
   | Proof_queue_busy
   | Proof_worker_unavailable of string
@@ -915,6 +916,8 @@ type preverify_error =
   | Preverify_unavailable of preverify_unavailable
 
 let preverify_unavailable_message = function
+  | Local_resource resource ->
+    "preverify " ^ Octra_core.Exec_resource.name resource ^ " unavailable"
   | Compute_queue_busy -> "compute queue remained full"
   | Proof_queue_busy -> "proof queue remained full"
   | Proof_worker_unavailable reason -> "proof worker unavailable: " ^ reason
@@ -1027,7 +1030,7 @@ let preverify_stealth_ranges ~keyed ~math ~strict ~pubkey_blob ~sender_enc ptd =
 
 let claim_payload_ok json =
   try
-    let j = Yojson.Safe.from_string json in
+    let j = Octra_core.Json_tree.read json in
     match Yojson.Safe.Util.(member "version" j |> to_int_option) with
     | Some 5 ->
       begin
@@ -1045,7 +1048,7 @@ let claim_payload_ok json =
 
 let key_switch_payload_ok json =
   try
-    let j = Yojson.Safe.from_string json in
+    let j = Octra_core.Json_tree.read json in
     let str_k k = Yojson.Safe.Util.(member k j |> to_string_option) in
     match str_k "new_pubkey", str_k "aes_kat" with
     | Some new_pk_b64, Some kat_hex ->
@@ -1173,13 +1176,13 @@ let submission_pubkey ~account_public_key tx =
   | Some pk, _ -> Some pk
   | None, pk -> pk
 
-let signature_check ~account_public_key tx =
+let signature_check ~signing ~account_public_key tx =
   match submission_pubkey ~account_public_key tx with
   | None -> Error ("invalid_signature", "no public key available")
   | Some pk ->
     if not (Address.verify_address_pubkey tx.Transaction.from pk) then
       Error ("invalid_address", "address does not match public key")
-    else if not (Transaction.verify tx pk) then
+    else if not (Octra_core.Tx_signature.verify signing tx pk) then
       Error ("invalid_signature", "signature verification failed")
     else Ok ()
 
@@ -1255,6 +1258,7 @@ let post_signature_check
   else Ok ()
 
 let submit_signature_check
+    ~signing
     ~account_public_key
     ~preverify_has_capacity
     ~preverify_pending
@@ -1263,7 +1267,7 @@ let submit_signature_check
     ~confirmed_nonce
     ~bft_window
     tx =
-  match signature_check ~account_public_key tx with
+  match signature_check ~signing ~account_public_key tx with
   | Error e -> Error e
   | Ok () ->
     match payload_check ~limits:payload_limits tx with

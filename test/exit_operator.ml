@@ -313,3 +313,24 @@ let check () =
     Service.Queued, true;
     Service.Committed, true;
   ]
+
+let check_offline () =
+  Test_workspace.with_dir "control-offline" (fun directory ->
+    let wallet = Filename.concat directory "wallet.json" in
+    write_json wallet (`Assoc ["address", `String owner.address;
+      "pub", `String (Base64.encode_exn owner.public);
+      "priv", `String (Base64.encode_exn owner.secret)]);
+    let binary = Test_workspace.absolute
+      (Filename.concat (Filename.dirname Sys.executable_name) "../bin/bft_control_tx.exe") in
+    List.iter (fun operation ->
+      let args = [|binary; "--wallet"; wallet; "--rpc"; "http://127.0.0.1:1/rpc";
+        "--op"; operation; "--nonce"; "1"; "--prepare"|] in
+      let open Lwt.Syntax in
+      Lwt_main.run (Lwt_process.with_process_full ~timeout:120. ("", args) (fun process ->
+        let* output, errors = Lwt.both (Lwt_io.read process#stdout) (Lwt_io.read process#stderr) in
+        let* status = process#status in
+        expect ("offline control preparation failed: " ^ errors) (status = Unix.WEXITED 0);
+        let json = Yojson.Safe.from_string output |> Yojson.Safe.Util.member "tx" in
+        let tx = T.of_yojson json |> get "prepared transaction" in
+        expect "offline control changed signature" (T.verify tx (Base64.encode_exn owner.public));
+        Lwt.return_unit))) ["validator_exit"; "validator_withdraw"])

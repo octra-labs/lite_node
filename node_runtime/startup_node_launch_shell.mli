@@ -15,6 +15,7 @@ type deps = {
   add_tx : Octra_core.Transaction.t -> (string, string) result;
   now : unit -> float;
   max_drift : float;
+  signing : unit -> Octra_core.Tx_signature.t;
   driver_ref : Octra_consensus.C_driver.t option ref;
   resource_compute : Resource_compute_service.t option;
   exit_fatal : unit -> unit;

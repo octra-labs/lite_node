@@ -531,9 +531,9 @@ let test_boot_set ?(seats = 8) ?(ahead = false) ?(wal = false) ?(recovered = fal
       F.write prior (F.of_finalize legacy);
       let deps = {deps with S.data_dir = prior} in
       let before = Octra_consensus.C_quorum_policy.make ~count_epoch:0L
-        ~stake_epoch:(Some (Int64.succ epoch)) in
+        ~stake_epoch:(Some (Int64.succ epoch)) ~round_epoch:(Some (Int64.succ epoch)) in
       let after = Octra_consensus.C_quorum_policy.make ~count_epoch:0L
-        ~stake_epoch:(Some epoch) in
+        ~stake_epoch:(Some epoch) ~round_epoch:(Some epoch) in
       expect "repair used journal before stake"
         (C.validator_set_hash (get (S.repair_set ~policy:before deps epoch))
          = C.validator_set_hash next_votes);

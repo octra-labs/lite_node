@@ -2,6 +2,10 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 module Frame = Octra_net.P2p_frame
+module VoteKeys = Set.Make (struct
+  type t = string * C_types.vote_type
+  let compare = Stdlib.compare
+end)
 
 type resource_committee_config = {
   activation_delay : int;
@@ -96,7 +100,14 @@ type catchup_range_response_record = {
 type catchup_query_window = {
   from_epoch : int64;
   max_epochs : int;
+  replies : C_reply_window.t;
 }
+
+exception Catchup_reply_error of exn
+
+let read_catchup_reply decode payload =
+  try decode payload with
+  | (Failure _ | Invalid_argument _) as error -> raise (Catchup_reply_error error)
 
 type peer_state_record = {
   responder_addr : string;
@@ -248,7 +259,10 @@ type t = {
   seen : C_seen.t;
   historical_replays : C_seen.t;
   mutable running : bool;
+  mutable query_work : C_query_work.t;
+  mutable query_cache : (int64 * int64 * int * bool * C_codec.catchup_epoch_record list * int64 option) list;
   mutable epoch_start_mono : int64;
+  mutable progress_step_at : int64;
   mutable pace : pace_wait option;
   mutable epoch_root_queries : epoch_root_response_record C_root_query.t;
   bundle_responses : (string, bundle_response_record list) Hashtbl.t;
@@ -270,6 +284,7 @@ type t = {
   mutable vote_log_issue : string option;
   mutable vote_fault : vote_fault option;
   durable_votes : (string, C_types.vote) Hashtbl.t;
+  pending_polc : (int64 * int, int) Hashtbl.t;
   mutable proof_lock : (int64 * int) option;
   mutable saved_polc : C_vote_log.polc_receipt option;
   pending_finalizes : (int64, pending_finalize) Hashtbl.t;
@@ -460,8 +475,11 @@ let create_for_policy policy ~config ~validator_set ~swarm ~start_height ~sync_l
     ~can_vote in
   { n_validators = validator_set.C_types.n; policy; config; engine; stake_vs; swarm;
     seen = C_seen.create ~capacity:10_000; running = false;
+    query_work = C_query_work.create (Mtime_clock.elapsed_ns ());
+    query_cache = [];
     historical_replays = C_seen.create ~capacity:4_096;
     epoch_start_mono = Mtime_clock.elapsed_ns ();
+    progress_step_at = Mtime_clock.elapsed_ns ();
     pace = None;
     epoch_root_queries = C_root_query.empty;
     bundle_responses = Hashtbl.create 16;
@@ -483,6 +501,7 @@ let create_for_policy policy ~config ~validator_set ~swarm ~start_height ~sync_l
     vote_log_issue = None;
     vote_fault = None;
     durable_votes = Hashtbl.create 16;
+    pending_polc = Hashtbl.create 8;
     proof_lock = None;
     saved_polc = None;
     pending_finalizes = Hashtbl.create 16;
@@ -590,6 +609,36 @@ let same_proposal_build (b : proposal_build) ~gen ~height ~round ~step =
 
 let local_validator t =
   C_types.is_validator t.engine.vs t.config.my_addr
+
+let query_validator t conn =
+  List.exists (fun (member : C_types.validator_info) ->
+    String.equal conn.Octra_net.P2p_conn.peer_id
+      (Octra_net.P2p_handshake.node_id_of_pubkey member.pubkey)) t.engine.vs.validators
+
+let serve_query t conn ~validator ~cost action =
+  let open Lwt.Syntax in
+  let* available = Octra_net.P2p_conn.await_service conn in
+  if not available then Lwt.return_unit else
+  let next, permit = C_query_work.step t.query_work (C_query_work.Start {
+    now = Mtime_clock.elapsed_ns (); peer = conn.Octra_net.P2p_conn.peer_id;
+    network = C_query_work.network (Lwt_unix.getpeername conn.fd);
+    validator; cost}) in
+  t.query_work <- next;
+  match permit with
+  | None -> Lwt.return_unit
+  | Some id ->
+    Lwt.finalize (fun () -> action id) (fun () ->
+      t.query_work <- fst (C_query_work.step t.query_work (C_query_work.Finish id));
+      Lwt.return_unit)
+
+let send_query ?wait conn frame =
+  Octra_net.P2p_conn.send_service ?wait conn frame
+
+let write_query t conn id cost frame =
+  let next, ready = C_query_work.step t.query_work (C_query_work.Prepared {
+    id; bytes = String.length frame.Frame.payload; cost}) in
+  t.query_work <- next;
+  match ready with None -> Lwt.return_unit | Some _ -> send_query conn frame
 
 let vote_floor_bootstrap = "vote log bootstrap required"
 
@@ -813,10 +862,25 @@ let proposal_verify_relevant ~current_round ~current_step ~proposal_round =
 
 let proposal_verify_current t (p : C_types.propose) =
   p.epoch_id = t.engine.state.height
-  && proposal_verify_relevant
-       ~current_round:t.engine.state.round
-       ~current_step:t.engine.state.step
-       ~proposal_round:p.round
+  && (proposal_verify_relevant
+        ~current_round:t.engine.state.round
+        ~current_step:t.engine.state.step
+        ~proposal_round:p.round
+      || (C_quorum_policy.round_wait t.policy t.engine.state.height
+          && p.round = t.engine.state.round
+          && let pid = C_hash.proposal_id p.header in
+             Option.is_none (C_engine.find_proposal_message t.engine ~proposal_id:pid ~round:p.round)
+             && (C_engine.polc_matches t.engine ~round:p.round ~proposal_id:pid
+                 || List.exists (fun votes ->
+                      match C_engine.quorum_result ~policy:t.policy votes
+                        ~chain_id:t.config.chain_id ~epoch_id:t.engine.state.height
+                        ~validator_set:t.engine.vs with
+                      | `QuorumOf known -> known = pid
+                      | _ -> false) [t.engine.prevotes; t.engine.precommits]
+                 || List.exists (fun votes ->
+                      match Hashtbl.find_opt votes.C_engine.votes t.config.my_addr with
+                      | Some vote -> vote.C_types.proposal_id = pid
+                      | None -> false) [t.engine.prevotes; t.engine.precommits])))
 
 let vote_key (v : C_types.vote) =
   Printf.sprintf "%s|%Ld|%d|%s|%s"
@@ -917,12 +981,21 @@ let finalized_vote ~height ~address pending (vote : C_types.vote) =
     && vote.proposal_id = value.proposal_id
 
 let hold_vote_fault t (v : C_types.vote) reason =
-  t.vote_fault <- Some { epoch_id = v.epoch_id; round = v.round; reason };
+  if v.epoch_id = t.engine.state.height && v.round >= t.engine.state.round
+     && not (Option.fold ~none:false ~some:(fun fault ->
+       fault.epoch_id = v.epoch_id && fault.round > v.round) t.vote_fault) then
+    t.vote_fault <- Some { epoch_id = v.epoch_id; round = v.round; reason };
   error_node t.config.my_addr
     "event = refuse_precommit_broadcast reason = %s epoch = %Ld round = %d"
     reason
     v.epoch_id
     v.round
+
+let clear_vote_fault t (v : C_types.vote) =
+  match t.vote_fault with
+  | Some fault when fault.epoch_id = v.epoch_id && fault.round = v.round ->
+    t.vote_fault <- None
+  | _ -> ()
 
 let proposal_binds_vote (v : C_types.vote) (p : C_types.propose) =
   String.equal p.chain_id v.chain_id
@@ -952,19 +1025,25 @@ let keep_polc t round ~required =
   let locked_round = match t.proof_lock with
     | Some (height, round) when height = t.engine.state.height -> round
     | _ -> -1 in
+  let keep_rounds = Hashtbl.fold (fun (epoch, round) _ rounds ->
+    if epoch = t.engine.state.height then round :: rounds else rounds) t.pending_polc [] in
   t.saved_polc <- None;
   match C_vote_log.polc_save ~policy:t.policy t.vote_log ~chain_id:t.config.chain_id
     ~epoch_id:t.engine.state.height ~validator_set:t.engine.vs
-    ~locked_round votes with
+    ~locked_round ~keep_rounds votes with
   | Error _ as error -> error
   | Ok receipt -> t.saved_polc <- Some receipt; Ok ()
 
 let persist_precommit ?proposal t (v : C_types.vote) =
+  let generation = t.engine.generation in
+  let current () = generation = t.engine.generation
+    && v.epoch_id = t.engine.state.height in
   let nil_hash = String.make 32 '\x00' in
-  if v.vote_type = C_types.Precommit && v.proposal_id <> nil_hash then
+  if not (current ()) then Lwt.return_false
+  else if v.vote_type = C_types.Precommit && v.proposal_id <> nil_hash then
     let key = vote_key v in
     if Hashtbl.mem t.durable_votes key then begin
-      t.vote_fault <- None;
+      clear_vote_fault t v;
       Lwt.return_true
     end
     else
@@ -979,7 +1058,10 @@ let persist_precommit ?proposal t (v : C_types.vote) =
       in
       match proposal with
       | Some proposal when proposal_binds_vote v proposal ->
-        (match keep_polc t v.round ~required:true with
+        let position = v.epoch_id, v.round in
+        let count () = Option.value ~default:0 (Hashtbl.find_opt t.pending_polc position) in
+        Hashtbl.replace t.pending_polc position (count () + 1);
+        Lwt.finalize (fun () -> match keep_polc t v.round ~required:true with
         | Error reason -> hold_vote_fault t v reason; Lwt.return_false
         | Ok () ->
         let open Lwt.Syntax in
@@ -992,13 +1074,24 @@ let persist_precommit ?proposal t (v : C_types.vote) =
             ~proposal_wire:(C_codec.encode_propose proposal)
             ~vote_wire:(C_codec.encode_vote v)
         in
-        if durable then begin
-          Hashtbl.replace t.durable_votes key v;
-          t.proof_lock <- Some (v.epoch_id, v.round);
-          t.vote_fault <- None
-        end else
-          hold_vote_fault t v "precommit_not_durable";
-        Lwt.return durable)
+        if not (current ()) then Lwt.return_false else begin
+          let durable = durable || Hashtbl.mem t.durable_votes key in
+          if durable then begin
+            Hashtbl.replace t.durable_votes key v;
+            let round = match t.proof_lock with
+              | Some (epoch, round) when epoch = v.epoch_id -> max round v.round
+              | _ -> v.round in
+            t.proof_lock <- Some (v.epoch_id, round);
+            clear_vote_fault t v
+          end else
+            hold_vote_fault t v "precommit_not_durable";
+          Lwt.return durable
+        end)
+          (fun () ->
+            let remaining = count () - 1 in
+            if remaining = 0 then Hashtbl.remove t.pending_polc position
+            else Hashtbl.replace t.pending_polc position remaining;
+            Lwt.return_unit)
       | Some _ ->
         hold_vote_fault t v "precommit_proposal_mismatch";
         Lwt.return_false
@@ -1057,16 +1150,31 @@ let resume_local_vote t =
       ~epoch_id:t.engine.state.height
   with
   | Ok None -> ()
-  | Ok (Some round) when round < C_codec.max_round ->
+  | Ok (Some round) when round < C_codec.max_round
+      && not (C_quorum_policy.round_wait t.policy t.engine.state.height) ->
     let target = round + 1 in
     if target > t.engine.state.round then begin
       C_engine.realign_round t.engine target;
       log_node t.config.my_addr
         "event = resume_local_vote epoch = %Ld prior_round = %d next_round = %d"
-        t.engine.state.height
-        round
-        target
+        t.engine.state.height round target
     end
+  | Ok (Some round) when round < C_codec.max_round ->
+    (match C_vote_log.round_votes t.vote_log ~chain_id:t.config.chain_id
+      ~validator:t.config.my_addr ~epoch_id:t.engine.state.height ~round with
+     | Error reason -> hold_vote_log t reason
+     | Ok votes ->
+       let target = if votes = [] then round + 1 else round in
+       if target > t.engine.state.round then C_engine.realign_round t.engine target;
+       let restored = if target = round && target = t.engine.state.round then
+           C_engine.restore_local_votes t.engine votes
+         else Ok () in
+       match restored with
+       | Error reason -> hold_vote_log t reason
+       | Ok () ->
+         log_node t.config.my_addr
+           "event = resume_local_vote epoch = %Ld prior_round = %d next_round = %d"
+           t.engine.state.height round t.engine.state.round)
   | Ok (Some _) ->
     hold_vote_log t "vote log reached round limit"
   | Error reason ->
@@ -1581,10 +1689,13 @@ let local_round_proposal t =
     Some proposal
   | _ -> None
 
-let send_vote_to t conn vote =
+let send_vote_to t conn (vote : C_types.vote) =
   let open Lwt.Syntax in
+  if vote.epoch_id <> t.engine.state.height then Lwt.return_unit else
+  let generation = t.engine.generation in
   let* stored = saved_vote t vote in
-  match stored with
+  if generation <> t.engine.generation || vote.C_types.epoch_id <> t.engine.state.height
+    then Lwt.return_unit else match stored with
   | None ->
     error_node t.config.my_addr
       "event = refuse_round_sync_vote type = %s epoch = %Ld round = %d"
@@ -1616,6 +1727,13 @@ let send_round_vote_to t conn (vote : C_types.vote) =
 
 let send_round_sync_response t conn ~requested_round ~with_witness =
   let open Lwt.Syntax in
+  let generation = t.engine.generation in
+  let height = t.engine.state.height in
+  let current () = generation = t.engine.generation && height = t.engine.state.height in
+  let send frame = if current () then Octra_net.P2p_conn.send conn frame
+    else Lwt.return_unit in
+  let send_vote vote = if current () then send_round_vote_to t conn vote
+    else Lwt.return_unit in
   let current_sync =
     if local_validator t && vote_allowed t then
       save_round_sync t (make_round_sync t ~request:false)
@@ -1632,18 +1750,14 @@ let send_round_sync_response t conn ~requested_round ~with_witness =
   let* () =
     match current_sync with
     | Some sync ->
-      Octra_net.P2p_conn.send
-        conn
-        (round_sync_frame sync)
+      send (round_sync_frame sync)
     | None -> Lwt.return_unit
   in
   let* () =
     match current_sync, compat_sync with
     | Some current, Some compat when current = compat -> Lwt.return_unit
     | _, Some sync ->
-      Octra_net.P2p_conn.send
-        conn
-        (round_sync_frame sync)
+      send (round_sync_frame sync)
     | _, None -> Lwt.return_unit
   in
   let witness =
@@ -1662,29 +1776,48 @@ let send_round_sync_response t conn ~requested_round ~with_witness =
   let* () =
     Lwt_list.iter_s
       (fun sync ->
-        Octra_net.P2p_conn.send conn (round_sync_frame sync))
+        send (round_sync_frame sync))
       witness
   in
   let* () =
     match local_round_proposal t with
     | None -> Lwt.return_unit
     | Some proposal ->
-      Octra_net.P2p_conn.send
-        conn
+      send
         {
           Frame.msg_type = Frame.msg_cons_propose;
           payload = C_codec.encode_propose proposal;
         }
   in
   let* () =
-    Lwt_list.iter_s (send_round_vote_to t conn) (current_round_votes t)
+    Lwt_list.iter_s send_vote (current_round_votes t)
   in
-  if requested_round < t.engine.state.round then
-    Lwt_list.iter_s
-      (send_round_vote_to t conn)
+  if not (current ()) then Lwt.return_unit
+  else if requested_round < t.engine.state.round
+     && C_quorum_policy.round_wait t.policy t.engine.state.height then
+    let recorded = if t.vote_log_issue <> None || !(t.finality_proof_needed) then []
+      else match C_vote_log.round_votes t.vote_log ~chain_id:t.config.chain_id
+      ~validator:t.config.my_addr ~epoch_id:t.engine.state.height ~round:requested_round with
+      | Ok votes when List.for_all (fun (vote : C_types.vote) ->
+          t.config.verify_fn vote.validator (C_hash.vote_sign_bytes vote) vote.signature) votes -> votes
+      | Ok _ -> hold_vote_log t "vote log historical signature is invalid"; []
+      | Error reason -> hold_vote_log t reason; [] in
+    let relayed = (C_engine.polc_votes_for_round t.engine requested_round
+      @ C_engine.precommits_for_round t.engine requested_round)
+      |> List.filter (fun (vote : C_types.vote) -> vote.validator <> t.config.my_addr) in
+    let _, votes = List.fold_left (fun (seen, votes) (vote : C_types.vote) ->
+        let key = vote.validator, vote.vote_type in
+        if VoteKeys.mem key seen then seen, votes
+        else VoteKeys.add key seen, vote :: votes) (VoteKeys.empty, []) (relayed @ recorded) in
+    Lwt_list.iter_s (fun (vote : C_types.vote) ->
+      if not (current ()) || vote.validator = t.config.my_addr
+         && (t.vote_log_issue <> None || !(t.finality_proof_needed)) then
+        Lwt.return_unit
+      else send_verified_vote_to conn vote) (List.rev votes)
+  else if requested_round < t.engine.state.round then
+    Lwt_list.iter_s send_vote
       (C_engine.polc_votes_for_round t.engine requested_round)
-  else
-    Lwt.return_unit
+  else Lwt.return_unit
 
 let round_step_rank = function
   | C_types.ProposeStep -> 1
@@ -2497,19 +2630,32 @@ let note_relief_refusal t cfg reason =
 let maybe_activate_relief t =
   let open Lwt.Syntax in
   match t.relief_plan with
-  | Some _ -> Lwt.return_unit
+  | Some _ ->
+    C_engine.set_relief_limit t.engine None;
+    Lwt.return_unit
   | None ->
     let height = t.engine.state.height in
     if Int64.compare height C_relief.activation_epoch < 0 then
       Lwt.return_unit
-    else if t.engine.state.round < C_relief.min_round then
+    else if t.engine.state.round < C_relief.min_round
+      && not (C_quorum_policy.round_wait t.policy height) then
       Lwt.return_unit
     else
+      let set_hash = C_config.validator_set_hash t.engine.vs in
       let* cfg_opt = load_dynamic_plan t in
-      match cfg_opt with
-      | None -> Lwt.return_unit
+      if height <> t.engine.state.height
+         || set_hash <> C_config.validator_set_hash t.engine.vs then Lwt.return_unit
+      else match cfg_opt with
+      | None ->
+        C_engine.set_relief_limit t.engine None;
+        Lwt.return_unit
       | Some cfg ->
         let target = relief_target t cfg in
+        C_engine.set_relief_limit t.engine
+          (C_relief.clock_limit ~chain_id:t.config.chain_id ~height ~current:t.engine.vs
+            ~activate_epoch:cfg.activate_epoch ~target ~fingerprint:cfg.fingerprint);
+        if t.engine.state.round < C_relief.min_round then Lwt.return_unit
+        else
         let proof =
           C_round_pool.witness
             t.round_pool
@@ -2537,7 +2683,9 @@ let maybe_activate_relief t =
           let* result = apply_relief t cfg mark target in
           begin
             match result with
-            | Ok () -> Lwt.return_unit
+            | Ok () ->
+              C_engine.set_relief_limit t.engine None;
+              Lwt.return_unit
             | Error reason ->
               note_relief_refusal t cfg reason;
               Lwt.return_unit
@@ -2545,13 +2693,14 @@ let maybe_activate_relief t =
 
 let restore_polc t =
   let height = t.engine.state.height in
-  if not (C_quorum_policy.linear_weight ~chain_id:t.config.chain_id ~epoch_id:height)
+  if C_quorum_policy.select t.policy height <> C_quorum_policy.Stake
     then Ok () else
   match C_vote_log.polc_load ~policy:t.policy t.vote_log ~chain_id:t.config.chain_id
     ~epoch_id:height ~validator_set:t.engine.vs with
   | Error _ as error -> error
   | Ok votes ->
-    let round = List.fold_left (fun round (vote : C_types.vote) -> max round (vote.round + 1))
+    let next = if C_quorum_policy.round_wait t.policy height then 0 else 1 in
+    let round = List.fold_left (fun round (vote : C_types.vote) -> max round (vote.round + next))
       t.engine.state.round votes in
     if round > t.engine.state.round then C_engine.realign_round t.engine round;
     List.iter (fun (vote : C_types.vote) ->
@@ -4182,7 +4331,7 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
         let q = C_codec.decode_bundle_query frame.payload in
         if q.chain_id <> t.config.chain_id then Lwt.return_unit
         else if not (local_validator t) then Lwt.return_unit
-        else begin
+        else serve_query t _conn ~validator:(query_validator t _conn) ~cost:4 (fun id ->
           match t.config.lookup_bundle q.proposal_id with
           | None -> Lwt.return_unit
           | Some (tx_hashes, txs_json, receipts_json) ->
@@ -4201,9 +4350,10 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
               signature = t.config.sign_fn (C_hash.bundle_response_sign_bytes r);
             } in
             let payload = C_codec.encode_bundle_response r in
-            Octra_net.P2p_conn.send _conn
+            let cost = min 4 (1 + (String.length payload + 524287) / 524288) in
+            write_query t _conn id cost
               { msg_type = Frame.msg_bundle_response; payload }
-        end)
+        ))
         (fun exn ->
           log_node t.config.my_addr "event = bad_bundle_query error = %s"
             (Printexc.to_string exn);
@@ -4257,9 +4407,17 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
         let q = C_codec.decode_catchup_query_range frame.payload in
         if q.chain_id <> t.config.chain_id then Lwt.return_unit
         else if not (local_validator t) then Lwt.return_unit
-        else begin
-          let outcome = t.config.lookup_catchup_range
-            ~from_epoch:q.from_epoch ~max_epochs:q.max_epochs in
+        else
+          let validator = query_validator t _conn in
+          let max_epochs = min q.max_epochs (if validator then C_catchup.range_epochs else 4) in
+          serve_query t _conn ~validator ~cost:(max 1 max_epochs) (fun id ->
+          let head = t.config.local_head_epoch () in
+          t.query_cache <- List.filter (fun (saved, _, _, _, _, _) -> saved = head) t.query_cache;
+          let cached = List.find_opt (fun (_, from, count, mode, _, _) ->
+            from = q.from_epoch && count = max_epochs && mode = is_v2) t.query_cache in
+          let outcome = match cached with
+            | Some (_, _, _, _, records, next) -> `Ok (records, next)
+            | None -> t.config.lookup_catchup_range ~from_epoch:q.from_epoch ~max_epochs in
           let make_response status error_code records next_epoch =
             let unsigned = C_codec.{
               chain_id = t.config.chain_id;
@@ -4305,9 +4463,14 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
               (C_codec.encode_catchup_range_response_v1 response,
                Frame.msg_catchup_range_response)
           in
-          Octra_net.P2p_conn.send _conn
+          (match cached, outcome with
+           | None, `Ok (records, next) when is_v2 && String.length payload <= Frame.catchup_payload_max ->
+             let prior = match t.query_cache with [] -> [] | entry :: _ -> [entry] in
+             t.query_cache <- (head, q.from_epoch, max_epochs, is_v2, records, next) :: prior
+           | _ -> ());
+          write_query t _conn id (max 1 (min max_epochs (List.length response.records)))
             { msg_type = response_msg_type; payload }
-        end)
+        ))
         (fun exn ->
           log_node t.config.my_addr
             "event = bad_catchup_query_range v2 = %b error = %s"
@@ -4317,24 +4480,34 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
               || t' = Frame.msg_catchup_range_response_v2 ->
       let is_v2 = (t' = Frame.msg_catchup_range_response_v2) in
       Lwt.catch (fun () ->
-        let r =
-          if is_v2 then C_codec.decode_catchup_range_response_v2 frame.payload
-          else C_codec.decode_catchup_range_response_v1 frame.payload
-        in
-        if r.chain_id <> t.config.chain_id then Lwt.return_unit
-        else if not (Hashtbl.mem t.catchup_query_windows r.request_id) then
+        let chain_id, request_id = read_catchup_reply C_codec.catchup_reply_header frame.payload in
+        if chain_id <> t.config.chain_id then begin
+          Octra_net.P2p_swarm.report_bad_peer t.swarm _conn
+            ~reason:"wrong_chain_catchup_reply";
           Lwt.return_unit
-        else begin
-          let window_opt =
-            Hashtbl.find_opt t.catchup_query_windows r.request_id
-          in
-          match window_opt with
-          | None ->
-            log_node t.config.my_addr
-              "event = ignore_catchup_range_response v2 = %b reason = unknown_request_empty_records"
-              is_v2;
-            Lwt.return_unit
-          | Some window when not (catchup_response_in_window window r.records) ->
+        end else
+        match Hashtbl.find_opt t.catchup_query_windows request_id with
+        | None -> Lwt.return_unit
+        | Some window ->
+        match C_reply_window.take ~now:(Mtime_clock.elapsed_ns ())
+          ~peer:_conn.Octra_net.P2p_conn.peer_id window.replies with
+        | C_reply_window.Expired | C_reply_window.Repeated -> Lwt.return_unit
+        | C_reply_window.Unexpected_peer ->
+          Octra_net.P2p_swarm.report_bad_peer t.swarm _conn
+            ~reason:"unexpected_catchup_peer";
+          Lwt.return_unit
+        | C_reply_window.Read replies ->
+        let window = {window with replies} in
+        Hashtbl.replace t.catchup_query_windows request_id window;
+        let r = read_catchup_reply
+          (if is_v2 then C_codec.decode_catchup_range_response_v2
+             ~max_records:window.max_epochs
+           else C_codec.decode_catchup_range_response_v1
+             ~max_records:window.max_epochs)
+          frame.payload
+        in
+        begin
+          if not (catchup_response_in_window window r.records) then begin
             log_node t.config.my_addr
               "event = ignore_catchup_range_response v2 = %b reason = epoch_outside_request from = %s"
               is_v2
@@ -4343,7 +4516,7 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
                  0
                  (min 12 (String.length r.responder_addr)));
             Lwt.return_unit
-          | Some window ->
+          end else
             let from_epoch = window.from_epoch in
             let response_epoch =
               match List.rev r.records with
@@ -4351,7 +4524,12 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
               | [] -> from_epoch
             in
             let* validator_set = validator_set_for_frame t response_epoch in
-            if not (C_types.is_validator validator_set r.responder_addr) then begin
+            if not (Option.fold ~none:false
+              ~some:(fun current -> current.replies.deadline = window.replies.deadline
+                && C_reply_window.Peers.mem _conn.peer_id current.replies.consumed)
+              (Hashtbl.find_opt t.catchup_query_windows request_id))
+              || deadline_reached window.replies.deadline then Lwt.return_unit
+            else if not (C_types.is_validator validator_set r.responder_addr) then begin
               log_node t.config.my_addr
                 "event = ignore_catchup_range_response v2 = %b reason = non_validator from = %s"
                 is_v2
@@ -4565,6 +4743,11 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
           log_node t.config.my_addr
             "event = bad_catchup_range_response v2 = %b error = %s"
             is_v2 (Printexc.to_string exn);
+          (match exn with
+           | Catchup_reply_error _ ->
+             Octra_net.P2p_swarm.report_bad_peer t.swarm _conn
+               ~reason:"invalid_frame_catchup_reply"
+           | _ -> ());
           Lwt.return_unit)
     | t' when t' = Frame.msg_vote_evidence ->
       Lwt.catch (fun () ->
@@ -5046,11 +5229,12 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
       max_epochs;
     } in
     let payload = C_codec.encode_catchup_query_range query in
+    let deadline = deadline_after budget in
     Hashtbl.remove t.catchup_responses request_id;
     Hashtbl.replace
       t.catchup_query_windows
       request_id
-      { from_epoch; max_epochs };
+      { from_epoch; max_epochs; replies = C_reply_window.create ~deadline [] };
     let rejected : (string, unit) Hashtbl.t = Hashtbl.create 4 in
     let proof_checked : (string, bool) Hashtbl.t = Hashtbl.create 4 in
     let frame = { Frame.msg_type; payload } in
@@ -5060,7 +5244,6 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
         (agreement_validator_set from_epoch)
         peer_ids
     in
-    let deadline = deadline_after budget in
     let wave_delay =
       catchup_wave_delay ~budget ~wave_count:(List.length waves)
     in
@@ -5068,6 +5251,10 @@ let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
       | [] -> wait_valid_with request_id rejected proof_checked deadline
       | _ when deadline_reached deadline -> Lwt.return_none
       | wave :: rest ->
+        Option.iter (fun window ->
+          Hashtbl.replace t.catchup_query_windows request_id
+            {window with replies = C_reply_window.extend wave window.replies})
+          (Hashtbl.find_opt t.catchup_query_windows request_id);
         let* () =
           Lwt_list.iter_p
             (fun peer_id ->
@@ -5215,7 +5402,8 @@ let request_missing_finalize t ~epoch_id records =
       Hashtbl.replace
         t.catchup_query_windows
         request_id
-        { from_epoch = epoch_id; max_epochs = 1 };
+        { from_epoch = epoch_id; max_epochs = 1;
+          replies = C_reply_window.create ~deadline:Int64.max_int peer_ids };
       Hashtbl.replace t.finality_query_requests request_id epoch_id;
       log_node t.config.my_addr
         "event = request_missing_finalize epoch = %Ld peers = %d attempt = %d"
@@ -5259,7 +5447,8 @@ let request_finality_proof t ~epoch_id records =
     Hashtbl.replace
       t.catchup_query_windows
       request_id
-      { from_epoch = epoch_id; max_epochs = 1 };
+      { from_epoch = epoch_id; max_epochs = 1;
+        replies = C_reply_window.create ~deadline:Int64.max_int peer_ids };
     Hashtbl.replace t.finality_proof_requests request_id epoch_id;
     log_node t.config.my_addr
       "event = finality_proof status = request epoch = %Ld peers = %d"
@@ -5410,12 +5599,17 @@ let set_height t height =
 let reset_height t height =
   set_height t height
 
-let catchup_height t height =
+let install_height t height =
   let open Lwt.Syntax in
   let* () = maybe_activate_scheduled_validator_set t ~target_epoch:height in
   let* () = maybe_activate_resource_committee t ~target_epoch:height in
   set_height t height;
   Lwt.return_unit
+
+let catchup_height t height =
+  if C_quorum_policy.round_wait t.policy t.engine.state.height
+     && Int64.compare height t.engine.state.height <= 0 then Lwt.return_unit
+  else install_height t height
 
 let start_height t height =
   (match t.vote_log_issue with
@@ -5434,7 +5628,7 @@ let start_height t height =
    | Some _
    | None -> ());
   let open Lwt.Syntax in
-  let* () = catchup_height t height in
+  let* () = install_height t height in
   load_round_sync t;
   process_outputs t
 
@@ -5444,7 +5638,7 @@ let restore_precommit_lock t proposal =
     | Error _ as error -> error
     | Ok () -> t.proof_lock <- Some (proposal.epoch_id, proposal.round); Ok ()
 
-let realign_progress t ~height ~round =
+let realign_progress_at t ~now ~height ~round =
   let open Lwt.Syntax in
   let current_height = t.engine.state.height in
   if height < current_height then
@@ -5456,6 +5650,17 @@ let realign_progress t ~height ~round =
           "event = realign_progress old_height = %Ld new_height = %Ld"
           current_height height;
         start_height t height
+      end else if C_quorum_policy.round_wait t.policy height then begin
+        let jumped = C_engine.try_round_skip t.engine
+          || (Int64.compare (Int64.sub now t.progress_step_at) 180_000_000_000L >= 0
+              && C_engine.try_round_step t.engine) in
+        if jumped then t.progress_step_at <- now;
+        if jumped then
+          clear_round_sync_jump t ~height ~round:t.engine.state.round;
+        log_node t.config.my_addr
+          "event = round_progress_request height = %Ld round = %d advanced = %b"
+          height t.engine.state.round jumped;
+        process_outputs t
       end else begin
         let current_round = t.engine.state.round in
         let target_round = max (current_round + 1) (round + 1) in
@@ -5468,6 +5673,9 @@ let realign_progress t ~height ~round =
       end
     in
     wake_ready t
+
+let realign_progress t ~height ~round =
+  realign_progress_at t ~now:(Mtime_clock.elapsed_ns ()) ~height ~round
 
 let start t =
   C_relay.open_ t.proposal_relay ~generation:t.engine.generation;

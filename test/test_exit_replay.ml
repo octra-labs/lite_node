@@ -309,6 +309,8 @@ let check_evidence_switch () =
   ]
 
 let () =
+  Exit_operator.check_offline ();
+  if Array.length Sys.argv = 2 && Sys.argv.(1) = "--offline" then Stdlib.exit 0;
   check_exit_switch ();
   check_evidence_switch ();
   let rows = check_lifecycle () in

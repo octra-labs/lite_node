@@ -54,6 +54,7 @@ type live_balance_op_args = {
 }
 
 type live_ledger_balance_op_args = {
+  registered : bool;
   ledger : Octra_core.Ledger.t;
   tx : Transaction.t;
   gate : unit -> Private_gate.reject option;
@@ -142,6 +143,7 @@ let live_ledger_balance_op_deps (args : live_ledger_balance_op_args) =
     tx = args.tx;
     gate = args.gate;
     with_kat =
+      (if args.registered then (fun _ apply -> apply ()) else
       with_kat
         {
           kat_state = Private_ledger.kat_state args.ledger;
@@ -156,7 +158,7 @@ let live_ledger_balance_op_deps (args : live_ledger_balance_op_args) =
             user_reason = r.notify_reason;
           });
         }
-        ~addr:args.tx.Transaction.from;
+        ~addr:args.tx.Transaction.from);
     plan = args.plan;
     log_failure = args.log_failure;
     trace_cipher = args.trace_cipher;

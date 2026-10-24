@@ -131,7 +131,7 @@ let check_route route ~epoch ~trusted txs receipts =
   | _ ->
     let deps = Proposal.{public_key_for_tx = (fun _ -> Some trusted);
       verify_address_pubkey = (fun ~addr ~pubkey -> Octra_core.Crypto.Address.verify_address_pubkey addr pubkey);
-      verify_tx_signature = (fun tx ~pubkey -> Tx.verify tx pubkey)} in
+      verify_tx_signature = (fun ~signing tx ~pubkey -> Octra_core.Tx_signature.verify signing tx pubkey)} in
     let limits = Proposal.limits ~max_txs:10 ~max_bytes:100_000 ~max_ou:(Z.of_int 1_000_000) in
     Result.is_ok (Proposal.verify_bundle deps ~limits ~header ~expected_tx_count:(List.length txs) txs receipts)
 

@@ -277,10 +277,48 @@ let old_anchor path =
     value store "resumed"
   ) (fun () -> S.close store)
 
+let test_space_retry path =
+  let* store = S.open_store ~fresh:true path in
+  Lwt.finalize (fun () ->
+    let* () = epoch store 1 "one" in
+    let* () = epoch store 2 "two" in
+    let* _ = S.collect_pack_at store ~keep:1 2 in
+    let* () = epoch store 3 "three" in
+    let reads = ref 0 in
+    let measure tree = incr reads; S.measure_tree tree in
+    let collect free = S.collect_pack_at ~free ~measure store ~keep:1 3 in
+    let* empty = collect 0L in
+    expect "empty disk did not defer GC"
+      (empty = S.Gc_space {free = 0L; need = S.gc_reserve});
+    expect "empty disk scanned the pack" (!reads = 0);
+    let* first = collect S.gc_reserve in
+    let need = match first with S.Gc_space value -> value.need
+      | _ -> failwith "space estimate did not defer" in
+    expect "pack was not measured once" (!reads = 1);
+    let* again = collect S.gc_reserve in
+    expect "repeat changed space decision" (again = first);
+    expect "space refusal rescanned the same commit" (!reads = 1);
+    let* tip = head store in
+    let* () = S.Store.Branch.set store.repo "pack_split_2" tip in
+    let* _ = collect S.gc_reserve in
+    expect "changed commit reused space estimate" (!reads = 2);
+    let* unchanged = head store in
+    expect "space checks changed committed head"
+      (S.Store.Commit.hash tip = S.Store.Commit.hash unchanged);
+    let* started = collect (Int64.add need 1_000_000L) in
+    expect "space recovery did not start GC"
+      (match started with S.Gc_started _ -> true | _ -> false);
+    expect "space recovery rescanned checked commit" (!reads = 2);
+    let* result = S.wait_pack_gc store in
+    ignore (ok result);
+    Lwt.return_unit
+  ) (fun () -> S.close store)
+
 let () =
   gc_keep_case ();
   repair_source_case ();
   repair_boot_case ();
+  Test_workspace.with_dir "gc-space" (fun path -> Lwt_main.run (test_space_retry path));
   let data = Filename.concat (Sys.getcwd ()) "runtime_data" in
   if not (Sys.file_exists data) then Unix.mkdir data 0o700;
   let path = Filename.concat data (Printf.sprintf "gc-head-%d" (Unix.getpid ())) in

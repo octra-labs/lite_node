@@ -46,7 +46,7 @@ let runtime () =
     compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
     settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
     marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
-    queue_head = (fun () -> None);
+    signing = (fun () -> Octra_core.Tx_signature.Historical); queue_head = (fun () -> None);
     duty_head = (fun () -> None);
     preverify_admit = (fun _ -> Ok ());
     save_drops = ignore;
@@ -56,6 +56,18 @@ let runtime () =
 
 let test_max_timestamp_drift () =
   expect "timestamp drift" (Float.equal R.max_timestamp_drift 300.0)
+
+let test_relay_size () =
+  Staging.clear ();
+  let item = standard_tx () in
+  let item = {item with Transaction.op_type = ProgramDeploy;
+    message = Some (String.make 5_030_000 'a')} in
+  let calls = ref 0 in
+  let runtime = {(runtime ()) with R.preverify_admit = (fun _ -> incr calls; Ok ())} in
+  let result = R.add_tx_to_staging runtime (ledger ()) item in
+  expect "relay size rejection differs" (result = Error "transaction JSON exceeds relay limit");
+  expect "relay size reached preverify" (!calls = 0);
+  expect "relay size retained transaction" (Staging.find_by_hash (Transaction.hash item) = None)
 
 let test_missing_sender () =
   let runtime = runtime () in
@@ -110,7 +122,7 @@ let test_preverify () =
       compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
       settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
       marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
-      queue_head = (fun () -> None);
+      signing = (fun () -> Octra_core.Tx_signature.Historical); queue_head = (fun () -> None);
       duty_head = (fun () -> None);
       preverify_admit = (fun tx ->
         admitted := Transaction.hash tx :: !admitted;
@@ -135,7 +147,7 @@ let test_preverify () =
       compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
       settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
       marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
-      queue_head = (fun () -> None);
+      signing = (fun () -> Octra_core.Tx_signature.Historical); queue_head = (fun () -> None);
       duty_head = (fun () -> None);
       preverify_admit = (fun _ -> Error "pre_verify_busy pending = 6 limit = 6");
       save_drops = ignore;
@@ -170,7 +182,7 @@ let test_eviction () =
       compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
       settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
       marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
-      queue_head = (fun () -> None);
+      signing = (fun () -> Octra_core.Tx_signature.Historical); queue_head = (fun () -> None);
       duty_head = (fun () -> None);
       preverify_admit = (fun _ -> Ok ());
       save_drops = (fun drops -> saved := drops @ !saved);
@@ -444,8 +456,8 @@ let test_delivery_retry () =
     expect "future timestamp refused"
       (Result.is_error (timed G.Active {item with timestamp = 20_000.}));
     expect "signature remains required"
-      (V.signature_check ~account_public_key:None item = Ok ()
-       && Result.is_error (V.signature_check ~account_public_key:None
+      (V.signature_check ~signing:Octra_core.Tx_signature.Historical ~account_public_key:None item = Ok ()
+       && Result.is_error (V.signature_check ~signing:Octra_core.Tx_signature.Historical ~account_public_key:None
           {item with message = (duty 101L).message}));
     ignore (Staging.remove_by_hash hash);
     expect "pool eviction retains valid repeat" (submit item = Ok hash);
@@ -530,10 +542,11 @@ let test_compute_paths () =
             sender_pk = (fun _ -> tx.public_key);
             add_tx = R.add_tx_to_staging ~relay:false runtime ledger;
             send_payload = (fun _ -> fail "unexpected compute fetch");
+            send_batch = (fun _ -> fail "unexpected compute fetch");
             broadcast_payload = (fun _ -> incr gossip);
             report_bad_peer = (fun _ -> fail "compute peer punished");
             close_peer = (fun () -> fail "compute peer closed");
-            now = Unix.gettimeofday; max_drift = 300.};
+            now = Unix.gettimeofday; signing = (fun () -> Octra_core.Tx_signature.Historical); max_drift = 300.};
           expect "compute gossip activation" (!gossip = if accepted then 1 else 0));
         expect "compute queue size" (Staging.staging_size () = if accepted then 1 else 0);
         expect "compute preverification activation" (!count = if accepted then 1 else 0);
@@ -543,6 +556,7 @@ let test_compute_paths () =
     List.iter check [Transaction.ComputeFund; Transaction.ComputeReturn; Transaction.ComputeSettle])
 
 let () =
+  test_relay_size ();
   test_compute_paths ();
   test_delivery_retry ();
   test_max_timestamp_drift ();

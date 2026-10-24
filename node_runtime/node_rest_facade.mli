@@ -9,6 +9,7 @@ module Tree = Octra_core.Tree
 module Wallet = Octra_core.Crypto.Wallet
 
 type runtime = {
+  signing : unit -> Octra_core.Tx_signature.t;
   swarm_ref : Octra_net.P2p_swarm.t option ref;
   duty_head : unit -> (int64 * Octra_core.Rule_graph.mode) option;
   proof_mode : unit -> Octra_core.Rule_graph.mode;

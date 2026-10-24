@@ -177,6 +177,9 @@ let runtime_shared ?preverify ?save_receipt_raw (runtime : runtime) =
   let private_transition =
     lazy
       (Octra_core.Private_transition.create
+        ~registered:(Octra_core.Rule_graph.program_inputs_at
+          ~chain_id:(Lazy.force env).Epoch_exec.chain_id
+          ~epoch:(Lazy.force env).epoch_id = Octra_core.Rule_graph.Active)
         ~preverify
         ~ledger:(Lazy.force backend).Epoch_exec.ledger
         ~epoch_id:(Lazy.force env).Epoch_exec.epoch_id

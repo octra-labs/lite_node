@@ -81,7 +81,10 @@ let length_path env typ path =
     end
   | _ -> None
 
-let rec expr env = function
+let expr env input =
+  let inferred = Hashtbl.create 16 in
+  let used = ref Oct_scope.Names.empty in
+  let rec expr env = function
   | EInt _ -> TInt
   | EBool _ -> TBool
   | EString _ -> TString
@@ -103,8 +106,22 @@ let rec expr env = function
           | Some _ when List.exists (String.equal name) env.active ->
             invalid ("constant dependency is cyclic name = " ^ name)
           | Some item when item.c_typ = TVoid ->
-            expr { env with active = name :: env.active } item.c_value
-          | Some item -> item.c_typ
+            let key = name, env.locals in
+            begin match Hashtbl.find_opt inferred key with
+            | Some (typ, dependencies) when not (List.exists
+                (fun name -> Oct_scope.Names.mem name dependencies) env.active) ->
+              used := Oct_scope.Names.union !used dependencies;
+              typ
+            | _ ->
+              let outer = !used in
+              used := Oct_scope.Names.singleton name;
+              let typ = expr { env with active = name :: env.active } item.c_value in
+              let dependencies = !used in
+              used := Oct_scope.Names.union outer dependencies;
+              Hashtbl.replace inferred key (typ, dependencies);
+              typ
+            end
+          | Some item -> used := Oct_scope.Names.add name !used; item.c_typ
           | None ->
             if List.mem name ["epoch"; "epoch_time"; "value"] then TInt
             else invalid ("variable is undefined name = " ^ name)
@@ -390,6 +407,15 @@ and custom_call env name types =
       fn.fn_params
       types;
     fn.fn_ret
+
+  in
+  expr env input
+
+let state_index env name keys = expr env (EIndex (name, keys))
+
+let storage_path env name keys path = expr env (EStoragePath (name, keys, path))
+
+let binary env op left right = expr env (EBinop (op, left, right))
 
 let add_local env name typ =
   { env with locals = (name, typ) :: env.locals }

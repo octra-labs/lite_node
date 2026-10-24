@@ -19,9 +19,12 @@ let profiles = [
 let schema = "octra_program_source"
 let key address = ["contracts"; address; "record"]
 let max_bytes = 2_097_152
-let consensus_id =
+let identity stamp =
   "program_source:owner:code_hash:report:state:deploy:historical:declared_compiler:base_200000:bytes_16:limit_2097152:constant_graph:scoped_code:for_limit:"
-  ^ Source_stamp.id
+  ^ stamp
+
+let consensus_id = identity Source_stamp.id
+let released_id = identity "b21391865660ba35426eaabc15e8d8a4d5a04a3754b73042bf57d5697fe108b6"
 
 let encode_sources value =
   Yojson.Safe.to_string (`Assoc [
@@ -116,7 +119,7 @@ let check_sources sources =
       | (Out_of_memory | Stack_overflow) as error -> raise error
       | _ -> Error "program source compilation failed")) (Ok ()) sources.files
 
-let compile sources =
+let compile ?(metered = false) sources =
   let main = sources.main in
   let resolver path = List.find_opt (fun (file : Program_package.source) -> file.path = path)
     sources.files |> Option.map (fun file -> file.Program_package.body) in
@@ -126,6 +129,8 @@ let compile sources =
     | None -> Ok (result.bytecode, result)
     | Some _ -> Error "program source compilation failed" in
   let ( let* ) = Result.bind in
+  let* () = if metered && List.mem sources.compiler ["historical"; "package_historical"]
+    then Error "program source compilation failed" else Ok () in
   let* () = check_sources sources |> Result.map_error (fun _ -> "program source compilation failed") in
   match sources.compiler with
   | "package" | "package_historical" | "package_source" | "package_preview" ->
@@ -133,18 +138,18 @@ let compile sources =
       | "package_source" -> Program_package.Source
       | "package_preview" -> Program_package.Preview
       | _ -> Program_package.Protocol in
-    Program_package.compile_at ~loops:sources.loops ~compiler
+    Program_package.compile_sources_at ~metered ~loops:sources.loops ~compiler
       ~point_ops:(sources.compiler <> "package_historical") ~main ~sources:sources.files
     |> Result.map (fun (value : Program_package.compiled) -> value.envelope, value.result)
     |> Result.map_error (fun _ -> "program source compilation failed")
-  | "protocol" -> success (if single then Oct_compile.compile source
-      else Oct_compile.compile_multi resolver main)
+  | "protocol" -> success (if single then Oct_compile.compile ~metered source
+      else Oct_compile.compile_multi ~metered resolver main)
   | "historical" -> success (if single then Prior_compile.compile source
       else Prior_compile.compile_multi resolver main)
   | "source" | "forms" ->
     let syntax = if sources.compiler = "source" then Oct_gen.Source else Oct_gen.Forms in
-    let compiled = if single then Aml_source.compile ~loops:sources.loops ~syntax source
-      else Aml_source.compile_multi ~loops:sources.loops ~syntax resolver main in
+    let compiled = if single then Aml_source.compile ~metered ~loops:sources.loops ~syntax source
+      else Aml_source.compile_multi ~program_only:false ~metered ~loops:sources.loops ~syntax resolver main in
     Result.bind (Result.map_error (fun _ -> "program source compilation failed") compiled)
       (fun compiled -> success (Oct_compile.source_result ~abi:Oct_compile.Source_abi ~syntax
         ~source_mode:(if single then "single" else "multi")
@@ -173,15 +178,15 @@ let source_scope files =
     | (Out_of_memory | Stack_overflow) as error -> raise error
     | _ -> true) files
 
-let scope_check ~main ~files =
+let scope_check ~metered ~main ~files =
   if not (source_scope files) then Unchanged else
   let resolver path = List.find_opt (fun (file : Program_package.source) -> file.path = path)
     files |> Option.map (fun file -> file.Program_package.body) in
   let codes = List.filter_map (fun syntax ->
-    match Aml_source.compile_multi ~loops:true ~syntax resolver main with
+    match Aml_source.compile_multi ~program_only:false ~metered ~loops:true ~syntax resolver main with
     | Ok value -> Some value.octb
     | Error _ -> None) [Oct_gen.Source; Oct_gen.Forms] in
-  let protocol = Oct_compile.compile_multi_mode ~loops:true ~program_only:false resolver main in
+  let protocol = Oct_compile.compile_multi_mode ~metered ~loops:true ~program_only:false resolver main in
   match protocol.error with
   | None -> Images (protocol.bytecode :: codes)
   | Some _ -> Images codes
@@ -219,15 +224,15 @@ let record_scope ~stored record =
   let* files = Program_package.normalize ~main files
     |> Result.map_error Program_package.error_message in
   let* code, _ = executable stored in
-  if scope_matches (scope_check ~main ~files) code then Ok ()
+  if scope_matches (scope_check ~metered:true ~main ~files) code then Ok ()
   else Error "program source scope differs"
 
-let verify sources ~exact ~stored =
+let verify ?(metered = false) sources ~exact ~stored =
   let ( let* ) = Result.bind in
   let* () = if List.mem (sources.compiler, sources.loops) profiles then Ok ()
     else Error "program source compiler invalid" in
-  let* code, result = compile sources in
-  let* () = if scope_matches (scope_check ~main:sources.main ~files:sources.files)
+  let* code, result = compile ~metered sources in
+  let* () = if scope_matches (scope_check ~metered ~main:sources.main ~files:sources.files)
       result.Oct_compile.bytecode then Ok ()
     else Error "program source scope differs" in
   let options = if exact then [code, result] else

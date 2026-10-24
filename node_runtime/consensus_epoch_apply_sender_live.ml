@@ -126,9 +126,14 @@ let run ?compute deps sender_txs =
       | Error reason -> failwith reason
     in
     let keyed = proof_key = Octra_core.Rule_graph.Active in
+    let program_inputs =
+      Octra_core.Rule_graph.program_inputs_at
+        ~chain_id:(deps.standard_env ()).Octra_core.Epoch_exec.chain_id
+        ~epoch:(deps.current_epoch ()) = Octra_core.Rule_graph.Active in
     let vm_tx_deps =
       Consensus_epoch_vm_shell.make_live_sender_vm_tx_deps
         Consensus_epoch_vm_shell.{
+          program_inputs;
           value_journal = vm_value.value_journal;
           program_journal = vm_value.program_journal;
           trusted_program_keys = deps.program_trust;
@@ -215,6 +220,7 @@ let run ?compute deps sender_txs =
     let balance_op_deps ~gate ~plan ~mark_debit ~log_failure =
       Consensus_epoch_private_balance_shell.live_ledger_balance_op_deps
         Consensus_epoch_private_balance_shell.{
+          registered = program_inputs;
           ledger = deps.ledger;
           tx;
           gate;
@@ -254,7 +260,7 @@ let run ?compute deps sender_txs =
                 (balance_op_deps
                    ~gate:fhe_gate
                    ~plan:(fun () ->
-                     Octra_core.Private_ledger.apply_encrypt ~keyed:(proof_key = Octra_core.Rule_graph.Active) ~math
+                     Octra_core.Private_ledger.apply_encrypt ~registered:program_inputs ~keyed:(proof_key = Octra_core.Rule_graph.Active) ~math
                        ~field_policy:deps.private_field_policy
                        ~strict:(proof_mode = Octra_core.Rule_graph.Active)
                        ~result_policy:
@@ -281,7 +287,7 @@ let run ?compute deps sender_txs =
                        fhe_gate ();
                      ])
                    ~plan:(fun () ->
-                     Octra_core.Private_ledger.apply_decrypt ~keyed:(proof_key = Octra_core.Rule_graph.Active) ~math
+                     Octra_core.Private_ledger.apply_decrypt ~registered:program_inputs ~keyed:(proof_key = Octra_core.Rule_graph.Active) ~math
                        ~field_policy:deps.private_field_policy
                        ~strict:(proof_mode = Octra_core.Rule_graph.Active)
                        ~result_policy:
@@ -298,6 +304,7 @@ let run ?compute deps sender_txs =
                   strict = (proof_mode = Octra_core.Rule_graph.Active);
                   math;
                   keyed;
+                  registered = program_inputs;
                   cipher_mode = deps.cipher_mode;
                   legacy_replay = (fun address ->
                     let cipher =
@@ -333,6 +340,7 @@ let run ?compute deps sender_txs =
                   strict = (proof_mode = Octra_core.Rule_graph.Active);
                   math;
                   keyed;
+                  registered = program_inputs;
                   stealth_count = !(deps.stealth_in_epoch_counter);
                   max_stealth_per_epoch = deps.max_stealth_per_epoch;
                   max_stealth_defer = deps.max_stealth_defer;
@@ -369,6 +377,7 @@ let run ?compute deps sender_txs =
                   strict = (proof_mode = Octra_core.Rule_graph.Active);
                   math;
                   keyed;
+                  registered = program_inputs;
                   private_result_policy = deps.private_result_policy;
                   current_epoch = deps.current_epoch;
                   trace_cipher = trace_enc_balance ~short:deps.short_addr;
@@ -395,6 +404,7 @@ let run ?compute deps sender_txs =
               | Error (tag, reason) -> reject_current_tx tag reason)
             | ContractUpgrade ->
               Consensus_epoch_vm_shell.run_program_upgrade_tx
+                ~metered:program_inputs
                 ~records:program_records
                 vm_tx_deps.runtime
                 ~trusted_program_keys:deps.program_trust

@@ -2,6 +2,7 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type io = {
+  signing : unit -> Octra_core.Tx_signature.t;
   guard : Octra_net.P2p_tx_gossip_guard.t;
   payload : string;
   peer_id : string;
@@ -10,6 +11,7 @@ type io = {
   sender_pk : Octra_core.Transaction.t -> string option;
   add_tx : Octra_core.Transaction.t -> (string, string) result;
   send_payload : string -> unit;
+  send_batch : (unit -> string option) list -> unit;
   broadcast_payload : string -> unit;
   report_bad_peer : string -> unit;
   close_peer : unit -> unit;

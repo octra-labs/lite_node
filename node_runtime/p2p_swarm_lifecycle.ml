@@ -9,10 +9,12 @@ type tx_callbacks = {
   add_tx : Octra_core.Transaction.t -> (string, string) result;
   now : unit -> float;
   max_drift : float;
+  signing : unit -> Octra_core.Tx_signature.t;
 }
 
 type transport = {
   send_tx_gossip : string -> unit;
+  send_batch : (unit -> string option) list -> unit;
   broadcast_tx_gossip : string -> unit;
   report_bad_peer : string -> unit;
   close_peer : unit -> unit;
@@ -33,6 +35,7 @@ type node_deps = {
   add_tx : Octra_core.Transaction.t -> (string, string) result;
   now : unit -> float;
   max_drift : float;
+  signing : unit -> Octra_core.Tx_signature.t;
   driver_ref : Octra_consensus.C_driver.t option ref;
   resource_compute : Resource_compute_service.t option;
 }
@@ -47,7 +50,9 @@ let transport_of_peer swarm conn =
   {
     send_tx_gossip = (fun payload ->
       Lwt.async (fun () ->
-        Octra_net.P2p_conn.send conn (frame_tx_gossip payload)));
+        Octra_net.P2p_conn.send_tx conn (frame_tx_gossip payload)));
+    send_batch = (fun builders -> Lwt.async (fun () ->
+      Octra_net.P2p_conn.send_batch conn ~msg_type:Octra_net.P2p_frame.msg_tx_gossip builders));
     broadcast_tx_gossip = (fun payload ->
       Lwt.async (fun () ->
         Octra_net.P2p_swarm.broadcast_except swarm
@@ -69,11 +74,13 @@ let dispatch_tx_deps
     sender_pk = tx.sender_pk;
     add_tx = tx.add_tx;
     send_payload = transport.send_tx_gossip;
+    send_batch = transport.send_batch;
     broadcast_payload = transport.broadcast_tx_gossip;
     report_bad_peer = transport.report_bad_peer;
     close_peer = transport.close_peer;
     now = tx.now;
     max_drift = tx.max_drift;
+    signing = tx.signing;
   }
 
 let handle_frame_with_transport
@@ -126,6 +133,7 @@ let node_tx_callbacks (deps : node_deps) =
     add_tx = deps.add_tx;
     now = deps.now;
     max_drift = deps.max_drift;
+    signing = deps.signing;
   }
 
 let forward_consensus driver_ref conn frame =

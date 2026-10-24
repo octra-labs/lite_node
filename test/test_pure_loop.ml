@@ -73,6 +73,7 @@ let rpc ~chain_id ~epoch name params =
     program_list = unused;
     program_call = unused;
     program_abi = unused;
+    program_verify = unused;
     program_save_abi = unused;
     program_tokens_by_address = unused;
   } in

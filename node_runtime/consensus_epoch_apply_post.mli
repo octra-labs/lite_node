@@ -40,6 +40,7 @@ val refs :
   tree:Octra_core.Tree.t ref ->
   deferred_stealth_txs:Octra_core.Transaction.t list ref ->
   stealth_in_epoch_counter:int ref ->
+  stealth_defer_count:(string, int) Hashtbl.t ->
   fhe_in_epoch_counter:int ref ->
   swarm_opt:Octra_net.P2p_swarm.t option ref ->
   node_refs

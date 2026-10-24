@@ -51,10 +51,20 @@ class SourcePin(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         expected = stamp.read_bytes()
         header = b"(* SPDX-License-Identifier: BSD-3-Clause *)\n(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)\n\n"
+        c_header = b"// SPDX-License-Identifier: BSD-3-Clause\n// Copyright (c) 2023-2026 Octra Labs <dev@octra.org>\n\n"
         for name in ("compiler", "aml", "policy", "wire", "runtime"):
             for path in (target / name).rglob("*"):
-                if path.is_file() and path.suffix in (".ml", ".mli"):
-                    path.write_bytes(header + path.read_bytes().removeprefix(header).rstrip(b"\n"))
+                if path.is_file() and path.suffix in (".ml", ".mli", ".c", ".h"):
+                    prefix = c_header if path.suffix in (".c", ".h") else header
+                    path.write_bytes(prefix + path.read_bytes().removeprefix(prefix).rstrip(b"\n"))
+        result, stamp = self.build(root)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stamp.read_bytes(), expected)
+        for name in ("compiler", "aml", "policy", "wire", "runtime"):
+            for path in (target / name).rglob("*"):
+                if path.is_file() and path.suffix in (".ml", ".mli", ".c", ".h"):
+                    prefix = c_header if path.suffix in (".c", ".h") else header
+                    path.write_bytes(path.read_bytes().removeprefix(prefix))
         result, stamp = self.build(root)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(stamp.read_bytes(), expected)

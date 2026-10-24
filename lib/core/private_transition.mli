@@ -11,6 +11,7 @@ type t
 val consensus_id : string
 
 val create :
+  registered:bool ->
   preverify:Preverify_commit.t option ->
   legacy_replay:
     (epoch:int ->

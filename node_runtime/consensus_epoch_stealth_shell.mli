@@ -108,6 +108,7 @@ type tx_deps = {
 }
 
 type gate_deps = {
+  registered : bool;
   expected_kat : unit -> string;
   stored_kat : string -> string option;
   set_kat : string -> string -> unit;
@@ -117,6 +118,7 @@ type gate_deps = {
 }
 
 type live_tx_args = {
+  registered : bool;
   strict : bool;
   math : bool;
   keyed : bool;
@@ -163,6 +165,7 @@ type live_tx_args = {
 }
 
 type live_ledger_tx_args = {
+  registered : bool;
   ledger : Octra_core.Ledger.t;
   field_policy : Private_ledger.field_policy;
   strict : bool;

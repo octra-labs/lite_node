@@ -1100,7 +1100,31 @@ let check_advance () =
        ~address:"octD"
        skipped)
 
+let check_restored_member () =
+  let cfg = Fold.participating in
+  let head = 1728099L in
+  let state = Fold.note_set cfg ~epoch:head
+    ~active:["octB"; "octC"; "octD"] Fold.empty |> Result.get_ok in
+  let registered = List.map entry addresses in
+  let selected state source =
+    Fold.filter cfg ~start:0L ~source registered state |> fst |> names in
+  expect "ready registration cannot create current membership"
+    (not (List.mem "octA" (selected state head)));
+  let pulse state epoch = Fold.note_pulse ~credit:epoch cfg ~epoch
+    ~active:false ~address:"octA" state |> Result.get_ok in
+  let first = pulse state head in
+  let repeated = List.fold_left (fun state _ -> pulse state head)
+    first (List.init 100 Fun.id) in
+  expect "retries at a stopped head cannot earn membership"
+    (Fold.to_string first = Fold.to_string repeated
+      && not (List.mem "octA" (selected repeated head)));
+  let resumed = List.init 16 (fun index -> Int64.add head (Int64.of_int ((index + 1) * 4)))
+    |> List.fold_left pulse repeated in
+  expect "confirmed pulse series permits restored member"
+    (List.mem "octA" (selected resumed (Int64.add head 64L)))
+
 let () =
+  check_restored_member ();
   check_window_and_proof ();
   check_rejoin_and_delay ();
   check_scale ();

@@ -141,6 +141,10 @@ val handle_request :
    (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result Lwt.t) route list ->
   Octra_core.Rpc.response Lwt.t
 
+val batch_plan :
+  (Octra_core.Rpc.request, Octra_core.Rpc.rpc_error) result list ->
+  (bool * (Octra_core.Rpc.request, Octra_core.Rpc.rpc_error) result) list
+
 val process_body :
   Rpc_http.meta ->
   string ->

@@ -14,13 +14,13 @@ type 'handler dispatch_adapters = {
     (Octra_core.Ledger.t -> addr:string -> rpc_result Lwt.t) ->
     'handler;
   store_address_lwt_read :
-    (Octra_core.Store_irmin.t -> addr:string -> rpc_result Lwt.t) ->
+    (registered:bool -> Octra_core.Store_irmin.t -> addr:string -> rpc_result Lwt.t) ->
     'handler;
   store_params_lwt_read :
     (Octra_core.Store_irmin.t -> params:Yojson.Safe.t -> rpc_result Lwt.t) ->
     'handler;
   store_ledger_address_lwt_read :
-    (Octra_core.Store_irmin.t ->
+    (registered:bool -> Octra_core.Store_irmin.t ->
      Octra_core.Ledger.t ->
      params:Yojson.Safe.t ->
      addr:string ->
@@ -65,16 +65,19 @@ val total_transactions :
   rpc_result Lwt.t
 
 val pvac_pubkey :
+  registered:bool ->
   Octra_core.Store_irmin.t ->
   addr:string ->
   rpc_result Lwt.t
 
 val pvac_status :
+  registered:bool ->
   Octra_core.Store_irmin.t ->
   addr:string ->
   rpc_result Lwt.t
 
 val pvac_migration_status :
+  registered:bool ->
   keyed:bool ->
   Pvac_status_actor.t ->
   Octra_core.Store_irmin.t ->
@@ -94,6 +97,7 @@ val encrypted_cipher :
   rpc_result Lwt.t
 
 val encrypted_balance :
+  registered:bool ->
   Octra_core.Store_irmin.t ->
   Octra_core.Ledger.t ->
   params:Yojson.Safe.t ->

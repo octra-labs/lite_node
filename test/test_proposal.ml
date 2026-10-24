@@ -79,7 +79,7 @@ let verify_deps ?(address_ok = true) ?(signature_ok = true) () =
   C.{
     public_key_for_tx = (fun tx -> tx.Transaction.public_key);
     verify_address_pubkey = (fun ~addr:_ ~pubkey:_ -> address_ok);
-    verify_tx_signature = (fun _ ~pubkey:_ -> signature_ok);
+    verify_tx_signature = (fun ~signing:_ _ ~pubkey:_ -> signature_ok);
   }
 
 let generous_limits =
@@ -759,6 +759,124 @@ let run_make_proposal deps =
        ~limits:generous_limits
        ~epoch_id:12L)
 
+let test_cell_retry () =
+  let module Core = Octra_core in
+  let module S = Core.Store_irmin in
+  let module L = Core.Ledger in
+  let module Cell = Octra_node_runtime.Consensus_circle_cell_preverify in
+  let run = Lwt_main.run in
+  Test_workspace.with_dir "cell-proposal" (fun dir ->
+    let store = run (S.open_store (Filename.concat dir "store")) in
+    let key = "OCTRA_PVAC_VERIFY_WORKER" in
+    let prior = Sys.getenv_opt key in
+    Unix.putenv key (Filename.concat dir "absent-worker");
+    Fun.protect ~finally:(fun () ->
+      Unix.putenv key (Option.value prior ~default:""); run (S.close store)) (fun () ->
+      let ledger = L.create store in
+      let owner = "oct" ^ String.make 44 '1' in
+      let circle = "oct" ^ String.make 44 '2' in
+      expect "cell account missing" (L.add_account ledger owner (Z.of_int 1_000_000) = Ok ());
+      run (L.flush_dirty_lwt ledger);
+      run (S.set_pvac_pubkey store owner "cell-test-key");
+      run (S.deploy_circle store Core.Circles.{circle_id = circle; runtime = Octb;
+        version = 1L; owner; code_hash = zero_hash_hex; stable_root = zero_hash_hex;
+        assets_root = zero_hash_hex; privacy_class = Public; browser_mode = Native_sealed;
+        resource_mode = Sealed_read; policy_hash = None; members_root = None;
+        export_policy = None; limits = default_limits});
+      let policy = Hashtbl.create 2 in
+      Hashtbl.add policy Core.Circle_hfhe_policy.require_live_key_policy_key "false";
+      Hashtbl.add policy Core.Circle_hfhe_policy.encrypt_proof_key "none";
+      ignore (run (S.save_circle_stable_storage store circle policy));
+      let root = run (L.hash ledger) in
+      let root_to_raw32 value =
+        match Octra_net.Oce1.hash32_of_hex (Core.Epoch_index_commitment.root_hex value) with
+        | Ok value -> value
+        | Error reason -> fail reason in
+      let cache_root = root_to_raw32 root in
+      let runtime = Cell.{store; ledger;
+        rules = Core.Rule_graph.create ~chain_id:"octra-test" ~root_at:(fun _ -> Core.Rule_graph.Missing);
+        env = (fun ~pre_state_root -> Core.Epoch_exec.{chain_id = "octra-test";
+          epoch_id = 12; proposer_addr = owner; validator_addrs = []; validator_pubkeys = [];
+          prev_state_root = pre_state_root; epoch_ts = 1.; ready_state_root_at = None; ready_max_lag = -1})} in
+      let message = Yojson.Safe.to_string (`Assoc [
+        "state_ref", `String (String.make 64 'a'); "key_id", `String "cell-key";
+        "plaintext_hash", `String (String.make 64 'b');
+        "ciphertext_commitment", `String (Base64.encode_exn (String.make 32 'c'));
+        "amount_commitment", `String (Base64.encode_exn (String.make 32 'd'))]) in
+      let ordinary = {(tx 1) with Transaction.from = "oct_other"} in
+      List.iter (fun op_type ->
+        let cell = {(tx ~message 1) with Transaction.op_type; from = owner; to_ = circle;
+          encrypted_data = Some (Base64.encode_exn "cell-cipher")} in
+        let plan = run (Core.Circle_cell_transition.prepare ~store ~ledger ~current_epoch:12 cell)
+          |> function Ok plan -> plan | Error reason -> fail reason in
+        let check verify kind =
+          let cache = Cache.create ~cap:4 in
+          let calls = ref 0 and online = ref false in
+          let build_preverify_once ~state_root ~tx_hashes inputs =
+            Cache.run_preverify_once ~epoch:12 cache ~purpose:Cache.Build_proposal
+              ~state_root ~tx_hashes ~txs:inputs (fun _ inputs ->
+                W.run_many ~registered:false ~keyed:false ~strict:false ~ledger
+                  ~field_policy:Core.Private_ledger.Unique_fields
+                  ~circle_cell_preverify:(fun ~pre_state_hash ~pre_state_root item ->
+                    incr calls;
+                    if !online then Lwt.return_ok plan.transition_hash
+                    else verify ~pre_state_hash ~pre_state_root item) inputs) in
+          let deps, probe = make_proposal_deps ~staging:[cell; ordinary]
+            ~ledger_root:root ~build_preverify_once () in
+          let selected = run (C.build_preverify ~limits:generous_limits
+            ~run_many:(fun inputs -> build_preverify_once ~state_root:cache_root
+              ~tx_hashes:(List.map Transaction.hash inputs) inputs) [cell; ordinary]) in
+          expect "cell failure blocked ordinary transaction" (selected.txs = [ordinary]);
+          expect "cell failure classification differs"
+            (match selected.batch.skipped with
+             | [skip] -> skip.tx = cell && skip.kind = kind
+               && W.checked_cacheable (W.Checked_skip skip) = (kind = W.Invalid)
+             | _ -> false);
+          expect "cell failure prevented proposal" (Option.is_some (run (C.make_proposal deps
+            ~chain_id:"octra-test" ~root_to_raw32 ~limits:generous_limits ~epoch_id:12L)));
+          expect "cell failure reached ordinary preview"
+            (List.map (fun request -> request.C.txs) !(probe.preview_requests) = [[ordinary]]);
+          expect "cell failure cache reuse differs" (!calls = if kind = W.Invalid then 1 else 2);
+          if kind = W.Unavailable then begin
+            online := true;
+            let recovered = run (build_preverify_once ~state_root:cache_root
+              ~tx_hashes:(List.map Transaction.hash [cell; ordinary]) [cell; ordinary]) in
+            expect "cell retry did not recover" (W.txs recovered = [cell] && !calls = 3);
+            let again = run (build_preverify_once ~state_root:cache_root
+              ~tx_hashes:(List.map Transaction.hash [cell; ordinary]) [cell; ordinary]) in
+            expect "cell receipt cache changed" (again = recovered && !calls = 3)
+          end in
+        expect "cell did not reach proof worker"
+          (run (Cell.run runtime ~pre_state_hash:(W.state_hash root) ~pre_state_root:root cell)
+           = Error (`Unavailable "proof worker unavailable: worker_missing"));
+        check (Cell.run runtime) W.Unavailable;
+        List.iter (fun error ->
+          check (fun ~pre_state_hash:_ ~pre_state_root:_ _ -> Lwt.fail error) W.Unavailable)
+          [Core.Private_ledger.Worker_retry "second verification busy";
+           Core.Exec_resource.Unavailable Host; Failure "cell read failed"];
+        check (fun ~pre_state_hash:_ ~pre_state_root:_ _ ->
+          Lwt.return_error (`Invalid "proof rejected")) W.Invalid;
+        List.iter (fun error ->
+          let propagated action =
+            let task = try action () with actual -> Lwt.fail actual in
+            run (Lwt.try_bind (fun () -> task) (fun _ -> Lwt.return_false)
+              (fun actual -> Lwt.return (actual = error))) in
+          let verify ~pre_state_hash:_ ~pre_state_root:_ _ = Lwt.fail error in
+          let refused = propagated (fun () ->
+            W.run ~registered:false ~keyed:false ~strict:false ~ledger
+              ~field_policy:Core.Private_ledger.Unique_fields
+              ~pre_state_hash:(W.state_hash root) ~pre_state_root:root
+              ~circle_cell_preverify:verify cell) in
+          expect "active cell failure was swallowed" refused;
+          let broken = {runtime with Cell.env = (fun ~pre_state_root:_ -> raise error)} in
+          expect "cell callback swallowed active failure"
+            (propagated (fun () -> Cell.run broken ~pre_state_hash:(W.state_hash root)
+              ~pre_state_root:root cell)))
+          [Out_of_memory; Stack_overflow; Lwt.Canceled;
+           Core.Exec_resource.Unavailable Memory; Core.Exec_resource.Unavailable Stack];
+        expect "cell preverify changed live root" (run (L.hash ledger) = root))
+        [Transaction.CircleBalanceCellPut; Transaction.CircleRegisterCellPut]))
+
 let test_circle_budget () =
   let module Lane = Octra_core.Resource_lanes in
   let module Commit = Octra_core.Preverify_commit in
@@ -1371,7 +1489,7 @@ let test_circle_receipt () =
     let limits = C.limits ~max_txs:1 ~max_bytes:(budget.max_bytes + 1) ~max_ou:budget.max_ou in
     let deps = C.{public_key_for_tx = (fun _ -> Some public);
       verify_address_pubkey = (fun ~addr ~pubkey -> Octra_core.Crypto.Address.verify_address_pubkey addr pubkey);
-      verify_tx_signature = (fun item ~pubkey -> Transaction.verify item pubkey)} in
+      verify_tx_signature = (fun ~signing item ~pubkey -> Octra_core.Tx_signature.verify signing item pubkey)} in
     List.iter (fun (size, ou, reason) ->
       let item = {empty with Transaction.message = Some (String.make size 'a'); ou}
         |> fun item -> Transaction.sign_with_privkey item secret in
@@ -2062,7 +2180,7 @@ let verify_proposal_deps ?(quarantine = false) ?(root = raw 'p')
       stores := (proposal_id, tx_hashes, txs, receipts_json) :: !stores);
     public_key_for_tx = (fun tx -> tx.Transaction.public_key);
     verify_address_pubkey = (fun ~addr:_ ~pubkey:_ -> true);
-    verify_tx_signature = (fun _ ~pubkey:_ -> true);
+    verify_tx_signature = (fun ~signing:_ _ ~pubkey:_ -> true);
     validator_pubkeys = (fun _ -> ["oct_validator", "pub"]);
     read_local_ledger_root = (fun () -> Lwt.return ledger_root);
     preview = (fun request ->
@@ -2376,7 +2494,7 @@ let test_verify_staging_lookup () =
     expect "local lookup still previews" (List.length !previews = 1);
     expect "local lookup still verifies"
       (verdict_rejects (Lwt_main.run (C.verify_proposal
-        { deps with verify_tx_signature = (fun _ ~pubkey:_ -> false) }
+        { deps with verify_tx_signature = (fun ~signing:_ _ ~pubkey:_ -> false) }
         ~chain_id:"octra-test" proposal)));
     expect "invalid signature avoids preview" (List.length !previews = 1);
     expect "validator leaves staging intact" (adapters.staging_total () = 2);
@@ -3347,6 +3465,11 @@ let test_precommit_write_failure () =
   expect "write failure no pending" (!pending = [])
 
 let () =
+  if Array.length Sys.argv = 2 && Sys.argv.(1) = "--cell" then begin
+    test_cell_retry ();
+    print_endline "status = pass test = cell_proposal";
+    exit 0
+  end;
   if Array.length Sys.argv = 2 && Sys.argv.(1) = "--order" then begin
     test_receipt_order ();
     print_endline "status = pass test = receipt_order";
@@ -3477,6 +3600,7 @@ let () =
   test_precommit_decode_failure ();
   test_pending_commit_hashes ();
   test_before_precommit_current ();
+  test_cell_retry ();
   test_before_precommit_reproposal ();
   test_before_precommit_active_set ();
   test_before_precommit_decoded ();

@@ -18,7 +18,7 @@ val mark_fields_at : ?base:(string * Yojson.Safe.t) list -> store:Octra_core.Sto
   chain_id:string -> address:string -> Octra_core.Set_fold.proof list ->
   ((string * Yojson.Safe.t) list, string) result Lwt.t
 
-val sign : key:string -> Octra_core.Transaction.t -> (Octra_core.Transaction.t, string) result
+val sign : signing:Octra_core.Tx_signature.t -> key:string -> Octra_core.Transaction.t -> (Octra_core.Transaction.t, string) result
 
 val stage :
   bft_mode:bool -> Node_rest_facade.runtime -> Octra_core.Ledger.t ->

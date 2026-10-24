@@ -12,6 +12,7 @@ module WSServer = Octra_core.Ws_server
 module Wallet = Octra_core.Crypto.Wallet
 
 type runtime = {
+  signing : unit -> Octra_core.Tx_signature.t;
   swarm_ref : Octra_net.P2p_swarm.t option ref;
   duty_head : unit -> (int64 * Octra_core.Rule_graph.mode) option;
   proof_mode : unit -> Octra_core.Rule_graph.mode;
@@ -93,6 +94,11 @@ let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
   let* () = Octra_core.Tx_envelope.check_compute ~settle:(runtime.settle_mode ())
     (runtime.compute_mode ()) [tx] in
   let* tx = prepare_tx ledger tx |> Result.map_error snd in
+  let* () = Octra_core.Tx_signature.check_active (runtime.signing ()) [tx] in
+  let* () =
+    let raw = Yojson.Safe.to_string (Transaction.to_yojson tx) in
+    if String.length raw > Octra_net.P2p_tx_gossip.max_tx_json
+    then Error "transaction JSON exceeds relay limit" else Ok () in
   let* () = Octra_core.Tx_payload.admit tx in
   let point = runtime.duty_head () in
   let head = Option.map fst point in
@@ -241,6 +247,7 @@ let validate_and_submit_tx runtime ledger (tx : Transaction.t) =
     let ( let* ) = Result.bind in
     let* tx = prepare_tx ledger tx in
     match Tx_view.submit_signature_check
+            ~signing:(runtime.signing ())
             ~account_public_key:acc.Ledger.public_key
             ~preverify_has_capacity:(Preverify_cache.has_capacity ())
             ~preverify_pending:(Preverify_cache.pending_count ())

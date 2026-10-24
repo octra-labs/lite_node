@@ -235,6 +235,8 @@ type t = {
   mutable polc_requests : (int, int) Hashtbl.t;
   mutable higher_round_evidence : (string, int) Hashtbl.t;
   mutable outputs : output list;
+  mutable vote_timers : round_step list;
+  mutable relief_limit : int option;
   mutable finalized_height : int64;
   mutable pending_finalized : finalize option;
   mutable generation : int;
@@ -268,6 +270,8 @@ let create_for_policy policy ~chain_id ~my_addr ~validator_set ~start_height ~ca
     polc_requests = Hashtbl.create 4;
     higher_round_evidence = Hashtbl.create 4;
     outputs = [];
+    vote_timers = [];
+    relief_limit = None;
     finalized_height = Int64.pred start_height;
     pending_finalized = None;
     generation = 0;
@@ -363,7 +367,28 @@ let cache_proposal_message t (proposal : propose) =
 let find_proposal_message t ~proposal_id ~round =
   Hashtbl.find_opt t.proposal_messages (proposal_id, round)
 
-let emit t o = t.outputs <- o :: t.outputs
+let votes_reach_quorum t votes =
+  C_types.quorum_reached_at ~policy:t.policy ~chain_id:t.chain_id
+    ~epoch_id:t.state.height t.vs ~signer_count:votes.count_total
+    ~signed_weight:votes.weight_total
+
+let timer_allowed t = function
+  | _ when not (C_quorum_policy.round_wait t.policy t.state.height) -> true
+  | _ when Option.fold ~none:false ~some:(fun limit -> t.state.round < limit) t.relief_limit -> true
+  | ProposeStep -> true
+  | PrevoteStep | PrecommitStep as step ->
+    let votes = if step = PrevoteStep then t.prevotes else t.precommits in
+    votes_reach_quorum t votes
+
+let emit t output =
+  match output with
+  | ScheduleTimeout timer when timer.step <> ProposeStep
+      && C_quorum_policy.round_wait t.policy t.state.height ->
+    if timer_allowed t timer.step && not (List.mem timer.step t.vote_timers) then begin
+      t.vote_timers <- timer.step :: t.vote_timers;
+      t.outputs <- output :: t.outputs
+    end
+  | _ -> t.outputs <- output :: t.outputs
 
 let same_finalize left right =
   Int64.equal left.epoch_id right.epoch_id
@@ -667,6 +692,7 @@ let prune_round_history t =
 let start_round t round =
   let prevotes = create_vote_set () in
   let precommits = create_vote_set () in
+  t.vote_timers <- [];
   t.state <- { t.state with round; step = ProposeStep };
   let previous = if round > 0 then Some (round - 1) else None in
   Option.iter (request_polc t) previous;
@@ -878,6 +904,7 @@ let start_height t height =
   t.generation <- t.generation + 1;
   t.outputs <- [];
   if not same_height then begin
+    t.relief_limit <- None;
     t.state <- initial_engine_state height;
     t.proposal_cache <- Hashtbl.create 8;
     t.proposal_messages <- Hashtbl.create 8
@@ -926,9 +953,18 @@ let polc_votes_for_round t round =
       String.compare left.validator right.validator)
   | _ -> []
 
+let precommits_for_round t round =
+  match Hashtbl.find_opt t.precommits_by_round round with
+  | None -> []
+  | Some votes ->
+    Hashtbl.fold (fun _ vote result -> vote :: result) votes.votes []
+    |> List.sort (fun (left : vote) (right : vote) ->
+      String.compare left.validator right.validator)
+
 let record_historical_prevote t (vote : vote) =
   if vote.round >= 0
-     && vote.round < t.state.round
+     && (vote.round < t.state.round
+         || (vote.round = t.state.round && C_quorum_policy.round_wait t.policy t.state.height))
      && (round_retained t vote.round
        || (C_quorum_policy.select t.policy t.state.height = C_quorum_policy.Stake
          && polc_matches t ~round:vote.round ~proposal_id:vote.proposal_id)) then begin
@@ -966,7 +1002,8 @@ let restored_precommit_lock t (proposal : propose) =
   in
   Int64.equal proposal.epoch_id t.state.height
   && t.state.locked_round = proposal.round
-  && t.state.round >= proposal.round + 1
+  && t.state.round >= proposal.round
+      + (if C_quorum_policy.round_wait t.policy t.state.height then 0 else 1)
   && same_value t.state.locked_value
 
 let restore_precommit_lock t (proposal : propose) =
@@ -998,7 +1035,10 @@ let restore_precommit_lock t (proposal : propose) =
       valid_round = proposal.round;
       valid_value = Some proposal.header;
     };
-    realign_round t (proposal.round + 1);
+    if C_quorum_policy.round_wait t.policy t.state.height then begin
+      t.generation <- t.generation + 1;
+      start_round t proposal.round
+    end else realign_round t (proposal.round + 1);
     Ok ()
   end
 
@@ -1060,6 +1100,18 @@ let try_round_skip t =
       realign_round t target;
       true
 
+let try_round_step t =
+  if not (C_quorum_policy.round_wait t.policy t.state.height)
+     || not (round_skip_ready t)
+     || Int64.compare t.state.height t.finalized_height <= 0
+     || t.state.round = max_int then false
+  else if Hashtbl.fold (fun validator round found ->
+    found || (round > t.state.round && C_types.is_validator t.vs validator))
+    t.higher_round_evidence false then begin
+    realign_round t (t.state.round + 1);
+    true
+  end else false
+
 let on_round_sync t ~round ~validator =
   if C_types.is_validator t.vs validator
      && round > t.state.round then begin
@@ -1120,6 +1172,44 @@ let schedule_step_timeout t step =
     delay_ms = timeout_ms ~round:t.state.round ~step;
     generation = t.generation;
   })
+
+let set_relief_limit t limit =
+  t.relief_limit <- limit;
+  if C_quorum_policy.round_wait t.policy t.state.height
+     && Option.fold ~none:false ~some:(fun stop -> t.state.round < stop) limit
+     && t.state.step <> ProposeStep then
+    schedule_step_timeout t t.state.step
+
+let restore_local_votes t (votes : vote list) =
+  let valid (vote : vote) =
+    vote.validator = t.my_addr && vote.chain_id = t.chain_id
+    && vote.epoch_id = t.state.height && vote.round = t.state.round
+    && conflicting_vote t vote = None
+    && (vote.vote_type <> Precommit || Octra_net.Hash_domain.is_nil vote.proposal_id
+        || (t.state.locked_round >= vote.round
+            && Option.fold ~none:false
+              ~some:(fun header -> C_hash.proposal_id header = vote.proposal_id)
+              t.state.locked_value))
+    && match C_types.pubkey_of_addr t.vs vote.validator with
+       | Some pubkey -> C_hash.verify_vote ~pubkey_raw:pubkey vote
+       | None -> false in
+  let kinds = List.map (fun (vote : vote) -> vote.vote_type) votes in
+  if List.length kinds <> List.length (List.sort_uniq compare kinds)
+     || not (List.for_all valid votes) then
+    Error "saved local round votes are invalid"
+  else begin
+    List.iter (fun (vote : vote) ->
+      ignore (add_vote ~policy:t.policy (vote_set_for t vote.vote_type) vote
+        ~validator_set:t.vs);
+      if vote.vote_type = Precommit then t.state <- {t.state with step = PrecommitStep}
+      else if t.state.step = ProposeStep then t.state <- {t.state with step = PrevoteStep};
+      if not (Octra_net.Hash_domain.is_nil vote.proposal_id) then
+        emit t (RequestProposal {round = vote.round; proposal_id = vote.proposal_id})
+    ) votes;
+    if votes <> [] then emit t (RequestRoundEvidence t.state.round);
+    schedule_step_timeout t t.state.step;
+    Ok ()
+  end
 
 let finalize_quorum t proposal_id =
   match find_header t proposal_id with
@@ -1226,7 +1316,9 @@ let resume_voting t ~sign_fn =
   end
 
 let on_ready t ~sign_fn =
-  resume_voting t ~sign_fn
+  resume_voting t ~sign_fn;
+  if C_quorum_policy.round_wait t.policy t.state.height
+     && t.state.step = PrevoteStep then schedule_step_timeout t PrevoteStep
 
 let do_propose ?parent_commit t (header : epoch_header)
     (tx_hashes : string list) ~sign_fn =
@@ -1592,8 +1684,8 @@ let on_vote t (v : vote) ~sign_fn =
       ignore (try_round_skip t)
     end;
   if v.round <> t.state.round then ()
-  else
-    match v.vote_type with
+  else begin
+    (match v.vote_type with
     | Prevote ->
       let result = add_vote ~policy:t.policy t.prevotes v ~validator_set:t.vs in
       Option.iter
@@ -1697,6 +1789,21 @@ let on_vote t (v : vote) ~sign_fn =
                  ~proposal_id
                  ~round:t.state.round))
        | _ -> ())
+    );
+    if C_quorum_policy.round_wait t.policy t.state.height
+       && t.state.step = PrevoteStep then schedule_step_timeout t PrevoteStep;
+    let waiting_header = match quorum_result ~policy:t.policy t.precommits
+      ~chain_id:t.chain_id ~epoch_id:t.state.height ~validator_set:t.vs with
+      | `QuorumOf pid -> not (Octra_net.Hash_domain.is_nil pid)
+          && Option.is_none (find_known_header t pid)
+      | _ -> false in
+    if C_quorum_policy.round_wait t.policy t.state.height
+       && votes_reach_quorum t t.precommits && not waiting_header
+       && t.state.height > t.finalized_height then begin
+      t.state <- {t.state with step = PrecommitStep};
+      schedule_step_timeout t PrecommitStep
+    end
+  end
   end
 
 let accept_finalize_batch t (f : finalize) =
@@ -1746,6 +1853,8 @@ let on_timeout t ~step ~round ~generation ~sign_fn =
   if generation <> t.generation then ()
   else if round <> t.state.round then ()
   else if step <> t.state.step then ()
+  else if not (timer_allowed t step) then
+    t.vote_timers <- List.filter (fun prior -> prior <> step) t.vote_timers
   else
     match step with
     | ProposeStep when local_voting_allowed t ->
@@ -1777,5 +1886,16 @@ let on_timeout t ~step ~round ~generation ~sign_fn =
          })
        | LocalVoteConflict _
        | LocalVoteDeferred -> ())
-    | ProposeStep | PrevoteStep | PrecommitStep ->
+    | ProposeStep | PrevoteStep | PrecommitStep
+      when not (C_quorum_policy.round_wait t.policy t.state.height) ->
+      start_round t (t.state.round + 1)
+    | ProposeStep ->
+      emit t (ScheduleTimeout {
+        step; round; generation;
+        delay_ms = timeout_ms ~round ~step;
+      })
+    | PrevoteStep ->
+      t.state <- {t.state with step = PrecommitStep};
+      schedule_step_timeout t PrecommitStep
+    | PrecommitStep ->
       start_round t (t.state.round + 1)

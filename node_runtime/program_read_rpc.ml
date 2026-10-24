@@ -30,6 +30,7 @@ type 'handler dispatch_adapters = {
   program_list : 'handler;
   program_call : 'handler;
   program_abi : 'handler;
+  program_verify : 'handler;
   program_save_abi : 'handler;
   program_tokens_by_address : 'handler;
 }
@@ -105,8 +106,7 @@ let dispatch adapters =
     program_storage_dump =
       store_label_read Octra_vm.Contract_rpc.contract_storage_dump_params;
     program_abi = adapters.program_abi;
-    program_verify =
-      store_chaindata_read Octra_vm.Contract_rpc.verify_params;
+    program_verify = adapters.program_verify;
     program_save_abi = adapters.program_save_abi;
     program_source =
       store_chaindata_read Octra_vm.Contract_rpc.source_params;

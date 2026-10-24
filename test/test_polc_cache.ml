@@ -202,9 +202,28 @@ let test_receipt_context () =
     ~chain_id:chain ~epoch_id:height ~validator_set:members ~locked_round:0
     (List.map (fun (v : C.vote) -> {v with signature = String.make 64 '\000'}) (proof 3))))
 
+let test_pending_proofs () =
+  Test_workspace.with_dir "pending-proofs" (fun directory ->
+    let members = set 4 in
+    let store = V.disk ~data_dir:directory in
+    let policy = C_quorum_policy.for_chain chain in
+    let proof round = List.map (vote height round (raw (string_of_int round)) C.Prevote) members.validators in
+    let save keep_rounds round = V.polc_save ~policy ~keep_rounds store ~chain_id:chain ~epoch_id:height
+      ~validator_set:members ~locked_round:(-1) (proof round) in
+    List.iter (fun round -> ignore (get (save [0; 1; 2] round))) [0; 1; 2];
+    let original = inode directory in
+    check "four pending proofs must wait" (save [0; 1; 2; 3] 3 = Error "vote proof retention is full");
+    check "capacity refusal replaced proof file" (inode directory = original);
+    let rounds () = get (V.polc_load store ~policy ~chain_id:chain ~epoch_id:height ~validator_set:members)
+      |> List.map (fun (vote : C.vote) -> vote.round) |> List.sort_uniq Int.compare in
+    check "protected proofs no longer readable" (rounds () = [0; 1; 2]);
+    ignore (get (save [1; 2] 3));
+    check "released reservation did not allow progress" (rounds () = [1; 2; 3]))
+
 let () =
   test_local_proof ();
   test_many_votes ();
   test_observer ();
   test_receipt_context ();
+  test_pending_proofs ();
   Printf.printf "status = pass test = polc_cache\n%!"

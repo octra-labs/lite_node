@@ -462,18 +462,18 @@ let cache_mode_case () =
     sender_enc_snapshot;
   } in
   PC.remove hash;
-  PC.insert_with_cap ~keyed:false hash (Lwt.return (PC.Checked result));
+  PC.insert_with_cap ~registered:false ~keyed:false hash (Lwt.return (PC.Checked result));
   expect
     (Option.is_some
-       (PC.ready_result ~keyed:false hash ~strict:false ~sender_enc_snapshot))
+       (PC.ready_result ~registered:false ~keyed:false hash ~strict:false ~sender_enc_snapshot))
     "prior cache result";
   expect
     (Option.is_none
-       (PC.ready_result ~keyed:false hash ~strict:true ~sender_enc_snapshot))
+       (PC.ready_result ~registered:false ~keyed:false hash ~strict:true ~sender_enc_snapshot))
     "active cache isolation";
   expect
     (Option.is_none
-       (PC.ready_result ~keyed:false hash ~strict:false ~sender_enc_snapshot:"other"))
+       (PC.ready_result ~registered:false ~keyed:false hash ~strict:false ~sender_enc_snapshot:"other"))
     "cipher cache isolation";
   PC.remove hash
 
@@ -677,7 +677,7 @@ let collect_ops () =
       clear_case path)
     (fun () ->
       List.iter (fun (op_type, waits) ->
-        let pool = Pool.create ~keyed:(fun () -> false) ~math:(fun () -> false)
+        let pool = Pool.create ~registered:(fun () -> false) ~keyed:(fun () -> false) ~math:(fun () -> false)
           ~field_policy:(fun () -> PL.Unique_fields)
           ~strict:(fun () -> true)
           ~result_policy:(fun () -> Octra_core.Private_result_policy.Recoverable)
@@ -697,7 +697,7 @@ let cache_key_mode_case () =
   let path, store, ledger, _, _ = setup "cache_key_mode" in
   let transaction = { (tx "switch") with T.op_type = T.KeySwitch } in
   let key ?(keyed = false) ?(math = false) ?(cipher_mode = Octra_core.Rule_graph.Prior) cap =
-    Lwt_main.run (PL.key_switch_cache_key ~keyed ~math ~cipher_mode
+    Lwt_main.run (PL.key_switch_cache_key ~registered:false ~keyed ~math ~cipher_mode
       PL.Unique_fields cap ledger transaction)
   in
   expect (String.equal (key false) (key false)) "prior cache key stable";
@@ -741,11 +741,11 @@ let switch_rule () =
           List.iter (fun keyed ->
             let payload = Yojson.Safe.to_string (`Assoc (fields valid)) in
             let transaction = {(tx payload) with T.op_type = T.KeySwitch; amount = Z.zero} in
-            let artifact = match Lwt_main.run (PL.preverify_key_switch_artifact ~keyed
+            let artifact = match Lwt_main.run (PL.preverify_key_switch_artifact ~registered:false ~keyed
                 ~cipher_mode:mode ~field_policy:PL.Unique_fields ~strict ledger transaction) with
               | Ok value -> value
               | Error error -> fail error.PL.reason in
-            let bind ?(keyed = keyed) cipher_mode = Lwt_main.run (PL.bind_key_switch_artifact ~keyed
+            let bind ?(keyed = keyed) cipher_mode = Lwt_main.run (PL.bind_key_switch_artifact ~registered:false ~keyed
               ~cipher_mode ~field_policy:PL.Unique_fields ~strict ledger transaction artifact) in
             expect (match bind mode with
               | PL.Key_switch_bound _ -> valid
@@ -764,7 +764,7 @@ let switch_rule () =
     let keyed = ref false in
     let transaction = {(tx (Yojson.Safe.to_string (`Assoc (fields true)))) with
       T.op_type = T.KeySwitch; amount = Z.zero} in
-    let pool = Pool.create ~keyed:(fun () -> !keyed) ~field_policy:(fun () -> PL.Unique_fields)
+    let pool = Pool.create ~registered:(fun () -> false) ~keyed:(fun () -> !keyed) ~field_policy:(fun () -> PL.Unique_fields)
       ~strict:(fun () -> true) ~math:(fun () -> false)
       ~cipher_mode:(fun () -> !mode) ledger in
     let ready () = match Lwt_main.run (Pool.await pool transaction) with
@@ -795,7 +795,7 @@ let switch_rule () =
         Lwt.return_ok (Queue.Verification_ready (snd (List.hd active))));
       bind = (fun tx artifact ->
         let open Lwt.Syntax in
-        let* result = PL.bind_key_switch_artifact ~keyed:false ~cipher_mode:!mode
+        let* result = PL.bind_key_switch_artifact ~registered:false ~keyed:false ~cipher_mode:!mode
           ~field_policy:PL.Unique_fields ~strict:true ledger tx artifact in
         Lwt.return (match result with
           | PL.Key_switch_bound plan -> Queue.Bound plan
@@ -816,7 +816,7 @@ let switch_rule () =
       expect (PL.key_switch_requests_legacy_audit ~cipher_mode
         ~field_policy:PL.Unique_fields zero = active) "zero history rule boundary";
       if active then begin
-        let pool = Pool.create ~keyed:(fun () -> false) ~field_policy:(fun () -> PL.Unique_fields)
+        let pool = Pool.create ~registered:(fun () -> false) ~keyed:(fun () -> false) ~field_policy:(fun () -> PL.Unique_fields)
           ~strict:(fun () -> true) ~math:(fun () -> false)
           ~cipher_mode:(fun () -> cipher_mode) ledger in
         expect (Pool.admit pool zero = Octra_core.Preverify_availability.Unmanaged)
@@ -824,7 +824,7 @@ let switch_rule () =
       end) [G.Prior, false; G.Active, true];
     let reused = ref false in
     let prepared = Lwt_main.run (Pool.await pool transaction) in
-    let result = Lwt_main.run (Octra_core.Preverify_worker.run ~keyed:false
+    let result = Lwt_main.run (Octra_core.Preverify_worker.run ~registered:false ~keyed:false
       ~cipher_mode:G.Active ~field_policy:PL.Unique_fields ~strict:true ~ledger
       ~prepared:(fun _ -> reused := true; Lwt.return prepared) zero) in
     expect (not !reused) "zero history bypassed prepared result";
@@ -843,12 +843,12 @@ let math_artifact () =
       List.iter (fun math ->
         List.iter (fun (transaction, accepted) ->
           let artifact =
-            match Lwt_main.run (PL.preverify_private_artifact ~keyed:false ~math
+            match Lwt_main.run (PL.preverify_private_artifact ~registered:false ~keyed:false ~math
                 ~field_policy:PL.Unique_fields ~strict:true ledger transaction) with
             | Ok artifact -> artifact
             | Error error -> fail error.PL.reason
           in
-          let bind math = Lwt_main.run (PL.bind_private_artifact ~keyed:false ~math
+          let bind math = Lwt_main.run (PL.bind_private_artifact ~registered:false ~keyed:false ~math
             ~field_policy:PL.Unique_fields ~strict:true ledger transaction artifact) in
           expect
             (match bind math with
@@ -952,7 +952,7 @@ let process_lwt ?(math = false) ?(artifacts = []) ?(keys = [])
   end;
   let* () = before () in
   let transition =
-    Octra_core.Private_transition.create ~keyed:false ~math
+    Octra_core.Private_transition.create ~registered:false ~keyed:false ~math
       ~preverify:(Some gate)
       ~ledger
       ~epoch_id:env.epoch_id
@@ -1009,7 +1009,7 @@ let batch_case () =
       let original = List.map (fun item -> L.find ledger item.T.from) inputs in
       let root = Lwt_main.run (L.hash ledger) in
       let artifacts = List.map (fun item ->
-        match Lwt_main.run (PL.preverify_private_artifact ~keyed:false ~math:true
+        match Lwt_main.run (PL.preverify_private_artifact ~registered:false ~keyed:false ~math:true
             ~field_policy:PL.Unique_fields ~strict:true ledger item) with
         | Ok artifact -> T.hash item, artifact
         | Error error -> fail error.PL.reason) inputs in
@@ -1018,7 +1018,7 @@ let batch_case () =
         | None -> Lwt.return Octra_core.Preverify_availability.Unmanaged
         | Some artifact ->
           let open Lwt.Syntax in
-          let* result = PL.bind_private_artifact ~keyed:false ~math:true
+          let* result = PL.bind_private_artifact ~registered:false ~keyed:false ~math:true
             ~field_policy:PL.Unique_fields ~strict:true ledger item artifact in
           match result with
           | PL.Private_bound plan ->
@@ -1030,7 +1030,7 @@ let batch_case () =
       let dependent = {first with T.nonce = 2} in
       let payment = {first with T.nonce = 3; op_type = T.Standard;
         amount = Z.one; encrypted_data = None} in
-      let checked = Lwt_main.run (W.run_many ~keyed:false ~math:true ~ledger ~prepared
+      let checked = Lwt_main.run (W.run_many ~registered:false ~keyed:false ~math:true ~ledger ~prepared
         ~field_policy:PL.Unique_fields ~strict:true
         [poor; first; dependent; payment; second; third]) in
       expect (W.txs checked = inputs) "independent private batch was isolated";
@@ -1050,7 +1050,7 @@ let batch_case () =
           ~proposal_id:"private_batch" (fun store ledger ->
             let* checked = Gate.check_bound ledger gate txs in
             begin match checked with Ok () -> () | Error error -> fail error end;
-            let transition = Apply.create ~keyed:false ~math:true ~preverify:(Some gate)
+            let transition = Apply.create ~registered:false ~keyed:false ~math:true ~preverify:(Some gate)
               ~ledger ~epoch_id:env.epoch_id
               ~owner_migration_mode:Octra_core.Rule_graph.Active
               ~cipher_mode:Octra_core.Rule_graph.Prior
@@ -1170,7 +1170,7 @@ let migration_retry () =
       Lwt_main.run (L.flush_dirty_lwt ledger);
       let account = L.find_opt ledger addr in
       let root = Lwt_main.run (L.hash ledger) in
-      let plan proof = PL.key_switch_plan ~keyed:false ~strict:true ~field_policy:PL.Unique_fields
+      let plan proof = PL.key_switch_plan ~registered:false ~keyed:false ~strict:true ~field_policy:PL.Unique_fields
         ~legacy_public_replay:replay ledger (transaction proof) in
       Fun.protect ~finally:(fun () -> Unix.putenv "OCTRA_PVAC_VERIFY_WORKER" worker) (fun () ->
         Unix.putenv "OCTRA_PVAC_VERIFY_WORKER" "runtime_data/absent_worker";
@@ -1179,7 +1179,7 @@ let migration_retry () =
         | Ok _ -> fail "migration skipped worker"
         end;
         if mode = "verified_zero_reset" then
-          match Lwt_main.run (PL.preverify_key_switch_artifact ~keyed:false ~strict:true
+          match Lwt_main.run (PL.preverify_key_switch_artifact ~registered:false ~keyed:false ~strict:true
               ~field_policy:PL.Unique_fields ledger (transaction proof)) with
           | Error error -> expect (PL.failure_action error = PL.Retry) "worker became rejected artifact"
           | Ok _ -> fail "worker failure produced artifact");
@@ -1225,7 +1225,7 @@ let switch_reuse () =
       let transaction = { (tx payload) with T.op_type = T.KeySwitch; amount = Z.zero } in
       expect (L.update_enc_balance ledger addr source_bytes = Ok ()) "switch source";
       Lwt_main.run (L.flush_dirty_lwt ledger);
-      let pool = Pool.create ~keyed:(fun () -> false) ~math:(fun () -> false) ~field_policy:(fun () -> PL.Unique_fields)
+      let pool = Pool.create ~registered:(fun () -> false) ~keyed:(fun () -> false) ~math:(fun () -> false) ~field_policy:(fun () -> PL.Unique_fields)
         ~cipher_mode:(fun () -> Octra_core.Rule_graph.Prior)
         ~strict:(fun () -> true) ledger in
       let prepared = match Lwt_main.run (Pool.await pool transaction) with
@@ -1238,7 +1238,7 @@ let switch_reuse () =
       let root = Lwt_main.run (L.hash ledger) in
       let old_key = Lwt_main.run (L.get_pvac_pubkey ledger addr) in
       let prior = match Lwt_main.run
-          (PL.preverify_key_switch_artifact ~keyed:false ~field_policy:PL.Unique_fields
+          (PL.preverify_key_switch_artifact ~registered:false ~keyed:false ~field_policy:PL.Unique_fields
              ~strict:false ledger transaction) with
         | Ok artifact -> [T.hash transaction, artifact]
         | Error e -> fail e.PL.reason
@@ -1306,7 +1306,7 @@ let switch_reuse () =
           let* () = check hash ("key_switch_rejected",
             "encrypted balance changed before key switch verification") in
           expect (L.update_enc_balance ledger addr source_bytes = Ok ()) "restore pool source";
-          let pool = Pool.create ~keyed:(fun () -> false) ~math:(fun () -> false) ~field_policy:(fun () -> PL.First_field)
+          let pool = Pool.create ~registered:(fun () -> false) ~keyed:(fun () -> false) ~math:(fun () -> false) ~field_policy:(fun () -> PL.First_field)
             ~cipher_mode:(fun () -> Octra_core.Rule_graph.Prior)
             ~strict:(fun () -> false) ledger in
           let* prepared = Pool.await pool transaction in
@@ -1330,7 +1330,7 @@ let switch_reuse () =
               ("switch source requires verification: " ^ name)
           in
           begin match Lwt_main.run
-              (PL.key_switch_plan ~keyed:false ~field_policy:PL.Unique_fields
+              (PL.key_switch_plan ~registered:false ~keyed:false ~field_policy:PL.Unique_fields
                  ~strict:true ledger transaction) with
           | Error error when PL.key_switch_failure_retryable error -> ()
           | _ -> fail "artifact binding populated the plan cache"
@@ -1446,7 +1446,7 @@ let reuse_case op =
       in
       let make_artifact strict =
         match Lwt_main.run
-          (PL.preverify_private_artifact ~keyed:false
+          (PL.preverify_private_artifact ~registered:false ~keyed:false
              ~field_policy:PL.Unique_fields
              ~strict
              ledger
@@ -1456,7 +1456,7 @@ let reuse_case op =
         | Error e -> fail e.PL.reason
       in
       let module Pool = Octra_node_runtime.Consensus_private_preverify in
-      let pool = Pool.create ~keyed:(fun () -> false) ~math:(fun () -> false)
+      let pool = Pool.create ~registered:(fun () -> false) ~keyed:(fun () -> false) ~math:(fun () -> false)
         ~field_policy:(fun () -> PL.Unique_fields)
         ~strict:(fun () -> true)
         ~result_policy:(fun () -> Octra_core.Private_result_policy.Recoverable)
@@ -1568,7 +1568,7 @@ let valid_case () =
       let plan =
         match
           Lwt_main.run
-            (PL.prepare_encrypt_plan
+            (PL.prepare_encrypt_plan ~registered:false
                ~field_policy:PL.Unique_fields
                ledger
                transaction)
@@ -1579,7 +1579,7 @@ let valid_case () =
       let prior_artifact =
         match
           Lwt_main.run
-            (PL.preverify_private_artifact ~keyed:false
+            (PL.preverify_private_artifact ~registered:false ~keyed:false
                ~field_policy:PL.Unique_fields
                ~strict:false
                ledger
@@ -1591,7 +1591,7 @@ let valid_case () =
       begin
         match
           Lwt_main.run
-            (PL.bind_private_artifact ~keyed:false
+            (PL.bind_private_artifact ~registered:false ~keyed:false
                ~field_policy:PL.Unique_fields
                ~strict:true
                ledger
@@ -1670,7 +1670,7 @@ let forged_case () =
       let plan =
         match
           Lwt_main.run
-            (PL.prepare_encrypt_plan
+            (PL.prepare_encrypt_plan ~registered:false
                ~field_policy:PL.Unique_fields
                ledger
                transaction)
@@ -1712,7 +1712,7 @@ let prior_receipt_case () =
       let plan =
         match
           Lwt_main.run
-            (PL.prepare_encrypt_plan
+            (PL.prepare_encrypt_plan ~registered:false
                ~field_policy:PL.Unique_fields
                ledger
                transaction)
@@ -1748,7 +1748,7 @@ let worker_retry_case () =
       let plan =
         match
           Lwt_main.run
-            (PL.prepare_encrypt_plan
+            (PL.prepare_encrypt_plan ~registered:false
                ~field_policy:PL.Unique_fields
                ledger
                transaction)
@@ -1774,7 +1774,7 @@ let worker_retry_case () =
           ~tx_hashes:[T.hash transaction] ~txs:[transaction]
           (fun _ inputs ->
             incr calls;
-            W.run_many ~keyed:false ~field_policy:PL.Unique_fields ~strict:true
+            W.run_many ~registered:false ~keyed:false ~field_policy:PL.Unique_fields ~strict:true
               ~ledger inputs))
       in
       let retried =
@@ -1796,7 +1796,7 @@ let worker_retry_case () =
             let module A = Octra_core.Preverify_availability in
             List.iter (fun available ->
               let batch = Lwt_main.run
-                (W.run_many ~keyed:false ~field_policy:PL.Unique_fields ~strict:true ~ledger
+                (W.run_many ~registered:false ~keyed:false ~field_policy:PL.Unique_fields ~strict:true ~ledger
                   ~prepared:(fun _ -> Lwt.return available) [transaction]) in
               match batch.W.ready, batch.skipped with
               | [], [skip] ->
@@ -1983,7 +1983,7 @@ let recovery_case () =
   let plan =
     match
       Lwt_main.run
-        (PL.prepare_encrypt_plan
+        (PL.prepare_encrypt_plan ~registered:false
            ~field_policy:PL.Unique_fields
            ledger
            transaction)

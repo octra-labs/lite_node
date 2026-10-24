@@ -72,6 +72,7 @@ type node_deps = {
   last_epoch_time : float ref;
   tree : Octra_core.Tree.t ref;
   stealth_in_epoch_counter : int ref;
+  stealth_defer_count : (string, int) Hashtbl.t;
   fhe_in_epoch_counter : int ref;
   swarm_opt : Octra_net.P2p_swarm.t option ref;
   get_meta : string -> string option;

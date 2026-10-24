@@ -263,7 +263,7 @@ type verify_proposal_deps = {
     unit;
   public_key_for_tx : Transaction.t -> string option;
   verify_address_pubkey : addr:string -> pubkey:string -> bool;
-  verify_tx_signature : Transaction.t -> pubkey:string -> bool;
+  verify_tx_signature : signing:Octra_core.Tx_signature.t -> Transaction.t -> pubkey:string -> bool;
   validator_pubkeys : int64 -> (string * string) list;
   read_local_ledger_root : unit -> string Lwt.t;
   preview :
@@ -343,7 +343,7 @@ type reject_reason =
 type verification_deps = {
   public_key_for_tx : Transaction.t -> string option;
   verify_address_pubkey : addr:string -> pubkey:string -> bool;
-  verify_tx_signature : Transaction.t -> pubkey:string -> bool;
+  verify_tx_signature : signing:Octra_core.Tx_signature.t -> Transaction.t -> pubkey:string -> bool;
 }
 
 type validator_pubkeys = (string * string) list

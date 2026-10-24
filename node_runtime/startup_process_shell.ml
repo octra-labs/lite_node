@@ -246,6 +246,9 @@ let configure_process ~exit_fatal =
   Octra_log.init_from_env ();
   Octra_log.info "init" "starting_node backend = irmin-pack";
   configure_lwt_engine ();
+  (try Lwt_preemptive.init 4 4 (fun _ -> ()) with error ->
+    Octra_log.error "init" "event = worker_start_failed error = %s" (Printexc.to_string error);
+    exit_fatal ());
   initialize_crypto exit_fatal;
   Random.self_init ()
 

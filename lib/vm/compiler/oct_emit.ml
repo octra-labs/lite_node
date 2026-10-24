@@ -4,10 +4,12 @@
 open Oct_lang
 
 exception GenError of string * int
+exception Emission_limit
 
 let gerr line msg = raise (GenError (msg, line))
 
 type env = {
+  symbols : Oct_symbols.t;
   structs : struct_def list;
   enums : enum_def list;
   consts : const_def list;
@@ -17,11 +19,14 @@ type env = {
   funcs : func_def list;
   func_labels : (string, int) Hashtbl.t;
   mutable locals : (string * int * typ) list;
-  mutable expanding : (string * int * int * (string * int * typ) list) list;
+  expanding : (string * int * int * (string * int * typ) list, unit) Hashtbl.t;
   mutable base_reg : int;
   mutable next_reg : int;
   mutable next_label : int;
   mutable code : Contract_vm.instr list;
+  mutable first_stop : bool;
+  mutable emitted : int;
+  capacity : int;
   mutable line : int;
   has_payable : bool;
   mutable in_nonreentrant : bool;
@@ -32,13 +37,18 @@ type env = {
   declaration : declaration;
 }
 
-let make_env loops checked declaration structs enums consts state events errors funcs = {
+let make_env ?(metered = false) loops checked declaration structs enums consts state events errors funcs = {
   structs; enums; consts; state; events; errors; funcs;
+  symbols = Oct_symbols.create structs enums consts state events errors funcs;
   func_labels = Hashtbl.create 16;
   locals = [];
-  expanding = [];
+  expanding = Hashtbl.create 16;
   base_reg = 1; next_reg = 1; next_label = 10000;
+  first_stop = false;
   code = []; line = 0;
+  emitted = 0;
+  capacity = if not metered then max_int else
+    if declaration = ProgramDecl then Program_limits.max_instructions else Bytecode.max_instrs;
   has_payable = List.exists (fun f -> f.fn_payable) funcs;
   in_nonreentrant = false;
   fn_is_view = false;
@@ -74,6 +84,9 @@ let alloc_label env =
   l
 
 let emit env instr =
+  if env.emitted >= env.capacity then raise Emission_limit;
+  env.emitted <- env.emitted + 1;
+  if env.code = [] then env.first_stop <- instr = Contract_vm.STOP;
   env.code <- instr :: env.code
 
 let emit_bytes32_check env r =
@@ -119,25 +132,25 @@ let emit_result_type_check env r typ =
   | _ -> ()
 
 let find_state env name =
-  List.find_opt (fun sf -> sf.sf_name = name) env.state
+  Hashtbl.find_opt env.symbols.state name
 
 let find_local env name =
   List.find_opt (fun (n, _, _) -> n = name) env.locals
 
 let find_event env name =
-  List.find_opt (fun ev -> ev.ev_name = name) env.events
+  Hashtbl.find_opt env.symbols.events name
 
 let find_const env name =
-  List.find_opt (fun c -> c.c_name = name) env.consts
+  Hashtbl.find_opt env.symbols.consts name
 
 let find_struct env name =
-  List.find_opt (fun sd -> sd.sd_name = name) env.structs
+  Hashtbl.find_opt env.symbols.structs name
 
 let find_enum env name =
-  List.find_opt (fun ed -> ed.en_name = name) env.enums
+  Hashtbl.find_opt env.symbols.enums name
 
 let find_error env name =
-  List.find_opt (fun ed -> ed.err_name = name) env.errors
+  Hashtbl.find_opt env.symbols.errors name
 
 let is_int_storage env t =
   t = TInt || t = TU64 || t = TU128 || t = TU256 || (match t with
@@ -933,7 +946,7 @@ let rec typ_of_expr env = function
      | "call" -> TString
      | "deploy" | "circle_spawn" -> TAddress
      | _ ->
-       (match List.find_opt (fun f -> f.fn_name = name) env.funcs with
+       (match Hashtbl.find_opt env.symbols.funcs name with
         | Some f -> f.fn_ret
         | None -> gerr env.line (Printf.sprintf "unknown function: %s" name)))
   | EStoragePath (field, keys, path) ->
@@ -1691,7 +1704,7 @@ and gen_builtin env name args =
    | _ ->
      match Hashtbl.find_opt env.func_labels name with
      | Some label ->
-       let target_func = List.find (fun f -> f.fn_name = name) env.funcs in
+       let target_func = Hashtbl.find env.symbols.funcs name in
        List.iteri (fun i _ ->
          let src = if i < nargs then nth i else begin
            let z = alloc_reg env in
@@ -1865,7 +1878,12 @@ and gen_expr env expr =
   | EVar "value" when not env.checked || Option.is_none (find_local env "value") ->
     gen_expr env EValue
   | EVar name ->
-    let outer = env.expanding in
+    let mode = List.fold_left (fun mode (name, bit) ->
+      if not env.checked || Option.is_none (find_local env name) then mode lor bit else mode)
+      0 ["epoch", 1; "epoch_time", 2; "value", 4] in
+    let name = match Oct_symbols.resolve env.symbols mode name with
+      | Ok name -> name
+      | Error _ -> raise Stack_overflow in
     let rec expand name =
       match name with
       | ("epoch" | "epoch_time" | "value")
@@ -1874,20 +1892,16 @@ and gen_expr env expr =
       | _ -> match find_const env name with
       | Some c ->
         let key = name, env.base_reg, env.next_reg, env.locals in
-        if List.mem key env.expanding then raise Stack_overflow;
-        env.expanding <- key :: env.expanding;
-        begin match c.c_value with
-        | EVar next -> (expand [@tailcall]) next
-        | value -> gen_expr env value
-        end
+        if Hashtbl.mem env.expanding key then raise Stack_overflow;
+        Hashtbl.add env.expanding key ();
+        Fun.protect ~finally:(fun () -> Hashtbl.remove env.expanding key) (fun () ->
+          match c.c_value with EVar next -> expand next | value -> gen_expr env value)
       | None ->
         begin match find_local env name with
         | Some (_, reg, _) -> reg
         | None -> gerr env.line (Printf.sprintf "undefined variable: %s" name)
         end in
-    let result = expand name in
-    env.expanding <- outer;
-    result
+    expand name
   | EField name ->
     (match find_state env name with
      | Some sf ->
@@ -2656,9 +2670,7 @@ let gen_constructor env (ctor : func_def) =
     | None -> ()
   ) ctor.fn_params;
   List.iter (gen_stmt env) ctor.fn_body;
-  (match List.rev env.code with
-   | Contract_vm.STOP :: _ -> ()
-   | _ -> emit env Contract_vm.STOP);
+  (if not env.first_stop then emit env Contract_vm.STOP);
   env.locals <- saved_locals;
   env.base_reg <- saved_base;
   env.next_reg <- saved_next
@@ -2800,9 +2812,7 @@ let gen_function env (f : func_def) label =
   env.in_nonreentrant <- f.fn_nonreentrant;
   List.iter (gen_stmt env) f.fn_body;
   if f.fn_nonreentrant then emit_nonreentrant_exit env;
-  (match List.rev env.code with
-   | Contract_vm.STOP :: _ -> ()
-   | _ -> emit env Contract_vm.STOP);
+  (if not env.first_stop then emit env Contract_vm.STOP);
   env.in_nonreentrant <- false;
   env.fn_is_view <- saved_view;
   env.fn_is_pure <- saved_pure;
@@ -2840,13 +2850,15 @@ let check_interface_method iface_name im f =
   check_interface_visibility iface_name im f
 
 let check_interfaces (ct : contract) =
+  let interfaces = Oct_symbols.first (fun item -> item.if_name) ct.interfaces in
+  let funcs = Oct_symbols.first (fun item -> item.fn_name) ct.funcs in
   List.iter (fun iface_name ->
-    let iface = match List.find_opt (fun i -> i.if_name = iface_name) ct.interfaces with
+    let iface = match Hashtbl.find_opt interfaces iface_name with
       | Some i -> i
       | None -> raise (GenError (Printf.sprintf "unknown interface: %s" iface_name, 0))
     in
     List.iter (fun im ->
-      match List.find_opt (fun f -> f.fn_name = im.im_name) ct.funcs with
+      match Hashtbl.find_opt funcs im.im_name with
       | None ->
         raise (GenError (Printf.sprintf "contract %s implements %s but missing method: %s"
           ct.name iface_name im.im_name, 0))
@@ -2854,10 +2866,14 @@ let check_interfaces (ct : contract) =
     ) iface.if_methods
   ) ct.implements
 
-let generate ?(loops = false) ?(checked = false) (ct : contract) =
+let generate ?(metered = false) ?(loops = false) ?(checked = false) (ct : contract) =
+  (match Oct_symbols.check ~metered ~functions:(List.length ct.funcs)
+      ~consts:(List.length ct.consts) with
+   | Ok () -> ()
+   | Error reason -> gerr 0 reason);
   check_interfaces ct;
   let env =
-    make_env
+    make_env ~metered
       loops
       checked
       ct.declaration

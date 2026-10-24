@@ -21,14 +21,13 @@ let check_const_refs definitions =
   in
   visit Names.empty Names.empty (List.map (fun (name, _) -> name, false) definitions)
 
-let check_consts program =
-  let names = Names.of_list (List.map (fun item -> item.c_name) program.consts) in
+let references accept values =
   let rec references found = function
     | [] -> found
     | value :: rest ->
       let add values = List.rev_append values rest in
       begin match value with
-      | EVar name when Names.mem name names ->
+      | EVar name when accept name ->
         references (Names.add name found) rest
       | EIndex (_, values) | ECall (_, values) | EArray values | ETuple values
       | EStoragePath (_, values, _) | EIndexField (_, values, _) -> references found (add values)
@@ -46,8 +45,12 @@ let check_consts program =
       | EEnumVariant _ -> references found rest
       end
   in
+  references Names.empty values
+
+let check_consts program =
+  let names = Names.of_list (List.map (fun item -> item.c_name) program.consts) in
   check_const_refs (List.map (fun item -> item.c_name,
-    references Names.empty [item.c_value]) program.consts)
+    references (fun name -> Names.mem name names) [item.c_value]) program.consts)
 
 let check_loops program =
   let ( let* ) = Result.bind in

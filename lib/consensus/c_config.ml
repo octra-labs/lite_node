@@ -7,6 +7,7 @@ type scheduled = {
 }
 
 let validator_set_hash (vs : C_types.validator_set) =
+  let weights = C_types.weight_index vs in
   let domain =
     if vs.weighted then "octra:consensus_validator_set:v2"
     else "octra:consensus_validator_set:v1"
@@ -23,7 +24,7 @@ let validator_set_hash (vs : C_types.validator_set) =
       Octra_net.Oce1.put_string buf v.address;
       Octra_net.Oce1.put_raw buf v.pubkey;
       if vs.weighted then
-        match C_types.weight_of_addr vs v.address with
+        match C_types.String_map.find_opt v.address weights with
         | None -> invalid_arg "validator weight missing"
         | Some weight ->
           Octra_net.Oce1.put_string buf (Z.to_string weight))

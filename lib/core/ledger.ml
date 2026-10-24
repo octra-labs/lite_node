@@ -40,20 +40,7 @@ type transfer_error =
   | Debit_rejected of string
   | Credit_rejected of string
 
-let run_s p =
-  match Lwt.state p with
-  | Lwt.Return v -> v
-  | Lwt.Fail e -> raise e
-  | Lwt.Sleep ->
-    let r = ref None in
-    Lwt.on_any p (fun v -> r := Some (Ok v)) (fun e -> r := Some (Error e));
-    let rec pump n =
-      if n > 10000000 then failwith "run_s: irmin I/O timeout"
-      else match !r with
-      | Some (Ok v) -> v
-      | Some (Error e) -> raise e
-      | None -> ignore (Lwt_engine.iter false); pump (n + 1)
-    in pump 0
+let run_s p = Exec_resource.await p
 
 let units_per_oct = Denomination.units_per_oct
 let format_balance = Denomination.format_balance
@@ -387,8 +374,8 @@ let set_pvac_pubkey l addr pk_blob =
   else
     Store_irmin.set_pvac_pubkey l.store addr pk_blob
 
-let get_pvac_pubkey l addr =
-  Store_irmin.get_pvac_pubkey l.store addr
+let get_pvac_pubkey ?registered l addr =
+  Store_irmin.get_pvac_pubkey ?registered l.store addr
 
 let get_pvac_key_hash l addr =
   Store_irmin.get_pvac_hash l.store addr

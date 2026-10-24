@@ -775,7 +775,7 @@ def floor_target(state):
         or epoch != head + 1
     ):
         return None
-    return head, round_id + 1
+    return head, round_id
 
 def install_floor(root, sup, values, args, live, target):
     head, round_id = target

@@ -106,6 +106,22 @@ let nonce ~rpc_url ~addr args =
         fail "invalid --nonce"
     end
 
+let signing ~rpc_url args =
+  if Octra_core.Rule_graph.tx_network_activation_for_chain
+      "octra-devnet-9871-cluster" = None then
+    Lwt.return Octra_core.Tx_signature.Historical
+  else
+  let chain_id = require_arg "--chain-id" args in
+  match Octra_core.Rule_graph.tx_network_activation_for_chain chain_id with
+  | None -> Lwt.return Octra_core.Tx_signature.Historical
+  | Some _ ->
+    rpc ~url:rpc_url ~method_name:"octra_runtimeVersion" ~params:[]
+    >|= fun status ->
+    if json_string "chain_id" status <> chain_id then fail "transaction network mismatch";
+    let epoch = json_int "profile_epoch" status in
+    if epoch < 0 then fail "transaction epoch is invalid";
+    Octra_core.Tx_signature.at ~chain_id ~epoch:(Int64.of_int epoch)
+
 let submit ~rpc_url tx =
   rpc
     ~url:rpc_url
@@ -221,6 +237,7 @@ let main () =
     fail (op_raw ^ " requires non-empty --message or --message-file");
   Lwt_main.run (
     nonce ~rpc_url ~addr:from args >>= fun nonce ->
+    signing ~rpc_url args >>= fun signing ->
     let message =
       match op_type, message with
       | Octra_core.Transaction.ValidatorBond, None ->
@@ -253,7 +270,7 @@ let main () =
       | None -> Octra_core.Transaction.ou_cost draft
     in
     let tx = { draft with Octra_core.Transaction.ou } in
-    let signed = Octra_core.Transaction.sign_with_privkey tx priv in
+    let signed = Octra_core.Tx_signature.sign signing tx priv in
     if List.mem "--prepare" args then begin
       print_endline (Yojson.Safe.to_string (`Assoc [
         "tx", Octra_core.Transaction.to_yojson signed;

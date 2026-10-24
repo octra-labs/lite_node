@@ -114,7 +114,7 @@ let runtime checked = Rest.{
   compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
   settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
   marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
-  queue_head = (fun () -> None);
+  signing = (fun () -> Octra_core.Tx_signature.Historical); queue_head = (fun () -> None);
   preverify_admit = (fun tx -> checked := tx :: !checked; Ok ());
   save_drops = ignore; find_drop = (fun _ -> None);
   drops_by_addr = (fun _ ~limit:_ ~offset:_ -> []);
@@ -200,10 +200,11 @@ let peer_io ledger tx seen sent = Handler.{
   add_tx = (fun input -> seen := input :: !seen;
     Rest.add_tx_to_staging ~relay:false (runtime (ref [])) ledger input);
   send_payload = (fun payload -> sent := payload :: !sent);
+  send_batch = (List.iter (fun build -> Option.iter (fun payload -> sent := payload :: !sent) (build ())));
   broadcast_payload = (fun payload -> sent := payload :: !sent);
   report_bad_peer = (fun _ -> failwith "unexpected peer penalty");
   close_peer = (fun () -> failwith "unexpected peer close");
-  now = (fun () -> tx.Tx.timestamp); max_drift = 300.;
+  now = (fun () -> tx.Tx.timestamp); signing = (fun () -> Octra_core.Tx_signature.Historical); max_drift = 300.;
 }
 
 let check_p2p legacy =

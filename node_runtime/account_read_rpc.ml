@@ -18,13 +18,13 @@ type 'handler dispatch_adapters = {
     (Ledger.t -> addr:string -> rpc_result Lwt.t) ->
     'handler;
   store_address_lwt_read :
-    (Octra_core.Store_irmin.t -> addr:string -> rpc_result Lwt.t) ->
+    (registered:bool -> Octra_core.Store_irmin.t -> addr:string -> rpc_result Lwt.t) ->
     'handler;
   store_params_lwt_read :
     (Octra_core.Store_irmin.t -> params:Yojson.Safe.t -> rpc_result Lwt.t) ->
     'handler;
   store_ledger_address_lwt_read :
-    (Octra_core.Store_irmin.t ->
+    (registered:bool -> Octra_core.Store_irmin.t ->
      Ledger.t ->
      params:Yojson.Safe.t ->
      addr:string ->
@@ -137,14 +137,14 @@ let total_transactions ~confirmed =
        ~confirmed
        ~staging:(Staging.staging_size ()))
 
-let pvac_pubkey store ~addr =
+let pvac_pubkey ~registered store ~addr =
   let open Lwt.Syntax in
-  let* pk_opt = Octra_core.Store_irmin.get_pvac_pubkey store addr in
+  let* pk_opt = Octra_core.Store_irmin.get_pvac_pubkey ~registered store addr in
   ok (Rpc_view.pvac_pubkey ~addr pk_opt)
 
-let pvac_status store ~addr =
+let pvac_status ~registered store ~addr =
   let open Lwt.Syntax in
-  let* pk_opt = Octra_core.Store_irmin.get_pvac_pubkey store addr in
+  let* pk_opt = Octra_core.Store_irmin.get_pvac_pubkey ~registered store addr in
   let* canonical_binding = Octra_core.Store_irmin.pvac_is_bound store addr in
   ok
     (Rpc_view.pvac_status
@@ -154,6 +154,7 @@ let pvac_status store ~addr =
           pk_opt))
 
 let pvac_migration_status
+    ~registered
     ~keyed
     status_actor
     store
@@ -171,6 +172,7 @@ let pvac_migration_status
   let* status =
     Pvac_status_actor.query
       status_actor
+      ~registered
       ~addr
       ~key_hash
       ~cipher
@@ -200,7 +202,7 @@ let encrypted_cipher ~addr ~account =
   Lwt.return (Result.map (fun cipher -> Rpc_view.encrypted_cipher ~addr ~cipher)
     (public_cipher (account_cipher account)))
 
-let encrypted_balance store ledger ~params ~addr =
+let encrypted_balance ~registered store ledger ~params ~addr =
   match Tx_view.encrypted_balance_auth params ~addr with
   | Error (Tx_view.Rpc_malformed e) ->
     Lwt.return (Error (Rpc.malformed_tx e))
@@ -208,7 +210,7 @@ let encrypted_balance store ledger ~params ~addr =
     Lwt.return (Error (Rpc.err (-32000) e None))
   | Ok () ->
     let open Lwt.Syntax in
-    let* pk_opt = Octra_core.Store_irmin.get_pvac_pubkey store addr in
+    let* pk_opt = Octra_core.Store_irmin.get_pvac_pubkey ~registered store addr in
     ok
       (Rpc_view.encrypted_balance
          ~addr

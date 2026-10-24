@@ -139,6 +139,7 @@ let node_backend
                 let captured = ref [] in
                 let private_transition =
                   Octra_core.Private_transition.create
+                    ~registered:(Core.Rule_graph.program_inputs_at ~chain_id:env.chain_id ~epoch:epoch_id = Core.Rule_graph.Active)
                     ~preverify:(Some preverify)
                     ~ledger:backend.Octra_core.Epoch_exec.ledger
                     ~epoch_id

@@ -101,27 +101,6 @@ let decode_bytecode ?(trusted = []) ?(point_ops = false) code_b64 =
   | (Stack_overflow | Out_of_memory) as error -> raise error
   | e -> Error (Printexc.to_string e)
 
-let decode_descriptor_bytecode code_b64 =
-  try
-    let raw = Base64.decode_exn code_b64 in
-    if Octra_vm.Program_envelope.is_program raw then
-      match Octra_vm.Code_check.decode_program_source ~point_ops:true raw with
-      | Ok admitted ->
-        Ok {
-          bytecode = Octra_vm.Code_check.code admitted;
-          profile = Octra_vm.Code_check.profile admitted;
-        }
-      | Error e -> Error (Octra_vm.Code_check.error_message e)
-    else
-      decode_bytecode ~point_ops:true code_b64
-  with
-  | (Stack_overflow | Out_of_memory) as error -> raise error
-  | e -> Error (Printexc.to_string e)
-
-let methods_of_bytecode bytecode =
-  Octra_vm.Contract.extract_methods bytecode
-  |> List.map (fun (name, view) -> { name; view; execution = Standard })
-
 let execution_name = function
   | Standard -> "standard"
   | Compute -> "compute"
@@ -273,8 +252,12 @@ let describe
               match info.runtime with
               | Octra_core.Circles.Octb ->
                 begin
-                  match decode_descriptor_bytecode code_b64 with
-                  | Ok admitted ->
+                  let* checked = Octra_core.Exec_resource.joined (fun () ->
+                    Octra_vm.Contract.methods_checked
+                      ~source:(Octra_vm.Program_envelope.is_program raw_code)
+                      ~trusted:[] ~point_ops:true raw_code) () in
+                  match checked with
+                  | Ok (methods, _) ->
                     Lwt.return (Ok {
                       circle_id;
                       info;
@@ -282,10 +265,11 @@ let describe
                       code_hash = info.code_hash;
                       code_b64 = None;
                       code_bytes = String.length raw_code;
-                      methods = methods_of_bytecode admitted.bytecode;
+                      methods = List.map (fun (name, view) ->
+                        {name; view; execution = Standard}) methods;
                     })
                   | Error e ->
-                    Lwt.return (Error ("invalid circle bytecode: " ^ e))
+                    Lwt.return (Error ("invalid circle bytecode: " ^ Octra_vm.Code_check.error_message e))
                 end
               | Octra_core.Circles.Wasm_v1 ->
                 let* wasm_descriptor_result =
@@ -321,13 +305,15 @@ let describe
                     end
                 end
           with
-          | (Stack_overflow | Out_of_memory) as error -> raise error
+          | (Stack_overflow | Out_of_memory | Octra_core.Exec_resource.Unavailable _
+             | Octra_core.Exec_resource.Exhausted _) as error -> raise error
           | e ->
             Lwt.return (Error ("invalid circle code: " ^ Printexc.to_string e))
         end
     end
 
 let load
+    ?launch
     ?snapshot
     ?(optional = false)
     ?(trusted = [])
@@ -378,7 +364,9 @@ let load
               match info.runtime with
               | Octra_core.Circles.Octb ->
                 begin
-                  match decode_bytecode ~trusted ~point_ops code_b64 with
+                  let* checked = Octra_core.Exec_resource.joined ?launch
+                    (fun () -> decode_bytecode ~trusted ~point_ops code_b64) () in
+                  match checked with
                   | Ok admitted ->
                     Lwt.return (Ok {
                       circle_id;
@@ -445,7 +433,8 @@ let load
                     end
                 end
           with
-          | (Stack_overflow | Out_of_memory) as error -> raise error
+          | (Stack_overflow | Out_of_memory | Octra_core.Exec_resource.Unavailable _
+             | Octra_core.Exec_resource.Exhausted _) as error -> raise error
           | e ->
             Lwt.return
               (Error

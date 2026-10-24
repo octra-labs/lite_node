@@ -52,6 +52,13 @@ type t = {
 
 let devnet_chain_id = "octra-devnet-9871-cluster"
 
+let devnet_tx_network_activation : activation option = None
+
+let tx_network_activation_for_chain chain_id =
+  if chain_id = devnet_chain_id then devnet_tx_network_activation else None
+
+let chain_id t = t.chain_id
+
 let devnet_circle_activation = {
   anchor_epoch = 1_293_376;
   anchor_state_root =
@@ -278,7 +285,8 @@ let duty_marks_activation_for_chain = stake_activation_for_chain
 let proof_key_activation_for_chain = stake_activation_for_chain
 
 let profile_epochs ~chain_id =
-  [standard_activation_for_chain chain_id;
+  [tx_network_activation_for_chain chain_id;
+   standard_activation_for_chain chain_id;
    set_plan_activation_for_chain chain_id;
    math_activation_for_chain chain_id;
    exit_activation_for_chain chain_id;
@@ -430,6 +438,10 @@ let consensus_id ~chain_id ~epoch =
     match proof_key_activation_for_chain chain_id with
     | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
     | Some _ | None -> plans)
+  |> (fun plans ->
+    match tx_network_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
   |> List.map activation_id
   |> String.concat "|"
 
@@ -526,6 +538,7 @@ let root_after_floor ~chain_id ~floor_epoch ~epoch =
       program_records_activation_for_chain chain_id;
       duty_marks_activation_for_chain chain_id;
       proof_key_activation_for_chain chain_id;
+      tx_network_activation_for_chain chain_id;
     ] in
     List.find_map
       (function
@@ -658,6 +671,9 @@ let program_source t ~epoch = mode t t.program_source_activation ~epoch
 let tx_envelope t ~epoch =
   mode t (tx_envelope_activation_for_chain t.chain_id) ~epoch
 
+let tx_network t ~epoch =
+  mode t (tx_network_activation_for_chain t.chain_id) ~epoch
+
 let fhe_work t ~epoch = mode t (fhe_work_activation_for_chain t.chain_id) ~epoch
 
 let wasm_float t ~epoch = mode t (wasm_float_activation_for_chain t.chain_id) ~epoch
@@ -693,6 +709,13 @@ let program_records_at ~chain_id ~epoch =
   match program_records_activation_for_chain chain_id with
   | Some plan when epoch >= plan.activation_epoch -> Active
   | Some _ | None -> Prior
+
+let program_inputs_at ~chain_id ~epoch =
+  match Octra_consensus.C_quorum_policy.round_epoch ~chain_id with
+  | Some height when Int64.of_int epoch >= height -> Active
+  | Some _ | None -> Prior
+
+let program_inputs_id = "registered_pvac:private_registry:kat_independent:emission_counter:program_65536:legacy_1048576"
 
 let settle_at ~chain_id ~epoch =
   match settle_activation_for_chain chain_id with

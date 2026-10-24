@@ -4,6 +4,30 @@
 From Stdlib Require Import List Bool Arith ZArith Lia.
 Import ListNotations.
 
+Module Stages.
+Section Trace.
+Variable State Input : Type.
+Variable old new : nat -> State -> Input -> State.
+Variable second : nat.
+Definition step epoch state input :=
+  if epoch <? second then old epoch state input else new epoch state input.
+Fixpoint apply (transition : nat -> State -> Input -> State) state events :=
+  match events with
+  | [] => state
+  | (epoch, input) :: rest => apply transition (transition epoch state input) rest
+  end.
+Theorem published_trace : forall events state,
+  Forall (fun event => fst event < second) events ->
+  apply step state events = apply old state events.
+Proof.
+  induction events as [|[epoch input] rest IH]; intros state H; simpl; auto.
+  inversion H; subst. unfold step. assert (epoch <? second = true) as E by (apply Nat.ltb_lt; auto).
+  rewrite E. apply IH; assumption.
+Qed.
+Print Assumptions published_trace.
+End Trace.
+End Stages.
+
 Record plan := {
   start : nat;
   anchor : nat

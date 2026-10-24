@@ -80,24 +80,7 @@ type ctx = {
 
 type rpc_result = (Yojson.Safe.t, Rpc.rpc_error) Stdlib.result
 
-let run_s p =
-  match Lwt.state p with
-  | Lwt.Return v -> v
-  | Lwt.Fail e -> raise e
-  | Lwt.Sleep ->
-    let r = ref None in
-    Lwt.on_any p (fun v -> r := Some (Ok v)) (fun e -> r := Some (Error e));
-    let rec pump n =
-      if n > 10000000 then failwith "run_s: irmin I/O timeout"
-      else
-        match !r with
-        | Some (Ok v) -> v
-        | Some (Error e) -> raise e
-        | None ->
-          ignore (Lwt_engine.iter false);
-          pump (n + 1)
-    in
-    pump 0
+let run_s p = Octra_core.Exec_resource.await p
 
 let with_address = Rpc_read_adapters.with_address
 
@@ -297,7 +280,7 @@ let program_tokens_by_address params ctx =
     params
 
 let fhe_pubkey_loader store addr =
-  match run_s (Store_irmin.get_pvac_pubkey store addr) with
+  match run_s (Store_irmin.get_pvac_pubkey ~registered:true store addr) with
   | None -> None
   | Some blob -> Some (Octra_vm.Contract_vm.Key_bytes blob)
 
@@ -331,14 +314,18 @@ let circle_view_auth params ctx =
     ~trusted:(Octra_vm.Program_trust.keys ctx.program_trust)
     ~profile:(profile_at ctx) ~store:ctx.store ~ledger:ctx.ledger params
 
-let octra_register_pvac_pubkey params ctx =
+let with_key_mode ctx action =
+  let mode = Octra_core.Rule_graph.program_inputs_at ~chain_id:ctx.chain_id ~epoch:!(ctx.current_epoch) in
+  action ~registered:(mode = Octra_core.Rule_graph.Active)
+
+let octra_register_pvac_pubkey params ctx = with_key_mode ctx (fun ~registered ->
   Registration_rpc.pvac_pubkey
-    ~existing:(Ledger.get_pvac_pubkey ctx.ledger)
+    ~existing:(Ledger.get_pvac_pubkey ~registered ctx.ledger)
     ~kat_mismatch:(fun ~addr ~got ~expected ->
       Octra_log.info "pvac"
         "aes_kat_mismatch addr = %s got = %s expected = %s"
         addr got expected)
-    params
+    params)
 
 let octra_private_transfer params ctx =
   Submit_rpc.private_transfer ~validate:ctx.deps.validate params
@@ -361,7 +348,7 @@ let migration_policy rules ~epoch =
   | _, _, _, Error fault, _ | _, _, _, _, Error fault -> Error fault
   | Ok owner, Ok cipher, Ok proof, Ok math, Ok key -> Ok (owner, cipher, proof, math, key)
 
-let octra_pvac_migration_status params ctx =
+let octra_pvac_migration_status params ctx = with_key_mode ctx (fun ~registered ->
   let epoch = !(ctx.current_epoch) in
   match migration_policy ctx.rules ~epoch with
   | Error fault ->
@@ -373,6 +360,7 @@ let octra_pvac_migration_status params ctx =
   | Ok (owner_migration_mode, cipher_mode, proof_mode, math, proof_key) ->
     with_account params ctx (fun addr account ->
       Account_read_rpc.pvac_migration_status
+        ~registered
         ~keyed:(proof_key = Octra_core.Rule_graph.Active)
         ctx.pvac_status
         ctx.store
@@ -383,7 +371,7 @@ let octra_pvac_migration_status params ctx =
         ~cipher_mode
         ~proof_mode
         ~addr
-        ~account)
+        ~account))
 
 let status_dispatch_adapters =
   Status_read_rpc.{ status_read }
@@ -393,9 +381,11 @@ let account_dispatch_adapters =
     ledger_params_read;
     ledger_params_no_ctx_read;
     ledger_address_lwt_read;
-    store_address_lwt_read;
+    store_address_lwt_read = (fun f params ctx -> with_key_mode ctx (fun ~registered ->
+      store_address_lwt_read (f ~registered) params ctx));
     store_params_lwt_read;
-    store_ledger_address_lwt_read;
+    store_ledger_address_lwt_read = (fun f params ctx -> with_key_mode ctx (fun ~registered ->
+      store_ledger_address_lwt_read (f ~registered) params ctx));
     account_lwt_read;
     pvac_migration_status = octra_pvac_migration_status;
     account = octra_account;
@@ -452,6 +442,9 @@ let program_dispatch =
         ~epoch:!(ctx.current_epoch) handler params);
     program_info = program_info_read;
     program_call = contract_call;
+    program_verify = (fun params ctx ->
+      store_chaindata_read
+        (Octra_vm.Contract_rpc.verify_params ~chain_id:ctx.chain_id) params ctx);
     program_abi = (fun params ctx ->
       store_chaindata_read
         (Octra_vm.Contract_rpc.abi_params
@@ -554,8 +547,8 @@ let start (cfg : config) =
     ~data_dir:cfg.data_dir ~chain_id:cfg.chain_id in
   let pvac_status =
     Pvac_status_actor.create {
-      load_pubkey = (fun ~addr ->
-        Octra_core.Store_irmin.get_pvac_pubkey cfg.store addr);
+      load_pubkey = (fun ~registered ~addr ->
+        Octra_core.Store_irmin.get_pvac_pubkey ~registered cfg.store addr);
       hash_pubkey = Octra_core.Store_irmin.pvac_hash;
       classify_cipher = Octra_core.Pvac_migration.classify_cipher;
       classify_key = Octra_core.Pvac_migration.classify_key;

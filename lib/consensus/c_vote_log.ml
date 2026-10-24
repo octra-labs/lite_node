@@ -394,7 +394,7 @@ let polc_saved receipt ~policy ~chain_id ~epoch_id ~validator_set ~round ~propos
     | (vote : vote) :: _ -> vote.round = round && vote.proposal_id = proposal_id
     | [] -> false) receipt.proofs
 
-let polc_save ?policy ?(sync = sync_directory) store ~chain_id ~epoch_id ~validator_set ~locked_round votes =
+let polc_save ?policy ?(sync = sync_directory) ?(keep_rounds = []) store ~chain_id ~epoch_id ~validator_set ~locked_round votes =
   let* () = polc_check ?policy ~chain_id ~epoch_id ~validator_set votes in
   let first = List.hd votes in
   let* original = polc_read store in
@@ -413,7 +413,8 @@ let polc_save ?policy ?(sync = sync_directory) store ~chain_id ~epoch_id ~valida
     compare (List.hd b).round (List.hd a).round) (votes :: prior) in
   let newest = (List.hd (List.hd sorted)).round in
   let proofs = List.filter (fun (proof : vote list) -> let round = (List.hd proof).round in
-    round = newest || round = locked_round || round = first.round) sorted in
+    round = newest || round = locked_round || round = first.round || List.mem round keep_rounds) sorted in
+  let* () = if List.length proofs <= 3 then Ok () else Error "vote proof retention is full" in
   let* () = List.fold_left (fun result proof ->
     let* () = result in
     if proof == votes then Ok () else
@@ -425,7 +426,9 @@ let polc_save ?policy ?(sync = sync_directory) store ~chain_id ~epoch_id ~valida
     let* () = directory path in
     let wire = `List (List.map (fun votes -> `List (List.map (fun vote -> `String
       (C_codec.encode_vote vote |> Base64.encode_exn)) votes)) proofs) |> Yojson.Safe.to_string in
-    publish_record ~sync path (polc_path path) wire in
+    if String.length wire > C_codec.max_validators * max_wire_bytes * 6 then
+      Error "vote proof size is invalid"
+    else publish_record ~sync path (polc_path path) wire in
   Ok {chain = chain_id; height = epoch_id; members = validator_set; policy; proofs}
 
 let polc_keep ?policy ?sync store ~chain_id ~epoch_id ~validator_set ~locked_round votes =
@@ -552,6 +555,25 @@ let belongs ~chain_id ~validator ~epoch_id (vote : vote) =
   String.equal vote.chain_id chain_id
   && String.equal vote.validator validator
   && Int64.equal vote.epoch_id epoch_id
+
+let round_votes store ~chain_id ~validator ~epoch_id ~round =
+  let read_slot vote_type =
+    let expected = {chain_id; validator; epoch_id; round; vote_type;
+      proposal_id = ""; signature = ""} in
+    let* found = match store with
+      | Memory (records, _) -> Ok (Hashtbl.find_opt records (key expected))
+      | Disk path ->
+        let file = Filename.concat path (name expected) in
+        if not (Sys.file_exists file) then Ok None
+        else Result.map Option.some (read file) in
+    match found with
+    | Some vote when not (belongs ~chain_id ~validator ~epoch_id vote)
+        || vote.round <> round || vote.vote_type <> vote_type ->
+      Error "vote log round slot does not match"
+    | _ -> Ok found in
+  let* prevote = read_slot Prevote in
+  let* precommit = read_slot Precommit in
+  Ok (List.filter_map Fun.id [prevote; precommit])
 
 let max_value (values : int list) =
   List.fold_left

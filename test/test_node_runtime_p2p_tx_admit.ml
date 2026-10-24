@@ -43,7 +43,7 @@ let test_accepts_standard () =
   in
   assert_verdict "standard accepted"
     Octra_node_runtime.P2p_tx_admit.Accept
-    (Octra_node_runtime.P2p_tx_admit.admit
+    (Octra_node_runtime.P2p_tx_admit.admit ~signing:Octra_core.Tx_signature.Historical
        ~now:1001.0
        ~max_drift:300.0
        ~sender_pk:(Some pub)
@@ -63,14 +63,14 @@ let test_special_targets () =
   assert_true "multi target valid" (Octra_node_runtime.P2p_tx_admit.to_valid multi);
   assert_verdict "stealth without payload rejected"
     Octra_node_runtime.P2p_tx_admit.Invalid_payload
-    (Octra_node_runtime.P2p_tx_admit.admit
+    (Octra_node_runtime.P2p_tx_admit.admit ~signing:Octra_core.Tx_signature.Historical
        ~now:1001.0
        ~max_drift:300.0
        ~sender_pk:(Some pub)
        stealth);
   assert_verdict "multi accepted"
     Octra_node_runtime.P2p_tx_admit.Accept
-    (Octra_node_runtime.P2p_tx_admit.admit
+    (Octra_node_runtime.P2p_tx_admit.admit ~signing:Octra_core.Tx_signature.Historical
        ~now:1001.0
        ~max_drift:300.0
        ~sender_pk:(Some pub)
@@ -96,7 +96,7 @@ let test_rejects_invalid_address () =
   in
   assert_verdict "invalid address"
     Octra_node_runtime.P2p_tx_admit.Invalid_address
-    (Octra_node_runtime.P2p_tx_admit.admit
+    (Octra_node_runtime.P2p_tx_admit.admit ~signing:Octra_core.Tx_signature.Historical
        ~now:1001.0
        ~max_drift:300.0
        ~sender_pk:(Some pub)
@@ -112,7 +112,7 @@ let test_rejects_invalid_address () =
   let reject_recipient recipient =
     tx ~from ~to_:recipient ~timestamp:1000.0 ~op_type:Octra_core.Transaction.Standard
     |> signed ~priv
-    |> Octra_node_runtime.P2p_tx_admit.admit
+    |> Octra_node_runtime.P2p_tx_admit.admit ~signing:Octra_core.Tx_signature.Historical
          ~now:1001.0
          ~max_drift:300.0
          ~sender_pk:(Some pub)
@@ -133,7 +133,7 @@ let test_rejects_timestamp () =
   in
   assert_verdict "timestamp drift"
     (Octra_node_runtime.P2p_tx_admit.Timestamp_drift 401.0)
-    (Octra_node_runtime.P2p_tx_admit.admit
+    (Octra_node_runtime.P2p_tx_admit.admit ~signing:Octra_core.Tx_signature.Historical
        ~now:1401.0
        ~max_drift:300.0
        ~sender_pk:(Some pub)
@@ -148,14 +148,14 @@ let test_rejects_signature () =
   in
   assert_verdict "missing signature key"
     Octra_node_runtime.P2p_tx_admit.Invalid_signature
-    (Octra_node_runtime.P2p_tx_admit.admit
+    (Octra_node_runtime.P2p_tx_admit.admit ~signing:Octra_core.Tx_signature.Historical
        ~now:1001.0
        ~max_drift:300.0
        ~sender_pk:None
        tx);
   assert_verdict "wrong signature key"
     Octra_node_runtime.P2p_tx_admit.Invalid_signature
-    (Octra_node_runtime.P2p_tx_admit.admit
+    (Octra_node_runtime.P2p_tx_admit.admit ~signing:Octra_core.Tx_signature.Historical
        ~now:1001.0
        ~max_drift:300.0
        ~sender_pk:(Some wrong_pub)
@@ -180,14 +180,14 @@ let test_reject_invalid_claim_secret () =
   in
   assert_verdict "non-hex claim secret rejected"
     Octra_node_runtime.P2p_tx_admit.Invalid_payload
-    (Octra_node_runtime.P2p_tx_admit.admit
+    (Octra_node_runtime.P2p_tx_admit.admit ~signing:Octra_core.Tx_signature.Historical
        ~now:1001.0
        ~max_drift:300.0
        ~sender_pk:(Some pub)
        (claim (String.make 64 'z')));
   assert_verdict "missing claim payload rejected"
     Octra_node_runtime.P2p_tx_admit.Invalid_payload
-    (Octra_node_runtime.P2p_tx_admit.admit
+    (Octra_node_runtime.P2p_tx_admit.admit ~signing:Octra_core.Tx_signature.Historical
        ~now:1001.0
        ~max_drift:300.0
        ~sender_pk:(Some pub)
@@ -199,7 +199,7 @@ let test_reject_invalid_claim_secret () =
         |> signed ~priv));
   assert_verdict "incomplete claim payload rejected"
     Octra_node_runtime.P2p_tx_admit.Invalid_payload
-    (Octra_node_runtime.P2p_tx_admit.admit
+    (Octra_node_runtime.P2p_tx_admit.admit ~signing:Octra_core.Tx_signature.Historical
        ~now:1001.0
        ~max_drift:300.0
        ~sender_pk:(Some pub)
@@ -217,7 +217,7 @@ let test_reject_shared_payload () =
     |> signed ~priv
   in
   let admit tx =
-    Octra_node_runtime.P2p_tx_admit.admit
+    Octra_node_runtime.P2p_tx_admit.admit ~signing:Octra_core.Tx_signature.Historical
       ~now:1001.0
       ~max_drift:300.0
       ~sender_pk:(Some pub)
@@ -247,7 +247,7 @@ let test_signature_before_payload () =
     tx ~from ~to_:from ~timestamp:1000.0 ~op_type:Octra_core.Transaction.EncryptOp
   in
   let admit value =
-    Octra_node_runtime.P2p_tx_admit.admit ~now:1001.0 ~max_drift:300.0
+    Octra_node_runtime.P2p_tx_admit.admit ~signing:Octra_core.Tx_signature.Historical ~now:1001.0 ~max_drift:300.0
       ~sender_pk:(Some pub) value
   in
   assert_verdict "signature precedes proof parsing"
@@ -288,7 +288,7 @@ let test_program_package_shape () =
   assert_verdict
     "malformed Program package rejected"
     Octra_node_runtime.P2p_tx_admit.Invalid_payload
-    (Octra_node_runtime.P2p_tx_admit.admit
+    (Octra_node_runtime.P2p_tx_admit.admit ~signing:Octra_core.Tx_signature.Historical
        ~now:1001.0
        ~max_drift:300.0
        ~sender_pk:(Some pub)
@@ -296,7 +296,7 @@ let test_program_package_shape () =
   assert_verdict
     "compiled Program package accepted"
     Octra_node_runtime.P2p_tx_admit.Accept
-    (Octra_node_runtime.P2p_tx_admit.admit
+    (Octra_node_runtime.P2p_tx_admit.admit ~signing:Octra_core.Tx_signature.Historical
        ~now:1001.0
        ~max_drift:300.0
        ~sender_pk:(Some pub)
@@ -320,7 +320,8 @@ let test_duty_retry () =
   } |> signed ~priv in
   let original = Tx.to_yojson item in
   let admit ?(bft_mode = true) duty value =
-    Admit.admit ~duty ~bft_mode ~now:1000. ~max_drift:300. ~sender_pk:(Some pub) value in
+    Admit.admit ~signing:Octra_core.Tx_signature.Historical
+      ~duty ~bft_mode ~now:1000. ~max_drift:300. ~sender_pk:(Some pub) value in
   let rest ?(bft_mode = true) duty value =
     View.pre_route_check ~duty ~bft_mode ~now:1000. ~max_timestamp_drift:300.
       ~observer_rpc_mode:false value in
@@ -367,7 +368,7 @@ let test_duty_retry () =
     assert_true (label ^ ": clock cannot claim retry")
       (not (View.duty_retry ~now ~duty ~bft_mode:true item));
     assert_true (label ^ ": P2P clock rejected")
-      (match Admit.admit ~duty ~bft_mode:true ~now ~max_drift:300.
+      (match Admit.admit ~signing:Octra_core.Tx_signature.Historical ~duty ~bft_mode:true ~now ~max_drift:300.
         ~sender_pk:(Some pub) item with Admit.Timestamp_drift _ -> true | _ -> false);
     assert_true (label ^ ": REST clock rejected")
       (Result.is_error (View.pre_route_check ~duty ~bft_mode:true ~now
@@ -381,11 +382,11 @@ let test_duty_retry () =
   assert_verdict "old duty still requires valid signature" Admit.Invalid_signature (admit duty bad);
   assert_true "REST signature check remains separate and mandatory"
     (rest duty bad = Ok ()
-     && Result.is_error (View.signature_check ~account_public_key:(Some pub) bad));
+     && Result.is_error (View.signature_check ~signing:Octra_core.Tx_signature.Historical ~account_public_key:(Some pub) bad));
   assert_verdict "old duty still requires sender key" Admit.Invalid_signature
-    (Admit.admit ~duty ~bft_mode:true ~now:1000. ~max_drift:300. ~sender_pk:None item);
+    (Admit.admit ~signing:Octra_core.Tx_signature.Historical ~duty ~bft_mode:true ~now:1000. ~max_drift:300. ~sender_pk:None item);
   assert_true "old caller has no implicit duty exception"
-    (match Admit.admit ~now:1000. ~max_drift:300. ~sender_pk:(Some pub) item with
+    (match Admit.admit ~signing:Octra_core.Tx_signature.Historical ~now:1000. ~max_drift:300. ~sender_pk:(Some pub) item with
      | Admit.Timestamp_drift _ -> true | _ -> false)
 
 let () =

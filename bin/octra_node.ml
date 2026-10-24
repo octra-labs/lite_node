@@ -551,8 +551,11 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       | Ok mode -> mode
       | Error fault -> failwith (Rule_graph.fault_message fault)
     in
+    let registered_at epoch =
+      Rule_graph.program_inputs_at ~chain_id:startup_network.chain_id ~epoch = Rule_graph.Active in
     let key_switch_preverify =
       Consensus_key_switch_preverify.create
+        ~registered:(fun () -> registered_at !current_epoch)
         ~keyed:(fun () -> proof_key_at !current_epoch)
         ~math:(fun () -> math_at !current_epoch)
         ~cipher_mode:(fun () -> cipher_at !current_epoch)
@@ -562,6 +565,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     in
     let private_preverify =
       Consensus_private_preverify.create
+        ~registered:(fun () -> registered_at !current_epoch)
         ~keyed:(fun () -> proof_key_at !current_epoch)
         ~math:(fun () -> math_at !current_epoch)
         ~field_policy:(fun () -> private_field_policy !current_epoch)
@@ -1010,6 +1014,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           last_epoch_time;
           tree;
           stealth_in_epoch_counter;
+          stealth_defer_count;
           fhe_in_epoch_counter;
           swarm_opt;
           get_meta = irmin_get_meta store;
@@ -1322,14 +1327,15 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         strict = (fun () -> private_proof_strict !current_epoch);
         math = (fun () -> math_at !current_epoch);
         keyed = (fun () -> proof_key_at !current_epoch);
+        registered = (fun () -> registered_at !current_epoch);
         get_pvac_pubkey =
-          (fun addr -> Ledger.get_pvac_pubkey ledger addr);
+          (fun ~registered addr -> Ledger.get_pvac_pubkey ~registered ledger addr);
         sender_enc =
           (fun addr ->
             Option.value
               ~default:"0"
               (Ledger.find ledger addr).encrypted_balance);
-        start_task = (fun ~keyed ~math -> Preverify_cache.start_task ~keyed ~math);
+        start_task = (fun ~registered ~keyed ~math -> Preverify_cache.start_task ~registered ~keyed ~math);
         verify_ranges =
           (fun ~keyed ~math ~strict ~pubkey_blob ~sender_enc ptd ->
             Octra_node_runtime.Tx_view.preverify_stealth_ranges
@@ -1373,6 +1379,11 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     let rest_runtime =
       Rest.{
         swarm_ref;
+        signing = (fun () ->
+          let epoch = match Octra_core.Head_manifest.get_cached () with
+            | Some head -> Int64.succ (Int64.of_int head.epoch_id)
+            | None -> Int64.of_int !current_epoch in
+          Octra_core.Tx_signature.at ~chain_id ~epoch);
         compute_mode = (fun () ->
           match Octra_core.Head_manifest.get_cached () with
           | Some head when head.epoch_id < max_int ->
@@ -1575,6 +1586,8 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       | None -> Set_post.Paused
       | Some head ->
         if head.epoch_id < 0 || head.epoch_id = max_int then Set_post.Paused
+        else if Result.is_error (Octra_core.Tx_signature.check_active
+          (rest_runtime.signing ()) [tx]) then Set_post.Expired
         else match Rule_graph.ready_exec rules ~epoch:(head.epoch_id + 1),
           Rule_graph.duty_marks rules ~epoch:(head.epoch_id + 1) with
           | Error _, _ | _, Error _ -> Set_post.Paused
@@ -1683,7 +1696,8 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
                 op_type = ValidatorReady;
                 encrypted_data = None;
               } in
-              let* tx = Octra_node_runtime.Set_delivery.sign ~key:wallet.priv draft in
+              let* tx = Octra_node_runtime.Set_delivery.sign
+                ~signing:(rest_runtime.signing ()) ~key:wallet.priv draft in
               Octra_node_runtime.Set_delivery.stage ~bft_mode:consensus_mode
                 rest_runtime ledger tx
         in
@@ -1851,6 +1865,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
           (fun _ ledger ->
             let* batch =
               Octra_core.Preverify_worker.run_many
+                ~registered:(registered_at epoch)
                 ~keyed:(proof_key_at epoch) ~math
                 ~cipher_mode:(cipher_at epoch)
                 ~field_policy:(private_field_policy epoch)
@@ -2206,6 +2221,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
             tx);
         now = Unix.gettimeofday;
         max_drift = Rest.max_timestamp_drift;
+        signing = rest_runtime.signing;
         driver_ref;
         resource_compute = Some resource_compute;
         exit_fatal = exit_error;

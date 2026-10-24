@@ -197,10 +197,10 @@ let source_binding ledger pre_state_hash tx =
         transition_hash = None;
       }
 
-let verify_private ~keyed ~math strict field_policy result_policy ledger tx =
+let verify_private ~registered ~keyed ~math strict field_policy result_policy ledger tx =
   let open Lwt.Syntax in
   let* result =
-    Private_ledger.verify_private ~keyed ~math
+    Private_ledger.verify_private ~registered ~keyed ~math
       ~field_policy
       ~strict
       ~result_policy
@@ -215,7 +215,7 @@ let verify_private ~keyed ~math strict field_policy result_policy ledger tx =
        })
        result)
 
-let verify_key_switch ~keyed ~math ~cipher_mode strict field_policy ?legacy_replay ledger tx =
+let verify_key_switch ~registered ~keyed ~math ~cipher_mode strict field_policy ?legacy_replay ledger tx =
   let open Lwt.Syntax in
   let replay =
     if
@@ -230,7 +230,7 @@ let verify_key_switch ~keyed ~math ~cipher_mode strict field_policy ?legacy_repl
       None
   in
   let* plan =
-    Private_ledger.key_switch_plan ~keyed ~math ~cipher_mode
+    Private_ledger.key_switch_plan ~registered ~keyed ~math ~cipher_mode
       ~field_policy
       ~strict
       ?legacy_public_replay:replay
@@ -258,7 +258,7 @@ let prepared_result = function
     | Private_ledger.Retry -> A.Pending
     | Private_ledger.Reject -> A.Invalid failure.Private_ledger.reason
 
-let prepared_operation ~field_policy ~ledger ~cap verify prepared tx =
+let prepared_operation ~registered ~field_policy ~ledger ~cap verify prepared tx =
   let open Lwt.Syntax in
   match prepared with
   | None ->
@@ -275,7 +275,7 @@ let prepared_operation ~field_policy ~ledger ~cap verify prepared tx =
       | A.Invalid reason -> Lwt.return (A.Invalid reason)
       | A.Ready value when prepared_matches tx value ->
         let* current =
-          Private_ledger.prepared_current
+          Private_ledger.prepared_current ~registered
             ~field_policy
             ~cap
             ledger
@@ -290,7 +290,7 @@ let prepared_operation ~field_policy ~ledger ~cap verify prepared tx =
         Lwt.return (A.Invalid "prepared operation mismatch")
     end
 
-let run_heavy ~keyed ~math ?(cipher_mode = Rule_graph.Prior)
+let run_heavy ~registered ~keyed ~math ?(cipher_mode = Rule_graph.Prior)
     ~field_policy
     ~strict
     ?ledger
@@ -309,20 +309,20 @@ let run_heavy ~keyed ~math ?(cipher_mode = Rule_graph.Prior)
       Private_ledger.key_switch_requests_legacy_audit ~cipher_mode ~field_policy tx
     then
       let* result =
-        verify_key_switch ~keyed ~math ~cipher_mode strict field_policy ?legacy_replay ledger tx
+        verify_key_switch ~registered ~keyed ~math ~cipher_mode strict field_policy ?legacy_replay ledger tx
       in
       Lwt.return (prepared_result result)
     else
-      prepared_operation
+      prepared_operation ~registered
         ~field_policy
         ~ledger
         ~cap:strict
-        (verify_key_switch ~keyed ~math ~cipher_mode strict field_policy ledger)
+        (verify_key_switch ~registered ~keyed ~math ~cipher_mode strict field_policy ledger)
         prepared
         tx
   | (T.EncryptOp | T.DecryptOp | T.StealthOp | T.ClaimOp), Some ledger ->
-    prepared_operation
-      (verify_private ~keyed ~math strict field_policy result_policy ledger)
+    prepared_operation ~registered
+      (verify_private ~registered ~keyed ~math strict field_policy result_policy ledger)
       prepared
       tx
       ~field_policy
@@ -337,7 +337,15 @@ let run_heavy ~keyed ~math ?(cipher_mode = Rule_graph.Prior)
   | _, None -> Lwt.return (A.Invalid "ledger_required")
   | _ -> Lwt.return (A.Invalid "lane_not_heavy")
 
-let run ~keyed ?(math = false) ?(cipher_mode = Rule_graph.Prior)
+let cell_check action =
+  Lwt.catch action (function
+    | (Out_of_memory | Stack_overflow | Lwt.Canceled
+      | Exec_resource.Unavailable (Memory | Stack)
+      | Private_ledger.Worker_stopped _) as error -> Lwt.fail error
+    | Private_ledger.Worker_retry reason -> Lwt.return_error (`Unavailable reason)
+    | _ -> Lwt.return_error (`Unavailable "circle_cell_preverify_exception"))
+
+let run ~registered ~keyed ?(math = false) ?(cipher_mode = Rule_graph.Prior)
     ~field_policy
     ~strict
     ?ledger
@@ -388,21 +396,19 @@ let run ~keyed ?(math = false) ?(cipher_mode = Rule_graph.Prior)
           pre_state_root
         with
         | Some ledger, Some verify, Some pre_state_hash, Some pre_state_root ->
-          let* state = source_binding ledger pre_state_hash tx in
-          begin
+          let* result = cell_check (fun () ->
+            let* state = source_binding ledger pre_state_hash tx in
             match state with
-            | Error error -> Lwt.return (Skip error)
+            | Error error -> Lwt.return_error (`Invalid error)
             | Ok state ->
               let* transition_hash =
                 verify ~pre_state_hash ~pre_state_root tx
               in
-              begin
-                match transition_hash with
-                | Ok transition_hash ->
-                  Lwt.return (transition_receipt tx state transition_hash)
-                | Error error -> Lwt.return (Skip error)
-              end
-          end
+              Lwt.return (Result.map (transition_receipt tx state) transition_hash)) in
+          Lwt.return (match result with
+            | Ok verdict -> verdict
+            | Error (`Invalid error) -> Skip error
+            | Error (`Unavailable error) -> Defer error)
         | None, _, _, _ -> Lwt.return (Skip "ledger_required")
         | _, None, _, _ ->
           Lwt.return (Skip "circle_cell_preverify_required")
@@ -411,7 +417,7 @@ let run ~keyed ?(math = false) ?(cipher_mode = Rule_graph.Prior)
       end
     else
       let* v =
-        run_heavy ~keyed ~math ~cipher_mode
+        run_heavy ~registered ~keyed ~math ~cipher_mode
           ~field_policy
           ~strict
           ?ledger
@@ -618,7 +624,7 @@ let checked_of_single_batch tx batch =
   | _ ->
     Error "invalid_single_preverify_batch"
 
-let run_many ~keyed ?(math = false) ?(cipher_mode = Rule_graph.Prior)
+let run_many ~registered ~keyed ?(math = false) ?(cipher_mode = Rule_graph.Prior)
     ~field_policy
     ~strict
     ?ledger
@@ -641,7 +647,7 @@ let run_many ~keyed ?(math = false) ?(cipher_mode = Rule_graph.Prior)
       Lwt.return (Checked_ready { tx; receipt = None })
     else
       let* verdict =
-        run ~keyed ~math ~cipher_mode
+        run ~registered ~keyed ~math ~cipher_mode
           ~field_policy
           ~strict
           ?ledger

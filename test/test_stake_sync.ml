@@ -17,7 +17,7 @@ let check label condition = if not condition then failwith label
 let run = Lwt_main.run
 let sha value = Digestif.SHA256.(digest_string value |> to_hex)
 let chain_id = "stake-sync"
-let policy = P.make ~count_epoch:0L ~stake_epoch:(Some 20L)
+let policy = P.make ~count_epoch:0L ~stake_epoch:(Some 20L) ~round_epoch:(Some 20L)
 
 let keys = List.init 7 (fun index ->
   let secret = String.make 32 (Char.chr (index + 31)) in
@@ -236,7 +236,7 @@ let test_profile () =
   let module Profile = Octra_node_runtime.Consensus_profile in
   let module Net = Octra_node_runtime.P2p_config in
   let chain_id = "octra-devnet-9871-cluster" in
-  let policy = P.make ~count_epoch:1_306_547L ~stake_epoch:(Some 1_700_000L) in
+  let policy = P.make ~count_epoch:1_306_547L ~stake_epoch:(Some 1_700_000L) ~round_epoch:(Some 1_700_000L) in
   let getenv name = Sys.getenv_opt name in
   let before = Profile.hash ~chain_id ~epoch:1_699_999 getenv in
   check "future stake changes prior profile"

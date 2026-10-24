@@ -630,7 +630,7 @@ let bond_payload_of_message = function
   | Some raw ->
     begin
       try
-        match Yojson.Safe.from_string raw with
+        match Json_tree.read raw with
         | `Assoc fields ->
           begin
             match
@@ -652,7 +652,7 @@ let ready_payload_of_message = function
   | Some raw ->
     begin
       try
-        match Yojson.Safe.from_string raw with
+        match Json_tree.read raw with
         | `Assoc fields ->
           begin
             match

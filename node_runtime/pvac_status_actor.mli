@@ -13,7 +13,7 @@ type stats = {
 }
 
 type deps = {
-  load_pubkey : addr:string -> string option Lwt.t;
+  load_pubkey : registered:bool -> addr:string -> string option Lwt.t;
   hash_pubkey : string -> string;
   classify_cipher : string -> Octra_core.Pvac_migration.cipher_class;
   classify_key : string option -> Octra_core.Pvac_migration.key_class;
@@ -29,6 +29,7 @@ val create : deps -> t
 
 val query :
   t ->
+  registered:bool ->
   addr:string ->
   key_hash:string option ->
   cipher:string ->

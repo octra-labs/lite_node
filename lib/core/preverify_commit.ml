@@ -37,14 +37,19 @@ let tx_hash tx =
 let heavy tx =
   Preverify_queue.needs_preverify tx
 
-let dup_by f xs =
+module Index = Map.Make (String)
+
+let index_by f xs =
   let rec go seen = function
-    | [] -> None
+    | [] -> Ok seen
     | x :: rest ->
       let key = f x in
-      if List.exists (String.equal key) seen then Some key
-      else go (key :: seen) rest in
-  go [] xs
+      if Index.mem key seen then Error key
+      else go (Index.add key x seen) rest in
+  go Index.empty xs
+
+let dup_by f xs =
+  match index_by f xs with Ok _ -> None | Error key -> Some key
 
 let receipt_hash r =
   r.Preverify_receipt.tx_hash
@@ -57,9 +62,6 @@ let find_receipt hash receipts =
 
 let receipt_for_tx gate tx =
   find_receipt (Transaction.hash tx) gate.receipts
-
-let find_tx hash txs =
-  List.find_opt (fun tx -> String.equal (tx_hash tx) hash) txs
 
 let check_receipt tx r =
   match Preverify_receipt.validate r with
@@ -158,19 +160,19 @@ let check_work gate used tx =
   reserve gate used (Resource_lanes.of_op tx.Transaction.op_type) (Resource_lanes.work tx)
 
 let check_orphan txs r =
-  match find_tx r.Preverify_receipt.tx_hash txs with
+  match Index.find_opt r.Preverify_receipt.tx_hash txs with
   | None -> Error ("orphan_receipt:" ^ r.tx_hash)
   | Some tx ->
     if heavy tx then Ok ()
     else Error ("receipt_for_light_tx:" ^ r.tx_hash)
 
-let check gate txs =
-  match dup_by tx_hash txs with
-  | Some hash -> Error ("duplicate_tx:" ^ hash)
-  | None ->
-    match dup_by receipt_hash gate.receipts with
-    | Some hash -> Error ("duplicate_receipt:" ^ hash)
-    | None ->
+let check_index gate txs =
+  match index_by tx_hash txs with
+  | Error hash -> Error ("duplicate_tx:" ^ hash)
+  | Ok tx_index ->
+    match index_by receipt_hash gate.receipts with
+    | Error hash -> Error ("duplicate_receipt:" ^ hash)
+    | Ok receipt_index ->
       let rec receipts = function
         | [] -> Ok ()
         | r :: rest ->
@@ -178,7 +180,7 @@ let check gate txs =
             match Preverify_receipt.validate r with
             | Error e -> Error ("invalid_receipt:" ^ e)
             | Ok () ->
-              match check_orphan txs r with
+              match check_orphan tx_index r with
               | Error e -> Error e
               | Ok () -> receipts rest
           end in
@@ -188,9 +190,9 @@ let check gate txs =
           if not (heavy tx) then tx_loop used rest
           else
             let hash = tx_hash tx in
-            match find_receipt hash gate.receipts with
-            | Error e -> Error e
-            | Ok r ->
+            match Index.find_opt hash receipt_index with
+            | None -> Error ("missing_receipt:" ^ hash)
+            | Some r ->
               match check_receipt tx r with
               | Error e -> Error e
               | Ok () ->
@@ -201,11 +203,15 @@ let check gate txs =
       | Error e -> Error e
       | Ok () ->
         tx_loop (List.map (fun lane -> lane, Resource_lanes.zero) Resource_lanes.all) txs
+        |> Result.map (fun () -> receipt_index)
+
+let check gate txs =
+  check_index gate txs |> Result.map (fun _ -> ())
 
 let check_bound ledger gate txs =
-  match check gate txs with
+  match check_index gate txs with
   | Error e -> Lwt.return_error e
-  | Ok () ->
+  | Ok receipts ->
     Lwt_list.fold_left_s
       (fun result tx ->
         match result with
@@ -213,9 +219,10 @@ let check_bound ledger gate txs =
         | Ok () when not (heavy tx) -> Lwt.return_ok ()
         | Ok () ->
           begin
-            match find_receipt (tx_hash tx) gate.receipts with
-            | Error e -> Lwt.return_error e
-            | Ok receipt -> check_state ledger tx receipt
+            let hash = tx_hash tx in
+            match Index.find_opt hash receipts with
+            | None -> Lwt.return_error ("missing_receipt:" ^ hash)
+            | Some receipt -> check_state ledger tx receipt
           end)
       (Ok ())
       txs

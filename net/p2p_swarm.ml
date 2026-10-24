@@ -484,6 +484,8 @@ let peer_diagnostics t =
 let broadcast ?(required = false) t (frame : P2p_frame.frame) =
   let open Lwt.Syntax in
   let* sent = connected_peers t
+    |> List.filter (fun conn -> frame.msg_type <> P2p_frame.msg_epoch_broadcast
+      || peer_role t conn.P2p_conn.peer_id = Observer)
     |> Lwt_list.map_p (fun conn -> enqueue_with_timeout conn frame send_deadline) in
   if required && not (List.exists Fun.id sent) then
     Lwt.fail_with "broadcast queues unavailable"
@@ -492,6 +494,8 @@ let broadcast ?(required = false) t (frame : P2p_frame.frame) =
 let broadcast_except t ~except (frame : P2p_frame.frame) =
   connected_peers t
   |> List.filter (fun conn -> conn.P2p_conn.peer_id <> except)
+  |> List.filter (fun conn -> frame.msg_type <> P2p_frame.msg_epoch_broadcast
+    || peer_role t conn.P2p_conn.peer_id = Observer)
   |> Lwt_list.iter_p (fun conn -> send_with_timeout conn frame send_deadline)
 
 let send_to t ~peer_id (frame : P2p_frame.frame) =

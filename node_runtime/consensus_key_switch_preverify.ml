@@ -16,7 +16,7 @@ let eligible_with ?(cipher_mode = Octra_core.Rule_graph.Prior) field_policy tx =
           ~field_policy
           tx)
 
-let create ~keyed ~field_policy ~strict ~math ~cipher_mode ledger =
+let create ~registered ~keyed ~field_policy ~strict ~math ~cipher_mode ledger =
   Pool.create
     ~max_running:Octra_core.Pvac_verify_worker.capacity
     ~max_queued:
@@ -31,7 +31,7 @@ let create ~keyed ~field_policy ~strict ~math ~cipher_mode ledger =
         let open Lwt.Syntax in
         let fields = field_policy () in
         let* result =
-          Private_ledger.preverify_key_switch_artifact ~keyed:(keyed ()) ~math:(math ())
+          Private_ledger.preverify_key_switch_artifact ~registered:(registered ()) ~keyed:(keyed ()) ~math:(math ())
             ~cipher_mode:(cipher_mode ())
             ~field_policy:fields
             ~strict:(strict ())
@@ -45,7 +45,7 @@ let create ~keyed ~field_policy ~strict ~math ~cipher_mode ledger =
             Lwt.return_error failure.Private_ledger.reason
           | Ok artifact ->
             let* binding =
-              Private_ledger.bind_key_switch_artifact ~keyed:(keyed ()) ~math:(math ())
+              Private_ledger.bind_key_switch_artifact ~registered:(registered ()) ~keyed:(keyed ()) ~math:(math ())
                 ~cipher_mode:(cipher_mode ())
                 ~field_policy:(field_policy ())
                 ~strict:(strict ())
@@ -66,7 +66,7 @@ let create ~keyed ~field_policy ~strict ~math ~cipher_mode ledger =
       bind = (fun tx artifact ->
         let open Lwt.Syntax in
         let* binding =
-          Private_ledger.bind_key_switch_artifact ~keyed:(keyed ()) ~math:(math ())
+          Private_ledger.bind_key_switch_artifact ~registered:(registered ()) ~keyed:(keyed ()) ~math:(math ())
             ~cipher_mode:(cipher_mode ())
             ~field_policy:(field_policy ())
             ~strict:(strict ())

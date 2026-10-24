@@ -639,7 +639,7 @@ let test_stake_plan () =
   expect "stake requires bonded weights"
     (not (C_types.has_quorum_for_rule P.Stake unweighted
       (List.map (fun (member : C_types.validator_info) -> member.address) unweighted.validators)));
-  let policy = P.make ~count_epoch:10L ~stake_epoch:(Some 20L) in
+  let policy = P.make ~count_epoch:10L ~stake_epoch:(Some 20L) ~round_epoch:(Some 20L) in
   expect "unweighted votes cannot finalize" (not (C_types.quorum_reached_at
     ~policy ~chain_id:devnet_chain_id ~epoch_id:20L unweighted
     ~signer_count:unweighted.n ~signed_weight:unweighted.total_weight));

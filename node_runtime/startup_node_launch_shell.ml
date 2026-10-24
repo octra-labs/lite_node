@@ -15,6 +15,7 @@ type deps = {
   add_tx : Octra_core.Transaction.t -> (string, string) result;
   now : unit -> float;
   max_drift : float;
+  signing : unit -> Octra_core.Tx_signature.t;
   driver_ref : Octra_consensus.C_driver.t option ref;
   resource_compute : Resource_compute_service.t option;
   exit_fatal : unit -> unit;
@@ -50,6 +51,7 @@ let run ?duty_head ?bft_mode ?exit_refused ?(shutdown = fun () -> Lwt.return_uni
         add_tx = deps.add_tx;
         now = deps.now;
         max_drift = deps.max_drift;
+    signing = deps.signing;
         driver_ref = deps.driver_ref;
         resource_compute = deps.resource_compute;
         exit_fatal = deps.exit_fatal;

@@ -898,13 +898,13 @@ let execution_case sender_key receiver_key transfer receipt deposit withdraw =
           ~validator_policy:(Octra_core.Validator_policy.of_env_exn (fun _ -> None))
           store ledger in
         let checked = List.map (fun tx ->
-          match run (W.run ~keyed:false ~math:false ~field_policy:Octra_core.Private_ledger.Unique_fields
+          match run (W.run ~registered:false ~keyed:false ~math:false ~field_policy:Octra_core.Private_ledger.Unique_fields
             ~strict:true ~ledger tx) with
           | W.Ready receipt -> receipt
           | W.Defer reason | W.Skip reason -> failwith reason) txs.(epoch) in
         receipts.(epoch) <- W.json_of_receipts checked;
         let preverify = Octra_core.Preverify_commit.create checked in
-        let transition = Private.create ~keyed:false ~math:false ~preverify:(Some preverify) ~ledger
+        let transition = Private.create ~registered:false ~keyed:false ~math:false ~preverify:(Some preverify) ~ledger
           ~epoch_id:epoch ~owner_migration_mode:G.Prior ~proof_mode:G.Active
           ~cipher_mode:G.Prior
           ~field_policy:Octra_core.Private_ledger.Unique_fields

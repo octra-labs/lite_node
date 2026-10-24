@@ -47,12 +47,13 @@ type node_refs = {
   tree : Octra_core.Tree.t ref;
   deferred_stealth_txs : Octra_core.Transaction.t list ref;
   stealth_in_epoch_counter : int ref;
+  stealth_defer_count : (string, int) Hashtbl.t;
   fhe_in_epoch_counter : int ref;
   swarm_opt : Octra_net.P2p_swarm.t option ref;
 }
 
 let refs ~current_epoch ~finality_state ~ledger ~last_epoch_time ~tree
-    ~deferred_stealth_txs ~stealth_in_epoch_counter ~fhe_in_epoch_counter
+    ~deferred_stealth_txs ~stealth_in_epoch_counter ~stealth_defer_count ~fhe_in_epoch_counter
     ~swarm_opt =
   {
     current_epoch;
@@ -62,6 +63,7 @@ let refs ~current_epoch ~finality_state ~ledger ~last_epoch_time ~tree
     tree;
     deferred_stealth_txs;
     stealth_in_epoch_counter;
+    stealth_defer_count;
     fhe_in_epoch_counter;
     swarm_opt;
   }
@@ -240,6 +242,7 @@ let node_effects refs effects input =
           ~tree:refs.tree
           ~deferred_stealth_txs:refs.deferred_stealth_txs
           ~stealth_in_epoch_counter:refs.stealth_in_epoch_counter
+          ~stealth_defer_count:refs.stealth_defer_count
           ~fhe_in_epoch_counter:refs.fhe_in_epoch_counter
           ~swarm_opt:refs.swarm_opt
           ~save_drops:effects.save_drops

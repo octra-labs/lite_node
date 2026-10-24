@@ -112,9 +112,7 @@ program Value {
     let file = S.pvac_legacy_path store absent in
     let out = open_out_bin file in
     Fun.protect ~finally:(fun () -> close_out out) (fun () -> output_string out "unrooted-key");
-    let refused = try ignore (ctx.get_fhe_pubkey absent); false with
-      | Octra_core.Exec_resource.Unavailable Host -> true in
-    expect "view accepted unrooted key" refused;
+    expect "view accepted unrooted key" (ctx.get_fhe_pubkey absent = None);
     let file = S.pvac_blob_path store (S.pvac_hash "key-before") in
     Unix.unlink file;
     let refused = try ignore (ctx.get_fhe_pubkey child); false with
@@ -1577,6 +1575,12 @@ program WorkRead {
        "circle_view_auth", true; "octra_circleViewAuth", true])
 
 let () =
+  if Array.exists (String.equal "--keys") Sys.argv then begin
+    List.iter (fun mode -> Test_workspace.with_dir "view_root" (run mode))
+      Octra_core.Rule_graph.[Prior; Active];
+    print_endline "event = view_keys status = pass";
+    exit 0
+  end;
   if Array.exists (String.equal "--assets") Sys.argv then begin
     Test_workspace.with_dir "asset_access" asset_root;
     print_endline "event = asset_access status = pass";

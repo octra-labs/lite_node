@@ -1701,7 +1701,7 @@ class ValidatorToolsTest(unittest.TestCase):
             "round_epoch": 42,
             "round": 7,
         }
-        self.assertEqual(upgrade_tool.floor_target(state), (41, 8))
+        self.assertEqual(upgrade_tool.floor_target(state), (41, 7))
         self.assertIsNone(upgrade_tool.floor_target({**state, "lag": 1}))
         self.assertIsNone(
             upgrade_tool.floor_target({**state, "round_epoch": 43})
@@ -2972,12 +2972,12 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(
             floor.call_args_list[0].args,
-            (WORK, values, wallet, WORK, 41, 8),
+            (WORK, values, wallet, WORK, 41, 7),
         )
         self.assertTrue(floor.call_args_list[0].kwargs["check"])
         self.assertEqual(
             floor.call_args_list[1].args,
-            (WORK, values, wallet, WORK, 41, 8),
+            (WORK, values, wallet, WORK, 41, 7),
         )
         stop_node.assert_called_once_with(WORK, WORK / "node.env")
         launch_node.assert_called_once_with(WORK, WORK / "node.env")
@@ -3171,7 +3171,7 @@ class ValidatorToolsTest(unittest.TestCase):
     def test_rejoin_capture_local(self):
         self.assertEqual(
             captured_round({"round_epoch": 42, "round": 7, "peer_round": 9}, 41),
-            8,
+            7,
         )
 
     def test_rejoin_handoff_explicit(self):

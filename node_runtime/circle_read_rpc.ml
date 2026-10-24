@@ -4,6 +4,7 @@
 module Rpc = Octra_core.Rpc
 
 let view_capacity = Circle_view_capacity.create ~limit:2
+let descriptor_capacity = Circle_view_capacity.create ~limit:1
 
 type rpc_result = (Yojson.Safe.t, Rpc.rpc_error) result
 
@@ -68,18 +69,21 @@ let with_epoch_snapshot store read =
 
 let program_descriptor ?snapshot ?(float_mode = Octra_core.Rule_graph.Prior) ~table_mode store ~circle_id =
   let open Lwt.Syntax in
-  let* described =
-    Octra_circle_runtime.Circle_program.describe
-      ?snapshot
-      ~inspect_mode:Octra_core.Rule_graph.Active
-      ~table_mode ~float_mode store circle_id in
-  match described with
-  | Ok descriptor ->
-    ok (Octra_circle_runtime.Circle_program.yojson_of_descriptor descriptor)
-  | Error "circle not found" ->
-    Lwt.return (Error (Rpc.not_found "circle not found"))
-  | Error e ->
-    Lwt.return (Error (rpc_error e))
+  Circle_view_capacity.with_slot descriptor_capacity
+    ~busy:(fun () -> Lwt.return (Error (Rpc.err 107 "circle program reader is busy; retry" None)))
+    (fun () ->
+      let* described =
+        Octra_circle_runtime.Circle_program.describe
+          ?snapshot
+          ~inspect_mode:Octra_core.Rule_graph.Active
+          ~table_mode ~float_mode store circle_id in
+      match described with
+      | Ok descriptor ->
+        ok (Octra_circle_runtime.Circle_program.yojson_of_descriptor descriptor)
+      | Error "circle not found" ->
+        Lwt.return (Error (Rpc.not_found "circle not found"))
+      | Error e ->
+        Lwt.return (Error (rpc_error e)))
 
 let info_public store ~circle_id =
   let open Lwt.Syntax in

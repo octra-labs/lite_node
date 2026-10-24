@@ -9,10 +9,12 @@ type tx_callbacks = {
   add_tx : Octra_core.Transaction.t -> (string, string) result;
   now : unit -> float;
   max_drift : float;
+  signing : unit -> Octra_core.Tx_signature.t;
 }
 
 type transport = {
   send_tx_gossip : string -> unit;
+  send_batch : (unit -> string option) list -> unit;
   broadcast_tx_gossip : string -> unit;
   report_bad_peer : string -> unit;
   close_peer : unit -> unit;
@@ -33,6 +35,7 @@ type node_deps = {
   add_tx : Octra_core.Transaction.t -> (string, string) result;
   now : unit -> float;
   max_drift : float;
+  signing : unit -> Octra_core.Tx_signature.t;
   driver_ref : Octra_consensus.C_driver.t option ref;
   resource_compute : Resource_compute_service.t option;
 }

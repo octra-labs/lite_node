@@ -73,6 +73,7 @@ type node_deps = {
   last_epoch_time : float ref;
   tree : Octra_core.Tree.t ref;
   stealth_in_epoch_counter : int ref;
+  stealth_defer_count : (string, int) Hashtbl.t;
   fhe_in_epoch_counter : int ref;
   swarm_opt : Octra_net.P2p_swarm.t option ref;
   get_meta : string -> string option;
@@ -316,6 +317,7 @@ let run_node (deps : node_deps) request =
             ~tree:deps.tree
             ~deferred_stealth_txs:request.deferred_stealth_txs
             ~stealth_in_epoch_counter:deps.stealth_in_epoch_counter
+            ~stealth_defer_count:deps.stealth_defer_count
             ~fhe_in_epoch_counter:deps.fhe_in_epoch_counter
             ~swarm_opt:deps.swarm_opt)
           Post.{

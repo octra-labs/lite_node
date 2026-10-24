@@ -96,7 +96,7 @@ type t = {
   mutable tags : tag_index;
   mutable split_epoch : int option;
   mutable gc_planning : bool;
-  mutable gc_need : int64 option;
+  mutable gc_need : (int * string * int64) option;
   tag_lock : Lwt_mutex.t;
   store_path : string;
   pvac_dir : string;
@@ -1009,11 +1009,11 @@ let pvac_is_bound t addr =
   | Some _
   | None -> Lwt.return false
 
-let get_pvac_pubkey ?snapshot t addr =
+let get_pvac_pubkey ?snapshot ?(registered = false) t addr =
   let unavailable reason =
-    match snapshot with
-    | None -> Lwt.fail_with reason
-    | Some _ -> Lwt.fail (Exec_resource.Unavailable Host)
+    match snapshot, registered with
+    | None, false -> Lwt.fail_with reason
+    | Some _, _ | None, true -> Lwt.fail (Exec_resource.Unavailable Host)
   in
   let* hash = read ?snapshot t (pvac_hash_path addr) in
   match hash with
@@ -1028,6 +1028,7 @@ let get_pvac_pubkey ?snapshot t addr =
       | None ->
         unavailable "pvac blob unavailable"
     end
+  | None when registered -> Lwt.return_none
   | None ->
     match read_file (pvac_legacy_path t addr), snapshot with
     | Some _, Some _ -> Lwt.fail (Exec_resource.Unavailable Host)
@@ -2750,7 +2751,8 @@ let pack_gc_status t =
   Lwt_mutex.with_lock t.tag_lock (fun () ->
     Lwt.return
       (t.split_epoch, Store.Gc.is_allowed t.repo,
-       t.gc_planning || not (Store.Gc.is_finished t.repo), t.gc_need))
+       t.gc_planning || not (Store.Gc.is_finished t.repo),
+       Option.map (fun (_, _, need) -> need) t.gc_need))
 
 type gc_start =
   | Gc_started of { floor : int; removed : int }
@@ -2923,9 +2925,13 @@ let clear_gc_plan t =
     t.gc_planning <- false;
     Lwt.return_unit)
 
-let save_gc_need t need =
+let gc_measure_key floor commit =
+  floor, Irmin.Type.to_string Store.Hash.t (Store.Commit.hash commit)
+
+let save_gc_need t ~floor ~commit need =
   Lwt_mutex.with_lock t.tag_lock (fun () ->
-    t.gc_need <- Some need;
+    let floor, hash = gc_measure_key floor commit in
+    t.gc_need <- Some (floor, hash, need);
     Lwt.return_unit)
 
 let start_pack_gc t ~keep ~floor ~commit current_epoch =
@@ -2967,7 +2973,7 @@ let start_pack_gc t ~keep ~floor ~commit current_epoch =
     | Some selected -> Lwt.return (Gc_wait (selected + keep))
     | None -> Lwt.return (Gc_missing floor))
 
-let collect_pack_at ?free t ~keep current_epoch =
+let collect_pack_at ?free ?(measure = measure_tree) t ~keep current_epoch =
   Lwt.catch
     (fun () ->
       if current_epoch <= 0 then Lwt.return (Gc_missing current_epoch)
@@ -2980,10 +2986,22 @@ let collect_pack_at ?free t ~keep current_epoch =
         | `Measure (floor, commit) ->
           Lwt.finalize
             (fun () ->
-              let* measure = measure_tree (Store.Commit.tree commit) in
-              let need = gc_space_need measure in
-              let* () = save_gc_need t need in
-              let free = Option.value ~default:(disk_free t.store_path) free in
+              let free_now () = match free with
+                | Some free -> free
+                | None -> disk_free t.store_path in
+              let free = free_now () in
+              if Int64.compare free gc_reserve < 0 then
+                Lwt.return (Gc_space { free; need = gc_reserve })
+              else
+              let* need = match t.gc_need with
+                | Some (saved_floor, hash, need)
+                  when (saved_floor, hash) = gc_measure_key floor commit -> Lwt.return need
+                | _ ->
+                  let* size = measure (Store.Commit.tree commit) in
+                  let need = gc_space_need size in
+                  let* () = save_gc_need t ~floor ~commit need in
+                  Lwt.return need in
+              let free = free_now () in
               if Int64.compare free need < 0 then
                 Lwt.return (Gc_space { free; need })
               else

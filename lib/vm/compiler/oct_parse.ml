@@ -1221,17 +1221,23 @@ let parse_import ts =
   in
   { imp_names = names; imp_path = path }
 
-let rec parse_fn_modifiers ts ~vis ~is_view ~is_pure ~is_payable ~nonreentrant funcs =
+module Function_names = Set.Make (String)
+
+let keep_function ts names funcs fn =
+  if Function_names.mem fn.fn_name !names then
+    perr ts ("duplicate function name = " ^ fn.fn_name);
+  names := Function_names.add fn.fn_name !names;
+  funcs := fn :: !funcs
+
+let rec parse_fn_modifiers ts ~names ~vis ~is_view ~is_pure ~is_payable ~nonreentrant funcs =
   match peek_token ts with
-  | TkView -> eat ts; parse_fn_modifiers ts ~vis ~is_view:true ~is_pure ~is_payable ~nonreentrant funcs
-  | TkPure -> eat ts; parse_fn_modifiers ts ~vis ~is_view ~is_pure:true ~is_payable ~nonreentrant funcs
-  | TkPayable -> eat ts; parse_fn_modifiers ts ~vis ~is_view:false ~is_pure:false ~is_payable:true ~nonreentrant funcs
-  | TkIdent "nonreentrant" -> eat ts; parse_fn_modifiers ts ~vis ~is_view ~is_pure ~is_payable ~nonreentrant:true funcs
+  | TkView -> eat ts; parse_fn_modifiers ts ~names ~vis ~is_view:true ~is_pure ~is_payable ~nonreentrant funcs
+  | TkPure -> eat ts; parse_fn_modifiers ts ~names ~vis ~is_view ~is_pure:true ~is_payable ~nonreentrant funcs
+  | TkPayable -> eat ts; parse_fn_modifiers ts ~names ~vis ~is_view:false ~is_pure:false ~is_payable:true ~nonreentrant funcs
+  | TkIdent "nonreentrant" -> eat ts; parse_fn_modifiers ts ~names ~vis ~is_view ~is_pure ~is_payable ~nonreentrant:true funcs
   | TkFn ->
     let fn = parse_function ts is_view is_pure is_payable ~nonreentrant vis in
-    if List.exists (fun prior -> String.equal prior.fn_name fn.fn_name) !funcs then
-      perr ts ("duplicate function name = " ^ fn.fn_name);
-    funcs := fn :: !funcs
+    keep_function ts names funcs fn
   | _ -> perr ts "expected fn after modifiers"
 
 let parse_contract ts =
@@ -1286,6 +1292,7 @@ let parse_contract ts =
   let errors = ref [] in
   let ctor = ref None in
   let funcs = ref [] in
+  let names = ref Function_names.empty in
   let forms = ref [] in
   let rec go () =
     skip_stmt_end ts;
@@ -1361,7 +1368,7 @@ let parse_contract ts =
         then perr ts "duplicate main declaration";
         forms := parse_main ts :: !forms
       end else
-        parse_fn_modifiers ts ~vis:Public ~is_view:false ~is_pure:false
+        parse_fn_modifiers ts ~names ~vis:Public ~is_view:false ~is_pure:false
           ~is_payable:false ~nonreentrant:false funcs;
       go ()
     | TkPrivate | TkInternal ->
@@ -1369,29 +1376,27 @@ let parse_contract ts =
         | TkPrivate -> eat ts; Private
         | TkInternal -> eat ts; Internal
         | _ -> Public in
-      parse_fn_modifiers ts ~vis ~is_view:false ~is_pure:false ~is_payable:false ~nonreentrant:false funcs;
+      parse_fn_modifiers ts ~names ~vis ~is_view:false ~is_pure:false ~is_payable:false ~nonreentrant:false funcs;
       go ()
     | TkView ->
       eat ts;
-      parse_fn_modifiers ts ~vis:Public ~is_view:true ~is_pure:false ~is_payable:false ~nonreentrant:false funcs;
+      parse_fn_modifiers ts ~names ~vis:Public ~is_view:true ~is_pure:false ~is_payable:false ~nonreentrant:false funcs;
       go ()
     | TkPure ->
       eat ts;
-      parse_fn_modifiers ts ~vis:Public ~is_view:false ~is_pure:true ~is_payable:false ~nonreentrant:false funcs;
+      parse_fn_modifiers ts ~names ~vis:Public ~is_view:false ~is_pure:true ~is_payable:false ~nonreentrant:false funcs;
       go ()
     | TkPayable ->
       eat ts;
-      parse_fn_modifiers ts ~vis:Public ~is_view:false ~is_pure:false ~is_payable:true ~nonreentrant:false funcs;
+      parse_fn_modifiers ts ~names ~vis:Public ~is_view:false ~is_pure:false ~is_payable:true ~nonreentrant:false funcs;
       go ()
     | TkIdent "nonreentrant" ->
       eat ts;
-      parse_fn_modifiers ts ~vis:Public ~is_view:false ~is_pure:false ~is_payable:false ~nonreentrant:true funcs;
+      parse_fn_modifiers ts ~names ~vis:Public ~is_view:false ~is_pure:false ~is_payable:false ~nonreentrant:true funcs;
       go ()
     | TkFn ->
       let fn = parse_function ts false false false Public in
-      if List.exists (fun prior -> String.equal prior.fn_name fn.fn_name) !funcs then
-        perr ts ("duplicate function name = " ^ fn.fn_name);
-      funcs := fn :: !funcs;
+      keep_function ts names funcs fn;
       go ()
     | TkIdent "form" ->
       if declaration <> ProgramDecl then

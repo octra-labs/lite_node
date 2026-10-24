@@ -281,7 +281,7 @@ let test_source_paths () =
       fail "Multi-file Program execution differs";
     with_chaindata (fun chaindata ->
       let verify main files =
-        Lwt_main.run (Octra_vm.Contract_rpc.verify_params ~store ~chaindata
+        Lwt_main.run (Octra_vm.Contract_rpc.verify_params ~chain_id:"record-test" ~store ~chaindata
           (`List [`String address; `Assoc ["main", main; "files", `List files]]))
       in
       let read () = Lwt_main.run (Octra_vm.Contract_rpc.source
@@ -291,7 +291,7 @@ let test_source_paths () =
         | Error _ -> ()
         | Ok _ -> fail "different source package was accepted"
       in
-      expect_error (Lwt_main.run (Octra_vm.Contract_rpc.verify ~store ~chaindata
+      expect_error (Lwt_main.run (Octra_vm.Contract_rpc.verify ~chain_id:"record-test" ~store ~chaindata
         ~addr:address ~source ~files_json:(Some [List.nth files 1])));
       begin
         match verify (`String main) files with
@@ -385,7 +385,7 @@ let test_source_program_verify () =
     with_chaindata (fun chaindata ->
       let verify value =
         Lwt_main.run
-          (Octra_vm.Contract_rpc.verify
+          (Octra_vm.Contract_rpc.verify ~chain_id:"record-test"
              ~store
              ~chaindata
              ~addr:address

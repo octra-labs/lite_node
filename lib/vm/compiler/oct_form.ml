@@ -60,7 +60,10 @@ let syn_name line column value =
   | Some found -> Ok found
   | None -> Error (located line column ("name is invalid = " ^ value))
 
-let rec typ line column = function
+module HostTypes = Type_graph.Host
+module CoreTypes = Type_graph.Core
+
+let type_step line column walk = function
   | TVoid -> Ok C_syn.TUnit
   | TInt -> Ok C_syn.TInt
   | TBool -> Ok C_syn.TBool
@@ -68,14 +71,16 @@ let rec typ line column = function
   | TU64 -> Ok (C_syn.TNum (C_type.Unsigned, Z.of_int 64))
   | TU128 -> Ok (C_syn.TNum (C_type.Unsigned, Z.of_int 128))
   | TU256 -> Ok (C_syn.TNum (C_type.Unsigned, Z.of_int 256))
-  | TTuple [left; right] ->
-    let* left = typ line column left in
-    let* right = typ line column right in
+  | TTuple [_; _] ->
+    let* left = walk [0; 0] in
+    let* right = walk [0; 1; 0] in
     Ok (C_syn.TPair (left, right))
   | value ->
     Error
       (located line column
         ("direct form type is unsupported = " ^ typ_to_string value))
+
+let typ line column value = HostTypes.mapper (type_step line column) value
 
 let mul = function
   | Once -> C_type.One
@@ -89,7 +94,20 @@ let syn_atom = function
   | C_eff.Close kind -> C_syn.AClose (C_nat.to_z kind)
 
 let same expected actual reason =
-  if expected = actual then Ok () else Error reason
+  let equal = CoreTypes.compare (fun node left right ->
+    match left, right with
+    | C_syn.TNum (ls, lb), C_syn.TNum (rs, rb) ->
+      if ls = rs && Z.equal lb rb then Some [] else None
+    | C_syn.TBytes left, C_syn.TBytes right
+    | C_syn.TCap left, C_syn.TCap right ->
+      if Z.equal left right then Some [] else None
+    | C_syn.TVec (ln, _), C_syn.TVec (rn, _)
+    | C_syn.TSeq (ln, _), C_syn.TSeq (rn, _) ->
+      if Z.equal ln rn then Some [node.Type_graph.at [1]] else None
+    | C_syn.TPair _, C_syn.TPair _
+    | C_syn.TSum _, C_syn.TSum _ -> Some [node.at [0]; node.at [1]]
+    | _ -> None) expected actual in
+  if equal then Ok () else Error reason
 
 let within_limit (value : core) =
   if value.nodes <= C_check.max_nodes then Ok value
@@ -741,24 +759,22 @@ and expr_atom program trail cache env value =
 let put name typ values =
   (name, typ) :: List.filter (fun (found, _) -> not (String.equal name found)) values
 
-let rec core_inputs line column binds env = function
+let converted_inputs line column binds env values =
+  let rec walk binds env = function
   | [] -> Ok (List.rev binds, env)
-  | (name, host) :: rest ->
+  | (name, converted) :: rest ->
     begin
-      match typ line column host with
-      | Error _ -> core_inputs line column binds env rest
+      match converted with
+      | Error _ -> walk binds env rest
       | Ok core ->
         let* key = syn_name line column name in
         let bind = C_syn.bind key C_type.Many core in
-        core_inputs line column (bind :: binds) ((name, key, core) :: env) rest
+        walk (bind :: binds) ((name, key, core) :: env) rest
     end
+  in
+  walk binds env values
 
-let strict program line column values term =
-  let* binds, env = core_inputs line column [] [] values in
-  let* value, _ = expr program [] [] env term in
-  Ok (binds, value)
-
-let rec host_typ = function
+let host_typ ?saved value = CoreTypes.mapper ?saved (fun walk -> function
   | C_syn.TInt -> Some TInt
   | C_syn.TBool -> Some TBool
   | C_syn.TBytes size when Z.equal size (Z.of_int 32) -> Some TBytes32
@@ -768,10 +784,24 @@ let rec host_typ = function
     Some TU128
   | C_syn.TNum (C_type.Unsigned, bits) when Z.equal bits (Z.of_int 256) ->
     Some TU256
-  | C_syn.TPair (left, right) ->
-    Option.bind (host_typ left) (fun left ->
-      Option.map (fun right -> TTuple [left; right]) (host_typ right))
-  | _ -> None
+  | C_syn.TPair _ ->
+    Option.bind (walk [0]) (fun left ->
+      Option.map (fun right -> TTuple [left; right]) (walk [1]))
+  | _ -> None) value
+
+type local = { host : typ; core : C_syn.typ option; copy : bool }
+
+let local host =
+  let core = Result.to_option (typ 0 1 host) in
+  let copy = Option.is_some (Option.bind core host_typ) in
+  { host; core; copy }
+
+let strict program line column values term =
+  let converted = List.map (fun (name, value) ->
+    name, match value.core with Some typ -> Ok typ | None -> Error "unsupported") values in
+  let* binds, env = converted_inputs line column [] [] converted in
+  let* value, _ = expr program [] [] env term in
+  Ok (binds, value)
 
 let rec host_infer program values = function
   | EInt _ -> Some TInt
@@ -783,7 +813,7 @@ let rec host_infer program values = function
   | EVar name ->
     begin
       match List.assoc_opt name values with
-      | Some value -> Some value
+      | Some value -> Some value.host
       | None ->
         Option.map
           (fun value -> value.c_typ)
@@ -861,12 +891,12 @@ let rec host_infer program values = function
     begin
       match host_infer program values input with
       | Some actual when Oct_types.compatible declared actual ->
-        host_infer program ((name, declared) :: values) body
+        host_infer program ((name, local declared) :: values) body
       | Some _ | None -> None
     end
   | ESplit (_, (left, _, left_typ), (right, _, right_typ), body) ->
     host_infer program
-      ((right, right_typ) :: (left, left_typ) :: values)
+      ((right, local right_typ) :: (left, local left_typ) :: values)
       body
   | EOrbit (_, turns, seed, (name, _, declared), body) ->
     begin
@@ -878,7 +908,7 @@ let rec host_infer program values = function
       match host_infer program values seed with
       | Some actual when turns_ok && Oct_types.compatible declared actual ->
         begin
-          match host_infer program ((name, declared) :: values) body with
+          match host_infer program ((name, local declared) :: values) body with
           | Some actual when Oct_types.compatible declared actual -> Some declared
           | Some _ | None -> None
         end
@@ -893,7 +923,7 @@ let rec host_infer program values = function
   | EAction (_, value) -> host_infer program values value
   | EUse value ->
     host_infer program
-      ((value.ux_bind, value.ux_typ) :: values)
+      ((value.ux_bind, local value.ux_typ) :: values)
       value.ux_body
   | EStoragePath _
   | EFieldProp _
@@ -901,9 +931,21 @@ let rec host_infer program values = function
   | EEnumVariant _ -> None
 
 let infer program line column values term =
-  match strict program line column values term with
-  | Ok (_, value) -> host_typ value.typ
-  | Error _ -> host_infer program values term
+  if List.exists (fun (name, value) ->
+    value.core <> None && not (C_syn.valid_name name)) values then
+    Option.map local (host_infer program values term)
+  else
+  let names = Oct_scope.references (fun _ -> true) [term] in
+  let used = Oct_scope.Names.elements names |> List.filter_map (fun name ->
+    Option.map (fun value -> name, value) (List.assoc_opt name values)) in
+  match strict program line column used term with
+  | Ok (_, value) ->
+    let saved = List.filter_map (fun (_, value) ->
+      if value.copy then Option.map (fun core -> core, Some value.host) value.core
+      else None) used |> Array.of_list in
+    let host = host_typ ~saved value.typ in
+    Option.map (fun host -> {host; core = Some value.typ; copy = true}) host
+  | Error _ -> Option.map local (host_infer program values term)
 
 let check_term program line column values term =
   let* binds, value = strict program line column values term in
@@ -975,7 +1017,7 @@ and check_stmt program line column values = function
     let* () = check_expr program line column values value in
     let local =
       match declared with
-      | Some value -> Some value
+      | Some value -> Some (local value)
       | None -> infer program line column values value
     in
     Ok (Option.fold ~none:values ~some:(fun typ -> put name typ values) local)
@@ -1031,7 +1073,7 @@ and check_stmt program line column values = function
   | SFor (name, first, last, body) ->
     let* () = check_expr program line column values first in
     let* () = check_expr program line column values last in
-    let* _ = check_stmts program line column (put name TInt values) body in
+    let* _ = check_stmts program line column (put name (local TInt) values) body in
     Ok values
   | SForEach (_, _, body) ->
     let* _ = check_stmts program line column values body in
@@ -1048,7 +1090,7 @@ and check_stmt program line column values = function
     Ok values
 
 let check_func program value =
-  let values = List.map (fun param -> param.p_name, param.p_typ) value.fn_params in
+  let values = List.map (fun param -> param.p_name, local param.p_typ) value.fn_params in
   let line = Oct_types.block_line value.fn_body in
   let* _ = check_stmts program line 1 values value.fn_body in
   Ok ()

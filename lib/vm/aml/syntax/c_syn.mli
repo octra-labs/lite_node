@@ -4,6 +4,7 @@
 type name
 
 val name : string -> name option
+val valid_name : string -> bool
 val slot : C_nat.t -> name
 val dslot : C_nat.t -> name
 val name_text : name -> string

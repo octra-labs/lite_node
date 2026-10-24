@@ -38,6 +38,9 @@ let inspect_mode backend env =
   | Ok fold -> fold.vm_bytes
   | Error reason -> raise (Policy_unavailable reason)
 
+let program_inputs env =
+  Rule_graph.program_inputs_at ~chain_id:env.Epoch_exec.chain_id ~epoch:env.epoch_id = Active
+
 let tree_hash root =
   match String.length root with
   | 32 -> root
@@ -64,7 +67,7 @@ let context ~program_trust ~object_cost backend env
       program_journal = Tx_effects.program effects;
       trusted_program_keys = program_trust;
       store = backend.Epoch_exec.store;
-      get_fhe_pubkey = Vm.live_fhe_pubkey backend.store;
+      get_fhe_pubkey = Vm.live_fhe_pubkey ~registered:(program_inputs env) backend.store;
       proof_mode = backend.proof_mode;
       fhe_work;
       proof_exec;
@@ -231,6 +234,7 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
         | Error reason -> Lwt.fail (Policy_unavailable reason)
         | Ok fold ->
           Vm.prepare_program_package
+            ~metered:(program_inputs env)
             ~records:fold.program_records
             ~proof_exec:fold.proof_exec
             ~preview:fold.fhe_work
@@ -371,6 +375,7 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
               | Ok fold -> fold.program_records
               | Error reason -> raise (Policy_unavailable reason) in
             Vm.run_program_upgrade_tx
+              ~metered:(program_inputs env)
               ~records
               runtime
               ~trusted_program_keys:program_trust

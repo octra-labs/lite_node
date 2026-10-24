@@ -13,4 +13,4 @@ val run :
   pre_state_hash:string ->
   pre_state_root:string ->
   Octra_core.Transaction.t ->
-  (string, string) result Lwt.t
+  (string, [ `Invalid of string | `Unavailable of string ]) result Lwt.t

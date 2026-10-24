@@ -108,6 +108,7 @@ type tx_deps = {
 }
 
 type gate_deps = {
+  registered : bool;
   expected_kat : unit -> string;
   stored_kat : string -> string option;
   set_kat : string -> string -> unit;
@@ -117,6 +118,7 @@ type gate_deps = {
 }
 
 type live_tx_args = {
+  registered : bool;
   strict : bool;
   math : bool;
   keyed : bool;
@@ -163,6 +165,7 @@ type live_tx_args = {
 }
 
 type live_ledger_tx_args = {
+  registered : bool;
   ledger : Octra_core.Ledger.t;
   field_policy : Private_ledger.field_policy;
   strict : bool;
@@ -211,6 +214,7 @@ let clear_preverify (deps : deps) tx_hash =
   deps.clear_defer_count tx_hash
 
 let kat_ok (deps : gate_deps) addr =
+  if deps.registered then true else
   let expected_kat = deps.expected_kat () in
   match deps.stored_kat addr with
   | None ->
@@ -257,6 +261,7 @@ let gate_reject deps tx =
 let live_tx_deps (args : live_tx_args) : tx_deps =
   let gate : gate_deps = {
     expected_kat = args.expected_kat;
+    registered = args.registered;
     stored_kat = args.stored_kat;
     set_kat = args.set_kat;
     log_backfill = args.log_backfill;
@@ -276,9 +281,9 @@ let live_tx_deps (args : live_tx_args) : tx_deps =
     defer_count = args.defer_count;
     set_defer_count = args.set_defer_count;
     clear_defer_count = args.clear_defer_count;
-    preverify_state = Preverify_cache.state;
+    preverify_state = Preverify_cache.state ~registered:args.registered;
     preverify_remove = Preverify_cache.remove;
-    preverify_ready = Preverify_cache.ready_result ~keyed:args.keyed ~math:args.math;
+    preverify_ready = Preverify_cache.ready_result ~registered:args.registered ~keyed:args.keyed ~math:args.math;
     log_cap_defer;
     log_defer;
     log_cache_hit;
@@ -312,6 +317,7 @@ let live_ledger_tx_deps (args : live_ledger_tx_args) : tx_deps =
     max_stealth_defer = args.max_stealth_defer;
     inline_verify_allowed = args.inline_verify_allowed;
     expected_kat = Octra_core.Pvac_registry.expected_kat;
+    registered = args.registered;
     stored_kat = Octra_core.Ledger.get_pvac_kat args.ledger;
     set_kat = Octra_core.Ledger.set_pvac_kat args.ledger;
     log_backfill = (fun addr ->
@@ -325,7 +331,7 @@ let live_ledger_tx_deps (args : live_ledger_tx_args) : tx_deps =
     defer_tx = args.defer_tx;
     reject = args.reject;
     plan = (fun tx ->
-      Octra_core.Private_ledger.stealth_plan
+      Octra_core.Private_ledger.stealth_plan ~registered:args.registered
         ~field_policy:args.field_policy
         ~cap:args.strict
         ~result_policy:(args.private_result_policy (args.current_epoch ()))
@@ -333,12 +339,12 @@ let live_ledger_tx_deps (args : live_ledger_tx_args) : tx_deps =
         tx);
     trace_cipher = args.trace_cipher;
     inline_range =
-      Octra_core.Private_ledger.stealth_inline_range ~keyed:args.keyed ~math:args.math
+      Octra_core.Private_ledger.stealth_inline_range ~registered:args.registered ~keyed:args.keyed ~math:args.math
         ~strict:args.strict
         args.ledger;
     accept_range = Octra_core.Private_ledger.stealth_accept_range;
     binding =
-      Octra_core.Private_ledger.stealth_binding ~keyed:args.keyed ~math:args.math
+      Octra_core.Private_ledger.stealth_binding ~registered:args.registered ~keyed:args.keyed ~math:args.math
         ~field_policy:args.field_policy
         ~strict:args.strict
         args.ledger;
@@ -454,14 +460,6 @@ let run (deps : deps) =
       | Failed_gate reason ->
         clear_preverify deps tx_hash;
         deps.reject "pre_verify_failed" (Printf.sprintf "reason = %s" reason)
-      | Timeout_gate reason ->
-        deps.clear_defer_count tx_hash;
-        deps.reject
-          "pre_verify_timeout"
-          (Printf.sprintf
-             "max_epochs = %d reason = %s"
-             deps.max_stealth_defer
-             reason)
       | Unavailable_gate unavailable ->
         deps.set_defer_count tx_hash unavailable.next_count;
         deps.log_defer

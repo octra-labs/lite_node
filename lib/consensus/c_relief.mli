@@ -21,6 +21,10 @@ val min_round : int
 
 val same_plan : mark -> mark -> bool
 
+val clock_limit :
+  chain_id:string -> height:int64 -> current:C_types.validator_set ->
+  activate_epoch:int64 -> target:C_types.validator_set -> fingerprint:string -> int option
+
 val decide :
   chain_id:string ->
   height:int64 ->

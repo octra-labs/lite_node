@@ -4,6 +4,7 @@
 type t
 
 val create :
+  registered:(unit -> bool) ->
   keyed:(unit -> bool) ->
   field_policy:(unit -> Octra_core.Private_ledger.field_policy) ->
   strict:(unit -> bool) ->

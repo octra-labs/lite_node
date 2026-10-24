@@ -54,6 +54,7 @@ type live_balance_op_args = {
 }
 
 type live_ledger_balance_op_args = {
+  registered : bool;
   ledger : Octra_core.Ledger.t;
   tx : Transaction.t;
   gate : unit -> Private_gate.reject option;

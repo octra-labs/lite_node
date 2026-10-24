@@ -457,7 +457,7 @@ program WorkCase {
         expect "preverify hashes differ from inputs" (tx_hashes = List.map T.hash txs);
         expect "preverify changed root" (state_root = root || state_root = root_raw root);
         batches := txs :: !batches;
-        W.run_many ~keyed:false ~field_policy:Core.Private_ledger.Unique_fields ~strict:false ~ledger
+        W.run_many ~registered:false ~keyed:false ~field_policy:Core.Private_ledger.Unique_fields ~strict:false ~ledger
           ~circle_preverify:(Node.Consensus_circle_preverify.run runtime) txs in
       let backend = Node.Consensus_proposal_preview_shell.node_backend
         ~program_trust:Octra_vm.Program_trust.empty ~rules
@@ -894,7 +894,7 @@ program WorkCase {
           validate_preverify_once = checked; preview;
           verify_address_pubkey = (fun ~addr ~pubkey ->
             Core.Crypto.Address.address_from_pubkey pubkey = addr);
-          verify_tx_signature = (fun tx ~pubkey -> T.verify tx pubkey);
+          verify_tx_signature = (fun ~signing tx ~pubkey -> Octra_core.Tx_signature.verify signing tx pubkey);
           verify_parent_commit = (fun ~epoch_id:_ -> function
             | Some value -> Core.Set_fold.read_parent ~chain_id:chain value
               |> Result.map (fun _ -> ())

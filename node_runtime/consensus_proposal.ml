@@ -262,7 +262,7 @@ type verify_proposal_deps = {
     unit;
   public_key_for_tx : Transaction.t -> string option;
   verify_address_pubkey : addr:string -> pubkey:string -> bool;
-  verify_tx_signature : Transaction.t -> pubkey:string -> bool;
+  verify_tx_signature : signing:Octra_core.Tx_signature.t -> Transaction.t -> pubkey:string -> bool;
   validator_pubkeys : int64 -> (string * string) list;
   read_local_ledger_root : unit -> string Lwt.t;
   preview :
@@ -342,7 +342,7 @@ type reject_reason =
 type verification_deps = {
   public_key_for_tx : Transaction.t -> string option;
   verify_address_pubkey : addr:string -> pubkey:string -> bool;
-  verify_tx_signature : Transaction.t -> pubkey:string -> bool;
+  verify_tx_signature : signing:Octra_core.Tx_signature.t -> Transaction.t -> pubkey:string -> bool;
 }
 
 type validator_pubkeys = (string * string) list
@@ -610,7 +610,7 @@ let receipt_root_matches ~header receipts_json =
 let short n s =
   String.sub s 0 (min n (String.length s))
 
-let invalid_signature deps tx =
+let invalid_signature deps ~signing tx =
   match deps.public_key_for_tx tx with
   | None ->
     Some (Invalid_tx_signature {
@@ -619,7 +619,7 @@ let invalid_signature deps tx =
     })
   | Some pubkey ->
     if deps.verify_address_pubkey ~addr:tx.from ~pubkey
-       && deps.verify_tx_signature tx ~pubkey then
+       && deps.verify_tx_signature ~signing tx ~pubkey then
       None
     else
       Some (Invalid_tx_signature {
@@ -627,8 +627,8 @@ let invalid_signature deps tx =
         from_addr = short 14 tx.from;
       })
 
-let verify_signatures deps txs =
-  List.find_map (invalid_signature deps) txs
+let verify_signatures deps ~signing txs =
+  List.find_map (invalid_signature deps ~signing) txs
 
 let verify_bundle deps ~limits ~header ~expected_tx_count txs receipts_json =
   let have = List.length txs in
@@ -687,7 +687,8 @@ let verify_bundle deps ~limits ~header ~expected_tx_count txs receipts_json =
             if not (within_limits ~limits inputs) then
               Error (Bundle_limit { totals = totals inputs; limits })
             else
-              match verify_signatures deps inputs with
+              match verify_signatures deps ~signing:(Octra_core.Tx_signature.at
+                ~chain_id:header.chain_id ~epoch:header.epoch_id) inputs with
               | Some bad -> Error bad
               | None ->
                 Ok {

@@ -16,21 +16,26 @@ import sys
 from pathlib import Path
 
 header = b'(* SPDX-License-Identifier: BSD-3-Clause *)\\n(* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)\\n\\n'
+c_header = b'// SPDX-License-Identifier: BSD-3-Clause\\n// Copyright (c) 2023-2026 Octra Labs <dev@octra.org>\\n\\n'
 paths = sorted(path for name in ('compiler', 'aml', 'policy', 'wire', 'runtime')
-    for path in Path(name).rglob('*') if path.is_file() and path.suffix in ('.ml', '.mli'))
+    for path in Path(name).rglob('*') if path.is_file() and path.suffix in ('.ml', '.mli', '.c', '.h'))
 digest = hashlib.sha256()
 for path in paths:
-    body = path.read_bytes().removeprefix(header).rstrip(b'\\n')
+    prefix = c_header if path.suffix in ('.c', '.h') else header
+    body = path.read_bytes().removeprefix(prefix).rstrip(b'\\n')
     item = hashlib.sha256(body).hexdigest()
     digest.update((item + '  ' + path.as_posix() + '\\n').encode())
 actual = digest.hexdigest()
-expected = 'b21391865660ba35426eaabc15e8d8a4d5a04a3754b73042bf57d5697fe108b6'
+expected = 'dc82575c6ce78ea308000118d83b80ba7006fc77cf06c66cc98902cc85382ec5'
 if actual != expected:
     sys.exit('source compiler content differs actual = ' + actual)
 print('let id = ' + repr(actual).replace(chr(39), chr(34)))"))))
 
 (library
  (name octra_vm)
+ (foreign_stubs
+  (language c)
+  (names type_index_stubs))
  (libraries
   octra_core
   octra_crypto_guard

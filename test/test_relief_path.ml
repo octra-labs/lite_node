@@ -341,9 +341,13 @@ let test_restart_split () =
         ~sign_fn:(sign member.C.address);
       List.iter (fun vote -> E.on_vote node.engine vote ~sign_fn:(sign member.address)) votes;
       check "two nodes lock" (node.engine.state.locked_value = Some value);
-      let precommit = drain node.engine |> List.find_map (function
-        | E.SendVote (v, _) when v.C.vote_type = Precommit -> Some v | _ -> None) |> Option.get in
-      check "proof saved before precommit" (Lwt_main.run (D.persist_precommit ~proposal node precommit))
+      let emitted = drain node.engine |> List.filter_map (function
+        | E.SendVote (vote, _) -> Some vote | _ -> None) in
+      check "locked node emitted precommit"
+        (List.exists (fun vote -> vote.C.vote_type = Precommit) emitted);
+      List.iter (fun vote ->
+        check "proof saved before precommit"
+          (Option.is_some (Lwt_main.run (D.saved_vote ~proposal node vote)))) emitted
     end;
     E.start_round node.engine 64;
     ignore (drain node.engine);

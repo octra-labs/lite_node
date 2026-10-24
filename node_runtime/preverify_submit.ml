@@ -43,9 +43,10 @@ type io = {
   strict : bool;
   math : bool;
   keyed : bool;
-  get_pvac_pubkey : string -> string option Lwt.t;
+  registered : bool;
+  get_pvac_pubkey : registered:bool -> string -> string option Lwt.t;
   sender_enc : string -> string;
-  start_task : keyed:bool -> math:bool -> string -> (unit -> task_result Lwt.t) -> admit;
+  start_task : registered:bool -> keyed:bool -> math:bool -> string -> (unit -> task_result Lwt.t) -> admit;
   verify_ranges :
     keyed:bool -> math:bool ->
     strict:bool ->
@@ -60,9 +61,10 @@ type launcher = {
   strict : unit -> bool;
   math : unit -> bool;
   keyed : unit -> bool;
-  get_pvac_pubkey : string -> string option Lwt.t;
+  registered : unit -> bool;
+  get_pvac_pubkey : registered:bool -> string -> string option Lwt.t;
   sender_enc : string -> string;
-  start_task : keyed:bool -> math:bool -> string -> (unit -> task_result Lwt.t) -> admit;
+  start_task : registered:bool -> keyed:bool -> math:bool -> string -> (unit -> task_result Lwt.t) -> admit;
   verify_ranges :
     keyed:bool -> math:bool ->
     strict:bool ->
@@ -132,11 +134,11 @@ let result_of_ranges ~keyed ~math ~strict ~sender_enc_snapshot = function
     Checked { delta_ok; balance_ok; strict; math; keyed; sender_enc_snapshot }
 
 let launch (io : io) =
-  io.start_task ~keyed:io.keyed ~math:io.math io.tx_hash (fun () ->
+  io.start_task ~registered:io.registered ~keyed:io.keyed ~math:io.math io.tx_hash (fun () ->
     let open Lwt.Syntax in
     let t0 = io.now () in
     Log.info "pre_verify" "start tx = %s from = %s" (short16 io.tx_hash) io.sender;
-    let* pk_opt = io.get_pvac_pubkey io.sender in
+    let* pk_opt = io.get_pvac_pubkey ~registered:io.registered io.sender in
     match pk_opt with
     | Some pubkey_blob ->
       Log.info "pre_verify" "pubkey loaded bytes = %d elapsed = %.1fs"
@@ -187,6 +189,7 @@ let launch_for_tx (launcher : launcher) ~tx_hash tx =
       strict;
       math;
       keyed;
+      registered = launcher.registered ();
       get_pvac_pubkey = launcher.get_pvac_pubkey;
       sender_enc = launcher.sender_enc;
       start_task = launcher.start_task;

@@ -961,7 +961,7 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
       let verify_record chaindata source =
         match
           Lwt_main.run
-            (Octra_vm.Contract_rpc.verify
+            (Octra_vm.Contract_rpc.verify ~chain_id:"record-test"
                ~store
                ~chaindata
                ~addr:address
@@ -990,7 +990,7 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
       let verify_input_rejected files reason =
         match
           Lwt_main.run
-            (Octra_vm.Contract_rpc.verify
+            (Octra_vm.Contract_rpc.verify ~chain_id:"record-test"
                ~store
                ~chaindata:(Option.get !chain)
                ~addr:address
@@ -1031,7 +1031,7 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
       let verify_files files =
         match
           Lwt_main.run
-            (Octra_vm.Contract_rpc.verify
+            (Octra_vm.Contract_rpc.verify ~chain_id:"record-test"
                ~store
                ~chaindata:(Option.get !chain)
                ~addr:address2
@@ -1365,7 +1365,7 @@ let () =
     | _ -> None
   in
   let linked_multi =
-    match Octra_vm.Aml_source.compile_multi ~syntax:Octra_vm.Oct_gen.Source multi_resolver "main.aml" with
+    match Octra_vm.Aml_source.compile_multi ~program_only:false ~syntax:Octra_vm.Oct_gen.Source multi_resolver "main.aml" with
     | Ok value -> value
     | Error error -> failwith ("linked multi: " ^ error)
   in

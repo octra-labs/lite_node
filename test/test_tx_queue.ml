@@ -58,7 +58,7 @@ let test_intake () = List.iter (fun duty ->
         compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
         settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
         marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
-        queue_head = (fun () -> None);
+        signing = (fun () -> Octra_core.Tx_signature.Historical); queue_head = (fun () -> None);
         duty_head = (fun () -> Some (10L, Octra_core.Rule_graph.Prior));
         preverify_admit = (fun tx -> seen := tx :: !seen; Ok ());
         save_drops = ignore; find_drop = (fun _ -> None); drops_by_addr = (fun _ ~limit:_ ~offset:_ -> [])} in
@@ -135,7 +135,7 @@ let test_circle_intake () =
         compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
         settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
         marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
-        queue_head = (fun () -> None);
+        signing = (fun () -> Octra_core.Tx_signature.Historical); queue_head = (fun () -> None);
         preverify_admit = (fun tx -> seen := tx :: !seen; Ok ());
         save_drops = (fun rows -> drops := rows @ !drops);
         find_drop = (fun _ -> None); drops_by_addr = (fun _ ~limit:_ ~offset:_ -> [])} in
@@ -225,7 +225,7 @@ let test_program_intake () =
           compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
           settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
           marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
-          queue_head = (fun () -> None);
+          signing = (fun () -> Octra_core.Tx_signature.Historical); queue_head = (fun () -> None);
           preverify_admit = (fun tx -> seen := tx :: !seen; Ok ());
           save_drops = (fun rows -> expect "unexpected queue drop" (rows = []));
           find_drop = (fun _ -> None); drops_by_addr = (fun _ ~limit:_ ~offset:_ -> [])} in
@@ -273,7 +273,7 @@ let test_deploy_intake () =
         compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
         settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
         marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
-        queue_head = (fun () -> None);
+        signing = (fun () -> Octra_core.Tx_signature.Historical); queue_head = (fun () -> None);
         save_drops = (fun rows -> expect "deploy replaced queue data" (rows = []));
         find_drop = (fun _ -> None); drops_by_addr = (fun _ ~limit:_ ~offset:_ -> [])} in
       let submit = Rest.add_tx_to_staging ~relay:false ~bft_mode:true runtime ledger in
@@ -385,7 +385,9 @@ let test_delivery () =
   let module Delivery = Octra_node_runtime.Set_delivery in
   let module Post = Octra_node_runtime.Set_post in
   let module Gossip = Octra_net.P2p_tx_gossip in
-  List.iter (fun (form, failure) -> Test_workspace.with_dir "tx_delivery" (fun dir ->
+  let throttled = Post.http_failure 429 in
+  expect "HTTP 429 is retryable" (match throttled with Post.Retry _ -> true | _ -> false);
+  List.iter (fun (form, failure, completion) -> Test_workspace.with_dir "tx_delivery" (fun dir ->
     let store = Lwt_main.run (Store.open_store (Filename.concat dir "store")) in
     Fun.protect ~finally:(fun () -> Pool.clear (); Lwt_main.run (Store.close store)) (fun () ->
       Pool.clear ();
@@ -400,7 +402,7 @@ let test_delivery () =
         compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
         settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
         marks_mode = (fun () -> Octra_core.Rule_graph.Prior);
-        queue_head = (fun () -> None);
+        signing = (fun () -> Octra_core.Tx_signature.Historical); queue_head = (fun () -> None);
         duty_head = (fun () -> Some (10L, Octra_core.Rule_graph.Prior));
         preverify_admit = (fun value ->
           checked := value :: !checked;
@@ -408,11 +410,18 @@ let test_delivery () =
         save_drops = ignore; find_drop = (fun _ -> None);
         drops_by_addr = (fun _ ~limit:_ ~offset:_ -> [])} in
       let frames, sent, warnings = ref [], ref [], ref [] in
+      let response, resolve = Lwt.task () in
+      let reason = match failure with
+        | Post.Retry reason | Post.Wait reason | Post.Refused reason -> reason in
       let network = Delivery.{
         broadcast = (fun frame -> frames := frame :: !frames);
         post = (fun value ->
+          expect "HTTP post starts after staging and gossip"
+            (Pool.find_by_hash (Tx.hash value) = Some value
+             && List.length !frames = List.length !sent + 1);
           sent := value :: !sent;
-          if List.length !sent = 1 then Lwt.return_error failure
+          if List.length !sent = 1 then
+            if completion = `Immediate then Lwt.return_error failure else response
           else Lwt.return_ok ());
       } in
       let clock, consumed = ref 0., ref false in
@@ -423,7 +432,7 @@ let test_delivery () =
         post = (fun _ -> failwith "duty delivery policy missing");
         warn = (fun reason -> warnings := reason :: !warnings);
       } in
-      Fun.protect ~finally:(fun () -> Post.stop post) (fun () ->
+      Fun.protect ~finally:(fun () -> Post.stop post; Lwt.cancel response) (fun () ->
         let stage = Delivery.stage ~bft_mode:true runtime ledger in
         expect "malformed duty has no retained item" (Result.is_error (stage {tx with signature = "bad"}));
         expect "malformed duty has no effects"
@@ -441,15 +450,45 @@ let test_delivery () =
         Lwt_main.run (Lwt.pause ());
         expect "first send retains prepared duty"
           (!sent = [tx] && !checked = [tx] && Post.pending post);
-        Pool.clear ();
-        clock := 1.;
-        Post.tick post;
-        Lwt_main.run (Lwt.pause ());
-        expect "retry restores identical signed duty"
-          (!sent = [tx; tx] && !checked = [tx; tx]
-           && Pool.find_by_hash (Tx.hash tx) = Some tx && Post.pending post);
-        expect "retry preserves transport warning" (!warnings = ["lost reply"]);
-        expect "each send broadcasts once" (List.length !frames = 2);
+        (match completion with
+         | `Immediate -> ()
+         | `Delayed | `Landed ->
+           expect "delayed HTTP retains staged and gossiped duty"
+             (Lwt.is_sleeping response && Pool.find_by_hash (Tx.hash tx) = Some tx
+              && List.length !frames = 1 && !warnings = []);
+           clock := 10.;
+           Post.tick post;
+           Lwt_main.run (Lwt.pause ());
+           expect "pending HTTP does not resend"
+             (Lwt.is_sleeping response && Post.pending post
+              && !sent = [tx] && List.length !frames = 1);
+           consumed := completion = `Landed;
+           Lwt.wakeup_later resolve (Error failure);
+           Lwt_main.run (Lwt.pause ()));
+        if completion = `Landed then begin
+          clock := 60.;
+          Post.tick post;
+          Lwt_main.run (Lwt.pause ());
+          expect "landed during HTTP retires without resend"
+            (not (Post.pending post) && !sent = [tx] && !checked = [tx]
+             && List.length !frames = 1 && !warnings = [])
+        end else begin
+          expect "HTTP failure retains staged duty"
+            (Post.pending post && Pool.find_by_hash (Tx.hash tx) = Some tx);
+          Pool.clear ();
+          clock := !clock +. 1.;
+          Post.tick post;
+          Lwt_main.run (Lwt.pause ());
+          expect "retry restores identical signed duty"
+            (!sent = [tx; tx] && !checked = [tx; tx]
+             && Pool.find_by_hash (Tx.hash tx) = Some tx && Post.pending post);
+          expect "retry preserves transport warning" (!warnings = [reason]);
+          expect "each send broadcasts once" (List.length !frames = 2);
+          consumed := true;
+          Post.tick post;
+          expect "landed duty retires without resend"
+            (not (Post.pending post) && !sent = [tx; tx])
+        end;
         List.iter (fun frame ->
           expect "duty gossip frame" (frame.Octra_net.P2p_frame.msg_type = Octra_net.P2p_frame.msg_tx_gossip);
           match Gossip.decode frame.payload with
@@ -457,10 +496,6 @@ let test_delivery () =
             expect "gossip and RPC use retained bytes"
               (hash = Tx.hash tx && tx_json = Yojson.Safe.to_string (Tx.to_yojson tx))
           | _ -> failwith "duty gossip decode") !frames;
-        consumed := true;
-        Post.tick post;
-        expect "landed duty retires without resend"
-          (not (Post.pending post) && !sent = [tx; tx]);
         let sent_count, frame_count = List.length !sent, List.length !frames in
         let refused = Lwt_main.run (Delivery.retry ~bft_mode:true runtime ledger network (alias tx)) in
         expect "changed retry identity is refused"
@@ -468,7 +503,11 @@ let test_delivery () =
         expect "changed retry has no network effects"
           (List.length !sent = sent_count && List.length !frames = frame_count)))))
     (List.concat_map (fun form ->
-      [form, Post.Retry "lost reply"; form, Post.Refused "lost reply"])
+      [form, Post.Retry "lost reply", `Immediate;
+       form, Post.Refused "lost reply", `Immediate;
+       form, throttled, `Immediate;
+       form, throttled, `Delayed;
+       form, throttled, `Landed])
       [(fun tx -> tx); alias; (fun tx -> {tx with Tx.public_key = None})])
 
 let test_proposal () =
@@ -564,7 +603,7 @@ let test_hold_intake () =
         let seen = ref [] in
         let rows = ref [] in
         let point () = Some (Int64.of_int !current) in
-        let runtime = Rest.{swarm_ref = ref None; queue_head = point;
+        let runtime = Rest.{swarm_ref = ref None; signing = (fun () -> Octra_core.Tx_signature.Historical); queue_head = point;
           compute_mode = (fun () -> Octra_core.Rule_graph.Prior);
           settle_mode = (fun () -> Octra_core.Rule_graph.Prior);
           marks_mode = (fun () -> Octra_core.Rule_graph.Prior);

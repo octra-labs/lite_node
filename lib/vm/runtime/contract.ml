@@ -32,7 +32,7 @@ let run_s p =
     let r = ref None in
     Lwt.on_any p (fun v -> r := Some (Ok v)) (fun e -> r := Some (Error e));
     let rec pump n =
-      if n > 100000 then failwith "run_s: irmin I/O timeout"
+      if n > 100000 then raise (Octra_core.Exec_resource.Unavailable Host)
       else match !r with
       | Some (Ok v) -> v
       | Some (Error e) -> raise e
@@ -112,7 +112,7 @@ let load_bytecode ?(trusted = []) ?(point_ops = false) store contract_addr =
   Option.map (fun loaded -> loaded.code)
     (load_loaded ~trusted ~point_ops store contract_addr)
 
-let load_async ?snapshot ~trusted ~point_ops store address =
+let read_async ?snapshot store address decode =
   let ( let* ) work next = Lwt.bind work (Octra_core.Exec_resource.protect next) in
   let* encoded = Octra_core.Store_irmin.load_bytecode ?snapshot store address in
   match encoded with
@@ -120,15 +120,13 @@ let load_async ?snapshot ~trusted ~point_ops store address =
   | Some encoded ->
     let* meta = Octra_core.Store_irmin.get_contract_meta ?snapshot store address in
     let mode = match meta with Some meta -> meta.check | None -> "binary" in
-    let work = Octra_core.Exec_resource.detach (fun () ->
+    Octra_core.Exec_resource.joined (fun () ->
       match Base64.decode encoded with
       | Error _ -> None
-      | Ok raw -> decode_mode ~trusted ~point_ops mode raw) () in
-    Lwt.finalize
-      (fun () -> Lwt.protected work)
-      (fun () -> Lwt.catch
-        (fun () -> Lwt.map (fun _ -> ()) (Lwt.protected work))
-        (fun _ -> Lwt.return_unit))
+      | Ok raw -> decode mode raw) ()
+
+let load_async ?snapshot ~trusted ~point_ops store address =
+  read_async ?snapshot store address (decode_mode ~trusted ~point_ops)
 
 let load_storage ?snapshot store contract_addr =
   run_s (Octra_core.Store_irmin.load_contract_storage ?snapshot store contract_addr)
@@ -203,6 +201,24 @@ let extract_methods bytecode =
       pc := !pc + 1
     done;
     List.rev !methods
+
+let method_cache : ((string * bool) list * int) Code_cache.t = Code_cache.create ()
+
+let methods_checked ~source ~trusted ~point_ops raw =
+  let key = Code_cache.key ~mode:(if source then 1 else 0) ~point_ops ~trusted raw in
+  Code_cache.run method_cache key (fun () ->
+    let checked = if source then Code_check.decode_program_source ~point_ops raw
+      else Code_check.decode_deploy ~trusted ~point_ops raw in
+    Result.map (fun checked ->
+      let code = Code_check.code checked in
+      extract_methods code, Array.length code) checked)
+
+let methods_async ?snapshot ~trusted ~point_ops store address =
+  read_async ?snapshot store address (fun mode raw ->
+    try methods_checked ~source:(mode = "source") ~trusted ~point_ops raw |> Result.to_option
+    with
+    | (Stack_overflow | Out_of_memory) as error -> raise error
+    | _ -> None)
 
 let extract_method_arity bytecode method_name =
   match find_dispatcher bytecode with

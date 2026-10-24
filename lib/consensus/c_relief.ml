@@ -156,6 +156,11 @@ let check_proof ~chain_id ~height current proof =
         end
     end
 
+let clock_limit ~chain_id ~height ~current ~activate_epoch ~target ~fingerprint =
+  if active ~chain_id ~height
+     && Result.is_ok (check_plan ~height ~current ~activate_epoch ~target ~fingerprint)
+  then Some min_round else None
+
 let decide ~chain_id ~height ~current ~activate_epoch ~target ~fingerprint
     ~proof =
   if not (active ~chain_id ~height) then Wait

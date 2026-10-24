@@ -94,13 +94,13 @@ let state_check math old_key source new_key target old_proof new_proof commitmen
         [T.EncryptOp; T.DecryptOp; T.StealthOp; T.ClaimOp];
       let blocked () =
         List.iter (fun (cipher_mode, strict) ->
-          let pool = K.create ~keyed:(fun () -> false) ~math:(fun () -> math)
+          let pool = K.create ~registered:(fun () -> false) ~keyed:(fun () -> false) ~math:(fun () -> math)
             ~field_policy:(fun () -> PL.Unique_fields) ~strict:(fun () -> strict)
             ~cipher_mode:(fun () -> cipher_mode) ledger in
           check "inactive pool does not queue proof"
             (K.admit pool (tx fields) = Octra_core.Preverify_availability.Unmanaged);
           check "inactive pool has no work" ((K.stats pool).pending = 0);
-          let result = run (PL.preverify_key_switch_artifact ~keyed:false ~math ~cipher_mode
+          let result = run (PL.preverify_key_switch_artifact ~registered:false ~keyed:false ~math ~cipher_mode
             ~field_policy:PL.Unique_fields ~strict ledger (tx fields)) in
           check "inactive proof refused" (match result with
             | Error failure -> failure.PL.reason = "unknown key_switch migration_mode = cipher_proof"
@@ -115,7 +115,7 @@ let state_check math old_key source new_key target old_proof new_proof commitmen
         let backend = if interrupt then
           {backend with E.flush_dirty = (fun () -> Lwt.fail_with "migration write interrupted")}
           else backend in
-        let transition = A.create ~keyed:false ~math ~preverify:None ~ledger ~epoch_id:1
+        let transition = A.create ~registered:false ~keyed:false ~math ~preverify:None ~ledger ~epoch_id:1
           ~owner_migration_mode:G.Active ~cipher_mode ~proof_mode:G.Active
           ~field_policy:Octra_core.Private_ledger.Unique_fields
           ~result_policy:Octra_core.Private_result_policy.Recoverable
@@ -158,9 +158,9 @@ let state_check math old_key source new_key target old_proof new_proof commitmen
       check "cached proof cannot bypass activation" (inactive.artifacts.confirmed = []);
       check "cached refusal preserves state" (capture () = before);
       blocked ();
-      let prepared = run (PL.key_switch_plan ~keyed:false ~math ~cipher_mode:G.Active
+      let prepared = run (PL.key_switch_plan ~registered:false ~keyed:false ~math ~cipher_mode:G.Active
         ~field_policy:PL.Unique_fields ~strict:true ledger (tx fields)) |> Result.get_ok in
-      let blocked_batch = run (Octra_core.Preverify_worker.run_many ~keyed:false ~math
+      let blocked_batch = run (Octra_core.Preverify_worker.run_many ~registered:false ~keyed:false ~math
         ~field_policy:PL.Unique_fields ~strict:true ~ledger
         ~prepared:(fun _ -> Lwt.return (Octra_core.Preverify_availability.Ready
           (PL.Prepared_key_switch prepared))) [tx fields]) in
@@ -175,7 +175,7 @@ let state_check math old_key source new_key target old_proof new_proof commitmen
             let counted = ref 0 in
             let open Lwt.Syntax in
             let* () = Octra_node_runtime.Consensus_epoch_key_switch_shell.run_live_ledger_tx
-              {ledger = fork; field_policy = PL.Unique_fields; strict = true; math; keyed = false;
+              {registered = false; ledger = fork; field_policy = PL.Unique_fields; strict = true; math; keyed = false;
                 cipher_mode = mode; legacy_replay = (fun _ -> failwith "unexpected history read");
                 gate = (fun () -> None);
                 reject_gate = (fun _ -> failwith "unexpected transaction gate");
@@ -341,7 +341,7 @@ let wallet_server ~keyed path =
             ~emission_policy:Octra_core.Emission_policy.Guard
             ~emission_schedule:(Octra_core.Emission_schedule.of_env_exn (fun _ -> None))
             ~validator_policy:(Octra_core.Validator_policy.of_env_exn (fun _ -> None)) store ledger in
-          let transition = A.create ~keyed ~math:true ~preverify:None ~ledger ~epoch_id:!epoch
+          let transition = A.create ~registered:false ~keyed ~math:true ~preverify:None ~ledger ~epoch_id:!epoch
             ~owner_migration_mode:G.Active ~cipher_mode:G.Active ~proof_mode:G.Active
             ~field_policy:PL.Unique_fields ~result_policy:Octra_core.Private_result_policy.Recoverable
             ~legacy_replay:(fun ~epoch:_ ~address:_ ~cipher:_ -> failwith "unexpected history read")

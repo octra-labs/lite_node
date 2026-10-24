@@ -153,7 +153,10 @@ let components ~epoch getenv =
      | Octra_core.Rule_graph.Active -> ["compute_settle", Octra_core.Compute_bill.consensus_id])
   @ (match Octra_core.Rule_graph.program_records_at ~chain_id ~epoch with
      | Octra_core.Rule_graph.Prior -> []
-     | Octra_core.Rule_graph.Active -> ["program_records", Octra_vm.Program_record.consensus_id])
+     | Octra_core.Rule_graph.Active -> ["program_records",
+       (if Octra_consensus.C_quorum_policy.round_wait
+          (Octra_consensus.C_quorum_policy.for_chain chain_id) (Int64.of_int epoch)
+        then Octra_vm.Program_record.consensus_id else Octra_vm.Program_record.released_id)])
   @ (match Octra_core.Rule_graph.proof_key_at ~chain_id ~epoch with
      | Octra_core.Rule_graph.Prior -> []
      | Octra_core.Rule_graph.Active -> ["proof_key", "pvac.proof.public_key.fields";
@@ -169,6 +172,12 @@ let components ~epoch getenv =
      | Octra_core.Rule_graph.Prior -> []
      | Octra_core.Rule_graph.Active ->
        ["cipher_migration", Octra_core.Private_ledger.cipher_proof_id])
+  @ (match Octra_core.Rule_graph.program_inputs_at ~chain_id ~epoch with
+     | Octra_core.Rule_graph.Prior -> []
+     | Octra_core.Rule_graph.Active -> ["program_inputs", Octra_core.Rule_graph.program_inputs_id])
+  @ (if Octra_consensus.C_quorum_policy.round_wait
+       (Octra_consensus.C_quorum_policy.for_chain chain_id) (Int64.of_int epoch) then
+       ["round_wait", Octra_consensus.C_quorum_policy.round_wait_id] else [])
 
 let derived ~epoch getenv =
   Octra_net.Hash_domain.hash_encoded "octra:consensus_standard" (fun buf ->
@@ -300,13 +309,21 @@ let () =
   let released = P.hash ~chain_id ~epoch:activation devnet_env in
   expect "stake profile epoch" (activation = 1_737_333);
   Printf.printf "event = stake_profile epoch = %d hash = %s\n%!" activation (raw_hex released);
-  expect "stake profile golden"
+  expect ("stake profile golden = " ^ raw_hex released)
     (raw_hex released = "dc5e4fe61b74b9ead7dcb6b2d56f851893be6796fc21b58b8db07db4a867d941");
   expect "stake profile differs" (released <> next);
   expect "stake profile components" (released = derived ~epoch:activation devnet_env);
+  let second = Option.get (Octra_consensus.C_quorum_policy.round_epoch ~chain_id) |> Int64.to_int in
+  expect "round profile epoch" (second = 1_740_000);
   List.iter (fun epoch ->
     expect "stake profile persists" (released = P.hash ~chain_id ~epoch devnet_env))
-    [activation + 1; max_int];
+    [activation + 1; second - 1];
+  let rounds = P.hash ~chain_id ~epoch:second devnet_env in
+  expect ("round profile golden = " ^ raw_hex rounds)
+    (raw_hex rounds = "023ced80e6e33bfdec1f5deb70c944d6faef9caf57b828e5312fe4c07d1cf5e1");
+  expect "round profile components" (rounds = derived ~epoch:second devnet_env);
+  expect "round profile persists" (rounds = P.hash ~chain_id ~epoch:max_int devnet_env);
+  expect "round profile switching" (P.switch_after ~chain_id ~applied_epoch:(second - 1));
   Printf.printf "event = next_profile epoch = 1688734 hash = %s\n%!" (raw_hex next);
   Printf.printf "event = proof_profile epoch = 1663000 hash = %s\n%!" (raw_hex proof);
   Printf.printf "event = exit_profile epoch = %d hash = %s\n" epoch (raw_hex current);

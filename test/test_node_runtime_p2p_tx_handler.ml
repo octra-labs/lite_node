@@ -50,11 +50,13 @@ let io ?(payload="") ?(has_tx=fun _ -> false) ?(find_tx=fun _ -> None)
     sender_pk;
     add_tx;
     send_payload = (fun payload -> sent := payload :: !sent);
+    send_batch = (List.iter (fun build -> Option.iter (fun payload -> sent := payload :: !sent) (build ())));
     broadcast_payload = (fun payload -> broadcast := payload :: !broadcast);
     report_bad_peer = (fun reason -> reported := reason :: !reported);
     close_peer = (fun () -> closed := true);
     now = (fun () -> 1000.0);
     max_drift;
+    signing = (fun () -> Octra_core.Tx_signature.Historical);
   } in
   io, sent, broadcast, reported, closed
 
@@ -296,10 +298,175 @@ let test_duty_wire_retry () =
     assert_true "admission refusal does not punish peer" (!reported = [] && not !closed))
     [Gossip.encode (Gossip.Tx { hash; tx_json }); legacy]
 
+let test_nested_message () =
+  let from, priv, pub = key () in
+  let to_, _, _ = key () in
+  let item = { (tx ~from ~to_ ~timestamp:1000.0) with public_key = Some pub }
+    |> signed ~priv in
+  let hash = Octra_core.Transaction.hash item in
+  let encoded = Yojson.Safe.to_string (Octra_core.Transaction.to_yojson item) in
+  let nested = String.make 20_000 '[' ^ "0" ^ String.make 20_000 ']' in
+  let tx_json = String.sub encoded 0 (String.length encoded - 1)
+    ^ ",\"extra\":" ^ nested ^ "}" in
+  List.iter (fun modern ->
+    List.iter (fun broken ->
+      let tx_json = if broken then tx_json ^ "?" else tx_json in
+      let payload = if modern then
+        Octra_net.P2p_tx_gossip.encode (Octra_net.P2p_tx_gossip.Tx {hash; tx_json})
+        else Octra_net.Oce1.encode (fun buffer -> Octra_net.Oce1.put_string buffer tx_json) in
+      let admitted = ref 0 in
+      let io, _, _, _, _ = io ~payload ~sender_pk:(fun _ -> Some pub)
+        ~add_tx:(fun actual ->
+          assert_true "nested field changed signed transaction" (actual = item);
+          incr admitted; Ok hash) () in
+      Octra_node_runtime.P2p_tx_handler.handle io;
+      assert_true (Printf.sprintf "nested gossip acceptance differs modern = %b broken = %b count = %d"
+        modern broken !admitted) (!admitted = if broken then 0 else 1)
+    ) [false; true]
+  ) [false; true];
+  List.iter (fun kind ->
+    assert_true "nested control payload accepted"
+      (Result.is_error (Octra_core.Bft_control_check.validate_message kind (Some nested))))
+    Octra_core.Transaction.[ValidatorBond; ValidatorReady; ValidatorSetUpdate; ValidatorEvidence];
+  List.iter (fun op_type -> assert_true "nested private payload accepted"
+    (not (Octra_node_runtime.Tx_view.encrypted_payload_ok
+      {item with op_type; encrypted_data = Some nested})))
+    Octra_core.Transaction.[EncryptOp; DecryptOp; StealthOp; ClaimOp; KeySwitch]
+
+let test_get_transport () =
+  let module N = Octra_net.P2p_conn in
+  let module F = Octra_net.P2p_frame in
+  let module G = Octra_net.P2p_tx_gossip in
+  let from, _, _ = key () and to_, _, _ = key () in
+  let item = tx ~from ~to_ ~timestamp:1000. in
+  let records = List.init 64 (fun index ->
+    let item = {item with Octra_core.Transaction.nonce = index + 1} in
+    Octra_core.Transaction.hash item, item) in
+  let hashes = List.map fst records in
+  let reads = ref 0 in
+  let source, _, _, _, _ = io ~payload:(G.encode (G.Get hashes))
+    ~has_tx:(fun hash -> List.mem_assoc hash records)
+    ~find_tx:(fun hash -> incr reads; List.assoc_opt hash records) () in
+  let run draining =
+    reads := 0;
+    let local, remote = Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+    let conn = N.create ~peer_class:Octra_net.P2p_frame_budget.Observer local
+      ~peer_id:"reader" ~addr:"local" ~direction:N.Inbound in
+    let deadline, wake = Lwt.wait () in
+    let pending = ref [] in
+    let source = {source with Octra_node_runtime.P2p_tx_handler.send_batch = (fun builders ->
+      let job = N.send_batch ~wait:(fun () -> Lwt.protected deadline) conn
+        ~msg_type:F.msg_tx_gossip builders in
+      pending := job :: !pending)} in
+    let handle () = Octra_node_runtime.P2p_tx_handler.handle_plan source in
+    if not draining then begin
+      for _ = 1 to 1000 do handle () done;
+      assert_true "Get eagerly serialized a blocked batch" (!reads = 1);
+      assert_true "Get retained excess frames" (List.length conn.tx_writes = 1);
+      assert_true "Get retained excess batches" (conn.tx_batches = 4);
+      assert_true "Get exceeded byte cap" (conn.tx_bytes <= N.tx_limit);
+      Lwt.wakeup wake ();
+      Lwt_main.run (let open Lwt.Syntax in
+        let* () = Lwt.pause () in
+        assert_true "transaction deadline closed peer" conn.connected;
+        assert_true "transaction deadline removed queued frame" (conn.tx_bytes > 0);
+        let* () = N.close conn in
+        let* () = Lwt.join !pending in
+        assert_true "closed Get retained bytes" (conn.tx_bytes = 0 && conn.tx_writes = []);
+        assert_true "closed Get retained batches" (conn.tx_batches = 0);
+        assert_true "closed Get retained queue" (Lwt_mvar.is_empty conn.write_queue);
+        Lwt_unix.close remote)
+    end else Lwt_main.run (let open Lwt.Syntax in
+      let notice = F.{msg_type = msg_tx_gossip; payload = G.encode (G.Inv hashes)} in
+      let sent = N.send_tx ~wait:(fun () -> Lwt.protected deadline) conn notice in
+      handle ();
+      handle ();
+      assert_true "Get built replies before pending transaction write" (!reads = 0);
+      let writer = N.write_loop conn in
+      let* prior = F.read_frame remote in
+      assert_true "pending transaction frame changed" (prior.payload = notice.payload);
+      let* () = Lwt_list.iter_s (fun hash ->
+        let* frame = F.read_frame remote in
+        let expected = G.encode (G.Tx {hash; tx_json = Yojson.Safe.to_string
+          (Octra_core.Transaction.to_yojson (List.assoc hash records))}) in
+        assert_true "honest Get wire changed" (frame.payload = expected);
+        Lwt.return_unit) (hashes @ hashes) in
+      let* () = Lwt.join !pending in
+      let* () = sent in
+      assert_true "honest batch lost replies" (!reads = 128 && conn.tx_batches = 0);
+      assert_true "honest batch retained bytes" (conn.tx_bytes = 0 && conn.tx_batches = 0);
+      let* () = N.close conn in let* () = writer in Lwt_unix.close remote)
+  in
+  run false;
+  run true
+
+let test_get_errors () =
+  let module N = Octra_net.P2p_conn in
+  let module F = Octra_net.P2p_frame in
+  let module G = Octra_net.P2p_tx_gossip in
+  let from, _, _ = key () and to_, _, _ = key () in
+  let item = tx ~from ~to_ ~timestamp:1000. in
+  let large = {item with Octra_core.Transaction.op_type = ProgramDeploy;
+    message = Some (String.make 5_030_000 'a')} in
+  let records = List.map (fun tx -> Octra_core.Transaction.hash tx, tx) [large; item] in
+  let local, remote = Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let conn = N.create ~peer_class:Octra_net.P2p_frame_budget.Validator local
+    ~peer_id:"reader" ~addr:"local" ~direction:N.Inbound in
+  let source, _, _, _, _ = io ~payload:(G.encode (G.Get (List.map fst records)))
+    ~has_tx:(fun hash -> List.mem_assoc hash records)
+    ~find_tx:(fun hash -> List.assoc_opt hash records) () in
+  let work = ref Lwt.return_unit in
+  let source = {source with Octra_node_runtime.P2p_tx_handler.send_batch = (fun builders ->
+    work := N.send_batch conn ~msg_type:F.msg_tx_gossip
+      ((fun () -> invalid_arg "local encoder error") :: builders))} in
+  Lwt_main.run (let open Lwt.Syntax in
+    let notice = F.{msg_type = msg_cons_vote; payload = "consensus"} in
+    let* () = N.send conn notice in
+    Octra_node_runtime.P2p_tx_handler.handle_plan source;
+    assert_true "local encoder failure closed peer" conn.connected;
+    let writer = N.write_loop conn in
+    let* prior = F.read_frame remote in
+    assert_true "encoder failure lost consensus queue" (prior = notice);
+    let* reply = F.read_frame remote in
+    assert_true "encoder failure lost next reply" (reply.payload = G.encode
+      (G.Tx {hash = Octra_core.Transaction.hash item;
+        tx_json = Yojson.Safe.to_string (Octra_core.Transaction.to_yojson item)}));
+    let* () = !work in
+    assert_true "encoder failure disconnected peer" conn.connected;
+    let* () = N.close conn in let* () = writer in Lwt_unix.close remote)
+
+let test_tx_deadline () =
+  let module N = Octra_net.P2p_conn in
+  let module F = Octra_net.P2p_frame in
+  List.iter (fun occupied ->
+    let local, remote = Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+    let conn = N.create ~peer_class:Octra_net.P2p_frame_budget.Validator local
+      ~peer_id:"reader" ~addr:"local" ~direction:N.Inbound in
+    let clock, wake = Lwt.wait () in
+    Lwt_main.run (let open Lwt.Syntax in
+      let vote = F.{msg_type = msg_cons_vote; payload = "consensus"} in
+      let tx = F.{msg_type = msg_tx_gossip; payload = "transaction"} in
+      let* () = if occupied then N.send conn vote else Lwt.return_unit in
+      let work = N.send_tx ~wait:(fun () -> Lwt.protected clock) conn tx in
+      Lwt.wakeup wake ();
+      let* () = Lwt.pause () in
+      assert_true "queue deadline closed consensus transport" conn.connected;
+      assert_true "queue deadline removed transferred transaction"
+        (Lwt.is_sleeping work = not occupied);
+      let writer = N.write_loop conn in
+      let* frame = F.read_frame remote in
+      assert_true "queue deadline changed frame" (frame = if occupied then vote else tx);
+      let* () = work in
+      assert_true "queue deadline leaked bytes" (conn.tx_bytes = 0);
+      let* () = N.close conn in let* () = writer in Lwt_unix.close remote)) [false; true]
+
 let () =
   Mirage_crypto_rng_unix.use_default ();
   test_inv_sends_get ();
   test_get_sends_tx ();
+  test_get_transport ();
+  test_get_errors ();
+  test_tx_deadline ();
   test_receive_broadcasts_inv ();
   test_drop_reports_and_closes ();
   test_seen_window ();
@@ -307,4 +474,5 @@ let () =
   test_signature_identity ();
   test_inv_repeat ();
   test_duty_wire_retry ();
+  test_nested_message ();
   print_endline "status = pass test = p2p_tx_handler"

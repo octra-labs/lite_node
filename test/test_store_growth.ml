@@ -236,7 +236,7 @@ let gc_case root =
       Lwt_main.run (write_changed store size 1 65 1);
       let before = disk_bytes path in
       let need =
-        match Lwt_main.run (S.collect_pack_at ~free:0L store ~keep:1 65) with
+        match Lwt_main.run (S.collect_pack_at ~free:S.gc_reserve store ~keep:1 65) with
         | S.Gc_space value -> value.need
         | _ -> fail "pack collection ignored zero free space"
       in

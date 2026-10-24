@@ -44,6 +44,7 @@ type node_refs = {
   tree : Tree.t ref;
   deferred_stealth_txs : Transaction.t list ref;
   stealth_in_epoch_counter : int ref;
+  stealth_defer_count : (string, int) Hashtbl.t;
   fhe_in_epoch_counter : int ref;
   swarm_opt : P2p_swarm.t option ref;
   save_drops : Staging.drop_record list -> unit;
@@ -51,13 +52,14 @@ type node_refs = {
 }
 
 let refs ~last_epoch_time ~tree ~deferred_stealth_txs
-    ~stealth_in_epoch_counter ~fhe_in_epoch_counter ~swarm_opt ~save_drops
+    ~stealth_in_epoch_counter ~stealth_defer_count ~fhe_in_epoch_counter ~swarm_opt ~save_drops
     ~confirmed_nonce =
   {
     last_epoch_time;
     tree;
     deferred_stealth_txs;
     stealth_in_epoch_counter;
+    stealth_defer_count;
     fhe_in_epoch_counter;
     swarm_opt;
     save_drops;
@@ -136,7 +138,10 @@ let node_deps refs =
     cleanup_dropped = Staging.cleanup_dropped;
     sweep_low_fee = (fun () -> ignore (Node_rest_facade.sweep_low_fee_stealth ()));
     retain_live_preverify = (fun () ->
-      Preverify_cache.retain (fun k -> Staging.find_by_hash k <> None));
+      let live hash = Option.is_some (Staging.find_by_hash hash) in
+      Preverify_cache.retain live;
+      Hashtbl.filter_map_inplace (fun hash count -> if live hash then Some count else None)
+        refs.stealth_defer_count);
     prune_preverify = Preverify_cache.prune;
     notify_staging_update = Node_rest_facade.notify_staging_update;
     peer_count = (fun () ->

@@ -80,9 +80,9 @@ let owner_checks samples =
     let module E = C.Epoch_exec in
     let operation = tx T.KeySwitch (fields samples.(0)) in
     let before = state ledger in
-    let old = run (PL.prepare_key_switch_plan ~keyed:false ~math:true
+    let old = run (PL.prepare_key_switch_plan ~registered:false ~keyed:false ~math:true
       ~field_policy:PL.Unique_fields ledger operation) |> get in
-    let prepared = run (PL.prepare_key_switch_plan ~keyed:true ~math:true
+    let prepared = run (PL.prepare_key_switch_plan ~registered:false ~keyed:true ~math:true
       ~field_policy:PL.Unique_fields ledger operation) in
     let root = run (L.hash ledger) |> PW.state_hash in
     let source = run (PW.source_binding ledger root operation) |> Result.get_ok in
@@ -92,7 +92,7 @@ let owner_checks samples =
     let gate = PC.create [receipt] in
     check "receipt validation failed"
       (run (PC.check_bound ledger gate [operation]) = Ok ());
-    let transition = PT.create ~preverify:(Some gate)
+    let transition = PT.create ~registered:false ~preverify:(Some gate)
       ~legacy_replay:(fun ~epoch:_ ~address:_ ~cipher:_ ->
         failwith "unexpected history read")
       ~ledger ~epoch_id:1 ~owner_migration_mode:C.Rule_graph.Active
@@ -129,20 +129,20 @@ let registration samples =
       let operation = tx T.KeySwitch (fields blob) in
       check "registration signature" (T.verify operation public_key);
       let before = state ledger in
-      let prepare keyed = run (PL.prepare_key_switch_plan ~keyed ~math:true
+      let prepare keyed = run (PL.prepare_key_switch_plan ~registered:false ~keyed ~math:true
         ~field_policy:PL.Unique_fields ledger operation) in
-      let verify keyed = run (PL.key_switch_plan ~keyed ~math:true
+      let verify keyed = run (PL.key_switch_plan ~registered:false ~keyed ~math:true
         ~field_policy:PL.Unique_fields ~strict:true ledger operation) in
       ignore (get (prepare false));
       ignore (get (verify false));
-      let artifact = run (PL.preverify_key_switch_artifact ~keyed:false ~math:true
+      let artifact = run (PL.preverify_key_switch_artifact ~registered:false ~keyed:false ~math:true
         ~field_policy:PL.Unique_fields ~strict:true ledger operation) |> get in
-      let reused = run (PL.bind_key_switch_artifact ~keyed:true ~math:true
+      let reused = run (PL.bind_key_switch_artifact ~registered:false ~keyed:true ~math:true
         ~field_policy:PL.Unique_fields ~strict:true ledger operation artifact) in
       check "prior artifact reused" (reused = PL.Key_switch_source_changed);
       refused_series (prepare true);
       refused_series (verify true);
-      let applied = run (PL.apply_key_switch ~keyed:true ~math:true
+      let applied = run (PL.apply_key_switch ~registered:false ~keyed:true ~math:true
         ~field_policy:PL.Unique_fields ~strict:true ledger operation) in
       check "invalid registration applied" (match applied with
         | PL.Key_switch_rejected {failure; consume_nonce = false} ->
@@ -209,10 +209,10 @@ let composition samples =
   with_ledger "key_owner_cache" (fun ledger ->
     let operation = tx T.KeySwitch (fields samples.(2) @ other_owner) in
     let before = state ledger in
-    ignore (get (run (PL.prepare_key_switch_plan ~keyed:true ~math:true
+    ignore (get (run (PL.prepare_key_switch_plan ~registered:false ~keyed:true ~math:true
       ~field_policy:PL.Unique_fields ~cap:false ledger operation)));
     check "prepared owner bypassed" (match
-      run (PL.apply_key_switch ~keyed:true ~math:true
+      run (PL.apply_key_switch ~registered:false ~keyed:true ~math:true
         ~field_policy:PL.Unique_fields ~strict:false ledger operation) with
       | PL.Key_switch_rejected {failure; consume_nonce = false} ->
         failure.tag = "key_switch_rejected"
@@ -231,7 +231,7 @@ let composition samples =
     let apply first second =
       let operation = tx T.KeySwitch (migration first second) in
       check "switch signature" (T.verify operation public_key);
-      run (PL.apply_key_switch ~keyed:true ~math:true ~cipher_mode:C.Rule_graph.Active
+      run (PL.apply_key_switch ~registered:false ~keyed:true ~math:true ~cipher_mode:C.Rule_graph.Active
         ~field_policy:PL.Unique_fields ~strict:true ledger operation) in
     let wrong_owner =
       tx T.KeySwitch (fields samples.(2) @ other_owner @ [
@@ -241,7 +241,7 @@ let composition samples =
         "new_zero_proof", `String new_proof;
         "amount_commitment", `String commitment]) in
     check "other key owner accepted" (match
-      run (PL.apply_key_switch ~keyed:true ~math:true ~cipher_mode:C.Rule_graph.Active
+      run (PL.apply_key_switch ~registered:false ~keyed:true ~math:true ~cipher_mode:C.Rule_graph.Active
         ~field_policy:PL.Unique_fields ~strict:true ledger wrong_owner) with
       | PL.Key_switch_rejected {failure; consume_nonce = false} ->
         failure.tag = "key_switch_rejected"
@@ -254,7 +254,7 @@ let composition samples =
     Option.iter (fun foreign ->
       let operation = tx T.KeySwitch (fields samples.(2) @ foreign) in
       check "foreign secret accepted" (match
-        run (PL.apply_key_switch ~keyed:true ~math:true
+        run (PL.apply_key_switch ~registered:false ~keyed:true ~math:true
           ~cipher_mode:C.Rule_graph.Active ~field_policy:PL.Unique_fields
           ~strict:true ledger operation) with
         | PL.Key_switch_rejected {failure; consume_nonce = false} ->
@@ -263,7 +263,7 @@ let composition samples =
       check "foreign secret changed state" (state ledger = before)) foreign_owner;
     let missing_owner = tx T.KeySwitch (fields samples.(2)) in
     check "missing owner accepted" (match
-      run (PL.apply_key_switch ~keyed:true ~math:true ~cipher_mode:C.Rule_graph.Active
+      run (PL.apply_key_switch ~registered:false ~keyed:true ~math:true ~cipher_mode:C.Rule_graph.Active
         ~field_policy:PL.Unique_fields ~strict:true ledger missing_owner) with
       | PL.Key_switch_rejected {failure; consume_nonce = false} ->
         failure.reason = "key ownership proof is required"
@@ -311,7 +311,7 @@ let composition samples =
         "blinding", `String (raw delta_blind |> b64)] in
       let operation = tx ~nonce:2 ~amount:(Z.of_int 5) T.DecryptOp fields in
       check "decrypt signature" (T.verify operation public_key);
-      run (PL.apply_decrypt ~keyed:true ~math:true ~field_policy:PL.Unique_fields
+      run (PL.apply_decrypt ~registered:false ~keyed:true ~math:true ~field_policy:PL.Unique_fields
         ~strict:true ledger operation) in
     run (L.set_pvac_pubkey ledger address samples.(4));
     let invalid_before = state ledger in
@@ -377,7 +377,7 @@ let stored_switch samples =
       "amount_commitment", `String commitment;
       "blinding", `String (b64 (raw blind))] in
     check "stored key decrypt accepted" (match
-      run (PL.apply_decrypt ~keyed:true ~math:true
+      run (PL.apply_decrypt ~registered:false ~keyed:true ~math:true
         ~field_policy:PL.Unique_fields ~strict:true ledger withdraw) with
       | Error failure -> failure.PL.tag = "bad_zero_proof"
       | Ok _ -> false);
@@ -388,7 +388,7 @@ let stored_switch samples =
       "old_zero_proof", `String old_proof;
       "new_zero_proof", `String new_proof;
       "amount_commitment", `String commitment] in
-    let apply proof = run (PL.apply_key_switch ~keyed:true ~math:true
+    let apply proof = run (PL.apply_key_switch ~registered:false ~keyed:true ~math:true
       ~cipher_mode:C.Rule_graph.Active ~field_policy:PL.Unique_fields
       ~strict:true ledger (tx T.KeySwitch (migration proof))) in
     check "old transcript accepted" (match apply prior_proof with

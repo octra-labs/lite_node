@@ -8,11 +8,13 @@ type tx_deps = {
   sender_pk : Octra_core.Transaction.t -> string option;
   add_tx : Octra_core.Transaction.t -> (string, string) result;
   send_payload : string -> unit;
+  send_batch : (unit -> string option) list -> unit;
   broadcast_payload : string -> unit;
   report_bad_peer : string -> unit;
   close_peer : unit -> unit;
   now : unit -> float;
   max_drift : float;
+  signing : unit -> Octra_core.Tx_signature.t;
 }
 
 type deps = {

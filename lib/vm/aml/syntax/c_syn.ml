@@ -11,16 +11,19 @@ let alpha code =
 
 let digit code = code >= Char.code '0' && code <= Char.code '9'
 
-let name text =
+let name_first code = alpha code || code = Char.code '_'
+
+let rec name_rest text len index =
+  index = len ||
+    (let code = Char.code (String.get text index) in name_first code || digit code)
+    && name_rest text len (index + 1)
+
+let valid_name text =
   let len = String.length text in
-  let first code = alpha code || code = Char.code '_' in
-  let rest code = first code || digit code in
-  let rec walk index =
-    index = len || rest (Char.code (String.get text index)) && walk (index + 1)
-  in
-  if len = 0 || len > name_max || not (first (Char.code (String.get text 0))) then None
-  else if walk 1 then Some text
-  else None
+  len > 0 && len <= name_max && name_first (Char.code (String.get text 0))
+  && name_rest text len 1
+
+let name text = if valid_name text then Some text else None
 
 let slot id = "$" ^ C_nat.text id
 let dslot id = "$d" ^ C_nat.text id

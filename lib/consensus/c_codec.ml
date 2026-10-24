@@ -177,13 +177,14 @@ let decode_round_fetch payload =
     { chain_id; epoch_id; after_round; through_round }) payload
 
 let encode_validator_set validator_set =
+  let weights = weight_index validator_set in
   O.encode (fun buf ->
     O.put_bool buf validator_set.weighted;
     O.put_list
       (fun buf (validator : validator_info) ->
         O.put_string buf validator.address;
         O.put_bytes buf validator.pubkey;
-        match weight_of_addr validator_set validator.address with
+        match String_map.find_opt validator.address weights with
         | Some weight -> O.put_string buf (Z.to_string weight)
         | None -> failwith "consensus codec: validator weight missing")
       buf
@@ -240,11 +241,13 @@ let decode_validator_set payload =
           match make_weighted_validator_set authors with
           | Error reason -> failwith ("consensus codec: author " ^ reason)
           | Ok checked ->
+            let addresses, pubkeys = List.fold_left (fun (addresses, pubkeys) voter ->
+              String_set.add voter.address addresses, String_set.add voter.pubkey pubkeys)
+              (String_set.empty, String_set.empty) validators.validators in
             if height < 0L || not weighted
               || List.exists (fun (member, _) ->
-                is_validator validators member.address
-                || List.exists (fun voter -> voter.pubkey = member.pubkey)
-                     validators.validators) authors then
+                String_set.mem member.address addresses
+                || String_set.mem member.pubkey pubkeys) authors then
               failwith "consensus codec: author context differs";
             {validators with authors = Some (height, weights_of_set checked)})
       payload
@@ -667,13 +670,19 @@ let encode_catchup_range_response_v1 (r : catchup_range_response) =
     O.put_string buf r.responder_addr;
     O.put_string buf r.signature)
 
-let decode_catchup_range_response_v1 payload =
+let catchup_reply_header payload =
+  let cursor = O.make_cursor payload in
+  let chain_id = get_string max_chain_id_bytes cursor in
+  let request_id = get_string max_request_id_bytes cursor in
+  chain_id, request_id
+
+let decode_catchup_range_response_v1 ?(max_records = max_catchup_records) payload =
   O.decode (fun c ->
     let chain_id = get_string max_chain_id_bytes c in
     let request_id = get_string max_request_id_bytes c in
     let status = get_string max_status_bytes c in
     let error_code = O.get_option (get_string max_error_bytes) c in
-    let records = O.get_list_bounded ~max:max_catchup_records decode_catchup_epoch_record_v1 c in
+    let records = O.get_list_bounded ~max:(min max_records max_catchup_records) decode_catchup_epoch_record_v1 c in
     let next_epoch = O.get_option O.get_u64 c in
     let responder_addr = get_string max_addr_bytes c in
     let signature = get_exact_string max_signature_bytes c in
@@ -690,13 +699,13 @@ let encode_catchup_range_response_v2 (r : catchup_range_response) =
     O.put_string buf r.responder_addr;
     O.put_string buf r.signature)
 
-let decode_catchup_range_response_v2 payload =
+let decode_catchup_range_response_v2 ?(max_records = max_catchup_records) payload =
   O.decode (fun c ->
     let chain_id = get_string max_chain_id_bytes c in
     let request_id = get_string max_request_id_bytes c in
     let status = get_string max_status_bytes c in
     let error_code = O.get_option (get_string max_error_bytes) c in
-    let records = O.get_list_bounded ~max:max_catchup_records decode_catchup_epoch_record_v2 c in
+    let records = O.get_list_bounded ~max:(min max_records max_catchup_records) decode_catchup_epoch_record_v2 c in
     let next_epoch = O.get_option O.get_u64 c in
     let responder_addr = get_string max_addr_bytes c in
     let signature = get_exact_string max_signature_bytes c in

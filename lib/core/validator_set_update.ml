@@ -342,7 +342,7 @@ let make_weighted ~source_epoch ~activate_epoch members =
 let of_message = function
   | None -> Error "validator_set_update requires message payload"
   | Some payload ->
-    try payload |> Yojson.Safe.from_string |> of_yojson
+    try payload |> Json_tree.read |> of_yojson
     with exn -> Error (Printexc.to_string exn)
 
 let to_string t =
@@ -540,13 +540,13 @@ let ready_of_yojson json =
 let ready_of_message = function
   | None -> Error "validator_ready requires message payload"
   | Some payload ->
-    try payload |> Yojson.Safe.from_string |> ready_of_yojson
+    try payload |> Json_tree.read |> ready_of_yojson
     with exn -> Error (Printexc.to_string exn)
 
 let ready_ext_of_message = function
   | None -> Error "validator_ready requires message payload"
   | Some payload ->
-    try payload |> Yojson.Safe.from_string |> ready_ext_of_yojson
+    try payload |> Json_tree.read |> ready_ext_of_yojson
     with exn -> Error (Printexc.to_string exn)
 
 let ready_to_string r =

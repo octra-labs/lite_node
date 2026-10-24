@@ -1,14 +1,6 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-type t = {
-  epoch : int64;
-  root : string;
-  declared_count : int32;
-  producer : string;
-  txs : Octra_core.Transaction.t list;
-}
-
 type observer_event =
   | Silent
   | Ignored of {
@@ -18,52 +10,33 @@ type observer_event =
       producer : string;
     }
 
-let tx_count t =
-  List.length t.txs
-
 let root_short root =
   if String.length root >= 16 then
     String.sub root 0 8 ^ ".." ^ String.sub root (String.length root - 8) 8
   else root
 
-let producer_short t =
-  String.sub t.producer 0 (min 14 (String.length t.producer))
-
-let tx_of_json tx_json =
-  match Octra_core.Tx_payload.decode_admit (Yojson.Safe.from_string tx_json) with
-  | Ok tx -> tx
-  | Error e -> failwith (Printf.sprintf "tx decode: %s" e)
-
-let parse payload =
-  let c = Octra_net.Oce1.make_cursor payload in
-  let epoch = Octra_net.Oce1.get_u64 c in
-  let root = Octra_net.Oce1.get_string c in
-  let declared_count = Octra_net.Oce1.get_u32 c in
-  let producer = Octra_net.Oce1.get_string c in
-  let tx_count = Int32.to_int (Octra_net.Oce1.get_u32 c) in
-  let txs =
-    List.init tx_count (fun _ ->
-      Octra_net.Oce1.get_string c |> tx_of_json)
-  in
-  {
-    epoch;
-    root;
-    declared_count;
-    producer;
-    txs;
-  }
-
 let observer_event ~observer payload =
-  try
-    let broadcast = parse payload in
-    if observer then
-      Ok (Ignored {
-        epoch = Int64.to_int broadcast.epoch;
-        tx_count = tx_count broadcast;
-        root = root_short broadcast.root;
-        producer = producer_short broadcast;
-      })
-    else
-      Ok Silent
-  with exn ->
-    Error (Printexc.to_string exn)
+  if not observer then Ok Silent
+  else try
+    let c = Octra_net.Oce1.make_cursor payload in
+    let text () =
+      let length = Octra_net.Oce1.get_u32_int c in
+      if length < 0 || length > 256 then failwith "epoch header field exceeds limit";
+      Octra_net.Oce1.get_raw c length
+    in
+    let epoch = Octra_net.Oce1.get_u64 c in
+    let root = text () in
+    let _ = Octra_net.Oce1.get_u32 c in
+    let producer = text () in
+    let count = Octra_net.Oce1.get_u32 c in
+    if epoch < 0L || epoch > Int64.of_int max_int || count < 0l then
+      failwith "epoch header count is invalid";
+    Ok (Ignored {
+      epoch = Int64.to_int epoch;
+      tx_count = Int32.to_int count;
+      root = root_short root;
+      producer = String.sub producer 0 (min 14 (String.length producer));
+    })
+  with
+  | Out_of_memory | Stack_overflow as error -> raise error
+  | _ -> Error "epoch_header_decode"

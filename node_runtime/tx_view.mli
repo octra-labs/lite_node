@@ -327,6 +327,7 @@ val pre_route_check :
   (unit, string * string) result
 
 val signature_check :
+  signing:Octra_core.Tx_signature.t ->
   account_public_key:string option ->
   Octra_core.Transaction.t ->
   (unit, string * string) result
@@ -352,6 +353,7 @@ val preverify_stealth_payload :
   Octra_core.Crypto.PrivateTransferV4.t option
 
 type preverify_unavailable =
+  | Local_resource of Octra_core.Exec_resource.resource
   | Compute_queue_busy
   | Proof_queue_busy
   | Proof_worker_unavailable of string
@@ -391,6 +393,7 @@ val post_signature_check :
   (unit, string * string) result
 
 val submit_signature_check :
+  signing:Octra_core.Tx_signature.t ->
   account_public_key:string option ->
   preverify_has_capacity:bool ->
   preverify_pending:int ->

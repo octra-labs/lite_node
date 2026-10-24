@@ -217,14 +217,14 @@ let node_routes h =
 let find method_name routes =
   List.assoc_opt method_name routes
 
-let env_seconds name fallback =
+let env_seconds name default =
   match Sys.getenv_opt name with
   | Some s ->
     begin
-      try (float_of_int (int_of_string s)) /. 1000.0 with _ -> fallback
+      try (float_of_int (int_of_string s)) /. 1000.0 with _ -> default
     end
   | None ->
-    fallback
+    default
 
 let handle_request meta req ctx routes =
   match find req.Rpc.method_ routes with
@@ -263,6 +263,20 @@ let handle_request meta req ctx routes =
        | Ok v -> Rpc.Result (v, req.id)
        | Error rpc_err -> Rpc.Error_ (rpc_err, req.id))
 
+let batch_plan requests =
+  let _, plan = List.fold_left (fun (remaining, plan) request ->
+    let metered = match request with
+      | Ok req -> (match req.Rpc.method_ with
+        | "octra_programAbi" | "octra_contractAbi"
+        | "circle_program_info" | "octra_circleProgramInfo"
+        | "circle_program_info_auth" | "octra_circleProgramInfoAuth" -> true
+        | _ -> false)
+      | Error _ -> false in
+    let allowed = not metered || remaining > 0 in
+    let remaining = if metered && allowed then remaining - 1 else remaining in
+    remaining, (allowed, request) :: plan) (4, []) requests in
+  List.rev plan
+
 let process_body meta body ctx routes =
   match Rpc.parse_body body with
   | Error e ->
@@ -277,14 +291,17 @@ let process_body meta body ctx routes =
     let* results =
       Lwt_list.map_s
         (function
-         | Ok req ->
-           let* resp = handle_request meta req ctx routes in
+         | allowed, Ok req ->
+           let* resp =
+             if not allowed then
+               Lwt.return (Rpc.Error_ (Rpc.err 107 "program read batch limit is 4" None, req.Rpc.id))
+             else handle_request meta req ctx routes in
            Lwt.return (Rpc_response_limit.batch_item ~count resp)
-         | Error e ->
+         | _, Error e ->
            Lwt.return
              (Rpc_response_limit.batch_item
                 ~count
                 (Rpc.Error_ (e, `Null))))
-        reqs
+        (batch_plan reqs)
     in
     Lwt.return (`List results)

@@ -56,6 +56,7 @@ type live_tx_args = {
 }
 
 type live_ledger_tx_args = {
+  registered : bool;
   ledger : Octra_core.Ledger.t;
   field_policy : Private_ledger.field_policy;
   strict : bool;
@@ -143,14 +144,14 @@ let live_tx_deps args =
 let live_ledger_tx_deps args =
   live_tx_deps {
     claim_plan =
-      Octra_core.Private_ledger.claim_plan ~keyed:args.keyed ~math:args.math
+      Octra_core.Private_ledger.claim_plan ~registered:args.registered ~keyed:args.keyed ~math:args.math
         ~field_policy:args.field_policy
         ~strict:args.strict
         args.ledger;
     debit = (fun tx fee nonce ->
       Octra_core.Ledger.debit args.ledger tx.Transaction.from fee nonce);
     balance_plan = (fun tx plan ->
-      Octra_core.Private_ledger.claim_balance_plan
+      Octra_core.Private_ledger.claim_balance_plan ~registered:args.registered
         ~cap:args.strict
         ~result_policy:(args.private_result_policy (args.current_epoch ()))
         args.ledger

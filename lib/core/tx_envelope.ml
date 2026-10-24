@@ -83,7 +83,8 @@ let check_epoch ~chain_id ~epoch txs =
     (Int64.min (Int64.of_int max_int) epoch)) in
   let* () = check_compute ~settle:(Rule_graph.settle_at ~chain_id ~epoch:height)
     (Rule_graph.vm_bytes_at ~chain_id ~epoch:height) txs in
-  check_mode (Rule_graph.tx_envelope_at ~chain_id ~epoch) txs
+  let* () = check_mode (Rule_graph.tx_envelope_at ~chain_id ~epoch) txs in
+  Tx_signature.check_active (Tx_signature.at ~chain_id ~epoch) txs
 
 let check_rule rules ~epoch txs =
   let* compute = Rule_graph.vm_bytes rules ~epoch |> Result.map_error Rule_graph.fault_message in
@@ -91,7 +92,13 @@ let check_rule rules ~epoch txs =
   let* () = check_compute ~settle compute txs in
   let* mode = Rule_graph.tx_envelope rules ~epoch
     |> Result.map_error Rule_graph.fault_message in
-  check_mode mode txs
+  let* () = check_mode mode txs in
+  let* network = Rule_graph.tx_network rules ~epoch
+    |> Result.map_error Rule_graph.fault_message in
+  let signing = match network with
+    | Rule_graph.Prior -> Tx_signature.Historical
+    | Rule_graph.Active -> Tx_signature.Network (Rule_graph.chain_id rules) in
+  Tx_signature.check_active signing txs
 
 let check_charged mode rejections =
   if List.for_all (fun (item : Tx_outcome.rejection) ->

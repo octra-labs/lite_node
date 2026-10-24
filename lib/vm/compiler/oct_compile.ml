@@ -364,19 +364,20 @@ let source_result ?(version = lang_version) ?(abi = Existing_abi) ?(syntax = Oct
     program_facts = Some program_facts;
   }
 
-let compile_form_ast ?(loops = false) ?(abi = Existing_abi) ~source_mode ~source_material ast =
-  match Aml_source.compile_ast ~loops ~syntax:Oct_gen.Forms ast with
+let compile_form_ast ?(metered = false) ?(loops = false) ?(abi = Existing_abi) ~source_mode ~source_material ast =
+  match Aml_source.compile_ast ~metered ~loops ~syntax:Oct_gen.Forms ast with
   | Error reason -> error_result reason
   | Ok compiled -> source_result ~abi ~source_mode ~source_material compiled
 
-let compile_ast_ready ?(loops = false) ?(abi = Existing_abi) ~checked ~source_mode ~source_material ast =
+let compile_ast_ready ?(metered = false) ?(loops = false) ?(abi = Existing_abi) ~checked ~source_mode ~source_material ast =
+  try
   let program = ast.Oct_lang.declaration = Oct_lang.ProgramDecl in
   let emit () =
     if ast.Oct_lang.forms <> [] then
-      compile_form_ast ~loops ~abi ~source_mode ~source_material ast
+      compile_form_ast ~metered ~loops ~abi ~source_mode ~source_material ast
     else
       let declaration = Oct_lang.declaration_to_string ast.Oct_lang.declaration in
-      let code = Oct_emit.generate ~loops ~checked ast in
+      let code = Oct_emit.generate ~metered ~loops ~checked ast in
       if program && Array.length code > Program_limits.max_instructions then
         error_result "Program instruction limit exceeded"
       else
@@ -415,17 +416,23 @@ let compile_ast_ready ?(loops = false) ?(abi = Existing_abi) ~checked ~source_mo
   if program
      && List.length ast.Oct_lang.funcs > Program_limits.max_functions then
     error_result "Program function limit exceeded"
-  else if program && checked && ast.Oct_lang.forms = [] then
+  else match Oct_symbols.check ~metered
+      ~functions:(List.length ast.funcs + List.length ast.forms)
+      ~consts:(List.length ast.consts) with
+  | Error reason -> error_result reason
+  | Ok () -> if program && checked && ast.Oct_lang.forms = [] then
     match Oct_check.check ast with
     | Error error -> error_result ("Program source type: " ^ error)
     | Ok () -> emit ()
   else
     emit ()
 
-let compile_ast ?(loops = false) ?(abi = Existing_abi) ?(checked = false) ~source_mode ~source_material ast =
+  with Oct_emit.Emission_limit -> error_result "Program instruction limit exceeded"
+
+let compile_ast ?(metered = false) ?(loops = false) ?(abi = Existing_abi) ?(checked = false) ~source_mode ~source_material ast =
   require_ast_shape ast;
   ignore (interface_index ast);
-  compile_ast_ready ~loops ~abi ~checked ~source_mode ~source_material ast
+  compile_ast_ready ~metered ~loops ~abi ~checked ~source_mode ~source_material ast
 
 let first_interfaces interfaces =
   interfaces
@@ -438,8 +445,8 @@ let first_interfaces interfaces =
   |> snd
   |> List.rev
 
-let compile_ast_first ?(loops = false) ?(checked = false) ~source_mode ~source_material ast =
-  compile_ast_ready
+let compile_ast_first ?(metered = false) ?(loops = false) ?(checked = false) ~source_mode ~source_material ast =
+  compile_ast_ready ~metered
     ~loops
     ~checked
     ~source_mode
@@ -518,10 +525,10 @@ let compile_exception = function
   | error ->
     error_result (Printf.sprintf "compile error: %s" (Printexc.to_string error))
 
-let compile source =
+let compile ?(metered = false) source =
   try
     let ast = Oct_parse.parse source in
-    compile_ast ~source_mode:"single" ~source_material:source ast
+    compile_ast ~metered ~source_mode:"single" ~source_material:source ast
   with
   | Oct_lex.LexError (msg, line, _col) ->
     error_result (Printf.sprintf "line %d: %s" line msg)
@@ -595,26 +602,26 @@ let check_ast ast =
   require_ast_shape ast;
   ignore (interface_index ast)
 
-let compile_multi_mode ?(loops = false) ?(abi = Existing_abi) ?(checked = false) ~program_only resolver main_path =
+let compile_multi_mode ?(metered = false) ?(loops = false) ?(abi = Existing_abi) ?(checked = false) ~program_only resolver main_path =
   compile_multi_with
     ~program_only
     ~check_ast
     ~select_interfaces:imported_interfaces
-    ~compile_ast:(compile_ast ~loops ~abi ~checked)
+    ~compile_ast:(compile_ast ~metered ~loops ~abi ~checked)
     resolver
     main_path
 
-let compile_multi_first_mode ?(loops = false) ?(checked = false) ~program_only resolver main_path =
+let compile_multi_first_mode ?(metered = false) ?(loops = false) ?(checked = false) ~program_only resolver main_path =
   compile_multi_with
     ~program_only
     ~check_ast:(fun _ -> ())
     ~select_interfaces:imported_interfaces_first
-    ~compile_ast:(compile_ast_first ~loops ~checked)
+    ~compile_ast:(compile_ast_first ~metered ~loops ~checked)
     resolver
     main_path
 
-let compile_multi resolver main_path =
-  compile_multi_mode ~program_only:false resolver main_path
+let compile_multi ?(metered = false) resolver main_path =
+  compile_multi_mode ~metered ~program_only:false resolver main_path
 
 let external_pcs code =
   Array.to_list code
@@ -753,12 +760,12 @@ let admit_program_source source raw =
 let compile_program_multi resolver main_path =
   emit_program (compile_multi_mode ~program_only:true resolver main_path)
 
-let compile_program_described ?(loops = false) resolver main_path =
+let compile_program_described ?(metered = false) ?(loops = false) resolver main_path =
   emit_program
-    (compile_multi_mode ~loops ~abi:Source_abi ~program_only:true resolver main_path)
+    (compile_multi_mode ~metered ~loops ~abi:Source_abi ~program_only:true resolver main_path)
 
-let compile_program_multi_first ?(loops = false) resolver main_path =
-  emit_program (compile_multi_first_mode ~loops ~program_only:true resolver main_path)
+let compile_program_multi_first ?(metered = false) ?(loops = false) resolver main_path =
+  emit_program (compile_multi_first_mode ~metered ~loops ~program_only:true resolver main_path)
 
 let compile_program_multi_checked resolver main_path =
   emit_program
@@ -768,7 +775,7 @@ let compile_program_multi_first_checked resolver main_path =
   emit_program
     (compile_multi_first_mode ~checked:true ~program_only:true resolver main_path)
 
-let compile_source_version ?(loops = false) ~version resolver main_path =
+let compile_source_version ?(metered = false) ?(loops = false) ~version resolver main_path =
   let sources = ref [] in
   let load path =
     match resolver path with
@@ -778,7 +785,7 @@ let compile_source_version ?(loops = false) ~version resolver main_path =
       Some body
   in
   try
-    match Aml_source.compile_multi ~loops ~syntax:Oct_gen.Source load main_path with
+    match Aml_source.compile_multi ~program_only:metered ~metered ~loops ~syntax:Oct_gen.Source load main_path with
     | Error reason -> error_result reason
     | Ok compiled when compiled.declaration <> Oct_lang.ProgramDecl ->
       error_result "Program declaration required"
@@ -788,8 +795,8 @@ let compile_source_version ?(loops = false) ~version resolver main_path =
       |> emit_program
   with error -> compile_exception error
 
-let compile_program_source ?(loops = false) resolver main_path =
-  compile_source_version ~loops ~version:lang_version resolver main_path
+let compile_program_source ?(metered = false) ?(loops = false) resolver main_path =
+  compile_source_version ~metered ~loops ~version:lang_version resolver main_path
 
-let compile_program_preview ?(loops = false) resolver main_path =
-  compile_source_version ~loops ~version:source_version resolver main_path
+let compile_program_preview ?(metered = false) ?(loops = false) resolver main_path =
+  compile_source_version ~metered ~loops ~version:source_version resolver main_path

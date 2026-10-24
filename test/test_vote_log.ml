@@ -71,6 +71,10 @@ let () =
       let stored = value "first write" (C_vote_log.keep store first) in
       expect "first signature preserved"
         (String.equal stored.signature first.signature);
+      let restored = value "read saved round" (C_vote_log.round_votes store
+        ~chain_id:first.chain_id ~validator:first.validator
+        ~epoch_id:first.epoch_id ~round:first.round) in
+      expect "saved round preserves exact vote" (restored = [first]);
       let replay = {
         first with
         signature = String.make 64 '\x22';

@@ -124,7 +124,7 @@ val kat_state : Ledger.t -> string -> kat
 
 val backfill_kat : Ledger.t -> string -> unit
 
-val encrypt_plan :
+val encrypt_plan : registered:bool ->
   keyed:bool -> ?math:bool ->
   field_policy:field_policy ->
   strict:bool ->
@@ -134,7 +134,7 @@ val encrypt_plan :
   Transaction.t ->
   (balance_plan, failure) result Lwt.t
 
-val prepare_encrypt_plan :
+val prepare_encrypt_plan : registered:bool ->
   field_policy:field_policy ->
   ?cap:bool ->
   ?result_policy:Private_result_policy.t ->
@@ -142,7 +142,7 @@ val prepare_encrypt_plan :
   Transaction.t ->
   (balance_plan, failure) result Lwt.t
 
-val decrypt_plan :
+val decrypt_plan : registered:bool ->
   keyed:bool -> ?math:bool ->
   field_policy:field_policy ->
   strict:bool ->
@@ -152,7 +152,7 @@ val decrypt_plan :
   Transaction.t ->
   (balance_plan, failure) result Lwt.t
 
-val prepare_decrypt_plan :
+val prepare_decrypt_plan : registered:bool ->
   field_policy:field_policy ->
   ?cap:bool ->
   ?result_policy:Private_result_policy.t ->
@@ -172,7 +172,7 @@ val apply_decrypt_plan :
   balance_plan ->
   (balance_plan, failure) result Lwt.t
 
-val apply_encrypt :
+val apply_encrypt : registered:bool ->
   keyed:bool -> ?math:bool ->
   field_policy:field_policy ->
   strict:bool ->
@@ -181,7 +181,7 @@ val apply_encrypt :
   Transaction.t ->
   (balance_plan, failure) result Lwt.t
 
-val apply_decrypt :
+val apply_decrypt : registered:bool ->
   keyed:bool -> ?math:bool ->
   field_policy:field_policy ->
   strict:bool ->
@@ -190,7 +190,7 @@ val apply_decrypt :
   Transaction.t ->
   (balance_plan, failure) result Lwt.t
 
-val key_switch_plan :
+val key_switch_plan : registered:bool ->
   keyed:bool -> ?math:bool ->
   ?cipher_mode:Rule_graph.mode ->
   field_policy:field_policy ->
@@ -200,7 +200,7 @@ val key_switch_plan :
   Transaction.t ->
   (key_switch_plan, failure) result Lwt.t
 
-val preverify_key_switch_artifact :
+val preverify_key_switch_artifact : registered:bool ->
   keyed:bool -> ?math:bool ->
   ?cipher_mode:Rule_graph.mode ->
   field_policy:field_policy ->
@@ -216,7 +216,7 @@ val private_failure_retryable : failure -> bool
 
 val failure_action : failure -> failure_action
 
-val bind_key_switch_artifact :
+val bind_key_switch_artifact : registered:bool ->
   keyed:bool -> ?math:bool ->
   ?cipher_mode:Rule_graph.mode ->
   field_policy:field_policy ->
@@ -226,7 +226,7 @@ val bind_key_switch_artifact :
   key_switch_artifact ->
   key_switch_binding Lwt.t
 
-val preverify_private_artifact :
+val preverify_private_artifact : registered:bool ->
   keyed:bool -> ?math:bool ->
   field_policy:field_policy ->
   strict:bool ->
@@ -236,7 +236,7 @@ val preverify_private_artifact :
   Transaction.t ->
   (private_artifact, failure) result Lwt.t
 
-val verify_private :
+val verify_private : registered:bool ->
   keyed:bool -> ?math:bool ->
   field_policy:field_policy ->
   strict:bool ->
@@ -246,7 +246,7 @@ val verify_private :
   Transaction.t ->
   (prepared, private_rejection) result Lwt.t
 
-val bind_private_artifact :
+val bind_private_artifact : registered:bool ->
   keyed:bool -> ?math:bool ->
   field_policy:field_policy ->
   strict:bool ->
@@ -256,7 +256,7 @@ val bind_private_artifact :
   private_artifact ->
   private_binding Lwt.t
 
-val prepared_current :
+val prepared_current : registered:bool ->
   field_policy:field_policy ->
   ?cap:bool ->
   Ledger.t ->
@@ -264,7 +264,7 @@ val prepared_current :
   prepared ->
   bool Lwt.t
 
-val key_switch_cache_key :
+val key_switch_cache_key : registered:bool ->
   keyed:bool -> ?math:bool ->
   ?cipher_mode:Rule_graph.mode ->
   field_policy ->
@@ -273,7 +273,7 @@ val key_switch_cache_key :
   Transaction.t ->
   string Lwt.t
 
-val prepare_key_switch_plan :
+val prepare_key_switch_plan : registered:bool ->
   keyed:bool -> ?math:bool ->
   ?cipher_mode:Rule_graph.mode ->
   field_policy:field_policy ->
@@ -301,7 +301,7 @@ val key_switch_requests_legacy_audit :
   Transaction.t ->
   bool
 
-val apply_key_switch :
+val apply_key_switch : registered:bool ->
   keyed:bool -> ?math:bool ->
   ?cipher_mode:Rule_graph.mode ->
   field_policy:field_policy ->
@@ -317,7 +317,7 @@ val apply_key_switch_plan :
   key_switch_plan ->
   key_switch_outcome Lwt.t
 
-val stealth_plan :
+val stealth_plan : registered:bool ->
   field_policy:field_policy ->
   ?cap:bool ->
   ?worker_priority:Compute_pool.priority ->
@@ -326,7 +326,7 @@ val stealth_plan :
   Transaction.t ->
   (stealth_plan, failure) result Lwt.t
 
-val prepare_stealth_plan :
+val prepare_stealth_plan : registered:bool ->
   field_policy:field_policy ->
   ?cap:bool ->
   ?worker_priority:Compute_pool.priority ->
@@ -335,7 +335,7 @@ val prepare_stealth_plan :
   Transaction.t ->
   (stealth_plan, failure) result Lwt.t
 
-val stealth_inline_range :
+val stealth_inline_range : registered:bool ->
   keyed:bool -> ?math:bool ->
   strict:bool ->
   ?worker_priority:Compute_pool.priority ->
@@ -348,7 +348,7 @@ val stealth_accept_range :
   stealth_range ->
   (unit, failure) result
 
-val stealth_binding :
+val stealth_binding : registered:bool ->
   keyed:bool -> ?math:bool ->
   field_policy:field_policy ->
   strict:bool ->
@@ -358,7 +358,7 @@ val stealth_binding :
   stealth_plan ->
   (unit, failure) result Lwt.t
 
-val claim_plan :
+val claim_plan : registered:bool ->
   keyed:bool -> ?math:bool ->
   field_policy:field_policy ->
   strict:bool ->
@@ -374,7 +374,7 @@ val prepare_claim_plan :
   Transaction.t ->
   (claim_plan, failure) result Lwt.t
 
-val claim_balance_plan :
+val claim_balance_plan : registered:bool ->
   ?cap:bool ->
   ?worker_priority:Compute_pool.priority ->
   ?result_policy:Private_result_policy.t ->

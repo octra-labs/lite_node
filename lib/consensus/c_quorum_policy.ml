@@ -9,13 +9,19 @@ type activation = {
 
 type rule = Prior | Capped | Stake
 
-type t = { count_epoch : int64; stake_epoch : int64 option }
+type t = { count_epoch : int64; stake_epoch : int64 option; round_epoch : int64 option }
 
-let make ~count_epoch ~stake_epoch =
+let with_round_epoch policy epoch =
+  if Option.fold ~none:false ~some:(fun round ->
+    match policy.stake_epoch with None -> true | Some stake -> round < stake) epoch then
+    invalid_arg "round activation order";
+  {policy with round_epoch = epoch}
+
+let make ~count_epoch ~stake_epoch ~round_epoch =
   if count_epoch < 0L || Option.fold ~none:false
     ~some:(fun epoch -> epoch <= count_epoch) stake_epoch then
     invalid_arg "quorum activation order";
-  {count_epoch; stake_epoch}
+  with_round_epoch {count_epoch; stake_epoch; round_epoch = None} round_epoch
 
 let rule_at ~count_epoch ~stake_epoch ~epoch_id =
   if Int64.compare count_epoch 0L < 0
@@ -58,6 +64,9 @@ let linear_epoch ~chain_id =
   Option.map (fun plan -> Int64.of_int plan.activation_epoch)
     (stake_activation_for_chain chain_id)
 
+let round_epoch ~chain_id =
+  if String.equal chain_id devnet_chain_id then Some 1_740_000L else None
+
 let count_epoch chain_id =
   match activation_for_chain chain_id with
   | None -> 0L
@@ -65,9 +74,15 @@ let count_epoch chain_id =
 
 let for_chain chain_id =
   make ~count_epoch:(count_epoch chain_id) ~stake_epoch:(linear_epoch ~chain_id)
+    ~round_epoch:(round_epoch ~chain_id)
 
 let select policy epoch_id =
   rule_at ~count_epoch:policy.count_epoch ~stake_epoch:policy.stake_epoch ~epoch_id
+
+let round_wait policy epoch_id =
+  Option.fold ~none:false ~some:(fun epoch -> epoch_id >= epoch) policy.round_epoch
+
+let round_wait_id = "quorum_timers:stored_vote_resume:durable_past_votes:checked_relief_limit:quorum_phase:signed_progress_retry:stalled_signed_step:past_precommits"
 
 let rule ~chain_id ~epoch_id =
   select (for_chain chain_id) epoch_id
@@ -94,7 +109,8 @@ let id_at policy ~chain_id ~epoch_id =
 
 let consensus_id_at ~chain_id ~epoch_id = id_at (for_chain chain_id) ~chain_id ~epoch_id
 
-let epochs policy = Option.to_list policy.stake_epoch
+let epochs policy = List.sort_uniq Int64.compare
+  (Option.to_list policy.stake_epoch @ Option.to_list policy.round_epoch)
 
 let linear_weight ~chain_id ~epoch_id =
   rule ~chain_id ~epoch_id = Stake
@@ -108,3 +124,5 @@ let count_cap_required ~chain_id ~epoch_id =
 let rewind_allowed ~chain_id ~from_epoch ~to_epoch =
   rewind_at ~count_epoch:(count_epoch chain_id)
     ~stake_epoch:(linear_epoch ~chain_id) ~from_epoch ~to_epoch
+  && not (Option.fold ~none:false
+    ~some:(fun epoch -> from_epoch >= epoch && to_epoch < epoch) (round_epoch ~chain_id))

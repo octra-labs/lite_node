@@ -33,7 +33,7 @@ let proof_of_message = function
   | Some raw ->
     begin
       try
-        match Yojson.Safe.from_string raw with
+        match Json_tree.read raw with
         | `Assoc ["evidence", `String encoded] ->
           let decoded = Base64.decode_exn encoded in
           if not (String.equal (Base64.encode_exn decoded) encoded) then

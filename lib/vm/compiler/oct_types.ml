@@ -21,22 +21,22 @@ let numeric_result left right =
   else if left = TU64 || right = TU64 then TU64
   else TInt
 
-let rec compatible expected actual =
-  expected = actual
-  || numeric expected && numeric actual
-  || match expected, actual with
-     | TBytes, TString | TString, TBytes -> true
+module Graph = Type_graph.Host
+
+let compatible expected actual =
+  Graph.compare (fun node expected actual ->
+    if numeric expected && numeric actual then Some []
+    else match expected, actual with
+     | TBytes, TString | TString, TBytes -> Some []
+     | TStruct left, TStruct right
      | TStruct left, TEnum right | TEnum left, TStruct right ->
-       String.equal left right
-     | TOption _, TOption TVoid -> true
-     | TOption left, TOption right -> compatible left right
-     | TList left, TList right -> compatible left right
-     | TMap (left_key, left_value), TMap (right_key, right_value) ->
-       compatible left_key right_key && compatible left_value right_value
-     | TTuple left, TTuple right ->
-       List.length left = List.length right
-       && List.for_all2 compatible left right
-     | _ -> false
+       if String.equal left right then Some [] else None
+     | TOption _, TOption TVoid -> Some []
+     | TOption _, TOption _
+     | TList _, TList _ -> Some [node.Type_graph.at [0]]
+     | TMap _, TMap _ -> Some [node.at [0]; node.at [1]]
+     | TTuple _, TTuple _ -> node.items [0]
+     | _ -> None) expected actual
 
 let rec statement_returns = function
   | SLocated (_, _, statement) -> statement_returns statement
