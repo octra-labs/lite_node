@@ -7,5 +7,5 @@ cd "$ROOT"
 build=${OCTRA_BUILD_DIR:-_build}
 OCTRA_RSS_CYCLES=${OCTRA_RSS_CYCLES:-100}
 export OCTRA_RSS_CYCLES
-opam exec -- dune build --root . --build-dir "$build" test/test_code_rss.exe
+opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --root . --build-dir "$build" test/test_code_rss.exe
 python3 test/code_rss_run.py "$build/default/test/test_code_rss.exe"

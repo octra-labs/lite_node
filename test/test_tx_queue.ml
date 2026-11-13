@@ -184,10 +184,10 @@ let test_circle_intake () =
       expect "circle carried key inflates wire size" (Lane.tx_bytes carried = budget.max_bytes + 44);
       expect "circle carried key resolves before check" (Rest.prepare_tx ledger carried = Ok exact);
       expect "circle normalized RPC control accepted"
-        (Rest.validate_and_submit_tx runtime ledger exact = Ok (Tx.hash exact));
+        (Lwt_main.run (Rest.validate_and_submit_tx runtime ledger exact) = Ok (Tx.hash exact));
       Pool.clear ();
       expect "circle RPC uses normalized byte size"
-        (Rest.validate_and_submit_tx runtime ledger carried = Ok (Tx.hash exact));
+        (Lwt_main.run (Rest.validate_and_submit_tx runtime ledger carried) = Ok (Tx.hash exact));
       Pool.clear ();
       expect "circle staging uses normalized byte size" (submit carried = Ok (Tx.hash exact));
       let larger = sized 1 in
@@ -658,7 +658,7 @@ let test_hold_intake () =
         expect "refusal error misclassified"
           (Octra_node_runtime.Tx_view.staging_error "preview refused in this epoch"
            = ("preview_refused", "retry after epoch commit or replace transaction at same nonce"));
-        let validate item = Result.map_error Octra_node_runtime.Tx_view.staging_error (submit item) in
+        let validate item = Lwt.return (Result.map_error Octra_node_runtime.Tx_view.staging_error (submit item)) in
         let response = Octra_node_runtime.Submit_rpc.submit ~validate
           (`List [Tx.to_yojson tx]) |> Lwt_main.run in
         expect "refusal RPC became pending"
@@ -705,7 +705,13 @@ let test_hold_entry () =
       (Preview.send (Check (Some current, Tx.hash first)) = Error "preview refused in this epoch");
     expect "hold changed queue ownership"
       (Pool.staging_size () = count && Z.equal (Pool.staging_total_ou ()) cost
-       && Pool.all () = pending && Pool.queue_state ~confirmed:0 (Tx.hash first) = lifetime);
+       && Pool.all () = pending && Pool.queue_state ~head:epoch ~confirmed:0 (Tx.hash first) = lifetime);
+    expect "hold status not exposed" (match Pool.queue_state ~head:current ~confirmed:0 (Tx.hash first) with
+      | Some (Pool.Wait_preview {after; attempts; expires_at}) ->
+        after = epoch && attempts = 1 && (match lifetime with
+          | Some (Pool.Ready {expires_at = previous}) -> expires_at = previous
+          | _ -> false)
+      | _ -> false);
     expect "hold deleted transaction" (Pool.find_by_hash (Tx.hash first) = Some first);
     expect "hold recorded a drop" (Pool.lookup_dropped (Tx.hash first) = None);
     expect "held nonce did not stop successors" (selected current = [other]);
@@ -795,6 +801,48 @@ let test_hold_capacity ?(send = Pool.Preview.send) () =
       (Result.is_error (send (Hold {head = current; epoch; hash = Tx.hash first}))
        && ready None first = Ok ()))
 
+let test_hold_growth () =
+  let module Preview = Pool.Preview in
+  Pool.clear ();
+  Fun.protect ~finally:Pool.clear (fun () ->
+    let tx = signed () in
+    let hash = Tx.hash tx in
+    let head = ref 2_000_000L in
+    ignore (Pool.add_smart ~head:!head ~lookup:(fun _ -> Some (Z.of_int 1_000_000, 0)) tx |> Result.get_ok);
+    let expires = (Hashtbl.find Pool.hash_index hash).added_at +. Pool.staging_ttl in
+    List.iter (fun count ->
+      let message = Preview.Hold {head = !head; epoch = Int64.succ !head; hash} in
+      expect "growing hold refused" (Preview.send message = Ok ());
+      expect "duplicate growing hold refused" (Preview.send message = Ok ());
+      let delay = Int64.of_int (1 lsl (min 6 count - 1)) in
+      let after = Int64.add !head delay in
+      let state = Pool.queue_state ~head:!head ~confirmed:0 hash in
+      expect "growing hold status differs"
+        (state = Some (Pool.Wait_preview {after; attempts = min 6 count; expires_at = expires}));
+      let fields = Octra_node_runtime.Tx_view.transaction_lookup_response
+        ?queue_state:state ~decode_message:Fun.id ~hash
+        (Octra_node_runtime.Tx_view.Lookup_pending tx) |> Result.get_ok |> Yojson.Safe.Util.to_assoc in
+      expect "RPC hold fields missing"
+        (List.assoc "stage_status" fields = `String "waiting_preview"
+         && List.assoc "resume_after_epoch" fields = `Intlit (Int64.to_string after)
+         && List.assoc "preview_attempts" fields = `Int (min 6 count));
+      expect "execution budget did not grow"
+        (Pool.preview_limit hash 3.75 = min 90. (3.75 *. float_of_int (1 lsl (min 6 count))));
+      expect "hold expired early"
+        (Result.is_error (Preview.send (Ready (Some (Int64.pred after), hash))));
+      expect "hold did not expire" (Preview.send (Ready (Some after, hash)) = Ok ());
+      expect "hold extended TTL" ((Hashtbl.find Pool.hash_index hash).added_at +. Pool.staging_ttl = expires);
+      head := after) [1; 2; 3; 4; 5; 6; 7];
+    let failures = Atomic.make 0 in
+    let workers = List.init 16 (fun _ -> Thread.create (fun () ->
+      for _ = 1 to 1000 do
+        if Preview.send (Hold {head = !head; epoch = Int64.succ !head; hash}) <> Ok ()
+        then ignore (Atomic.fetch_and_add failures 1)
+      done) ()) in
+    List.iter Thread.join workers;
+    expect "hold lost under contention" (Atomic.get failures = 0);
+    expect "hold recorded deletion" (Pool.lookup_dropped hash = None))
+
 let () =
   Mirage_crypto_rng_unix.use_default ();
   let cases = match Array.to_list Sys.argv with
@@ -813,7 +861,8 @@ let () =
        "circle_selection", test_circle_selection; "circle_bytes", test_circle_bytes;
        "deploy_intake", test_deploy_intake;
        "hold_state", test_hold_state; "hold_intake", test_hold_intake;
-       "hold_entry", test_hold_entry; "hold_capacity", (fun () -> test_hold_capacity ())]
+       "hold_entry", test_hold_entry; "hold_capacity", (fun () -> test_hold_capacity ());
+       "hold_growth", test_hold_growth]
     | _ -> invalid_arg "queue test arguments" in
   let failed = List.filter_map (fun (name, run) ->
     try run (); Printf.printf "event = test name = %s status = passed\n%!" name; None

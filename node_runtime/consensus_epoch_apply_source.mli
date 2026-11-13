@@ -26,11 +26,6 @@ type fatal =
 
 type deps = {
   rules : Octra_core.Rule_graph.t;
-  check_override_receipts :
-    epoch_id:int ->
-    receipts:string list ->
-    Transaction.t list ->
-    (unit, string) result;
   find_finalized : int -> C_types.finalize option;
   cached_bundle : string -> cached_bundle option;
   receipt_root_matches : C_types.epoch_header -> string list -> bool;
@@ -40,11 +35,6 @@ type deps = {
 
 type node_deps = {
   rules : Octra_core.Rule_graph.t;
-  check_override_receipts :
-    epoch_id:int ->
-    receipts:string list ->
-    Transaction.t list ->
-    (unit, string) result;
   find_finalized : int -> C_types.finalize option;
   cached_bundle : string -> cached_bundle option;
   receipt_root_matches : C_types.epoch_header -> string list -> bool;

@@ -14,7 +14,11 @@ if [ -n "$names$refs" ]; then
   printf 'status = fail check = print_style reason = test_layout\n' >&2
   exit 1
 fi
-opam exec -- dune build --root "$root" --build-dir "$build" test/test_print_style.exe
+if [ "$#" -eq 1 ] && [ "$1" = --layout ]; then
+  printf 'status = pass check = test_layout\n'
+  exit 0
+fi
+opam exec -- python3 "$root/controls/lib/gc_build.py" -- dune build --root "$root" --build-dir "$build" test/test_print_style.exe
 if [ "$#" -gt 0 ]; then
   opam exec -- "$build/default/test/test_print_style.exe" "$@"
   exit 0

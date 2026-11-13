@@ -45,7 +45,10 @@ type node_effects = {
 
 let node_effects deps =
   let live_backend =
-    Octra_core.Epoch_exec.make_live_backend deps.store deps.ledger
+    Octra_core.Epoch_exec.make_live_backend
+      ~execution_profile:(fun ~chain_id ~epoch ->
+        Consensus_profile.execution_profile ~chain_id ~epoch Sys.getenv_opt)
+      deps.store deps.ledger
   in
   {
     footer = {

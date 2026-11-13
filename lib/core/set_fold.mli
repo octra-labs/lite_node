@@ -29,6 +29,9 @@ type proof = {
 type mark_claim = { epoch : int64; signature : string }
 type mark_set = int64 * string * Octra_consensus.C_types.validator_set
 type evidence = Pulse | Commit of proof | Marks of mark_claim list
+type parent_view
+val prepare_parent : marks:bool -> chain_id:string ->
+  Octra_consensus.C_types.parent_commit -> (parent_view, string) result
 
 val marks_id : string
 val encode_marks : mark_claim list -> string
@@ -119,6 +122,7 @@ val allows :
   address:string ->
   t ->
   bool
+val change_epochs : cfg -> start:int64 -> t -> int64 list
 val exclusion :
   cfg ->
   start:int64 ->
@@ -143,6 +147,7 @@ val read_parent :
   Octra_consensus.C_types.parent_commit ->
   ((final * string list * string list), string) result
 val advance :
+  ?prepared:parent_view ->
   ?cap_mode:cap_mode ->
   ?marks:bool ->
   cfg ->

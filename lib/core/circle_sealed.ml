@@ -60,7 +60,7 @@ let digest ~circle_id ~key_id ~passphrase plaintext =
 
 let plaintext_digest plaintext = Digestif.SHA256.(digest_string plaintext |> to_hex)
 
-let write_digest ?(mode = Compatible) ~circle_id ~key_id ~passphrase plaintext =
+let write_digest ?(mode = Keyed) ~circle_id ~key_id ~passphrase plaintext =
   let _ = text circle_id, text key_id, text passphrase in
   match mode with
   | Compatible -> plaintext_digest plaintext

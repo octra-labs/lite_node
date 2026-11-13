@@ -346,7 +346,7 @@ let plan_deploy_input ~bytecode_b64_opt ~deployer ~nonce ~target =
     ~nonce
     ~target
 
-let parse_call index = function
+let parse_call ?(scalar_work = false) index = function
   | `Assoc fields ->
     let str name =
       match List.assoc_opt name fields with
@@ -361,6 +361,10 @@ let parse_call index = function
     in
     let amount =
       match List.assoc_opt "amount" fields with
+      | Some ((`String text | `Intlit text) as value) ->
+        if scalar_work && (String.length text > 128) then
+          invalid_arg "multi_exec amount exceeds limit";
+        z_of_json value
       | Some value -> z_of_json value
       | None -> Z.zero
     in
@@ -377,7 +381,7 @@ let parse_call index = function
     | _, _, Error e -> Error e)
   | _ -> Error (Printf.sprintf "multi_exec call %d must be object" index)
 
-let parse_multi_exec_calls ~max_calls message =
+let parse_multi_exec_calls ?(scalar_work = false) ~max_calls message =
   try
     let json = Octra_core.Json_tree.read message in
     let call_items =
@@ -398,7 +402,7 @@ let parse_multi_exec_calls ~max_calls message =
       let rec loop index acc = function
         | [] -> Ok (List.rev acc)
         | item :: remainder ->
-          match parse_call index item with
+          match parse_call ~scalar_work index item with
           | Error e -> Error e
           | Ok call -> loop (index + 1) (call :: acc) remainder
       in

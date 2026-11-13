@@ -7,6 +7,7 @@ type effects = {
   ledger_hash : unit -> string Lwt.t;
   cached_head : unit -> Octra_core.Head_manifest.t option;
   expected_prev_root : int -> string option;
+  check_execution : int -> Octra_core.Head_manifest.t option -> (unit, string) result Lwt.t;
   fatal : string -> unit;
   require_sync : Sync_need.t -> unit;
   exit : unit -> unit;

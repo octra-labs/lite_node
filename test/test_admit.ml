@@ -230,7 +230,7 @@ let check_cipher_limit () =
   in
   check
     "public cipher reached signature admission"
-    (View.payload_check ~limits:View.payload_limits value
+    (Lwt_main.run (View.payload_check ~limits:View.payload_limits value)
      = Error
          ("malformed_transaction", "malformed or oversized encrypted_data"))
 

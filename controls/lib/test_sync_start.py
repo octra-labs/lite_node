@@ -44,6 +44,10 @@ class SyncStartTest(unittest.TestCase):
         self.values = {"OCTRA_STATE_SYNC_SOURCES": self.base + "/primary",
             "OCTRA_JOIN_RPC": self.base + "/primary," + self.base + "/secondary",
             "OCTRA_CHECKPOINT_EPOCH": "1278039"}
+        native = mock.patch.object(sync_tip, "native_tip", return_value = {
+            "head": 1_723_441, "local": 1_706_811, "root": "a" * 64, "stamp": "verified"})
+        native.start()
+        self.addCleanup(native.stop)
         self.source("primary", 1_706_811, 1_706_760)
         self.source("secondary", 1_723_441, None)
 
@@ -118,24 +122,26 @@ class SyncStartTest(unittest.TestCase):
 
     def test_no_head(self):
         self.server.replies.clear()
-        with mock.patch.object(config, "sync_snapshot") as download:
+        with mock.patch.object(sync_tip, "native_tip", return_value = None), \
+                mock.patch.object(config, "sync_snapshot") as download:
             with self.assertRaisesRegex(ValidatorError, "head = unknown"):
                 config.maybe_sync(self.args, self.data, self.values)
             download.assert_not_called()
         self.unchanged()
 
-    def test_independent_head_failure(self):
+    def test_offline_floor(self):
         for head in [1_706_811, 1_723_441]:
             self.source("primary", head, head - 1)
             for route in [self.base + "/primary", self.base + "/secondary", ""]:
                 self.server.replies["/secondary/state-sync/head"] = (503, {})
                 values = self.values | {"OCTRA_JOIN_RPC": route}
-                status = "independent_unavailable" if route.endswith("/secondary") else "independent_missing"
                 with self.subTest(head = head, route = route), \
+                        mock.patch.object(sync_tip, "native_tip", return_value = None), \
                         mock.patch.object(config, "sync_snapshot") as download:
-                    with self.assertRaisesRegex(ValidatorError, "head_status = " + status):
-                        config.maybe_sync(self.args, self.data, values)
-                    download.assert_not_called()
+                    config.maybe_sync(self.args, self.data, values)
+                    download.assert_called_once()
+                    self.assertEqual(download.call_args.kwargs["min_epoch"],
+                        int(values["OCTRA_CHECKPOINT_EPOCH"]))
                 self.unchanged()
 
     def test_primary_unavailable(self):

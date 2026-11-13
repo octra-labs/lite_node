@@ -1,0 +1,175 @@
+--- a/src/index.ml
++++ b/src/index.ml
+@@ -179,6 +179,7 @@
+     rename_lock : Semaphore.t;
+         (** A lock used to protect a critical bit when finalizing a [merge]
+             operation. All operations should be guarded by this lock. *)
++    mutable exclusive : bool;
+     mutable pending_cancel : bool;
+         (** A signal for the merging thread to terminate prematurely. *)
+   }
+@@ -192,7 +193,10 @@
+   type t = instance option ref
+ 
+   let check_open t =
+-    match !t with Some instance -> instance | None -> raise Closed
++    match !t with
++    | Some instance when instance.exclusive -> invalid_arg "Index operation during exclusive work"
++    | Some instance -> instance
++    | None -> raise Closed
+ 
+   (** {1 Clear} *)
+ 
+@@ -586,7 +590,7 @@
+               index_path
+           in
+           let entries = Int63.div (IO.offset io) Entry.encoded_sizeL in
+-          if entries = Int63.zero then None
++          if entries = Int63.zero then (IO.close io; None)
+           else (
+             Log.debug (fun l ->
+                 l "[%s] index file detected. Loading %a entries"
+@@ -614,6 +618,7 @@
+       sync_lock = Semaphore.make true;
+       writer_lock;
+       pending_cancel = false;
++      exclusive = false;
+     }
+ 
+   type cache = (string * bool, instance) Cache.t
+@@ -891,21 +896,18 @@
+           pp_forced ());
+     Stats.incr_nb_merge ();
+ 
+-    (* Cleanup previous crashes of the merge thread. *)
+-    Option.iter
++    (try Option.iter
+       (fun l ->
+         transfer_log_async_to_log ~root:t.root ~generation:t.generation
+           ~log:t.log ~log_async:(Log_file.io l))
+       t.log_async;
+     reset_log_async t;
+ 
+-    (* NOTE: We flush [log] {i after} enabling [log_async] to ensure that no
+-       unflushed bindings make it into [log] before being merged into the index.
+-       This satisfies the invariant that all bindings are {i first} persisted in
+-       a log, so that the [index] IO doesn't need to trigger the
+-       [flush_callback]. *)
+-    flush_instance ~no_async:() ~with_fsync:true t;
++    flush_instance ~no_async:() ~with_fsync:true t
++    with error -> Semaphore.release t.merge_lock; raise error);
++    let entered = ref false in
+     let go () =
++      entered := true;
+       let merge_result, rename_lock_wait =
+         Fun.protect
+           (fun () -> unsafe_perform_merge ~filter ~hook t)
+@@ -928,7 +930,10 @@
+             merge_lock_wait Mtime.Span.pp rename_lock_wait);
+       merge_result
+     in
+-    if blocking then go () |> Thread.return else Thread.async go
++    if blocking then go () |> Thread.return
++    else try Thread.async go with error ->
++      if not !entered then Semaphore.release t.merge_lock;
++      raise error
+ 
+   let is_empty t =
+     (* A read-only instance may have not yet loaded the [log], if no explicit
+@@ -1057,12 +1062,60 @@
+                 Log_file.iter log ~f:(fun entry -> f entry.key entry.value))
+ 
+   (** {1 Close} *)
++
++  let with_exclusive it action =
++    let t = check_open it in
++    t.pending_cancel <- true;
++    Fun.protect
++      ~finally:(fun () -> t.pending_cancel <- false)
++      (fun () -> Semaphore.with_acquire "exclusive" t.merge_lock (fun () ->
++        Semaphore.with_acquire "exclusive" t.rename_lock (fun () ->
++          ignore (check_open it);
++          t.exclusive <- true;
++          Fun.protect action ~finally:(fun () -> t.exclusive <- false))))
++
++  let try_exclusive it action =
++    let t = match !it with Some t -> t | None -> raise Closed in
++    if t.exclusive || not (Semaphore.try_acquire t.merge_lock) then None
++    else Fun.protect ~finally:(fun () -> Semaphore.release t.merge_lock)
++      (fun () ->
++        if not (Semaphore.try_acquire t.rename_lock) then None
++        else Fun.protect ~finally:(fun () -> Semaphore.release t.rename_lock)
++          (fun () ->
++            ignore (check_open it);
++            t.exclusive <- true;
++            Fun.protect (fun () -> Some (action ()))
++              ~finally:(fun () -> t.exclusive <- false)))
+ 
++  let release_files ~flush t =
++    let actions = [
++      (fun () -> if flush then flush_instance ~with_fsync:true t);
++      (fun () -> Option.iter Log_file.close t.log);
++      (fun () -> Option.iter Log_file.close t.log_async);
++      (fun () -> Option.iter (fun (i : index) -> IO.close i.io) t.index);
++      (fun () -> Option.iter IO.Lock.unlock t.writer_lock);
++    ] in
++    let error = List.fold_left (fun first action ->
++      let next = try action (); None with error -> Some error in
++      match first with None -> next | Some _ -> first) None actions in
++    match error with None -> () | Some error -> raise error
++
++  let abort it =
++    match !it with
++    | None -> ()
++    | Some t ->
++        if t.open_instances <> 1 then invalid_arg "Index abort requires exclusive ownership";
++        with_exclusive it (fun () ->
++          it := None;
++          t.open_instances <- 0;
++          release_files ~flush:false t)
++
+   let close' ~hook ?immediately it =
+     let abort_merge = Option.is_some immediately in
+     match !it with
+     | None -> Log.debug (fun l -> l "close: instance already closed")
+     | Some t ->
++        ignore (check_open it);
+         Log.debug (fun l -> l "[%s] close" (Filename.basename t.root));
+         if abort_merge then (
+           t.pending_cancel <- true;
+@@ -1077,10 +1130,7 @@
+               Log.debug (fun l ->
+                   l "[%s] last open instance: closing the file descriptor"
+                     (Filename.basename t.root));
+-              if not t.config.readonly then flush_instance ~with_fsync:true t;
+-              Option.iter Log_file.close t.log;
+-              Option.iter (fun (i : index) -> IO.close i.io) t.index;
+-              Option.iter (fun lock -> IO.Lock.unlock lock) t.writer_lock))
++              release_files ~flush:(not t.config.readonly) t))
+ 
+   let close = close' ~hook:(fun _ -> ())
+ 
+--- a/src/index_intf.ml
++++ b/src/index_intf.ml
+@@ -113,6 +113,10 @@
+         to {!v}.
+       - If [with_fsync] is [true], this also flushes the OS caches for each [IO]
+         instance. *)
++
++  val with_exclusive : t -> (unit -> 'a) -> 'a
++  val try_exclusive : t -> (unit -> 'a) -> 'a option
++  val abort : t -> unit
+ 
+   val close : ?immediately:unit -> t -> unit
+   (** Closes all resources used by [t], flushing any internal buffers in the
+--- a/src/platform.ml
++++ b/src/platform.ml
+@@ -24,6 +24,8 @@
+   val acquire : string -> t -> unit
+   (** Acquire the given semaphore. Acquisition is not re-entrant. *)
+ 
++  val try_acquire : t -> bool
++
+   val release : t -> unit
+   (** Release the given semaphore. If any threads are attempting to acquire the
+       semaphore, exactly one of them will gain access to the semaphore. *)

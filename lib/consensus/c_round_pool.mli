@@ -44,6 +44,7 @@ val sent_range :
   C_codec.round_sync list
 
 val witness :
+  ?policy:C_quorum_policy.t ->
   t ->
   chain_id:string ->
   epoch_id:int64 ->

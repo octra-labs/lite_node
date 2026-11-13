@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-from sync_tip import sync_head, sync_epoch, sync_fields, sync_issue
+from sync_tip import sync_head, sync_fields, sync_issue, native_tip
 
 from release import trusted as trusted_release
 from validator_common import ValidatorError
@@ -48,6 +48,7 @@ from sync_need import make
 from sync_need import SCHEMA as NEED_SCHEMA
 from sync_need import history_limit, snapshot_lag
 from validator_config import operator_wallet
+from validator_config import network_update
 from wal_check import inspect as inspect_wal
 
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
@@ -486,15 +487,15 @@ def round_value(payload, key):
     return value if value >= 0 else None
 
 def sync_target(state, tip):
-    values = [
-        value
-        for value in [
-            tip["head"] if tip is not None else None,
-            state.get("peer_epoch"),
-        ]
-        if isinstance(value, int)
-    ]
-    return max(values) if values else None
+    head = state.get("head_epoch")
+    if (state.get("process") != "online" or state.get("rpc") != "ready"
+            or type(head) is not int or head < 0):
+        return None
+    native = tip.get("native") if isinstance(tip, dict) else None
+    if isinstance(native, dict) and native.get("local") == head and type(native.get("head")) is int:
+        return native["head"]
+    target = state.get("sync_target")
+    return target if type(target) is int and target >= head else None
 
 def sync_wait(values, need, wait, interval, *, min_epoch = 0):
     deadline = time.monotonic() + wait
@@ -607,6 +608,18 @@ def profile_match(version, release):
     return (release["runtime_profile_hash"] in hashes
         and selected == version.get("runtime_profile_hash"))
 
+def profile_current(version, release, head):
+    if not isinstance(version, dict) or type(head) is not int or head < 0:
+        return False
+    digest = version.get("runtime_profile_hash")
+    epoch = version.get("profile_epoch")
+    return (isinstance(digest, str) and re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+        and type(epoch) is int and epoch in (head, head + 1)
+        and version.get("chain_id") == release["chain_id"]
+        and version.get("consensus_profile") == release["consensus_profile"]
+        and version.get("consensus_rules_id") == release["consensus_rules_id"]
+        and profile_match(version, {"chain_id": release["chain_id"], "runtime_profile_hash": digest}))
+
 def view(values, pid, release):
     status = rpc_status(values["OCTRA_API_PORT"])
     peers = rpc_method(values["OCTRA_API_PORT"], "octra_consensusPeerStates")
@@ -617,7 +630,8 @@ def view(values, pid, release):
     round_epoch = round_value(round_state, "epoch_id")
     round_id = round_value(round_state, "round")
     local = status.get("head_epoch") if isinstance(status, dict) else None
-    remote = peer_head(peers)
+    native = native_tip(values, query=rpc_method)
+    remote = native["head"] if native is not None and type(local) is int and native["local"] == local else None
     wallet = load_wallet(Path(values["OCTRA_DATA_DIR"]) / "wallet.json")
     try:
         member = membership(values, wallet)
@@ -645,6 +659,7 @@ def view(values, pid, release):
         if isinstance(version, dict) else "unknown",
         "source_match": source_match,
         "runtime_match": runtime_match,
+        "profile_current": profile_current(version, release, local),
         "live_profile": version.get("runtime_profile_hash")
         if isinstance(version, dict) else None,
         "profile_epoch": version.get("profile_epoch") if isinstance(version, dict) else None,
@@ -654,7 +669,9 @@ def view(values, pid, release):
         if isinstance(version, dict) else None,
         "rpc": "ready" if isinstance(status, dict) else "unavailable",
         "head_epoch": local,
+        "head_root": status.get("state_root") if isinstance(status, dict) else None,
         "peer_epoch": remote,
+        "sync_target": remote,
         "lag": max(0, remote - local) if isinstance(local, int) and isinstance(remote, int) else None,
         "voting": voting,
         "voting_reason": reason,
@@ -842,6 +859,18 @@ def disk_state(values, config):
         need,
     )
 
+def local_upgrade_allowed(values, config, state, release):
+    source = state.get("live_source")
+    if (state.get("process") != "online" or state.get("rpc") != "ready"
+            or state.get("binary_match") is not True or state.get("profile_current") is not True
+            or state.get("source_match") is not False
+            or not isinstance(source, str) or HEX40.fullmatch(source) is None
+            or source != values.get("OCTRA_SOURCE_COMMIT") or source == release["source_commit"]
+            or type(state.get("head_epoch")) is not int or state["head_epoch"] < 0):
+        return False
+    disk = disk_state(values, config)
+    return disk.need is None and disk.epoch == state["head_epoch"] and disk.root == state.get("head_root")
+
 def resume_plan(before, after):
     if before.epoch != after.epoch:
         return Resume(False, "head_changed")
@@ -931,9 +960,9 @@ def preflight(root, sup, values, use_sudo, head=None):
     if sup["kind"] == "systemd" and use_sudo:
         call(["sudo", "-n", "true"], quiet=True)
     free = shutil.disk_usage(root).free
-    emit(disk_free_gib=round(free / 1024 ** 3, 1))
-    if free < 4 * 1024 ** 3:
-        raise ValidatorError("less than 4 GiB is free; expand the volume before building")
+    emit(disk_free_gib = round(free / 1024 ** 3, 1))
+    if free < 9 * 1024 ** 3:
+        raise ValidatorError("less than 9 GiB is free; expand the volume before building")
 
 def git_update(root, public, source):
     dirty = capture(["git", "status", "--porcelain", "--untracked-files=no"], cwd=root)
@@ -992,6 +1021,7 @@ def release_sync_values(root, values, release):
         root / "config/network.env",
         release["network_sha256"],
     )
+    network_update(values, network)
     selected = dict(values)
     for key in (
         "OCTRA_STATE_SYNC_SOURCES",
@@ -1177,6 +1207,8 @@ def restore_plan(values, config, plan, min_epoch=None):
     return need
 
 def apply(root, sup, values, args, release):
+    prior_values = values
+    local_only = False
     public, source = release_target(release, args, values)
     state = view(values, sup["pid"], release) if sup["pid"] else {}
     preflight(root, sup, values, args.sudo, head=state.get("head_epoch"))
@@ -1209,7 +1241,10 @@ def apply(root, sup, values, args, release):
             journal = need if replay else None, guard = need if resumed and not replay else None)
     if (need is None and (tip is None or tip["head"] is None) and state.get("process") == "online"
             and state.get("lag") is None):
-        raise ValidatorError("network head is unavailable; node was not stopped; retry upgrade")
+        local_only = local_upgrade_allowed(values, sup["config"], state, release)
+        if not local_only:
+            raise ValidatorError("network head is unavailable; node was not stopped; retry upgrade")
+        emit(event = "upgrade_local", reason = "native_target_unavailable", action = "build_then_probe")
     if need is None and matches(state):
         worker = Path(values.get("OCTRA_PVAC_VERIFY_WORKER", "")).expanduser()
         if worker.is_file() and sha256_file(worker) == values.get("OCTRA_PVAC_VERIFY_WORKER_HASH"):
@@ -1263,7 +1298,7 @@ def apply(root, sup, values, args, release):
     if sup["kind"] == "pm2" and prior_binary.parent != next_binary.parent:
         emit(event = "runtime_path", prior = prior_binary, current = next_binary)
     if sup["pid"]:
-        state = view(values, sup["pid"], release)
+        state = view(prior_values if local_only else values, sup["pid"], release)
     faults = durable_faults(values["OCTRA_DATA_DIR"], state.get("head_epoch"))
     if faults:
         for fault in faults:
@@ -1273,6 +1308,9 @@ def apply(root, sup, values, args, release):
         marked = read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"])
         require_profile(state, release,
             allow_missing = marked is not None)
+    if local_only and (values["OCTRA_DATA_DIR"] != prior_values["OCTRA_DATA_DIR"]
+            or not local_upgrade_allowed(prior_values, sup["config"], state, release)):
+        raise ValidatorError("local upgrade state changed; node was not stopped; retry upgrade")
     stop(sup, args.sudo)
     owners = data_pids(values["OCTRA_DATA_DIR"])
     if owners:
@@ -1309,9 +1347,11 @@ def apply(root, sup, values, args, release):
     return wait_node(root, sup, values, args, release, prior_binary,
         journal = need if replay else None,
         guard = (read_need(Path(values["OCTRA_DATA_DIR"]), values["OCTRA_CHAIN_ID"]) or restored)
-            if restored is not None else None)
+            if restored is not None else None,
+        **({"require_target": True} if local_only else {}))
 
-def wait_node(root, sup, values, args, release, prior_binary, *, journal = None, guard = None):
+def wait_node(root, sup, values, args, release, prior_binary, *, journal = None, guard = None,
+        require_target = False):
     deadline = time.monotonic() + args.wait_seconds
     recovering = journal is not None or guard is not None
     offline_since = None
@@ -1408,11 +1448,12 @@ def wait_node(root, sup, values, args, release, prior_binary, *, journal = None,
             marker = None
             time.sleep(args.interval)
             continue
-        if ready(values["OCTRA_OPERATOR_ROLE"], state):
+        authenticated = not require_target or sync_target(state, None) is not None
+        if authenticated and ready(values["OCTRA_OPERATOR_ROLE"], state):
             result = "validator_active" if values["OCTRA_OPERATOR_ROLE"] == "validator" else "observer_synced"
             emit(status=result, **state)
             return 0
-        if join_pending(values["OCTRA_OPERATOR_ROLE"], state):
+        if authenticated and join_pending(values["OCTRA_OPERATOR_ROLE"], state):
             emit(
                 status="installed",
                 reason = "validator_entry_pending",
@@ -1426,6 +1467,8 @@ def wait_node(root, sup, values, args, release, prior_binary, *, journal = None,
                 state,
                 release,
             )
+            if not authenticated:
+                status, reason, action, code = "pending", "native_target_unavailable", "leave_running", 2
             emit(
                 status=status,
                 reason=reason,

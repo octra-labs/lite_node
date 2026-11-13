@@ -107,6 +107,36 @@ let load source ~epoch_id =
         | Journal.Valid record ->
           Result.map Option.some (record_parent record)
 
+let set_at_head source ~epoch_id (head : Octra_core.Head_manifest.t) =
+  let ( let* ) = Result.bind in
+  if epoch_id < 0L || epoch_id = Int64.max_int
+     || epoch_id <> Int64.of_int head.epoch_id then
+    Error "validator source epoch differs from durable head"
+  else
+    match Journal.read_at_head ~chain_id:source.chain_id ~epoch:epoch_id
+      ~state_root:head.state_root ~txid_hi:head.txid_hi source.data_dir with
+    | Journal.Missing ->
+      let module Floor = Octra_core.History_floor in
+      let* floor = Octra_core.Store_chaindata.history_floor source.chaindata in
+      (match floor with
+       | None -> Error "validator source certificate is missing"
+       | Some floor ->
+         if Floor.chain_id floor <> source.chain_id
+            || Int64.of_int (Floor.epoch floor) <> epoch_id
+            || Floor.state_root floor <> head.state_root
+            || Floor.txid_hi floor <> head.txid_hi
+            || Some (Floor.ledger_state_root floor) <> head.ledger_state_root
+            || Some (Floor.epoch_index_hash floor) <> head.epoch_index_hash
+            || Some (Floor.epoch_index_root floor) <> head.epoch_index_root then
+           Error "validator source floor differs from durable head"
+         else
+           let* parent = validate (Floor.parent_commit floor) in
+           Ok parent.validator_set)
+    | Journal.Invalid reason -> Error ("validator source journal is invalid: " ^ reason)
+    | Journal.Valid record ->
+      let* parent = record_parent record in
+      Ok parent.validator_set
+
 let proposal source ~epoch_id =
   if epoch_id < 0L then Error "proposal epoch is invalid"
   else if epoch_id = 0L || not (required source epoch_id) then Ok None

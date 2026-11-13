@@ -449,6 +449,8 @@ let view_call
     ~call_params
     ~caller_addr
     ~include_storage =
+  let open Lwt.Syntax in
+  let* response = Octra_vm.Contract_rpc.run_view ~stop (fun () ->
   Circle_view_capacity.with_slot
     ~timeout:(Octra_vm.Contract_rpc.view_seconds, fun () ->
       Lwt.return (Error (Rpc.err (-32005) "circle view time limit exceeded" None)))
@@ -487,7 +489,10 @@ let view_call
         else
           ok (Circle_view.view_result return_value)
       | Octra_vm.Receipt_view.View_call_failed error ->
-        Lwt.return (Error (rpc_error error)))
+        Lwt.return (Error (rpc_error error)))) in
+  match response with
+  | Ok result -> Lwt.return result
+  | Error error -> Lwt.return_error error
 
 let view_call_public
     ?snapshot

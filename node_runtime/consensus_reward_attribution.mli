@@ -15,6 +15,7 @@ val full_set :
   t
 
 val resolve_for_epoch :
+  ?policy:Octra_consensus.C_quorum_policy.t ->
   chain_id:string ->
   epoch_id:int64 ->
   proposer_addr:string ->
@@ -35,12 +36,14 @@ val of_source :
   (t, string) result
 
 val bind_finality :
+  ?policy:Octra_consensus.C_quorum_policy.t ->
   validator_set:Octra_consensus.C_types.validator_set ->
   Octra_consensus.C_types.finalize ->
   t ->
   (t, string) result
 
 val prove_finality :
+  ?policy:Octra_consensus.C_quorum_policy.t ->
   validator_set:Octra_consensus.C_types.validator_set ->
   Octra_consensus.C_types.finalize ->
   t ->

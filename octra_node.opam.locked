@@ -141,6 +141,9 @@ build: [
   ["mkdir" "-p" "mcl/obj" "mcl/lib"]
   [make "-C" "mcl" "MCL_FP_BIT=256" "MCL_FR_BIT=256" "lib/libmcl.a"]
   [
+    "python3"
+    "controls/lib/gc_build.py"
+    "--"
     "dune"
     "build"
     "--root"

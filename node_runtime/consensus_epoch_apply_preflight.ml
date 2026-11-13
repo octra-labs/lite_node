@@ -11,6 +11,7 @@ type effects = {
   ledger_hash : unit -> string Lwt.t;
   cached_head : unit -> Octra_core.Head_manifest.t option;
   expected_prev_root : int -> string option;
+  check_execution : int -> Head.t option -> (unit, string) result Lwt.t;
   fatal : string -> unit;
   require_sync : Sync_need.t -> unit;
   exit : unit -> unit;
@@ -61,6 +62,14 @@ let run effects request =
   let open Lwt.Syntax in
   let* ledger_root = effects.ledger_hash () in
   let head = effects.cached_head () in
+  let* execution = effects.check_execution request.epoch_id head in
+  let* () = match execution with
+    | Ok () -> Lwt.return_unit
+    | Error reason ->
+      effects.fatal ("event = epoch_preflight action = refuse reason = " ^ reason);
+      effects.exit ();
+      Lwt.fail_with ("execution profile refused: " ^ reason)
+  in
   let consensus_root =
     match head with
     | Some head -> head.Head.state_root

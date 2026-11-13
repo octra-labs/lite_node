@@ -47,3 +47,18 @@ val create_server :
             Cohttp_lwt.Body.t ->
             (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t) ->
   unit Lwt.t
+
+val control_path : string -> string
+val control_address : string -> Unix.sockaddr
+
+val control_reply :
+  query:(unit -> (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result Lwt.t) ->
+  string ->
+  Yojson.Safe.t Lwt.t
+
+val with_sync_control :
+  ?unavailable:(string -> unit) ->
+  data_dir:string ->
+  query:(unit -> (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result Lwt.t) ->
+  (unit -> unit Lwt.t) ->
+  unit Lwt.t

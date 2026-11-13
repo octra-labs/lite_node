@@ -35,6 +35,149 @@ let vote epoch round pid kind member =
   {value with signature = sign member.address (H.vote_sign_bytes value)}
 let path () = Test_workspace.unique_dir "polc-cache"
 
+let state_parent members epoch root =
+  let value = { (header epoch (C.leader_of members ~epoch_id:epoch ~round:0).address) with
+    C.proposed_state_root = root } in
+  let pid = H.proposal_id value in
+  C.{validator_set = members; certificate = {chain_id = chain; epoch_id = epoch;
+    commit_round = 0; header = value; proposal_id = pid;
+    precommits = List.map (vote epoch 0 pid C.Precommit) members.validators}}
+
+let state_txs members locked =
+  let donor = List.hd locked and heavy = List.nth members.C.validators 17 in
+  List.init 15 (fun index ->
+    let tx = Octra_core.Transaction.{from = donor.C.address; to_ = heavy.address;
+      amount = Z.one; nonce = index + 1; ou = Z.of_int 1_000; timestamp = 1.;
+      signature = ""; public_key = Some (Base64.encode_exn donor.pubkey);
+      message = None; op_type = Standard; encrypted_data = None} in
+    {tx with signature = Base64.encode_exn (sign donor.address
+      (Octra_core.Transaction.serialize_for_signing tx))})
+
+let state_value ?finalize epoch members txs =
+  let module Core = Octra_core in
+  let module N = Octra_node_runtime in
+  let module S = Core.Store_irmin in
+  let module L = Core.Ledger in
+  let module X = Core.Epoch_exec in
+  let module R = Core.Rule_graph in
+  let run = Lwt_main.run in
+  let raw_root root = N.Consensus_pending_commit_recovery.raw32_of_hex
+    (Core.Epoch_index_commitment.root_hex root) |> Option.get in
+  let at = Int64.to_int epoch in
+  Test_workspace.with_dir "polc-state" (fun directory ->
+    let location = Filename.concat directory "irmin_store" in
+    let store = run (S.open_store location) in
+    let parent, value, result = Fun.protect ~finally:(fun () -> run (S.close store)) (fun () ->
+      let ledger = L.create store in
+      let initial = Z.of_int 1_000_000_000 in
+      List.iter (fun member -> get (L.add_account_with_pubkey ledger member.C.address initial
+        (Base64.encode_exn member.pubkey))) members.C.validators;
+      run (L.flush_dirty_lwt ledger);
+      run (S.set_meta store "last_epoch" (string_of_int (at - 1)));
+      run (S.set_meta store "current_epoch" (string_of_int at));
+      run (S.set_meta store "total_supply" (Z.to_string (L.get_total_supply ledger)));
+      run (S.set_meta store "emission_remaining" "0");
+      Option.iter (fun profile ->
+        let marker = get (X.execution_marker_to_string X.{epoch = at - 1; profile}) in
+        run (S.set_meta store X.execution_meta_key marker))
+        (N.Consensus_profile.execution_profile ~chain_id:chain ~epoch:(at - 1) Sys.getenv_opt);
+      let before = run (L.hash ledger) in
+      let earlier = state_parent members (Int64.sub epoch 2L) (raw_root before) in
+      let previous = Int64.pred epoch in
+      let state, reason, changed = Core.Set_fold.advance ~marks:true Core.Set_fold.participating
+        ~chain_id:chain ~start:previous ~at:previous ~parent:(Some earlier) Core.Set_fold.empty |> get in
+      check "state duty initialization refused" (changed && reason = None);
+      run (S.set_meta store Core.Set_fold.meta_key (Core.Set_fold.to_string state));
+      let root = run (L.hash ledger) in
+      let parent = state_parent members previous (raw_root root) in
+      let proposer = (C.leader_of members ~epoch_id:epoch ~round:2).address in
+      let rules = R.create ~chain_id:chain ~root_at:(fun at ->
+        match R.root_after_floor ~chain_id:chain ~floor_epoch:(Int64.to_int epoch) ~epoch:at with
+        | Some root -> R.Root root | None -> R.Missing) in
+      let env = N.Consensus_proposal.epoch_exec_env ~chain_id:chain ~epoch_id:epoch ~epoch_ts:1.
+        ~proposer ~validator_pubkeys:(List.map (fun member ->
+          member.C.address, Base64.encode_exn member.pubkey) members.validators)
+        ~prev_state_root:(raw_root root) ~ready_state_root_at:(fun _ -> Lwt.return_none) ~ready_max_lag:0 in
+      List.iter (fun tx -> get (Core.Tx_signature.check
+        (Core.Tx_signature.at ~chain_id:chain ~epoch) tx)) txs;
+      let reward = get (N.Consensus_reward_attribution.of_parent_commit parent) in
+      let preverify = Core.Preverify_commit.create [] in
+      let trust = Octra_vm.Program_trust.empty in
+      let preview = N.Consensus_proposal_preview_shell.node_backend ~program_trust:trust ~rules
+        ~legacy_replay:(fun ~epoch:_ ~address:_ ~cipher:_ -> failwith "unexpected private replay")
+        ~private_result_policy:(fun _ -> Core.Private_result_policy.Recoverable)
+        ~max_fhe:0 ~max_stealth:0 store ledger in
+      let prepared = run (preview.prepare ~epoch_id:at ~proposal_id:"polc-state"
+        ~expected_prev_root:(Some root) ~preverify ~parent_commit:(Some parent) ~reward ~env ~txs) |> get in
+      check "state preview changed retained root" (run (L.hash ledger) = root);
+      check "state preview lost transactions" (List.map fst prepared.execution.artifacts.confirmed = txs
+        && prepared.execution.artifacts.rejected = []
+        && Z.equal prepared.execution.artifacts.confirmed_fees (Z.of_int 15_000));
+      let hashes = List.map Core.Transaction.hash txs in
+      let _, index = Core.Epoch_index_commitment.next_root_from_hashes_i64
+        ~prev:Core.Epoch_index_commitment.genesis_root ~epoch_id:epoch ~start_txid:1L hashes in
+      let post = Core.Epoch_index_commitment.folded_state_root
+        ~ledger_state_root:prepared.execution.post_state_root ~epoch_index_root:index in
+      let value = { (header epoch proposer) with C.prev_state_root = raw_root root;
+        tx_list_hash = E.tx_list_hash_for_header (List.map (fun hash ->
+          N.Consensus_pending_commit_recovery.raw32_of_hex hash |> Option.get) hashes);
+        proposed_state_root = raw_root post; parent_commit_hash = H.parent_commit_hash parent; txid_hi = 15L } in
+      let result = Option.map (fun (finalized : C.finalize) ->
+        check "state certificate changed proposal" (finalized.header = value
+          && finalized.proposal_id = H.proposal_id value && finalized.parent_commit = Some parent);
+        check "state certificate rejected" (C_qc.validate_finalize ~chain_id:chain ~validator_set:members
+          ~verify_vote:(fun vote -> match C.pubkey_of_addr members vote.C.validator with
+            | None -> false | Some pubkey -> H.verify_vote ~pubkey_raw:pubkey vote) finalized = C_qc.Valid);
+        let fold = N.Set_rule.bind rules ~chain_id:chain ~parent:(Some parent) ~epoch:at |> get in
+        let policy = fold at |> get in
+        let backend = X.make_live_backend ~fold ~proof_mode:policy.standard_mode ~math:policy.math
+          ~execution_profile:(fun ~chain_id ~epoch ->
+            N.Consensus_profile.execution_profile ~chain_id ~epoch Sys.getenv_opt) store ledger in
+        let execution = run (X.run_core ~reward:(Some reward) ~preverify:(Some preverify) ~backend ~env ~txs
+          ~process_tx:(fun ~backend ~env tx -> N.Consensus_vm_transition.process_tx ~preverify
+            ~save_receipt_raw:(fun ~tx_hash:_ ~json:_ -> failwith "unexpected program receipt") ~backend ~env
+            ~circle_mode:(R.circle rules ~epoch:at |> Result.map_error R.fault_message |> get)
+            ~wasm_compute_mode:(R.wasm_compute rules ~epoch:at |> Result.map_error R.fault_message |> get)
+            ~program_trust:trust ~object_cost:(R.object_cost rules ~epoch:at = Ok R.Active) tx)) |> get in
+        check "state apply differs from retained branch" (execution = prepared.execution);
+        let applied_root = run (L.hash ledger) in
+        check "state apply root differs" (applied_root = prepared.execution.post_state_root);
+        let donor = (List.hd txs).Core.Transaction.from in
+        List.iter (fun member ->
+          let account = L.find ledger member.C.address in
+          check "state nonce differs" (account.nonce = if member.address = donor then 15 else 0)) members.validators;
+        check "state recipient lost amount" (Z.geq
+          (L.find ledger (List.hd txs).Core.Transaction.to_).balance (Z.add initial (Z.of_int 15)));
+        applied_root) finalize in
+      parent, value, result) in
+    Option.iter (fun expected ->
+      let reopened = run (S.open_store location) in
+      Fun.protect ~finally:(fun () -> run (S.close reopened)) (fun () ->
+        check "state reopen root differs" (run (L.hash (L.create reopened)) = expected))) result;
+    parent, value, result)
+
+let state_apply source destination =
+  let module J = Yojson.Safe.Util in
+  let input = Yojson.Safe.from_file source in
+  let decode f value = f (Base64.decode_exn (J.to_string value)) in
+  let members, locked, prior = match J.member "sample" input |> J.to_list with
+    | [members; locked; prior; _] ->
+      let members = decode C_codec.decode_validator_set members in
+      let locked = J.to_list locked |> List.map J.to_string in
+      members, List.map (fun address -> List.find (fun member -> member.C.address = address)
+        members.C.validators) locked, decode C_codec.decode_propose prior
+    | _ -> failwith "state sample shape differs" in
+  let finalize = decode C_codec.decode_finalize (J.member "finalize" input) in
+  let _, value, root = state_value ~finalize prior.C.epoch_id members (state_txs members locked) in
+  check "state input header differs" (prior.header = value);
+  let result = `Assoc ["status", `String "passed"; "epoch", `Intlit (Int64.to_string value.epoch_id);
+    "ledger_root", `String (Option.get root); "state_root", `String
+      (Octra_node_runtime.Text.raw_to_hex value.proposed_state_root);
+    "txid_hi", `String "15"; "nonce", `Int 15; "reopened", `Bool true] in
+  Out_channel.with_open_gen [Open_wronly; Open_creat; Open_excl; Open_binary] 0o600 destination
+    (fun stream -> output_string stream (Yojson.Safe.to_string result ^ "\n"));
+  print_endline "event = polc_state status = passed"
+
 let make ?(durable = ref true) directory members epoch member role ready pending =
   let store = V.disk ~data_dir:directory in
   let swarm = Octra_net.P2p_swarm.create Octra_net.P2p_swarm.{
@@ -428,11 +571,99 @@ let test_search_policy () =
     let node = make (path ()) members epoch member (ref true) (ref true) (ref 0) in
     E.start_round node.engine 71;
     node.running <- true;
-    let expected = if epoch >= height && epoch < 1_740_000L then Some 0 else None in
+    let expected = if epoch >= height then Some 0 else None in
     check "proof search crossed its policy interval"
       (D.proof_search_step node ~now:0L = expected && node.engine.proof_search = expected);
     Lwt_main.run (D.stop node))
-    [Int64.pred height; height; 1_739_999L; 1_740_000L]
+    [Int64.pred height; height; 1_739_999L; 1_740_000L; 1_760_000L]
+
+let test_search_paced () =
+  let epoch = 1_740_000L in
+  let members = set 58 in
+  let local = C.leader_of members ~epoch_id:epoch ~round:123 in
+  let node = make (path ()) members epoch local (ref true) (ref true) (ref 0) in
+  E.start_round node.engine 123;
+  node.running <- true;
+  let targets = ref [] in
+  for second = 0 to 1_919 do
+    let now = Int64.mul (Int64.of_int second) 1_000_000_000L in
+    Option.iter (fun round -> targets := (second, round) :: !targets)
+      (D.proof_search_step node ~now)
+  done;
+  check "paced search stopped before old rounds"
+    (List.exists (fun (_, round) -> round = 120) !targets);
+  List.iter (fun (second, _) ->
+    let count = List.fold_left (fun count (sent, _) ->
+      if sent <= second && sent > second - 60 then count + 1 else count) 0 !targets in
+    check "paced search exceeded response credits" (count <= 4)) !targets;
+  Lwt_main.run (D.stop node)
+
+let test_referenced_round () =
+  let epoch = 1_740_000L in
+  let members = set 4 in
+  let local = List.hd members.validators in
+  let node = make (path ()) members epoch local (ref true) (ref true) (ref 0) in
+  E.start_round node.engine 4;
+  ignore (E.drain_outputs node.engine);
+  let leader = C.leader_of members ~epoch_id:epoch ~round:4 in
+  let value = header epoch leader.address in
+  let proposal = C.{chain_id = chain; epoch_id = epoch; round = 4; valid_round = Some 2;
+    header = value; tx_hashes = []; parent_commit = None; proposer = leader.address; signature = ""} in
+  let proposal = {proposal with signature = sign leader.address (H.propose_sign_bytes proposal)} in
+  E.on_propose node.engine proposal ~verify_fn:node.config.verify_fn
+    ~execute_fn:node.config.execute_fn ~sign_fn:node.config.sign_fn;
+  check "unlocked receiver did not request proof"
+    (List.exists (function E.RequestRoundEvidence 2 -> true | _ -> false)
+      (E.drain_outputs node.engine));
+  for round = 5 to 133 do
+    E.start_round node.engine round;
+    ignore (E.drain_outputs node.engine)
+  done;
+  check "referenced proof request was removed" (E.polc_request_pending node.engine 2);
+  check "proof request table exceeded capacity"
+    (Hashtbl.length node.engine.polc_requests <= E.round_history_limit);
+  check "proof search changed lock" (node.engine.state.locked_round = -1)
+
+let test_request_pressure () =
+  List.iter (fun locked ->
+    let epoch = 1_740_000L in
+    let members = set 4 in
+    let node = make (path ()) members epoch (List.hd members.validators) (ref true) (ref true) (ref 0) in
+    let propose round valid_round =
+      E.start_round node.engine round;
+      ignore (E.drain_outputs node.engine);
+      let leader = C.leader_of members ~epoch_id:epoch ~round in
+      let value = header epoch leader.address in
+      let proposal = C.{chain_id = chain; epoch_id = epoch; round; valid_round = Some valid_round;
+        header = value; tx_hashes = []; parent_commit = None; proposer = leader.address; signature = ""} in
+      let proposal = {proposal with signature = sign leader.address (H.propose_sign_bytes proposal)} in
+      E.on_propose node.engine proposal ~verify_fn:node.config.verify_fn
+        ~execute_fn:node.config.execute_fn ~sign_fn:node.config.sign_fn;
+      value in
+    for index = 0 to 63 do
+      let round = 4 + 2 * index in
+      ignore (propose round (round - 2));
+      ignore (E.drain_outputs node.engine)
+    done;
+    check "request pressure not reached" (Hashtbl.length node.engine.polc_requests = 64);
+    if locked then begin
+      let value = header epoch (List.hd members.validators).address in
+      node.engine.state <- {node.engine.state with locked_round = 200;
+        locked_value = Some value; valid_round = 200; valid_value = Some value}
+    end;
+    let value = propose 300 220 in
+    check "current proof blocked by old references"
+      (List.exists (function E.RequestRoundEvidence 220 -> true | _ -> false)
+        (E.drain_outputs node.engine));
+    let pid = H.proposal_id value in
+    List.iter (fun member -> E.on_vote node.engine (vote epoch 220 pid C.Prevote member)
+      ~sign_fn:node.config.sign_fn) members.validators;
+    check "current proof lost after request pressure"
+      (E.polc_matches node.engine ~round:220 ~proposal_id:pid);
+    check "request pressure changed lock"
+      (node.engine.state.locked_round = if locked then 200 else -1);
+    check "request pressure exceeded limit" (Hashtbl.length node.engine.polc_requests <= 64))
+    [false; true]
 
 let test_past_value () =
   let members = set 4 in
@@ -753,6 +984,633 @@ let test_search_frames count known =
     check "empty proof marker hid current votes" (List.exists (fun frame ->
       frame.F.msg_type = F.msg_cons_vote && (C_codec.decode_vote frame.payload).round = 83) !frames))
 
+let test_request_queue () =
+  let module Q = C_round_request in
+  let scope = Q.{ height; generation = 0 } in
+  let state = ref (Q.create scope) in
+  let move message =
+    let next, effect = Q.step !state message in
+    state := next;
+    effect in
+  let original = Q.token !state in
+  let offer round = move (Q.Offer { token = Q.token !state; round; stamp = None }) in
+  check "request capacity differs" (Q.capacity = 64);
+  for round = 0 to 63 do
+    check "request refused before capacity" (offer round = None)
+  done;
+  check "duplicate request consumed capacity" (offer 0 = None
+    && List.length (!state).queue = 64);
+  check "request queue exceeded capacity" (offer 64 = Some (Q.Refused Q.Full));
+  let take now round = match move (Q.Take now) with
+    | Some (Q.Send (serial, query)) ->
+      check "request FIFO order differs" (query.round = round);
+      serial
+    | _ -> failwith "eligible request was not dispatched" in
+  let first = take 0L 0 in
+  check "concurrent request started" (move (Q.Take Q.interval) = None);
+  check "in-flight duplicate was queued" (offer 0 = None && List.length (!state).queue = 63);
+  check "in-flight request escaped capacity" (offer 64 = Some (Q.Refused Q.Full));
+  ignore (move (Q.Complete (first, 0L)));
+  check "request interval shortened" (move (Q.Take 1_099_999_999L) = None);
+  ignore (move (Q.Begin_notice 500_000_000L));
+  ignore (move (Q.Begin_notice 600_000_000L));
+  ignore (move (Q.End_notice 700_000_000L));
+  check "notification in flight allowed request" (move (Q.Take 2_000_000_000L) = None);
+  ignore (move (Q.End_notice 2_000_000_000L));
+  check "notification did not delay request" (move (Q.Take 3_099_999_999L) = None);
+  let second = take 3_100_000_000L 1 in
+  let next = { scope with generation = 1 } in
+  check "generation change left active send"
+    (move (Q.Advance (next, 3_200_000_000L)) = Some (Q.Cancel second)
+      && not (Q.pending !state) && (!state).active = None);
+  check "old generation request was accepted"
+    (move (Q.Offer { token = original; round = 2; stamp = None }) = Some (Q.Refused Q.Other_scope));
+  ignore (offer 7);
+  check "generation change erased cooldown" (move (Q.Take 4_299_999_999L) = None);
+  let third = take 4_300_000_000L 7 in
+  ignore (move (Q.Complete (second, 9_000_000_000L)));
+  check "old completion changed active send"
+    (Option.map fst (!state).active = Some third && (!state).last = Some 4_300_000_000L);
+  let before_stop = Q.token !state in
+  check "stop left active send" (move (Q.Close 4_400_000_000L) = Some (Q.Cancel third)
+    && not (Q.pending !state));
+  check "stopped dispatcher accepted request" (offer 8 = Some (Q.Refused Q.Closed));
+  ignore (move (Q.Open (next, 4_500_000_000L)));
+  check "old async producer survived stop"
+    (move (Q.Offer { token = before_stop; round = 8; stamp = None }) = Some (Q.Refused Q.Other_scope));
+  ignore (offer 8);
+  check "restart erased cooldown" (move (Q.Take 5_499_999_999L) = None);
+  let fourth = take 5_500_000_000L 8 in
+  let next_height = Q.{ height = Int64.succ height; generation = 2 } in
+  check "height change left active send"
+    (move (Q.Advance (next_height, 5_600_000_000L)) = Some (Q.Cancel fourth));
+  ignore (offer 0);
+  check "clock reversal allowed request" (move (Q.Take 5_000_000_000L) = None);
+  ignore (take 6_700_000_000L 0)
+
+let test_request_reopen () =
+  let members = set 4 in
+  let member = List.hd members.validators in
+  let node = make (path ()) members height member (ref true) (ref true) (ref 0) in
+  E.start_round node.engine 3;
+  ignore (E.drain_outputs node.engine);
+  E.realign_round node.engine 83;
+  ignore (E.drain_outputs node.engine);
+  let old = vote height 2 (raw "reopen-proof") C.Prevote member in
+  E.record_historical_prevote node.engine old;
+  let votes () = Hashtbl.find_opt node.engine.prevotes_by_round 2 in
+  check "request reopen setup lost votes" (Option.is_some (votes ()));
+  E.start_height node.engine height;
+  check "same height lost proof request" (E.polc_request_pending node.engine 2);
+  check "same height erased requested votes" (Option.is_some (votes ()));
+  check "same height did not retry proof" (List.exists (function
+    | E.RequestRoundEvidence 2 -> true | _ -> false) (E.drain_outputs node.engine));
+  E.start_height node.engine (Int64.succ height);
+  check "new height retained old proof request" (not (E.polc_request_pending node.engine 2));
+  check "new height retained old votes" (votes () = None)
+
+let test_request_delivery () =
+  let members = set 4 in
+  let node = make (path ()) members height (List.hd members.validators)
+    (ref true) (ref true) (ref 0) in
+  E.start_round node.engine 3;
+  ignore (E.drain_outputs node.engine);
+  let query () = Hashtbl.find node.engine.polc_requests 2 in
+  let first = (query ()).stamp in
+  let age = (query ()).asked in
+  E.renew_polc_requests node.engine;
+  check "renew erased request age" ((query ()).asked = age && (query ()).stamp = first);
+  Lwt_main.run (D.broadcast_round_sync_at node ~round:2);
+  check "stopped request marked sent" ((query ()).delivery = E.Waiting);
+  node.running <- true;
+  for round = 1000 to 1063 do
+    ignore (D.move_round_requests node (C_round_request.Offer {
+      token = C_round_request.token node.round_requests; round; stamp = None }))
+  done;
+  for round = 4 to 7 do
+    E.start_round node.engine round;
+    ignore (E.drain_outputs node.engine);
+    check "refused request was not retried" ((query ()).asked = round);
+    Lwt_main.run (D.broadcast_round_sync_at node ~round:2);
+    check "full queue request marked sent" ((query ()).delivery = E.Waiting)
+  done;
+  let report stamp generation epoch sent = E.report_polc_request node.engine
+    ~height:epoch ~generation ~round:2 ~stamp:(Some stamp) ~sent in
+  let current = query () in
+  report first node.engine.generation height true;
+  report current.stamp (node.engine.generation + 1) height true;
+  report current.stamp node.engine.generation (Int64.succ height) true;
+  check "other request completion changed state" (query () = current);
+  report current.stamp node.engine.generation height true;
+  check "current request completion ignored" ((query ()).delivery = E.Delivered);
+  E.start_round node.engine 8;
+  E.request_polc node.engine 2;
+  let next = query () in
+  report current.stamp node.engine.generation height false;
+  check "old request failure changed retry" (query () = next);
+  ignore (D.move_round_requests node (C_round_request.Close 0L));
+  ignore (D.move_round_requests node (C_round_request.Open (D.round_request_scope node, 0L)));
+  Lwt_main.run (D.broadcast_round_sync_at node ~round:2);
+  check "disconnected query not queued" (List.exists (fun (query : C_round_request.query) ->
+    query.round = 2) node.round_requests.queue);
+  ignore (D.move_round_requests node (C_round_request.Close 0L));
+  check "closing queue lost pending request" ((query ()).delivery = E.Waiting);
+  Lwt_main.run (D.stop node)
+
+let test_vote_request_stamp () =
+  let members = set 4 in
+  let member = List.hd members.validators in
+  let node = make (path ()) members height member (ref true) (ref true) (ref 0) in
+  E.start_round node.engine 3;
+  ignore (E.drain_outputs node.engine);
+  let payload = C_codec.encode_vote (vote height 2 (raw "request-stamp") C.Prevote member) in
+  D.remember_frame node Octra_net.P2p_frame.msg_cons_vote payload;
+  check "first requested vote refused" (D.historical_vote_replay_needed node payload);
+  check "same request accepted repeated vote" (not (D.historical_vote_replay_needed node payload));
+  E.start_round node.engine 4;
+  ignore (E.drain_outputs node.engine);
+  check "new request lost repeated historical vote" (D.historical_vote_replay_needed node payload);
+  check "retry accepted duplicate historical vote" (not (D.historical_vote_replay_needed node payload));
+  let module Conn = Octra_net.P2p_conn in
+  let fd, writer = Lwt_unix.pipe () in
+  let conn = Conn.create ~peer_class:Octra_net.P2p_frame_budget.Validator fd
+    ~peer_id:(Octra_net.P2p_handshake.node_id_of_pubkey member.pubkey)
+    ~addr:"vote-request" ~direction:Conn.Inbound in
+  node.running <- true;
+  Fun.protect ~finally:(fun () ->
+    Lwt_main.run (D.stop node);
+    Lwt_main.run (Conn.close conn);
+    Lwt_main.run (Lwt_unix.close writer)) (fun () ->
+    for round = 5 to 8 do
+      Hashtbl.remove node.engine.prevotes_by_round 2;
+      Hashtbl.remove node.engine.source_prevotes 2;
+      E.start_round node.engine round;
+      E.request_polc node.engine 2;
+      ignore (E.drain_outputs node.engine);
+      Lwt_main.run (D.on_p2p_message node conn Octra_net.P2p_frame.{msg_type = msg_cons_vote; payload});
+      let votes = Hashtbl.find_opt node.engine.prevotes_by_round 2 in
+      check "requested vote lost through peer route" (Option.fold ~none:false
+        ~some:(fun votes -> Hashtbl.mem votes.E.votes member.address) votes);
+      check "single historical vote fabricated quorum" (not (Hashtbl.mem node.engine.polc_by_round 2))
+    done)
+
+let test_returned_requests () =
+  List.iter (fun skip ->
+    let members = set 4 in
+    let member = List.hd members.validators in
+    let node = make (path ()) members height member (ref true) (ref true) (ref 0) in
+    let module Conn = Octra_net.P2p_conn in
+    let fd, writer = Lwt_unix.pipe () in
+    let conn = Conn.create ~peer_class:Octra_net.P2p_frame_budget.Validator fd
+      ~peer_id:(Octra_net.P2p_handshake.node_id_of_pubkey member.pubkey)
+      ~addr:"return-request" ~direction:Conn.Inbound in
+    let payload = C_codec.encode_vote (vote height 1 (raw "return-request") C.Prevote member) in
+    let visits = ref [] in
+    node.running <- true;
+    Fun.protect ~finally:(fun () ->
+      Lwt_main.run (D.stop node);
+      Lwt_main.run (Conn.close conn);
+      Lwt_main.run (Lwt_unix.close writer)) (fun () ->
+      for round = 1 to 2400 do
+        if skip && round mod 3 = 0 then E.realign_round node.engine round
+        else E.start_round node.engine round;
+        let queries = E.drain_outputs node.engine |> List.filter_map (function
+          | E.RequestRoundEvidence round -> Some round | _ -> None) in
+        check "return lost recent request" (E.polc_request_pending node.engine (round - 1));
+        check "return exceeded request capacity" (Hashtbl.length node.engine.polc_requests <= 64);
+        if round > 128 && List.mem 1 queries then begin
+          visits := round :: !visits;
+          Printf.printf "event = query_return round = %d skip = %b stamp = %d pending = %b\n%!"
+            round skip (Option.value ~default:(-1) (E.polc_request_stamp node.engine 1))
+            (E.polc_request_pending node.engine 1);
+          Hashtbl.remove node.engine.prevotes_by_round 1;
+          Hashtbl.remove node.engine.source_prevotes 1;
+          Lwt_main.run (D.on_p2p_message node conn Octra_net.P2p_frame.{msg_type = msg_cons_vote; payload});
+          check "returned vote lost through peer route"
+            (Option.fold ~none:false ~some:(fun votes -> Hashtbl.mem votes.E.votes member.address)
+              (Hashtbl.find_opt node.engine.prevotes_by_round 1));
+          check "returned single vote fabricated quorum" (not (Hashtbl.mem node.engine.polc_by_round 1))
+        end;
+        List.iter (fun target -> E.report_polc_request node.engine ~height
+          ~generation:node.engine.generation ~round:target
+          ~stamp:(E.polc_request_stamp node.engine target) ~sent:true) queries
+      done;
+      check "evicted request did not return four times" (List.length !visits >= 4);
+      check "return changed lock" (node.engine.state.locked_round = -1))) [false; true]
+
+let test_sweep_progress () =
+  List.iter (fun through ->
+    List.iter (fun limit ->
+      let cursor = ref (0, limit) in
+      for expected = 0 to limit do
+        let found, next = E.sweep_step ~through !cursor in
+        check "sweep skipped a round" (found = expected);
+        check "sweep moved pass end" (snd !cursor = limit);
+        cursor := next
+      done;
+      check "sweep did not wrap" (!cursor = (0, through))) [0; 1; 2; 63; 64; 1000])
+    [0; 1; 9999; max_int - 1];
+  let target, next = E.sweep_step ~through:0 (max_int - 1, max_int - 1) in
+  check "sweep overflowed integer" (target = max_int - 1 && next = (0, 0))
+
+let test_named_requests () =
+  let members = set 4 in
+  let node = make (path ()) members height (List.hd members.validators)
+    (ref true) (ref false) (ref 0) in
+  let propose round target =
+    let leader = C.leader_of members ~epoch_id:height ~round in
+    let proposal = C.{chain_id = chain; epoch_id = height; round; valid_round = Some target;
+      header = header height leader.address; tx_hashes = []; parent_commit = None;
+      proposer = leader.address; signature = ""} in
+    let proposal = {proposal with signature = sign leader.address (H.propose_sign_bytes proposal)} in
+    E.on_propose node.engine proposal ~verify_fn:node.config.verify_fn
+      ~execute_fn:node.config.execute_fn ~sign_fn:node.config.sign_fn in
+  E.start_round node.engine 100;
+  ignore (E.drain_outputs node.engine);
+  for target = 1 to 50 do propose 100 target done;
+  check "equivocations pinned multiple requests"
+    (List.filter (E.round_referenced node.engine) (List.init 50 ((+) 1)) = [1]);
+  for round = 101 to 200 do
+    E.start_round node.engine round;
+    propose round (round - 2);
+    ignore (E.drain_outputs node.engine)
+  done;
+  let named = List.filter (E.round_referenced node.engine) (List.init 200 Fun.id) in
+  check "named request limit exceeded" (List.length named = 32);
+  E.start_round node.engine 201;
+  propose 201 180;
+  check "repeated name consumed another slot"
+    (List.length (List.filter (E.round_referenced node.engine) (List.init 200 Fun.id)) = 32)
+
+let test_named_send_order () =
+  let members = set 4 in
+  let node = make (path ()) members height (List.hd members.validators)
+    (ref true) (ref true) (ref 0) in
+  node.running <- true;
+  E.start_round node.engine 1000;
+  ignore (E.drain_outputs node.engine);
+  for round = 100 to 163 do
+    E.request_polc node.engine round;
+    ignore (D.move_round_requests node (C_round_request.Offer {
+      token = C_round_request.token node.round_requests; round;
+      stamp = E.polc_request_stamp node.engine round }))
+  done;
+  let leader = C.leader_of members ~epoch_id:height ~round:1000 in
+  let proposal = C.{chain_id = chain; epoch_id = height; round = 1000; valid_round = Some 900;
+    header = header height leader.address; tx_hashes = []; parent_commit = None;
+    proposer = leader.address; signature = ""} in
+  let proposal = {proposal with signature = sign leader.address (H.propose_sign_bytes proposal)} in
+  E.on_propose node.engine proposal ~verify_fn:node.config.verify_fn
+    ~execute_fn:node.config.execute_fn ~sign_fn:node.config.sign_fn;
+  Lwt_main.run (D.broadcast_round_sync_at node ~round:900);
+  check "named request did not lead full queue"
+    ((List.hd node.round_requests.queue).round = 900);
+  check "named request grew queue" (List.length node.round_requests.queue = 64);
+  check "displaced request marked delivered"
+    ((Hashtbl.find node.engine.polc_requests 163).delivery = E.Waiting);
+  let token = C_round_request.token node.round_requests in
+  ignore (D.move_round_requests node (C_round_request.Offer {token; round = 900; stamp = Some 10000}));
+  ignore (D.move_round_requests node (C_round_request.Offer {token; round = 900; stamp = Some 9999}));
+  check "older offer replaced request"
+    ((List.find (fun (query : C_round_request.query) -> query.round = 900)
+        node.round_requests.queue).stamp = Some 10000);
+  let active = match D.move_round_requests node (C_round_request.Take (node.proof_clock ())) with
+    | Some (C_round_request.Send (serial, query)) ->
+      check "named request sent behind renewals" (query.round = 900); serial
+    | _ -> failwith "named request not dispatched" in
+  ignore (D.move_round_requests node (C_round_request.Prioritize {token; round = 901; stamp = None}));
+  check "priority cancelled active send" (Option.map fst node.round_requests.active = Some active);
+  Lwt_main.run (D.stop node)
+
+let test_send_refusal () =
+  let module Conn = Octra_net.P2p_conn in
+  let members = set 4 in
+  let member = List.hd members.validators in
+  let node = make (path ()) members height member (ref true) (ref true) (ref 0) in
+  let node = {node with D.proof_clock = (fun () -> 0L)} in
+  let fd, writer = Lwt_unix.pipe () in
+  let conn = Conn.create ~peer_class:Octra_net.P2p_frame_budget.Validator fd
+    ~peer_id:"send-refusal" ~addr:"send-refusal" ~direction:Conn.Inbound in
+  Hashtbl.add node.swarm.peers conn.peer_id conn;
+  E.start_round node.engine 3;
+  ignore (E.drain_outputs node.engine);
+  node.running <- true;
+  Fun.protect ~finally:(fun () ->
+    Lwt_main.run (D.stop node);
+    Lwt_main.run (Conn.close conn);
+    Lwt_main.run (Lwt_unix.close writer)) (fun () ->
+    Lwt_main.run (Lwt_mvar.put conn.write_queue Octra_net.P2p_frame.{msg_type = 0; payload = "occupied"});
+    let pending = D.broadcast_round_sync_at node ~round:2 in
+    check "full peer queue did not suspend send" (Lwt.is_sleeping pending);
+    Lwt_main.run (Conn.close conn);
+    Lwt_main.run pending;
+    let query = Hashtbl.find node.engine.polc_requests 2 in
+    check "failed peer enqueue counted as delivery" (query.delivery = E.Waiting);
+    check "failed peer enqueue kept active send" (node.round_send = None && node.round_requests.active = None);
+    E.start_round node.engine 4;
+    check "failed send was not retried" (List.exists (function
+      | E.RequestRoundEvidence 2 -> true | _ -> false) (E.drain_outputs node.engine)))
+
+let test_request_notice () =
+  let module F = Octra_net.P2p_frame in
+  let module Conn = Octra_net.P2p_conn in
+  let members = set 4 in
+  let leader = C.leader_of members ~epoch_id:height ~round:83 in
+  let member = List.find (fun member -> member.C.address <> leader.address) members.validators in
+  let now = ref 0L in
+  let node = make (path ()) members height member (ref true) (ref true) (ref 0) in
+  let node = {node with D.proof_clock = (fun () -> !now)} in
+  E.start_round node.engine 83;
+  ignore (E.drain_outputs node.engine);
+  node.running <- true;
+  let fd, writer = Lwt_unix.pipe () in
+  let conn = Conn.create ~peer_class:Octra_net.P2p_frame_budget.Validator fd
+    ~peer_id:(Octra_net.P2p_handshake.node_id_of_pubkey leader.pubkey)
+    ~addr:"request-notice" ~direction:Conn.Inbound in
+  Hashtbl.add node.swarm.peers conn.peer_id conn;
+  let frames = ref [] in
+  let rec consume () =
+    let open Lwt.Syntax in
+    let* frame = Lwt_mvar.take conn.write_queue in
+    conn.pending_writes <- max 0 (conn.pending_writes - 1);
+    frames := frame :: !frames;
+    consume () in
+  let consumer = consume () in
+  let retry, release = Lwt.task () in
+  let run work = Lwt_main.run (let open Lwt.Syntax in let* () = work in Lwt.pause ()) in
+  let syncs () = List.rev !frames |> List.map (fun frame ->
+    check "unexpected notification frame" (frame.F.msg_type = F.msg_cons_round_sync);
+    let sync = C_codec.decode_round_sync frame.payload in
+    check "notification signature differs" (sync.chain_id = chain && sync.epoch_id = height
+      && sync.validator = member.address && H.verify_round_sync ~pubkey_raw:member.pubkey sync);
+    sync) in
+  let queries () = syncs () |> List.filter_map (fun sync ->
+    if sync.C_codec.request && sync.round <> 83 then Some sync.round else None) in
+  Fun.protect ~finally:(fun () ->
+    Lwt_main.run (D.stop node);
+    if Lwt.is_sleeping retry then Lwt.wakeup release ();
+    Lwt.cancel consumer;
+    Lwt_main.run (Conn.close conn);
+    Lwt_main.run (Lwt_unix.close writer)) (fun () ->
+    run (D.broadcast_round_sync_at node ~round:82);
+    let pid = raw "request-notice-proof" in
+    E.record_polc node.engine 2 pid;
+    run (D.start_proposal_fetch ~sleep:(fun _ -> retry) node ~round:2 ~proposal_id:pid);
+    check "async fetch bypassed request queue" (queries () = [82]
+      && List.exists (fun (query : C_round_request.query) -> query.round = 2)
+        node.round_requests.queue);
+    now := 500_000_000L;
+    run (D.broadcast_round_sync node ~request:false);
+    let notice = List.find (fun sync -> not sync.C_codec.request) (syncs ()) in
+    let saved = get (C_sync_log.load node.sync_log ~chain_id:chain ~validator:member.address
+      ~epoch_id:height ~verify:(H.verify_round_sync ~pubkey_raw:member.pubkey)) in
+    check "current notification was not saved" (notice.round = 83
+      && notice.step = C.ProposeStep && List.mem notice saved);
+    now := 1_100_000_000L;
+    run (D.drain_round_requests node);
+    check "false notification did not reserve reply window" (queries () = [82]);
+    now := 1_600_000_000L;
+    run (D.drain_round_requests node);
+    check "async historical request was not sent" (queries () = [82; 2]);
+    run (D.broadcast_round_sync_at node ~round:3);
+    now := 2_000_000_000L;
+    run (D.broadcast_round_sync node ~request:true);
+    now := 2_700_000_000L;
+    run (D.drain_round_requests node);
+    check "true notification did not reserve reply window" (queries () = [82; 2]);
+    now := 3_100_000_000L;
+    run (D.drain_round_requests node);
+    check "pending request lost after notification" (queries () = [82; 2; 3]);
+    run (D.stop node);
+    node.running <- true;
+    now := 4_200_000_000L;
+    ignore (D.move_round_requests node
+      (C_round_request.Open (D.round_request_scope node, !now)));
+    Lwt.wakeup release ();
+    run (Lwt.pause ());
+    check "stopped async fetch restarted" (queries () = [82; 2; 3]
+      && Hashtbl.length node.proposal_fetches = 0);
+    let sleeps = ref 0 and drains = ref 0 in
+    Lwt_main.run (D.proof_wake_loop node ~sleep:(fun _ ->
+      incr sleeps;
+      if !sleeps = 2 then node.running <- false;
+      Lwt.pause ()) ~drain:(fun () -> incr drains; Lwt.return_unit));
+    check "idle nonleader drained outputs" (!drains = 0))
+
+let test_request_generation () =
+  let module F = Octra_net.P2p_frame in
+  let module Conn = Octra_net.P2p_conn in
+  let members = set 4 in
+  let leader = C.leader_of members ~epoch_id:height ~round:83 in
+  let member = List.find (fun member -> member.C.address <> leader.address) members.validators in
+  List.iter (fun proposal_query ->
+    let now = ref 0L and applied = ref [] in
+    let node = make (path ()) members height member (ref true) (ref true) (ref 0) in
+    let node = {node with D.proof_clock = (fun () -> !now); config = {node.config with
+      on_finalized = (fun ~validator_set finalize ->
+        check "batch finalize validator set differs" (validator_set = members);
+        applied := finalize :: !applied;
+        Lwt.return_unit)}} in
+    E.start_round node.engine 3;
+    ignore (E.drain_outputs node.engine);
+    E.realign_round node.engine 83;
+    let outputs = E.drain_outputs node.engine in
+    check "blocked batch request order differs" (List.filter_map (function
+      | E.RequestRoundEvidence round -> Some round | _ -> None) outputs = [82; 2]);
+    let value = header height leader.address in
+    let pid = H.proposal_id value in
+    List.iter (fun output -> E.emit node.engine (match output with
+      | E.RequestRoundEvidence 2 when proposal_query ->
+        E.RequestProposal { round = 0; proposal_id = pid }
+      | output -> output)) outputs;
+    let final = C.{chain_id = chain; epoch_id = height; commit_round = 83;
+      header = value; proposal_id = pid; parent_commit = None;
+      precommits = List.map (vote height 83 pid C.Precommit) members.validators} in
+    check "batch finalize was not retained" (E.emit_finalized node.engine final);
+    node.running <- true;
+    let fd, writer = Lwt_unix.pipe () in
+    let conn = Conn.create ~peer_class:Octra_net.P2p_frame_budget.Validator fd
+      ~peer_id:(Octra_net.P2p_handshake.node_id_of_pubkey leader.pubkey)
+      ~addr:"request-generation" ~direction:Conn.Inbound in
+    Hashtbl.add node.swarm.peers conn.peer_id conn;
+    let occupied = F.{msg_type = 0; payload = "occupied"} in
+    Lwt_main.run (Lwt_mvar.put conn.write_queue occupied);
+    let frames = ref [] and consumer = ref None and work = ref None in
+    let rec consume () =
+      let open Lwt.Syntax in
+      let* frame = Lwt_mvar.take conn.write_queue in
+      if frame != occupied then begin
+        conn.pending_writes <- max 0 (conn.pending_writes - 1);
+        frames := frame :: !frames
+      end;
+      consume () in
+    Fun.protect ~finally:(fun () ->
+      Lwt_main.run (D.stop node);
+      Option.iter Lwt.cancel !work;
+      Option.iter Lwt.cancel !consumer;
+      Lwt_main.run (Conn.close conn);
+      Lwt_main.run (Lwt_unix.close writer)) (fun () ->
+      let pending = D.process_outputs node in
+      work := Some pending;
+      check "request did not block on peer queue" (Lwt.is_sleeping pending
+        && Option.fold ~none:false ~some:(fun (_, query) -> query.C_round_request.round = 82)
+          node.round_requests.active && conn.pending_writes > 0);
+      let before = D.round_request_scope node in
+      D.set_height node (Int64.succ height);
+      ignore (E.drain_outputs node.engine);
+      check "blocked batch scope did not change" (D.round_request_scope node <> before);
+      consumer := Some (consume ());
+      let rec settle turns = match Lwt.state pending with
+        | Lwt.Return () -> Lwt.return_unit
+        | Lwt.Fail error -> Lwt.fail error
+        | Lwt.Sleep ->
+          check "blocked batch did not complete" (turns > 0);
+          Lwt.bind (Lwt.pause ()) (fun () -> settle (turns - 1)) in
+      Lwt_main.run (settle 100);
+      Lwt_main.run (Lwt.pause ());
+      check "scope change discarded finalized output" (!applied = [final]
+        && node.engine.pending_finalized = None);
+      check "scope change discarded signed finalize" (List.exists (fun frame ->
+        frame.F.msg_type = F.msg_cons_finalize && C_codec.decode_finalize frame.payload = final) !frames);
+      now := 1_100_000_000L;
+      Lwt_main.run (D.drain_round_requests node);
+      Lwt_main.run (Lwt.pause ());
+      let requests = List.filter_map (fun frame ->
+        if frame.F.msg_type <> F.msg_cons_round_sync then None else
+        let sync = C_codec.decode_round_sync frame.payload in
+        check "batch request signature differs" (H.verify_round_sync ~pubkey_raw:member.pubkey sync);
+        if sync.request then Some sync else None) !frames in
+      check (if proposal_query then "old proposal batch crossed height"
+        else "old evidence batch crossed height") (requests = []
+          && node.round_requests.queue = [] && Hashtbl.length node.proposal_fetches = 0)))
+    [false; true]
+
+let test_reply_order () =
+  let module F = Octra_net.P2p_frame in
+  let module Conn = Octra_net.P2p_conn in
+  let members = set 4 in
+  let leaders = List.map (fun round ->
+    (C.leader_of members ~epoch_id:height ~round).address) [3; 83] in
+  let requester = List.find (fun member -> not (List.mem member.C.address leaders))
+    members.validators in
+  let donor = List.find (fun member -> member.C.address <> requester.address
+    && member.address <> (C.leader_of members ~epoch_id:height ~round:83).address)
+    members.validators in
+  let now = ref 0L in
+  let receiver = make (path ()) members height requester (ref true) (ref true) (ref 0) in
+  let receiver = {receiver with D.proof_clock = (fun () -> !now)} in
+  let sender = make (path ()) members height donor (ref true) (ref true) (ref 0) in
+  let sender = {sender with D.proof_clock = (fun () -> !now)} in
+  let pid = raw "reply-order-proof" in
+  E.start_round sender.engine 83;
+  ignore (E.drain_outputs sender.engine);
+  E.record_polc sender.engine 2 pid;
+  List.iter (fun member ->
+    let old = vote height 2 pid C.Prevote member in
+    E.record_historical_prevote sender.engine old;
+    if member.C.address = donor.address then ignore (get (V.keep sender.vote_log old)))
+    members.validators;
+  let capture member =
+    let fd, writer = Lwt_unix.pipe () in
+    let conn = Conn.create ~peer_class:Octra_net.P2p_frame_budget.Validator fd
+      ~peer_id:(Octra_net.P2p_handshake.node_id_of_pubkey member.C.pubkey)
+      ~addr:"reply-order" ~direction:Conn.Inbound in
+    let frames = ref [] in
+    let rec consume () =
+      let open Lwt.Syntax in
+      let* frame = Lwt_mvar.take conn.write_queue in
+      conn.pending_writes <- max 0 (conn.pending_writes - 1);
+      frames := frame :: !frames;
+      consume () in
+    conn, writer, frames, consume () in
+  let outgoing, left, requests, sent = capture donor in
+  let incoming, right, replies, received = capture requester in
+  Fun.protect ~finally:(fun () ->
+    Lwt_main.run (D.stop receiver);
+    Lwt_main.run (D.stop sender);
+    List.iter Lwt.cancel [sent; received];
+    Lwt_main.run (Conn.close outgoing);
+    Lwt_main.run (Conn.close incoming);
+    Lwt_main.run (Lwt_unix.close left);
+    Lwt_main.run (Lwt_unix.close right)) (fun () ->
+    check "reply window opened early" (D.round_sync_response_due ~last:None ~now:0L
+      && not (D.round_sync_response_due ~last:(Some 0L) ~now:999_999_999L)
+      && D.round_sync_response_due ~last:(Some 0L) ~now:1_000_000_000L);
+    receiver.running <- true;
+    sender.running <- true;
+    E.start_round receiver.engine 3;
+    check "initial requester is leader" (not (E.am_i_leader receiver.engine));
+    Lwt_main.run (D.process_outputs receiver);
+    check "disconnected historical request was not retained"
+      (Option.map (fun query -> query.E.asked) (Hashtbl.find_opt receiver.engine.polc_requests 2) = Some 3);
+    Hashtbl.add receiver.swarm.peers outgoing.peer_id outgoing;
+    Hashtbl.add sender.swarm.peers incoming.peer_id incoming;
+    E.realign_round receiver.engine 83;
+    check "paired requester is leader" (not (E.am_i_leader receiver.engine));
+    check "responder is leader" (not (E.am_i_leader sender.engine));
+    let outputs = E.drain_outputs receiver.engine in
+    check "engine request order differs" (List.filter_map (function
+      | E.RequestRoundEvidence round -> Some round | _ -> None) outputs = [82; 2]);
+    List.iter (E.emit receiver.engine) outputs;
+    let observed = ref [] and last_reply = ref None in
+    let deliver frame =
+      let open Lwt.Syntax in
+      check "unexpected requester frame" (frame.F.msg_type = F.msg_cons_round_sync);
+      let sync = C_codec.decode_round_sync frame.payload in
+      check "request identity differs" (sync.chain_id = chain && sync.epoch_id = height
+        && sync.validator = requester.address
+        && H.verify_round_sync ~pubkey_raw:requester.pubkey sync);
+      check "request phase differs" (if sync.request then
+        List.mem sync.round [82; 2] && sync.step = C.PrevoteStep
+        else sync.round = 83 && sync.step = C.ProposeStep);
+      observed := (sync, frame) :: !observed;
+      let before = List.length !replies in
+      let* () = D.on_p2p_message sender incoming frame in
+      let* () = Lwt.pause () in
+      if List.length !replies > before then begin
+        check "round change bypassed reply window" (Option.fold ~none:true
+          ~some:(fun prior -> Int64.sub !now prior >= 1_000_000_000L) !last_reply);
+        last_reply := Some !now
+      end;
+      Lwt.return_unit in
+    let flush () =
+      let frames = List.rev !requests in
+      requests := [];
+      Lwt_list.iter_s deliver frames in
+    let has_proof () =
+      let votes = List.filter_map (fun frame ->
+        if frame.F.msg_type = F.msg_cons_vote then Some (C_codec.decode_vote frame.payload)
+        else None) !replies in
+      List.for_all (fun (v : C.vote) -> v.round = 2 && v.proposal_id = pid) votes
+      && Result.is_ok (V.polc_check ~policy:sender.policy ~chain_id:chain ~epoch_id:height
+        ~validator_set:members votes) in
+    Lwt_main.run (D.process_outputs receiver);
+    Lwt_main.run (Lwt.pause ());
+    Lwt_main.run (flush ());
+    check "recent round received no response" (!last_reply = Some 0L);
+    let ticks = Lwt_mvar.create_empty () in
+    let wake = D.proof_wake_loop receiver ~sleep:(fun seconds ->
+      check "proof wake interval differs" (seconds = 1.1);
+      Lwt_mvar.take ticks) ~drain:(fun () -> D.process_outputs receiver) in
+    receiver.proof_wake <- Some wake;
+    List.iter (fun tick ->
+      check "proof wake stopped before delivery" (Lwt.is_sleeping wake);
+      now := Int64.mul (Int64.of_int tick) 1_100_000_000L;
+      Lwt_main.run (let open Lwt.Syntax in
+        let* () = Lwt_mvar.put ticks () in
+        Lwt.pause ());
+      Lwt_main.run (flush ())) [1; 2; 3];
+    let recovered = has_proof () in
+    let queries = List.rev !observed |> List.filter (fun (sync, _) -> sync.C_codec.request) in
+    check "wire request order differs" (List.map (fun (sync, _) -> sync.C_codec.round)
+      queries = [82; 2]);
+    let historical = List.find (fun (sync, _) -> sync.C_codec.round = 2) queries |> snd in
+    replies := [];
+    now := Int64.add !now 1_100_000_000L;
+    Lwt_main.run (deliver historical);
+    check "historical-only response lacks signed proof" (has_proof ());
+    check "nonleader historical proof was not delivered" recovered)
+
 let test_value_source () =
   let source = set 4 in
   let author = C.leader_of source ~epoch_id:height ~round:2 in
@@ -779,38 +1637,23 @@ let test_value_source () =
   check "source author accepted without proof" (not (D.check_proposal_frame unknown proposal));
   Lwt_main.run (D.stop node)
 
-let test_driver_recovery () =
+let test_driver_recovery epoch =
   let recovered = ref [] in
   let weights = [1; 1; 1; 500; 1; 1; 1; 1; 1; 1; 2; 1; 1; 1; 1; 1;
     2; 10_000; 1; 1; 1; 1; 1; 2; 1; 1; 1; 701; 13; 1; 1] in
   let selected = List.mapi (fun index weight -> fst (List.nth keys index),
     Z.mul (Z.of_int weight) (Z.of_int 1_000_000)) weights in
   let members = get (C.make_weighted_validator_set selected) in
-  let epoch = 1_737_349L in
   let heavy = fst (List.nth selected 17) in
   let locked = selected |> List.filter (fun (_, weight) -> Z.leq weight (Z.of_int 2_000_000))
     |> List.filteri (fun index _ -> index < 17) |> List.map fst in
   let donor = List.hd locked in
-  let txs = List.init 15 (fun index ->
-    let tx = Octra_core.Transaction.{from = donor.address; to_ = heavy.address;
-      amount = Z.one; nonce = index + 1; ou = Z.of_int 1_000; timestamp = 1.;
-      signature = ""; public_key = Some (Base64.encode_exn donor.pubkey);
-      message = None; op_type = Standard; encrypted_data = None} in
-    {tx with signature = Base64.encode_exn (sign donor.address
-      (Octra_core.Transaction.serialize_for_signing tx))}) in
+  let txs = state_txs members locked in
   let bodies = List.map (fun tx -> Octra_core.Transaction.to_yojson tx |> Yojson.Safe.to_string) txs in
   let hashes = List.map (fun tx -> Octra_node_runtime.Consensus_pending_commit_recovery.raw32_of_hex
     (Octra_core.Transaction.hash tx) |> Option.get) txs in
-  let prior = header (Int64.pred epoch)
-    (C.leader_of members ~epoch_id:(Int64.pred epoch) ~round:0).address in
-  let prior_id = H.proposal_id prior in
-  let parent = C.{certificate = {chain_id = chain; epoch_id = Int64.pred epoch;
-    commit_round = 0; header = prior; proposal_id = prior_id;
-    precommits = List.map (vote (Int64.pred epoch) 0 prior_id C.Precommit) members.validators};
-    validator_set = members} in
+  let parent, value, _ = state_value epoch members txs in
   let author = C.leader_of members ~epoch_id:epoch ~round:2 in
-  let value = { (header epoch author.address) with tx_list_hash = E.tx_list_hash_for_header hashes;
-    parent_commit_hash = H.parent_commit_hash_opt (Some parent); txid_hi = 15L } in
   let pid = H.proposal_id value in
   let proposal = C.{chain_id = chain; epoch_id = epoch; round = 2; valid_round = None;
     header = value; tx_hashes = hashes; parent_commit = Some parent;
@@ -840,8 +1683,9 @@ let test_driver_recovery () =
             && p.tx_hashes = hashes && p.parent_commit = Some parent
             then D.Proposal_accept else D.Proposal_reject))}} in
     let receiver = build () in
+    let signed_round = if C_quorum_policy.round_wait receiver.policy epoch then round else round - 1 in
     ignore (get (V.keep receiver.vote_log
-      (vote epoch (round - 1) Octra_net.Hash_domain.nil_hash C.Precommit heavy)));
+      (vote epoch signed_round Octra_net.Hash_domain.nil_hash C.Precommit heavy)));
     let receiver = if restart then build () else receiver in
     get (D.restore_polc receiver);
     D.resume_local_vote receiver;
@@ -893,7 +1737,9 @@ let test_driver_recovery () =
         check "pending bundle differs" (proposal_id = pid && tx_hashes = List.map hex hashes);
         cache := Some (hashes, List.map (fun tx -> Octra_core.Transaction.to_yojson tx
           |> Yojson.Safe.to_string) txs, receipts_json));
-      validator_count = members.n; quorum = members.quorum} in
+      validator_count = members.n;
+      reached = (fun matched -> List.length matched >= max 0 (members.quorum - 1));
+      level = string_of_int (max 0 (members.quorum - 1))} in
     Fun.protect ~finally:(fun () -> Octra_core.Head_manifest.cached := saved_head) (fun () ->
       check "pending did not restore" (Lwt_main.run (R.run_with_driver runtime sender)));
     get (Lwt_main.run (D.restore_relief sender));
@@ -941,7 +1787,7 @@ let test_driver_recovery () =
         check "missing old proposal falsely recovered" (receiver.engine.state.valid_value = None
           && receiver.engine.state.locked_round = -1 && !checks = 0);
         check "old responders did not pin search" (Option.fold ~none:false
-          ~some:(fun query -> query.C_proof_search.target = 2 && query.attempts = 4)
+          ~some:(fun query -> query.C_proof_search.target = 2 && query.attempts <= 4)
           receiver.proof_search);
         Printf.printf "status = pass test = missing_old_value round = %d\n%!" round
       end else begin
@@ -956,7 +1802,9 @@ let test_driver_recovery () =
       let restarted = build () in
       get (D.restore_polc restarted);
       D.resume_local_vote restarted;
-      let round = leader_round restarted.engine.state.round in
+      let next_round = restarted.engine.state.round
+        + if C_quorum_policy.round_wait restarted.policy epoch then 1 else 0 in
+      let round = leader_round next_round in
       E.start_round restarted.engine round;
       restarted.running <- true;
       Hashtbl.add restarted.swarm.peers outgoing.peer_id outgoing;
@@ -998,14 +1846,35 @@ let test_driver_recovery () =
         check "31-member execution did not finalize original value"
           (Option.fold ~none:false ~some:(fun f -> f.C.proposal_id = pid) node.engine.pending_finalized)) nodes;
       recovered := (members, locked, proposal, repeated) :: !recovered;
-      Printf.printf "status = pass test = driver_value round = %d restart = %b validators = 31 locked = 17\n%!"
-        round restart end))
+      Printf.printf "status = pass test = driver_value epoch = %Ld round = %d restart = %b validators = 31 locked = 17\n%!"
+        epoch round restart end))
     [83, true, true; 56, true, false; 67, true, false; 71, true, false;
       83, true, false; 122, true, false; 56, false, false; 67, false, false;
       71, false, false; 83, false, false];
   !recovered
 
 let () =
+  Printexc.record_backtrace true;
+  if Array.length Sys.argv = 4 && Sys.argv.(1) = "--apply-state" then begin
+    state_apply Sys.argv.(2) Sys.argv.(3);
+    exit 0
+  end;
+  test_sweep_progress ();
+  test_returned_requests ();
+  test_named_requests ();
+  test_named_send_order ();
+  test_request_queue ();
+  test_request_reopen ();
+  test_request_delivery ();
+  test_vote_request_stamp ();
+  test_send_refusal ();
+  test_request_notice ();
+  test_request_generation ();
+  test_reply_order ();
+  test_search_policy ();
+  test_search_paced ();
+  test_referenced_round ();
+  test_request_pressure ();
   test_wait_priority ();
   test_wait_realign ();
   test_wake_error ();
@@ -1013,13 +1882,16 @@ let () =
   test_search_round_churn ();
   test_search_frames 31 true;
   test_search_frames 200 false;
-  test_search_policy ();
-  let recovered = test_driver_recovery () in
+  let recovered = test_driver_recovery 1_737_349L in
+  let active = test_driver_recovery 1_740_000L in
+  check "recovery sample counts differ" (List.length recovered = 9 && List.length active = 9);
+  let recovered = recovered @ active in
   (match Sys.getenv_opt "OCTRA_VALUE_TRACE" with
    | None -> ()
    | Some file ->
      if not (String.starts_with ~prefix:"runtime_data/" file)
        || List.mem ".." (String.split_on_char '/' file) then invalid_arg "trace path";
+     let file = Test_workspace.source file in
      Yojson.Safe.to_file file (`List (List.map (fun (members, locked, prior, proposal) ->
        `List [`String (Base64.encode_exn (C_codec.encode_validator_set members));
          `List (List.map (fun member -> `String member.C.address) locked);

@@ -800,6 +800,7 @@ let validate_record ~chain_id ~expected_validator_set_hash ~prev_eic
         | Error error -> Error ("catchup transaction envelope: " ^ error)
         | Ok () ->
         match Octra_core.Preverify_receipt_policy.check
+                ~rejections:partition.rejections
                 ~epoch_id:(Int64.to_int record.epoch_id)
                 ~receipts:partition.preverify
                 parsed_txs with

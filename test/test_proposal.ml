@@ -640,6 +640,7 @@ let test_check_quarantine () =
   expect "admission shell quarantine no start" (!started = [])
 
 type proposal_probe = {
+  holds : string list ref;
   start_heights : int64 list ref;
   preview_requests : C.build_preview_request list ref;
   set_proposals : (Transaction.t list * string list) list ref;
@@ -702,6 +703,7 @@ let make_proposal_deps ?(state_attested = true) ?(quarantine_active = false)
   let stored_bundles = ref [] in
   let frozen_writes = ref [] in
   let probe = {
+    holds = ref [];
     start_heights;
     preview_requests;
     set_proposals;
@@ -729,7 +731,7 @@ let make_proposal_deps ?(state_attested = true) ?(quarantine_active = false)
     staging_txs = (fun ?(circles = true) () ->
       if circles then staging else Octra_node_runtime.Circle_refill.without staging);
     evict_preview = (fun ?epoch:_ _ -> failwith "unexpected preview eviction");
-    hold_preview = (fun ~epoch:_ _ -> failwith "unexpected preview hold");
+    hold_preview = (fun ~epoch:_ tx -> probe.holds := Transaction.hash tx :: !(probe.holds));
     admits_tx = admits;
     build_preverify_once;
     staging_total = (fun () -> List.length staging);
@@ -1045,6 +1047,7 @@ let test_make_reuse_frozen_bundle () =
    | None ->
      fail "make frozen result");
   expect "make frozen no preview" (!(probe.preview_requests) = []);
+  expect "make frozen no set" (!(probe.set_proposals) = []);
   expect "make frozen stored"
     (!(probe.stored_bundles) =
      [envelope.proposal_id, final_hashes, final_txs, ["receipt"]]);
@@ -1122,6 +1125,7 @@ let test_make_preview_rejections () =
   expect "make freeze" (List.length !(probe.frozen_writes) = 1)
 
 let test_paid_proposal () =
+  List.iter (fun prepared ->
   let paid = tx 1 in
   let unpaid = { (tx 1) with from = "oct_other" } in
   let calls = ref 0 in
@@ -1135,7 +1139,17 @@ let test_paid_proposal () =
       confirmed = []; rejected; confirmed_fees = paid.ou; tx_count = 0}} in
   let deps, probe = make_proposal_deps ~staging:[paid; unpaid]
     ~preview_result:preview () in
-  expect "paid proposal absent" (Option.is_some (run_make_proposal deps));
+  let deps = {deps with C.evict_preview = (fun ?epoch:_ item ->
+    expect "paid transaction evicted" (item = unpaid))} in
+  let prepare request =
+    if !calls >= 2 then Lwt.fail (Octra_core.Exec_resource.Exhausted
+      (Transaction.hash paid, Octra_core.Exec_resource.Time))
+    else Lwt.return_ok C.{execution = Result.get_ok (preview request);
+      preverify = request.preverify} in
+  let result = Lwt_main.run (C.make_proposal ?prepare:(if prepared then Some prepare else None)
+    ~clock:(fun () -> 0.) ~budget:15. deps ~chain_id:"octra-test"
+    ~root_to_raw32:Fun.id ~limits:generous_limits ~epoch_id:12L) in
+  expect "paid proposal lost to repeated preparation" (Option.is_some result);
   expect "paid proposal retry count" (!calls = 2);
   match !(probe.stored_bundles) with
   | [_, [], [], receipts] ->
@@ -1152,7 +1166,258 @@ let test_paid_proposal () =
         validator_pubkeys = []; preverify = Octra_core.Preverify_commit.create []; txs = inputs })));
     let forged = List.map (fun (item : O.rejection) -> {item with charged = false}) outcomes.rejections in
     expect "unpaid marker accepted" (not (O.equal forged outcomes.rejections))
-  | _ -> fail "paid bundle changed"
+  | _ -> fail "paid bundle changed") [false; true]
+
+let test_preview_moved () =
+  let module E = Octra_core.Epoch_exec in
+  let target = tx 1 in
+  let other = {(tx 1) with from = "oct_other"} in
+  let row ?(kind = "compute_fund_failed") ?(charged = true) reason item =
+    E.{tx = item; error_type = kind; reason; charged} in
+  let pass confirmed rejected = E.{post_state_root = raw 'q'; artifacts = {
+    confirmed = List.map (fun item -> item, 0) confirmed; rejected;
+    confirmed_fees = Z.zero; tx_count = List.length confirmed}} in
+  let hash = Transaction.hash in
+  let both = List.sort String.compare [hash target; hash other] in
+  let duplicate = Error ("preview_outcome_invalid:" ^ Result.get_error
+    (Octra_core.Tx_outcome.build ~inputs:[target; target] [])) in
+  let paid = pass [] [row "input refused" target] in
+  let twice = pass [] [row "input refused" target; row "input refused" target] in
+  let unpaid reason = pass [target] [row ~charged:false reason other] in
+  let cases = [
+    "same", paid, paid, Ok [];
+    "class", pass [target] [], paid, Ok [hash target];
+    "text", paid, pass [] [row "input absent" target], Ok [hash target];
+    "pair", pass [] [row ~kind:"a:b" "c" target],
+      pass [] [row ~kind:"a" "b:c" target], Ok [hash target];
+    "exception", pass [] [row ~kind:"wasm_exception" "one" target],
+      pass [] [row ~kind:"wasm_exception" "two" target], Ok [];
+    "free", unpaid "one", unpaid "two", Ok [];
+    "left", pass [target] [], pass [] [row ~charged:false "one" target], Ok [hash target];
+    "right", pass [] [row ~charged:false "one" target], pass [target] [], Ok [hash target];
+    "order", pass [target; other] [],
+      pass [] [row "input refused" target; row "input refused" other], Ok both;
+    "prior", twice, paid, duplicate;
+    "result", paid, twice, duplicate] in
+  let faults = List.filter_map (fun (name, prior, result, expected) ->
+    let actual = C.preview_moved ~prior ~result in
+    if actual = expected then None
+    else Some (Printf.sprintf "case = %s %s" name (match actual with
+      | Ok moved -> Printf.sprintf "count = %d" (List.length moved)
+      | Error error -> "error = " ^ error))) cases in
+  if faults <> [] then fail ("preview moved: " ^ String.concat "; " faults)
+
+let test_paid_change () =
+  let module E = Octra_core.Epoch_exec in
+  let module O = Octra_core.Tx_outcome in
+  let module Work = Octra_core.Exec_resource in
+  let target = tx 1 in
+  let free = {(tx 1) with from = "oct_free"} in
+  let later = {(tx 2) with from = "oct_free"} in
+  let extra = {(tx 1) with from = "oct_extra"} in
+  let preview mode request =
+    let txs = request.C.txs in
+    let joint = List.mem free txs in
+    let near = List.mem extra txs in
+    let cut = mode = `Cut && near && not joint
+      && Work.defer (Transaction.hash extra) Work.Host in
+    let refuse reason item = E.{tx = item; error_type = "compute_fund_failed";
+      reason; charged = item = target} in
+    let rejected = List.filter_map (fun item ->
+      if item = target then
+        match mode, joint with
+        | (`Joint | `Reserve), false | `Alone, true -> Some (refuse "input refused" item)
+        | `Text, _ -> Some (refuse (if joint then "input refused" else "input absent") item)
+        | _ -> None
+      else if item = extra || (mode = `Cut && not near) then None
+      else Some (refuse "sender refused" item)) txs in
+    let confirmed = List.filter (fun item -> not (cut && item = extra)
+      && not (List.exists (fun (row : E.tx_reject) -> row.tx = item) rejected)) txs
+      |> Transaction.consensus_order in
+    Ok E.{post_state_root = raw 'q'; artifacts = {
+      confirmed = List.map (fun item -> item, 0) confirmed; rejected;
+      confirmed_fees = Z.zero; tx_count = List.length confirmed}} in
+  let run (mode, name, staging) prepared =
+    let preview = preview mode in
+    let deps, probe = make_proposal_deps ~staging ~preview_result:preview () in
+    let deps = {deps with C.evict_preview = (fun ?epoch:_ item ->
+      expect "paid change evicted moved transaction" (item = free))} in
+    let prepare request = Lwt.return_ok C.{execution = Result.get_ok (preview request);
+      preverify = request.preverify} in
+    let result = Lwt_main.run (C.make_proposal ?prepare:(if prepared then Some prepare else None)
+      ~clock:(fun () -> 0.) ~budget:15. deps ~chain_id:"octra-test"
+      ~root_to_raw32:Fun.id ~limits:generous_limits ~epoch_id:12L) in
+    let label = Printf.sprintf "mode = %s prepared = %b" name prepared in
+    let held hash = List.mem hash !(probe.holds) in
+    match result, !(probe.stored_bundles) with
+    | Some _, [_, _, txs, receipts] ->
+      let outcomes = Result.get_ok (O.decode ~confirmed:txs receipts) in
+      let inputs = Result.get_ok (O.merge ~confirmed:txs ~rejections:outcomes.rejections) in
+      let verdict = C.verify_preview_partition ~inputs ~confirmed:txs
+        ~rejections:outcomes.rejections (preview { C.epoch_id = 12L;
+          epoch_ts = 1.; proposal_id = "paid"; expected_prev_root = raw 'p';
+          prev_state_root = raw 'p'; parent_commit = None; proposer = "oct_creator";
+          validator_pubkeys = []; preverify = Octra_core.Preverify_commit.create []; txs = inputs }) in
+      let rows = List.map (fun (row : O.rejection) -> row.tx, row.charged) outcomes.rejections in
+      let shape = match mode with
+        | `Cut -> txs = [free; target] && rows = [] && held (Transaction.hash extra)
+        | `Reserve -> txs = [] && rows = [target, true] && held (Transaction.hash free)
+        | _ -> txs = [] && rows = [free, false] in
+      (match verdict with
+       | Error error -> [label ^ " verdict = " ^ error]
+       | Ok () when held (Transaction.hash target) -> [label ^ " verdict = target_held"]
+       | Ok () when not shape -> [label ^ " verdict = content_differs"]
+       | Ok () -> [])
+    | _ -> [label ^ " verdict = proposal_missing"] in
+  let pair = [free; target] in
+  let cases = [`Joint, "joint", pair; `Alone, "alone", pair; `Text, "text", pair;
+    `Cut, "cut", [extra; free; target]] in
+  let faults = List.concat_map (fun case -> List.concat_map (run case) [false; true]) cases
+    @ run (`Reserve, "reserve", [free; later; target]) true in
+  if faults <> [] then fail ("paid change: " ^ String.concat "; " faults)
+
+let test_refill_saved () =
+  let module R = Octra_core.Exec_resource in
+  let run mode =
+    let first = tx 1 in
+    let refused = {(tx 1) with from = "oct_refused"} in
+    let extra = {(tx 1) with from = "oct_extra"} in
+    let calls = ref 0 in
+    let moved = ref false in
+    let live = ref true in
+    let after field before changed () =
+      if !moved && mode = field then changed else before in
+    let base, probe = make_proposal_deps ~staging:[first; refused; extra] () in
+    let conflict = C.build_proposal_envelope ~chain_id:"octra-test" ~epoch_id:12L
+      ~prev_state_root:(raw 'p') ~final_hashes:[] ~final_txs:[] ~receipts_json:[]
+      ~proposed_state_root:(raw 'z') ~creator_addr:"oct_creator"
+      ~next_txid:7L ~head_txid_hi:(Some 6L) ~parent_commit:None ~ts:99. in
+    let deps = {base with C.current = (fun () -> !live);
+      current_epoch = after `Epoch 12 13;
+      current_round = after `Round 3 4;
+      state_attested = after `Attested true false;
+      quarantine_active = after `Quarantine false true;
+      cached_head = after `Head None (Some (proposal_head (raw 'h')));
+      prev_eic_root = after `Eic (base.prev_eic_root ()) (raw 'e');
+      next_txid = after `Next 7L 8L;
+      head_txid_hi = after `High (Some 6L) (Some 7L);
+      proposer = after `Proposer "oct_creator" "oct_changed";
+      validator_pubkeys = (fun _ -> after `Members
+        ["oct_validator", "pub"] ["oct_other", "pub"] ());
+      parent_commit = (fun ~epoch_id:_ -> after `Parent (Ok None) (Error "parent changed") ());
+      previous_epoch_ts = (fun _ -> after `Previous (Some 89.) (Some 90.) ());
+      frozen_bundle = (fun _ -> after `Frozen None (Some conflict.frozen_bundle) ());
+      read_prev_ledger_root = (fun () ->
+        let open Lwt.Syntax in
+        let* () = if !moved && mode = `ReadCancel then
+            let+ () = Lwt.pause () in live := false
+          else Lwt.return_unit in
+        if !moved && mode = `ReadError then Lwt.fail (Failure "root read failed")
+        else if !moved && mode = `NoLedger then Lwt.return_none
+        else Lwt.return (after `Root (Some (raw 'p')) (Some (raw 'r')) ()));
+      evict_preview = (fun ?epoch:_ item -> expect "refill evicted completed work" (item = refused))} in
+    let prepare (request : C.build_preview_request) =
+      incr calls;
+      let result confirmed rejected root =
+        Lwt.return_ok C.{execution = Result.get_ok
+          (exec_result ~confirmed ~rejected ~post_state_root:root);
+          preverify = request.C.preverify} in
+      match !calls with
+      | 1 ->
+        expect "refill initial selection" (request.txs = [first; refused]);
+        result [first] [refused] (raw 'l')
+      | 2 ->
+        expect "refill stable selection" (request.txs = [first]);
+        result [first] [] (raw 'q')
+      | 3 ->
+        expect "refill extension selection" (request.txs = [first; extra]);
+        expect "refill published before selection"
+          (!(probe.stored_bundles) = [] && !(probe.frozen_writes) = []);
+        moved := true;
+        (match mode with
+        | `Success -> result request.txs [] (raw 'w')
+        | `Error -> Lwt.return_error "extension refused"
+        | `Cancelled -> Lwt.fail Lwt.Canceled
+        | `Exception -> Lwt.fail (Failure "extension failed")
+        | `Host -> Lwt.fail (R.Unavailable Host)
+        | `Memory -> Lwt.fail (R.Unavailable Memory)
+        | `Stack -> Lwt.fail (R.Unavailable Stack)
+        | `Context -> live := false; Lwt.fail (R.Unavailable Time)
+        | _ -> Lwt.fail (R.Exhausted (Transaction.hash first, R.Time)))
+      | _ -> fail "refill repeated completed work" in
+    let result = Lwt_main.run (Lwt.try_bind (fun () ->
+      C.make_proposal ~prepare ~clock:(fun () ->
+        if !moved && mode = `AcceptClosed then 6. else after `Deadline 0. 20. ()) ~budget:15. deps
+        ~chain_id:"octra-test" ~root_to_raw32:Fun.id
+        ~limits:{generous_limits with C.max_txs = 2} ~epoch_id:12L)
+      (fun value -> Lwt.return_ok value) (fun error -> Lwt.return_error error)) in
+    expect "refill count differs" (!calls = 3);
+    expect "refill held completed transaction" (!(probe.holds) = []);
+    match mode, result with
+    | (`Time | `AcceptClosed | `Success), Ok (Some plan) ->
+      let items, root = if mode = `Success then [first; extra], raw 'w' else [first], raw 'q' in
+      let hashes = List.map Transaction.hash items in
+      let _, eic = Octra_core.Epoch_index_commitment.next_root_from_hashes
+        ~prev:(base.prev_eic_root ()) ~epoch_id:12 ~start_txid:7L hashes in
+      let expected = Octra_core.Epoch_index_commitment.folded_state_root
+        ~ledger_state_root:root ~epoch_index_root:eic in
+      expect "refill retained wrong root" (plan.header.proposed_state_root = expected);
+      expect "refill retained wrong transactions" (plan.tx_hashes = hashes);
+      expect "refill publication count"
+        (List.length !(probe.stored_bundles) = 1 && List.length !(probe.frozen_writes) = 1
+         && !(probe.set_proposals) = [items, hashes]);
+      let module O = Octra_core.Tx_outcome in
+      let outcomes = if mode = `Success then [] else Result.get_ok
+        (O.build ~inputs:[first; refused] [refused, "bad", "rejected"]) in
+      let receipts = O.encode [] outcomes in
+      let expected = C.build_proposal_envelope ~chain_id:"octra-test" ~epoch_id:12L
+        ~prev_state_root:(raw 'p') ~final_hashes:hashes ~final_txs:items ~receipts_json:receipts
+        ~proposed_state_root:expected ~creator_addr:"oct_creator" ~next_txid:7L
+        ~head_txid_hi:(Some 6L) ~parent_commit:None ~ts:99. in
+      expect "refill changed checked envelope" (plan.header = expected.header);
+      expect "refill changed receipt bytes"
+        (!(probe.stored_bundles) = [expected.proposal_id, hashes, items, receipts]);
+      let key = Cache.freeze_key ~epoch_id:12L ~round:3 in
+      expect "refill changed freeze identity" (!(probe.frozen_writes) = [key, expected.frozen_bundle])
+    | (`Time | `AcceptClosed), _ -> fail "refill discarded checked proposal"
+    | `Success, _ -> fail "refill extension missing"
+    | `Cancelled, Error Lwt.Canceled ->
+      expect "refill cancellation published" (!(probe.stored_bundles) = [] && !(probe.frozen_writes) = [])
+    | `Exception, Error (Failure reason) when reason = "extension failed" ->
+      expect "refill failure published" (!(probe.stored_bundles) = [] && !(probe.frozen_writes) = [])
+    | `ReadError, Error (Failure reason) when reason = "root read failed" ->
+      expect "refill unreadable root published" (!(probe.stored_bundles) = [] && !(probe.frozen_writes) = [])
+    | (`Error | `Host | `Memory | `Stack | `Context | `Deadline | `Epoch | `Round
+      | `Attested | `Quarantine | `Head | `Eic | `Next | `High | `Proposer
+      | `Members | `Parent | `Previous | `Root | `ReadCancel | `NoLedger | `Frozen), Ok None ->
+      expect "refill changed context published"
+        (!(probe.set_proposals) = [] && !(probe.stored_bundles) = [] && !(probe.frozen_writes) = [])
+    | _ -> fail "refill result differs" in
+  List.iter run [`Time; `AcceptClosed; `Success; `Error; `Cancelled; `Exception; `Host; `Memory;
+    `Stack; `Context; `Deadline; `Epoch; `Round; `Attested; `Quarantine; `Head;
+    `Eic; `Next; `High; `Proposer; `Members; `Parent; `Previous; `Root; `ReadCancel;
+    `ReadError; `NoLedger; `Frozen]
+
+let test_publish_failure () =
+  List.iter (fun phase ->
+    let base, probe = make_proposal_deps ~staging:[tx 1] () in
+    let calls = ref [] in
+    let publish step action =
+      calls := step :: !calls;
+      if phase = step then raise (Octra_core.Exec_resource.Unavailable Time);
+      action () in
+    let deps = {base with C.set_proposal = (fun txs hashes ->
+        publish `Set (fun () -> base.set_proposal txs hashes));
+      store_bundle = (fun ~proposal_id ~tx_hashes ~txs ~receipts_json ->
+        publish `Store (fun () -> base.store_bundle ~proposal_id ~tx_hashes ~txs ~receipts_json));
+      freeze = (fun key value -> publish `Freeze (fun () -> base.freeze key value))} in
+    let propagated = try ignore (run_make_proposal deps); false with
+      | Octra_core.Exec_resource.Unavailable Time -> true in
+    expect "publication failure hidden" propagated;
+    let expected = match phase with
+      | `Set -> [`Set] | `Store -> [`Store; `Set] | `Freeze -> [`Freeze; `Store; `Set] in
+    expect "publication failure retried" (!calls = expected);
+    expect "publication failure wrote freeze" (!(probe.frozen_writes) = [])) [`Set; `Store; `Freeze]
 
 let test_private_apply_slot () =
   let item key ou =
@@ -1420,6 +1685,848 @@ let test_preview_resources () =
     ignore (Lwt_main.run (Work.run ~hash:"tx" (fun () -> Lwt.fail Exit))); false
     with Exit -> true in
   expect "unrelated failure reinterpreted" raised
+
+let test_preview_time () =
+  let module Work = Octra_core.Exec_resource in
+  let first = tx 1 in
+  let slow = {(tx 1) with Transaction.from = "oct_slow"} in
+  let last = {(tx 1) with Transaction.from = "oct_last"} in
+  let inputs = Transaction.consensus_order [first; slow; last] in
+  let deps, probe = make_proposal_deps ~staging:inputs () in
+  let removed = ref [] in
+  let prior = deps.preview in
+  let deps = {deps with C.preview = (fun request ->
+    if List.mem slow request.C.txs && not (Array.exists (String.equal "selection") Sys.argv)
+    then Work.run ~hash:(Transaction.hash slow) (fun () -> Lwt.fail (Work.Unavailable Work.Time))
+    else prior request);
+    evict_preview = (fun ?epoch:_ item -> removed := item :: !removed)} in
+  expect "time limit stopped proposal" (Option.is_some (run_make_proposal deps));
+  expect "local time refusal removed transaction" (!removed = []);
+  match !(probe.stored_bundles) with
+  | [_, _, confirmed, receipts] ->
+    expect "time limit removed healthy transaction"
+      (confirmed = List.filter ((<>) slow) inputs);
+    let outcome = Octra_core.Tx_outcome.decode ~confirmed receipts |> Result.get_ok in
+    expect "time limit produced consensus rejection" (outcome.rejections = [])
+  | _ -> fail "time limited proposal missing"
+
+let test_preview_duration () =
+  let module Work = Octra_core.Exec_resource in
+  let item = tx 1 in
+  List.iter (fun duration -> List.iter (fun worker ->
+    let now = ref 0. in
+    let deps, probe = make_proposal_deps ~staging:[item] () in
+    let action () = now := !now +. duration; () in
+    let deps = {deps with C.preview = (fun request ->
+      if request.C.txs = [] then deps.preview request else
+      Work.run ~hash:(Transaction.hash item) (fun () ->
+        let open Lwt.Syntax in
+        let* () = if worker then
+            Work.detach ~launch:(fun work input -> Lwt.return (work input)) action ()
+          else Lwt.return (Work.work action) in
+        deps.preview request));
+      evict_preview = (fun ?epoch:_ _ -> failwith "elapsed time evicted transaction")} in
+    let plan = Lwt_main.run (C.make_proposal ~budget:40. ~clock:(fun () -> !now) deps
+      ~chain_id:"octra-test" ~root_to_raw32:Fun.id ~limits:generous_limits ~epoch_id:12L) in
+    expect "elapsed time prevented proposal" (Option.is_some plan);
+    expect "elapsed time excluded transaction" ((Option.get plan).tx_hashes = [Transaction.hash item]);
+    expect "elapsed time changed staging" (deps.staging_txs () = [item]);
+    expect "elapsed time retried completed work" (List.length !(probe.preview_requests) = 1))
+    [false; true]) [1.; 8.5]
+
+let test_build_budget () =
+  let module Work = Octra_core.Exec_resource in
+  let inputs = List.init 4 (fun i -> {(tx 1) with Transaction.from = "oct" ^ string_of_int i}) in
+  let now = ref 0. in
+  let attempts = ref 0 in
+  let deps, probe = make_proposal_deps ~staging:inputs () in
+  let deps = {deps with C.preview = (fun request ->
+    incr attempts;
+    match request.C.txs with
+    | [] -> deps.preview request
+    | item :: _ -> Work.run ~hash:(Transaction.hash item) (fun () ->
+        now := !now +. 4.;
+        Work.work (fun () -> raise (Work.Unavailable Work.Host))))} in
+  let result = Lwt_main.run (C.make_proposal ~budget:10. ~clock:(fun () -> !now) deps
+    ~chain_id:"octra-test" ~root_to_raw32:Fun.id ~limits:generous_limits ~epoch_id:12L) in
+  expect "proposal deadline restarted" (result = None && !attempts = 2);
+  expect "expired proposal published" (!(probe.stored_bundles) = [] && !(probe.frozen_writes) = []);
+  expect "deadline changed staging" (deps.staging_txs () = inputs);
+  let pending, _ = Lwt.task () in
+  let cancelled = ref false in
+  Lwt.on_cancel pending (fun () -> cancelled := true);
+  let deps, probe = make_proposal_deps ~staging:inputs
+    ~build_preverify_once:(fun ~state_root:_ ~tx_hashes:_ _ -> pending) () in
+  let result = Lwt_main.run (C.make_proposal ~budget:0.05 deps
+    ~chain_id:"octra-test" ~root_to_raw32:Fun.id ~limits:generous_limits ~epoch_id:12L) in
+  expect "precheck ignored deadline" (result = None && !cancelled);
+  expect "precheck timeout published" (!(probe.set_proposals) = []);
+  List.iter (fun budget ->
+    expect "invalid proposal duration accepted" (try
+      ignore (C.make_proposal ~budget deps ~chain_id:"octra-test"
+        ~root_to_raw32:Fun.id ~limits:generous_limits ~epoch_id:12L); false
+    with Invalid_argument _ -> true)) [0.; -1.; nan; infinity]
+
+let test_host_budget () =
+  let module Work = Octra_core.Exec_resource in
+  let slow = tx 1 in
+  let healthy = {slow with Transaction.from = "oct_healthy"} in
+  let deps, probe = make_proposal_deps ~staging:[slow; healthy] () in
+  let cancelled = ref false in
+  let deps = {deps with C.preview = (fun request ->
+    if not (List.mem slow request.C.txs) then deps.preview request else
+    Work.run ~hash:(Transaction.hash slow) (fun () -> Work.interrupt (fun () ->
+      let pending, _ = Lwt.task () in
+      Lwt.on_cancel pending (fun () -> cancelled := true);
+      pending)))} in
+  let result = Lwt_main.run (C.make_proposal ~budget:0.2 deps
+    ~chain_id:"octra-test" ~root_to_raw32:Fun.id ~limits:generous_limits ~epoch_id:12L) in
+  expect "host deadline omitted healthy work"
+    (Option.map (fun (plan : Octra_consensus.C_driver.proposal_plan) -> plan.tx_hashes) result = Some [Transaction.hash healthy]);
+  expect "host deadline did not cancel" !cancelled;
+  expect "host deadline did not hold" (List.mem (Transaction.hash slow) !(probe.holds));
+  expect "host deadline changed staging" (deps.staging_txs () = [slow; healthy]);
+  match !(probe.stored_bundles) with
+  | [_, _, confirmed, receipts] ->
+    let outcome = Octra_core.Tx_outcome.decode ~confirmed receipts |> Result.get_ok in
+    expect "host time produced rejection" (outcome.rejections = [])
+  | _ -> fail "host deadline result absent"
+
+let test_proposal_prefix () =
+  let module Work = Octra_core.Exec_resource in
+  let inputs = List.init 4 (fun i -> {(tx 1) with Transaction.from = "oct" ^ string_of_int i})
+    |> Transaction.consensus_order in
+  let now = ref 0. in
+  let deps, probe = make_proposal_deps ~staging:inputs () in
+  let deps = {deps with C.preview = (fun request ->
+    let rec take = function
+      | tx :: rest when Work.next () -> now := !now +. 2.; tx :: take rest
+      | _ -> [] in
+    let confirmed = take request.C.txs in
+    Lwt.return (exec_result ~confirmed ~rejected:[] ~post_state_root:(raw 'l')))} in
+  let result = Lwt_main.run (C.make_proposal ~budget:15. ~clock:(fun () -> !now) deps
+    ~chain_id:"octra-test" ~root_to_raw32:Fun.id ~limits:generous_limits ~epoch_id:12L) in
+  expect "completed prefix omitted" (Option.map (fun (plan : Octra_consensus.C_driver.proposal_plan) ->
+    plan.tx_hashes) result = Some (List.map Transaction.hash (List.filteri (fun i _ -> i < 3) inputs)));
+  expect "prefix replayed work" (!now = 6.);
+  expect "prefix held unstarted work" (!(probe.holds) = []);
+  expect "prefix changed staging" (deps.staging_txs () = inputs)
+
+let test_preview_selection () =
+  let module Work = Octra_core.Exec_resource in
+  let inputs = List.init 4 (fun i -> {(tx 1) with Transaction.from = "oct" ^ string_of_int i}) in
+  let slow = List.filteri (fun i _ -> i < 2) inputs in
+  let healthy = List.filteri (fun i _ -> i >= 2) inputs in
+  let deps, probe = make_proposal_deps ~staging:inputs () in
+  let calls = ref 0 in
+  let deps = {deps with C.preview = (fun request ->
+    incr calls;
+    let confirmed = List.filter (fun item ->
+      if not (Work.next ~hash:(Transaction.hash item) ()) then false
+      else if List.mem item slow then begin
+        expect "selection defer missing" (Work.defer (Transaction.hash item) Work.Time);
+        false
+      end else true) request.C.txs in
+    Lwt.return (exec_result ~confirmed ~rejected:[] ~post_state_root:(raw 'l')))} in
+  let result = run_make_proposal deps in
+  expect "selection lost healthy senders" (Option.map (fun (plan : C_driver.proposal_plan) ->
+    plan.tx_hashes) result = Some (List.map Transaction.hash healthy));
+  expect "selection replayed completed work" (!calls = 1);
+  expect "selection held another sender"
+    (List.sort String.compare !(probe.holds) = List.sort String.compare (List.map Transaction.hash slow));
+  expect "selection changed staging" (deps.staging_txs () = inputs)
+
+let test_preview_replay () =
+  let module Work = Octra_core.Exec_resource in
+  let inputs = List.init 4 (fun i -> {(tx 1) with Transaction.from = "oct" ^ string_of_int i}) in
+  let refused = List.hd inputs in
+  let healthy = List.nth inputs 1 in
+  let now = ref 0. in
+  let calls = ref 0 in
+  let deps, probe = make_proposal_deps ~staging:inputs () in
+  let deps = {deps with C.preview = (fun request ->
+    incr calls;
+    let selected = List.filter (fun item ->
+      if Work.next ~hash:(Transaction.hash item) () then begin
+        now := !now +. (if !calls = 1 then 3. else 0.5);
+        true
+      end else false) request.C.txs in
+    Lwt.return (exec_result ~confirmed:(List.filter ((<>) refused) selected)
+      ~rejected:(List.filter ((=) refused) selected) ~post_state_root:(raw 'l')))} in
+  let result = Lwt_main.run (C.make_proposal ~budget:15. ~clock:(fun () -> !now) deps
+    ~chain_id:"octra-test" ~root_to_raw32:Fun.id ~limits:generous_limits ~epoch_id:12L) in
+  expect "replay omitted completed work" (Option.map (fun (plan : C_driver.proposal_plan) ->
+    plan.tx_hashes) result = Some [Transaction.hash healthy]);
+  expect "replay admitted unseen work" (!calls = 2 && !now = 6.5);
+  expect "replay held unstarted work" (!(probe.holds) = []);
+  expect "replay changed staging" (deps.staging_txs () = inputs)
+
+let test_preview_expiry () =
+  let module Work = Octra_core.Exec_resource in
+  let item = tx 1 in
+  List.iter (fun elapsed ->
+    let now = ref 0. and current = ref true in
+    let deps, probe = make_proposal_deps ~staging:[item] () in
+    let deps = {deps with C.current = (fun () -> !current);
+      preview = (fun request ->
+        Lwt.catch (fun () -> Work.run ~hash:(Transaction.hash item) (fun () ->
+          if elapsed then now := 20. else current := false;
+          Work.work (fun () -> ());
+          deps.preview request)) (function
+          | Work.Exhausted (hash, resource) ->
+            expect "expiry defer absent" (Work.defer hash resource);
+            deps.preview {request with C.txs = []}
+          | error -> Lwt.fail error))} in
+    let result = Lwt_main.run (C.make_proposal ~budget:15. ~clock:(fun () -> !now) deps
+      ~chain_id:"octra-test" ~root_to_raw32:Fun.id ~limits:generous_limits ~epoch_id:12L) in
+    expect "expired preview published" (result = None && !(probe.stored_bundles) = []);
+    expect "expired preview held transaction" (!(probe.holds) = [])) [false; true];
+  List.iter (fun error_type ->
+    let refused = {item with Transaction.from = "oct_refused"} in
+    let deps, probe = make_proposal_deps ~staging:[item; refused] () in
+    let calls = ref 0 in
+    let prepare request =
+      incr calls;
+      let confirmed = List.filter ((<>) refused) request.C.txs in
+      let rejected = List.filter ((=) refused) request.C.txs in
+      let execution = Result.get_ok (exec_result ~confirmed ~rejected ~post_state_root:(raw 'l')) in
+      let artifacts = {execution.Octra_core.Epoch_exec.artifacts with rejected =
+        List.map (fun (row : Octra_core.Epoch_exec.tx_reject) -> {row with error_type})
+          execution.artifacts.rejected} in
+      Lwt.return_ok C.{execution = {execution with artifacts}; preverify = request.preverify} in
+    let result = Lwt_main.run (C.make_proposal ~prepare ~budget:15. ~clock:(fun () -> 0.) deps
+      ~chain_id:"octra-test" ~root_to_raw32:Fun.id ~limits:generous_limits ~epoch_id:12L) in
+    expect "fresh prepare failure blocked other sender" (Option.map
+      (fun (plan : C_driver.proposal_plan) -> plan.tx_hashes) result = Some [Transaction.hash item]);
+    expect "fresh prepare failure lost hold"
+      (!(probe.holds) = [Transaction.hash refused] && !calls = 2))
+    ["vm_transition_incomplete"; "vm_transition_exception"];
+  let refused = {item with Transaction.from = "oct_refused"} in
+  let now = ref 0. and calls = ref 0 in
+  let deps, probe = make_proposal_deps ~staging:[item; refused] () in
+  let deps = {deps with C.preview = (fun request ->
+    incr calls;
+    match !calls with
+    | 1 ->
+      now := 8.;
+      Lwt.return (exec_result ~confirmed:[item] ~rejected:[refused] ~post_state_root:(raw 'l'))
+    | 2 ->
+      Work.run ~hash:(Transaction.hash item) (fun () ->
+        Work.work (fun () -> now := !now +. 1.5);
+        deps.preview request)
+    | _ ->
+      Lwt.return (exec_result ~confirmed:request.C.txs ~rejected:[] ~post_state_root:(raw 'l')))} in
+  let result = Lwt_main.run (C.make_proposal ~budget:15. ~clock:(fun () -> !now) deps
+    ~chain_id:"octra-test" ~root_to_raw32:Fun.id ~limits:generous_limits ~epoch_id:12L) in
+  expect "late repeat held completed transaction" (!(probe.holds) = []);
+  expect "repeat window continued selection" (!calls = 3);
+  expect "late repeat published incomplete result" (Option.map
+    (fun (plan : C_driver.proposal_plan) -> plan.tx_hashes) result = Some []);
+  let deps, probe = make_proposal_deps ~staging:[item] () in
+  let deps = {deps with C.hold_preview = (fun ~epoch:_ _ -> raise (Work.Unavailable Work.Host));
+    preview = (fun _ ->
+      expect "hold error defer absent" (Work.defer (Transaction.hash item) Work.Time);
+      Lwt.return (exec_result ~confirmed:[] ~rejected:[] ~post_state_root:(raw 'l')))} in
+  let result = try run_make_proposal deps with
+    Work.Unavailable Work.Host -> fail "hold failure escaped proposal" in
+  expect "hold failure published proposal" (result = None && !(probe.stored_bundles) = [])
+
+let test_program_window () =
+  let module Core = Octra_core in
+  let module Work = Core.Exec_resource in
+  let module S = Core.Store_irmin in
+  let module L = Core.Ledger in
+  let module X = Core.Epoch_exec in
+  let module P = Circle_proposal in
+  Test_workspace.with_dir "program_window" (fun dir ->
+    let store = Lwt_main.run (S.open_store (Filename.concat dir "store")) in
+    Fun.protect ~finally:(fun () -> Lwt_main.run (S.close store)) (fun () ->
+      let people = List.init 4 (fun i -> P.identity (i + 1))
+        |> List.sort (fun a b -> String.compare a.P.address b.P.address) in
+      let ledger = L.create store in
+      List.iter (fun who -> ignore (L.add_account ledger who.P.address (Z.of_int 1_000_000)
+        |> Result.get_ok)) people;
+      Lwt_main.run (L.flush_dirty_lwt ledger);
+      Lwt_main.run (S.set_meta store "total_supply" (Z.to_string (L.get_total_supply ledger)));
+      Lwt_main.run (S.set_meta store "emission_remaining" "0");
+      let root = Lwt_main.run (L.hash ledger) in
+      let inputs = List.mapi (fun i who -> P.signed who ~ou:1000
+        ~op_type:(if i < 2 then Transaction.ProgramExec
+          else if i = 2 then Standard else ValidatorReady)
+        ~to_:(List.hd people).address ~nonce:1 ~message:"[]" ~method_:None) people in
+      let slow = List.hd inputs in
+      let kept = List.filteri (fun i _ -> i >= 2) inputs in
+      expect "program window input order" (Transaction.consensus_order inputs = inputs);
+      let now = ref 0. in
+      let visited = ref [] in
+      let env = X.{chain_id = "octra-test"; epoch_id = 12; proposer_addr = slow.from;
+        validator_addrs = []; validator_pubkeys = []; prev_state_root = root;
+        epoch_ts = 99.; ready_state_root_at = None; ready_max_lag = -1} in
+      let execute txs = Core.State_preview.with_preview ~base_store:store ~base_ledger:ledger
+        ~proof_mode:Core.Rule_graph.Prior ~fold:X.prior_fold ~epoch_id:12
+        ~proposal_id:"program-window" (fun backend ->
+          X.run_core ~reward:None ~preverify:None ~backend ~env ~txs
+            ~process_tx:(fun ~backend ~env:_ tx -> Work.run ~hash:(Transaction.hash tx) (fun () ->
+              let open Lwt.Syntax in
+              visited := tx :: !visited;
+              expect "program window debit" (L.debit backend.X.ledger tx.from (Z.of_int 10) tx.nonce = Ok ());
+              let* () = S.set_meta backend.store tx.from "visited" in
+              Work.work (fun () ->
+                now := !now +. (if tx.op_type = ProgramExec then 6. else 0.01));
+              Lwt.return_ok (X.Confirmed Z.zero)))) in
+      let captured = ref None in
+      let deps, probe = make_proposal_deps ~staging:inputs ~ledger_root:root () in
+      let deps = {deps with C.preview = (fun request ->
+        Lwt.map (fun result -> captured := Some result; result) (execute request.C.txs))} in
+      let result = Lwt_main.run (C.make_proposal ~budget:15. ~clock:(fun () -> !now) deps
+        ~chain_id:"octra-test" ~root_to_raw32:P.root_raw ~limits:generous_limits ~epoch_id:12L) in
+      expect "program cut omitted other senders" (Option.map
+        (fun (plan : C_driver.proposal_plan) -> plan.tx_hashes) result
+        = Some (List.map Transaction.hash kept));
+      expect "program cut executed second call" (List.rev !visited = slow :: kept);
+      expect "program cut held unstarted work" (!(probe.holds) = [Transaction.hash slow]);
+      expect "program cut changed staging" (deps.staging_txs () = inputs);
+      expect "program cut changed ledger" (Lwt_main.run (L.hash ledger) = root);
+      let selected = Option.get !captured |> Result.get_ok in
+      expect "program cut produced refusal" (selected.X.artifacts.rejected = []);
+      let replay = Lwt_main.run (execute kept) |> Result.get_ok in
+      expect "program cut replay differs" (selected = replay)))
+
+let test_repeat_window () =
+  let module Core = Octra_core in
+  let module Work = Core.Exec_resource in
+  let module Pool = Core.Tx_staging in
+  let module Refill = Octra_node_runtime.Circle_refill in
+  let module S = Core.Store_irmin in
+  let module L = Core.Ledger in
+  let module X = Core.Epoch_exec in
+  let module P = Circle_proposal in
+  List.iter (fun (prepared, descendants, operation_cut) ->
+  Pool.clear ();
+  Test_workspace.with_dir "repeat_window" (fun dir ->
+    let store = Lwt_main.run (S.open_store (Filename.concat dir "store")) in
+    Fun.protect ~finally:(fun () -> Pool.clear (); Lwt_main.run (S.close store)) (fun () ->
+      let people = List.init 3 (fun i -> P.identity (i + 1))
+        |> List.sort (fun a b -> String.compare a.P.address b.P.address) in
+      let ledger = L.create store in
+      List.iter (fun who -> ignore (L.add_account ledger who.P.address (Z.of_int 1_000_000)
+        |> Result.get_ok)) people;
+      Lwt_main.run (L.flush_dirty_lwt ledger);
+      Lwt_main.run (S.set_meta store "total_supply" (Z.to_string (L.get_total_supply ledger)));
+      Lwt_main.run (S.set_meta store "emission_remaining" "0");
+      let root = Lwt_main.run (L.hash ledger) in
+      let item i nonce op_type = P.signed (List.nth people i) ~ou:1000 ~op_type
+        ~to_:(List.hd people).address ~nonce ~message:"[]" ~method_:None in
+      let nonce = if descendants then 2 else 1 in
+      let healthy = item 0 1 Transaction.Standard
+      and refused = item 1 nonce Transaction.Standard
+      and heavy = item 2 nonce Transaction.ProgramExec in
+      let inputs = if descendants then
+          [healthy; item 1 1 Standard; refused; item 1 3 Standard;
+            item 2 1 Standard; heavy; item 2 3 Standard]
+        else [healthy; refused; heavy] in
+      let retained = if descendants then
+          List.filter (fun item -> item.Transaction.nonce = 1) inputs
+        else [healthy] in
+      let rejected = List.filter (fun item -> item.Transaction.from = refused.from
+        && item.nonce >= refused.nonce) inputs in
+      let shortened = Refill.through ~rejected inputs in
+      let without_heavy = Refill.before ~excluded:[heavy] shortened in
+      let requests = if operation_cut then [inputs; shortened; without_heavy; retained]
+        else if descendants && prepared then [inputs; shortened; retained]
+        else [inputs; retained] in
+      let executions = if operation_cut then
+          [inputs; Refill.through ~rejected:[heavy] shortened; without_heavy; retained]
+        else requests in
+      expect "repeat window input order" (Transaction.consensus_order inputs = inputs);
+      expect "repeat window input cutoffs"
+        (Refill.before ~excluded:(heavy :: rejected) inputs = retained);
+      List.iter (fun item -> ignore (Pool.add_smart
+        ~lookup:(fun _ -> Some (Z.of_int 100_000_000, 0)) item |> Result.get_ok)) inputs;
+      expect "repeat window staging inputs" (Pool.all () = inputs);
+      expect "repeat window pool cutoffs"
+        (Refill.before ~excluded:(List.rev (heavy :: rejected)) (Pool.all ()) = retained);
+      expect "repeat window cutoff idempotence"
+        (Refill.before ~excluded:(heavy :: heavy :: rejected) retained = retained);
+      let entry = Hashtbl.find Pool.hash_index (Transaction.hash heavy) in
+      if not operation_cut then entry.preview <- Some (Pool.hold_after 10L None);
+      let allowance = if operation_cut then 3.75 else 7.5 in
+      expect "repeat window operation allowance" (Pool.preview_limit (Transaction.hash heavy) 3.75 = allowance);
+      expect "repeat window prior hold active"
+        (Pool.Preview.send (Pool.Preview.Ready (Some 11L, Transaction.hash heavy)) = Ok ());
+      let now = ref 0. and calls = ref 0 and visited = ref [] and captured = ref None in
+      let received = ref [] in
+      let evicted = ref [] in
+      let env = X.{chain_id = "octra-test"; epoch_id = 12; proposer_addr = healthy.from;
+        validator_addrs = []; validator_pubkeys = []; prev_state_root = root;
+        epoch_ts = 99.; ready_state_root_at = None; ready_max_lag = -1} in
+      let execute txs = Core.State_preview.with_preview ~base_store:store ~base_ledger:ledger
+        ~proof_mode:Core.Rule_graph.Prior ~fold:X.prior_fold ~epoch_id:12
+        ~proposal_id:"repeat-window" (fun backend ->
+          X.run_core ~reward:None ~preverify:None ~backend ~env ~txs
+            ~process_tx:(fun ~backend ~env:_ item -> Work.run ~hash:(Transaction.hash item) (fun () ->
+              let open Lwt.Syntax in
+              visited := (!calls, item) :: !visited;
+              let debit = L.debit backend.X.ledger item.from (Z.of_int 10) item.nonce in
+              if item.from = refused.from && item.nonce > refused.nonce then
+                expect "repeat window descendant nonce accepted" (Result.is_error debit)
+              else expect "repeat window debit" (debit = Ok ());
+              let* () = S.set_meta backend.store item.from (string_of_int item.nonce) in
+              if item = heavy then begin
+                let first, second = if operation_cut then
+                    (if !calls = 1 then 0.5, 0.5 else 2., 2.)
+                  else if not descendants then 2., 4.
+                  else if prepared then 1.15, 1.15 else 1.9, 1.9 in
+                Work.work (fun () -> now := !now +. first);
+                Work.work (fun () -> now := !now +. second)
+              end else Work.work (fun () -> now := !now +. 0.1);
+              if List.mem item rejected then Lwt.return_error ("bad", "refused")
+              else Lwt.return_ok (X.Confirmed Z.zero)))) in
+      let deps, probe = make_proposal_deps ~staging:(Pool.all ()) ~ledger_root:root () in
+      let preview request =
+        incr calls;
+        received := request.C.txs :: !received;
+        Lwt.map (fun result -> captured := Some result; result) (execute request.C.txs) in
+      let deps = {deps with C.preview;
+        staging_txs = (fun ?(circles = true) () ->
+          if circles then Pool.all () else Refill.without (Pool.all ()));
+        proposer = (fun () -> healthy.from);
+        validator_pubkeys = (fun _ -> []);
+        evict_preview = (fun ?epoch item ->
+          expect "repeat window eviction identity"
+            (operation_cut && prepared && epoch = Some 12L && item = refused && !evicted = []);
+          let _, permitted = Pool.Preview.step ~limit:1 Pool.Preview.empty
+            (Pool.Preview.Refuse {head = 11L; epoch = 12L; hash = Transaction.hash item}) in
+          expect "repeat window eviction epoch refused" (permitted = Ok ());
+          expect "repeat window eviction missing pool entry" (Option.is_some (Pool.drop_preview item));
+          evicted := [item]);
+        hold_preview = (fun ~epoch item ->
+          deps.hold_preview ~epoch item;
+          Pool.Preview.send (Pool.Preview.Hold {head = 11L; epoch; hash = Transaction.hash item})
+            |> Result.get_ok)} in
+      let prepare = if not prepared then None else Some (fun (request : C.build_preview_request) ->
+        Lwt.map (Result.map (fun execution -> C.{execution; preverify = request.C.preverify}))
+          (preview request)) in
+      let result = Lwt_main.run (C.make_proposal ?prepare ~budget:15. ~clock:(fun () -> !now) deps
+        ~chain_id:"octra-test" ~root_to_raw32:P.root_raw ~limits:generous_limits ~epoch_id:12L) in
+      expect "repeat window lost other sender" (Option.map
+        (fun (plan : C_driver.proposal_plan) -> plan.tx_hashes) result
+          = Some (List.map Transaction.hash retained));
+      expect "repeat window preview inputs" (List.rev !received = requests);
+      expect "repeat window execution order" (List.rev !visited =
+        List.concat (List.mapi (fun index txs -> List.map (fun item -> index + 1, item) txs) executions));
+      let elapsed = List.mapi (fun index txs -> List.fold_left (fun total item ->
+        total +. if item <> heavy then 0.1 else if operation_cut then
+          (if index = 0 then 1. else 4.)
+        else if not descendants then 6. else if prepared then 2.3 else 3.8) 0. txs) executions
+        |> List.fold_left (+.) 0. in
+      expect "repeat window retry count"
+        (!calls = List.length requests && abs_float (!now -. elapsed) < 0.000001);
+      expect "repeat window hold differs" (List.mem (Transaction.hash heavy) !(probe.holds) = operation_cut);
+      expect "repeat window grew skipped allowance"
+        (Pool.preview_limit (Transaction.hash heavy) 3.75 = 7.5);
+      expect "repeat window ready differs"
+        (Result.is_ok (Pool.Preview.send (Pool.Preview.Ready (Some 11L, Transaction.hash heavy)))
+          = not operation_cut);
+      expect "repeat window changed base ledger" (Lwt_main.run (L.hash ledger) = root);
+      List.iter (fun who ->
+        expect "repeat window changed base nonce" ((L.find ledger who.P.address).L.nonce = 0);
+        expect "repeat window changed base store"
+          (Lwt_main.run (S.get_meta store who.P.address) = None)) people;
+      expect "repeat window eviction differs" (!evicted = if operation_cut then [refused] else []);
+      let pending = if operation_cut then List.filter ((<>) refused) inputs else inputs in
+      expect "repeat window changed staging" (Pool.all () = pending);
+      expect "repeat window evicted retained sender"
+        (List.for_all (fun item -> List.mem item (Pool.all ())) retained);
+      expect "repeat window lost nonce descendants"
+        (List.for_all (fun item -> List.mem item (Pool.all ()))
+          (List.filter (fun item -> item.Transaction.nonce > nonce) inputs));
+      let module Outcome = Core.Tx_outcome in
+      let receipts = match !(probe.stored_bundles) with
+        | [_, _, _, receipts] -> receipts
+        | _ -> fail "repeat window publication count" in
+      let outcomes = Outcome.decode ~confirmed:retained receipts |> Result.get_ok in
+      let expected = if operation_cut then
+          Outcome.build ~inputs:(retained @ [refused]) [refused, "bad", "refused"] |> Result.get_ok
+        else [] in
+      expect "repeat window refusal receipt differs" (Outcome.equal outcomes.rejections expected);
+      let selected = Option.get !captured |> Result.get_ok in
+      let replay = Lwt_main.run (execute retained) |> Result.get_ok in
+      expect "repeat window replay differs" (selected = replay);
+      expect "repeat window retained rejection rows" (selected.X.artifacts.rejected = []);
+      let hashes = List.map Transaction.hash retained in
+      let _, eic = Core.Epoch_index_commitment.next_root_from_hashes
+        ~prev:(deps.prev_eic_root ()) ~epoch_id:12 ~start_txid:7L hashes in
+      let expected = Core.Epoch_index_commitment.folded_state_root
+        ~ledger_state_root:replay.X.post_state_root ~epoch_index_root:eic |> P.root_raw in
+      expect "repeat window published root differs"
+        ((Option.get result).header.proposed_state_root = expected))))
+    [false, false, false; true, false, false; false, true, false; true, true, false;
+      true, true, true]
+
+let test_completion_window () =
+  let module Core = Octra_core in
+  let module Work = Core.Exec_resource in
+  let module S = Core.Store_irmin in
+  let module L = Core.Ledger in
+  let module X = Core.Epoch_exec in
+  let module P = Circle_proposal in
+  List.iter (fun (prepared, asynchronous, early) ->
+  Core.Tx_staging.clear ();
+  Test_workspace.with_dir "completion_window" (fun dir ->
+    let store = Lwt_main.run (S.open_store (Filename.concat dir "store")) in
+    Fun.protect ~finally:(fun () -> Core.Tx_staging.clear (); Lwt_main.run (S.close store)) (fun () ->
+      let people = List.init 4 (fun i -> P.identity (i + 1))
+        |> List.sort (fun a b -> String.compare a.P.address b.P.address) in
+      let ledger = L.create store in
+      List.iter (fun who -> ignore (L.add_account ledger who.P.address (Z.of_int 1_000_000)
+        |> Result.get_ok)) people;
+      Lwt_main.run (L.flush_dirty_lwt ledger);
+      Lwt_main.run (S.set_meta store "total_supply" (Z.to_string (L.get_total_supply ledger)));
+      Lwt_main.run (S.set_meta store "emission_remaining" "0");
+      let root = Lwt_main.run (L.hash ledger) in
+      let inputs = List.mapi (fun i who -> P.signed who ~ou:1000
+        ~op_type:(if i = 0 then (if early then Transaction.ProgramDeploy else ProgramExec)
+          else if early && i = 2 then ProgramExec else Standard)
+        ~to_:(List.hd people).address ~nonce:1 ~message:"[]" ~method_:None) people in
+      let slow = List.hd inputs and healthy = List.nth inputs 1 and edge = List.nth inputs 2 in
+      expect "completion window input order" (Transaction.consensus_order inputs = inputs);
+      if early then ignore (Core.Tx_staging.add_smart
+        ~lookup:(fun _ -> Some (Z.of_int 100_000_000, 0)) edge |> Result.get_ok);
+      let now = ref 0. and visited = ref [] in
+      let env = X.{chain_id = "octra-test"; epoch_id = 12; proposer_addr = slow.from;
+        validator_addrs = []; validator_pubkeys = []; prev_state_root = root;
+        epoch_ts = 99.; ready_state_root_at = None; ready_max_lag = -1} in
+      let execute ?foreign txs = Core.State_preview.with_preview ~base_store:store ~base_ledger:ledger
+        ~proof_mode:Core.Rule_graph.Prior ~fold:X.prior_fold ~epoch_id:12
+        ~proposal_id:"completion-window" (fun backend ->
+          X.run_core ~reward:None ~preverify:None ~backend ~env ~txs
+            ~process_tx:(fun ~backend ~env:_ tx -> Work.run ~hash:(Transaction.hash tx) (fun () ->
+              let open Lwt.Syntax in
+              visited := tx :: !visited;
+              expect "completion window debit" (L.debit backend.X.ledger tx.from (Z.of_int 10) tx.nonce = Ok ());
+              let* () = S.set_meta backend.store tx.from "visited" in
+              Option.iter (fun hash -> raise (Work.Window_expired hash)) foreign;
+              let cost () = now := !now +.
+                (if tx = slow then 6. else if tx = healthy then (if early then 1.8 else 2.9)
+                  else if early then 0.3 else 0.2) in
+              let* () = if asynchronous then Work.interrupt (fun () -> cost (); Lwt.return_unit)
+                else Lwt.return (Work.work cost) in
+              Lwt.return_ok (X.Confirmed Z.zero)))) in
+      let captured = ref None in
+      let deps, probe = make_proposal_deps ~staging:inputs ~ledger_root:root () in
+      let preview request =
+        Lwt.map (fun result -> captured := Some result; result) (execute request.C.txs) in
+      let deps = {deps with C.preview} in
+      let prepare = if not prepared then None else Some (fun (request : C.build_preview_request) ->
+        Lwt.map (Result.map (fun execution -> C.{execution; preverify = request.C.preverify}))
+          (preview request)) in
+      let result = Lwt_main.run (C.make_proposal ?prepare ~budget:15. ~clock:(fun () -> !now) deps
+        ~chain_id:"octra-test" ~root_to_raw32:P.root_raw ~limits:generous_limits ~epoch_id:12L) in
+      let kept = if early then [healthy; List.nth inputs 3] else [healthy] in
+      expect "completion window lost completed work" (Option.map
+        (fun (plan : C_driver.proposal_plan) -> plan.tx_hashes) result = Some (List.map Transaction.hash kept));
+      expect "completion window hold absent"
+        (List.sort String.compare !(probe.holds) = List.sort String.compare
+          [Transaction.hash slow]);
+      expect "completion window executed unseen work" (List.rev !visited =
+        if early then inputs else [slow; healthy; edge]);
+      expect "completion window changed staging" (deps.staging_txs () = inputs);
+      expect "completion window changed ledger" (Lwt_main.run (L.hash ledger) = root);
+      let selected = Option.get !captured |> Result.get_ok in
+      expect "completion window produced refusal" (selected.X.artifacts.rejected = []);
+      let replay = Lwt_main.run (execute kept) |> Result.get_ok in
+      expect "completion window replay differs" (selected = replay);
+      let omitted = ref [] in
+      let foreign = Transaction.hash edge in
+      let refused = Lwt_main.run (Lwt.catch (fun () ->
+        Lwt.map (fun _ -> false) (Work.preview ~accept:(fun () -> true)
+          ~defer:(fun _ _ -> fail "window used resource hold")
+          ~omit:(fun hash -> omitted := hash :: !omitted)
+          (fun () -> execute ~foreign [healthy]))) (function
+            | Work.Window_expired hash when hash = foreign -> Lwt.return_true
+            | error -> Lwt.fail error)) in
+      expect "completion window accepted foreign identity" (refused && !omitted = []);
+      expect "completion window foreign changed ledger" (Lwt_main.run (L.hash ledger) = root))))
+    [false, false, true; true, true, true;
+      false, false, false; false, true, false; true, false, false; true, true, false]
+
+let test_refill_core () =
+  let module Core = Octra_core in
+  let module Work = Core.Exec_resource in
+  let module S = Core.Store_irmin in
+  let module L = Core.Ledger in
+  let module X = Core.Epoch_exec in
+  let module P = Circle_proposal in
+  let module Shell = Octra_node_runtime.Consensus_proposal_preview_shell in
+  Test_workspace.with_dir "refill_core" (fun dir ->
+    let store = Lwt_main.run (S.open_store (Filename.concat dir "store")) in
+    Fun.protect ~finally:(fun () -> Lwt_main.run (S.close store)) (fun () ->
+      let people = List.init 3 (fun i -> P.identity (i + 1))
+        |> List.sort (fun a b -> String.compare a.P.address b.P.address) in
+      let ledger = L.create store in
+      List.iter (fun who -> ignore (L.add_account ledger who.P.address (Z.of_int 1_000_000)
+        |> Result.get_ok)) people;
+      Lwt_main.run (L.flush_dirty_lwt ledger);
+      Lwt_main.run (S.set_meta store "total_supply" (Z.to_string (L.get_total_supply ledger)));
+      Lwt_main.run (S.set_meta store "emission_remaining" "0");
+      let root = Lwt_main.run (L.hash ledger) in
+      let inputs = List.map (fun who -> P.signed who ~ou:1000 ~op_type:Standard
+        ~to_:(List.hd people).address ~nonce:1 ~message:"[]" ~method_:None) people in
+      let first = List.hd inputs and refused = List.nth inputs 1 in
+      expect "core refill input order" (Transaction.consensus_order inputs = inputs);
+      let now = ref 0. and calls = ref 0 in
+      let saved = ref None in
+      let visited = ref [] in
+      let run ~epoch_id ~proposal_id ~expected_prev_root ~preverify:_ ~parent_commit:_
+          ~reward:_ ~env ~txs =
+        Core.State_preview.with_preview ~base_store:store ~base_ledger:ledger
+          ~proof_mode:Core.Rule_graph.Prior ~fold:X.prior_fold ~epoch_id ~proposal_id
+          ?expected_prev_root (fun backend ->
+            X.run_core ~reward:None ~preverify:None ~backend ~env ~txs
+              ~process_tx:(fun ~backend ~env:_ item -> Work.run ~hash:(Transaction.hash item) (fun () ->
+                let open Lwt.Syntax in
+                visited := (!calls, item) :: !visited;
+                expect "core refill debit" (L.debit backend.X.ledger item.from (Z.of_int 10) item.nonce = Ok ());
+                let* () = S.set_meta backend.store item.from "visited" in
+                Work.work (fun () -> now := !now +. (if !calls = 3 then 4. else 0.01));
+                if item = refused then Lwt.return_error ("bad", "refused")
+                else Lwt.return_ok (X.Confirmed Z.zero)))) in
+      let prepare ~epoch_id ~proposal_id ~expected_prev_root ~preverify ~parent_commit ~reward ~env ~txs =
+        incr calls;
+        let open Lwt.Syntax in
+        let+ value = run ~epoch_id ~proposal_id ~expected_prev_root ~preverify ~parent_commit ~reward ~env ~txs in
+        if !calls = 2 then saved := Some value;
+        Result.map (fun execution -> C.{execution; preverify}) value in
+      let shell : Shell.deps = {chain_id = "octra-test"; program_trust = Octra_vm.Program_trust.empty;
+        backend = {run; prepare}; ready_state_root_at = (fun _ -> Lwt.return_none);
+        ready_max_lag = -1; warn = ignore} in
+      let prepare = Shell.prepare_at ~mode:(fun ~epoch:_ -> Ok Core.Rule_graph.Active)
+        shell 12L |> Result.get_ok |> Option.get in
+      let deps, probe = make_proposal_deps ~staging:inputs ~ledger_root:root () in
+      let deps = {deps with C.proposer = (fun () -> first.from);
+        validator_pubkeys = (fun _ -> []);
+        evict_preview = (fun ?epoch:_ item -> expect "core refill evicted completed work" (item = refused))} in
+      let result = Lwt_main.run (C.make_proposal ~prepare ~budget:15. ~clock:(fun () -> !now)
+        deps ~chain_id:"octra-test" ~root_to_raw32:P.root_raw
+        ~limits:{generous_limits with C.max_txs = 2} ~epoch_id:12L) in
+      expect "core refill discarded checked proposal" (Option.is_some result);
+      expect "core refill retry count" (!calls = 3);
+      expect "core refill execution order"
+        (List.rev !visited = [1, first; 1, refused; 2, first; 3, first]);
+      expect "core refill held completed work" (!(probe.holds) = []);
+      expect "core refill changed base ledger" (Lwt_main.run (L.hash ledger) = root);
+      let original = Option.get !saved |> Result.get_ok in
+      let hashes = [Transaction.hash first] in
+      let _, eic = Core.Epoch_index_commitment.next_root_from_hashes
+        ~prev:(deps.prev_eic_root ()) ~epoch_id:12 ~start_txid:7L hashes in
+      let expected = Core.Epoch_index_commitment.folded_state_root
+        ~ledger_state_root:original.X.post_state_root ~epoch_index_root:eic |> P.root_raw in
+      let plan = Option.get result in
+      expect "core refill root differs" (plan.header.proposed_state_root = expected && plan.tx_hashes = hashes);
+      expect "core refill publication count"
+        (List.length !(probe.stored_bundles) = 1 && List.length !(probe.frozen_writes) = 1)))
+
+let test_window_renew () =
+  let module Core = Octra_core in
+  let module Pool = Core.Tx_staging in
+  let module Work = Core.Exec_resource in
+  let module S = Core.Store_irmin in
+  let module L = Core.Ledger in
+  let module X = Core.Epoch_exec in
+  let module P = Circle_proposal in
+  let prior = Pool.{head = 9L; count = 2; after = 11L} in
+  let renewed = Pool.hold_after ~mode:Pool.Renew 11L (Some prior) in
+  expect "renewal grew count" (renewed = Pool.{head = 11L; count = 2; after = 13L});
+  expect "renewal repeated within head" (Pool.hold_after ~mode:Pool.Renew 11L (Some renewed) = renewed);
+  expect "growth stopped increasing count"
+    (Pool.hold_after 11L (Some prior) = Pool.{head = 11L; count = 3; after = 15L});
+  List.iter (fun prepared ->
+  List.iter (fun (op_type, start, seconds, renew) ->
+    Pool.clear ();
+    Test_workspace.with_dir "window_renew" (fun dir ->
+      let store = Lwt_main.run (S.open_store (Filename.concat dir "store")) in
+      Fun.protect ~finally:(fun () -> Pool.clear (); Lwt_main.run (S.close store)) (fun () ->
+        let people = List.init 2 (fun i -> P.identity (i + 1))
+          |> List.sort (fun a b -> String.compare a.P.address b.P.address) in
+        let ledger = L.create store in
+        List.iter (fun who -> L.add_account ledger who.P.address (Z.of_int 1_000_000)
+          |> Result.get_ok |> ignore) people;
+        Lwt_main.run (L.flush_dirty_lwt ledger);
+        Lwt_main.run (S.set_meta store "total_supply" (Z.to_string (L.get_total_supply ledger)));
+        Lwt_main.run (S.set_meta store "emission_remaining" "0");
+        let root = Lwt_main.run (L.hash ledger) in
+        let item who kind = P.signed who ~ou:1000 ~op_type:kind
+          ~to_:(List.hd people).address ~nonce:1 ~message:"[]" ~method_:None in
+        let ordinary = item (List.hd people) Transaction.Standard in
+        let slow = item (List.nth people 1) op_type in
+        let inputs = [ordinary; slow] in
+        expect "renewal input order" (Transaction.consensus_order inputs = inputs);
+        List.iter (fun tx -> Pool.add_smart ~lookup:(fun _ -> Some (Z.of_int 1_000_000, 0)) tx
+          |> Result.get_ok |> ignore) inputs;
+        let entry = Hashtbl.find Pool.hash_index (Transaction.hash slow) in
+        entry.preview <- Some prior;
+        expect "renewal accepted wrong epoch" (Result.is_error (Pool.Preview.send
+          (Pool.Preview.Renew {head = 11L; epoch = 13L; hash = Transaction.hash slow})));
+        expect "renewal invented missing hold" (Result.is_error (Pool.Preview.send
+          (Pool.Preview.Renew {head = 11L; epoch = 12L; hash = Transaction.hash ordinary})));
+        let now = ref 0. and captured = ref None in
+        let env = X.{chain_id = "octra-test"; epoch_id = 12; proposer_addr = ordinary.from;
+          validator_addrs = []; validator_pubkeys = []; prev_state_root = root;
+          epoch_ts = 99.; ready_state_root_at = None; ready_max_lag = -1} in
+        let execute txs = Core.State_preview.with_preview ~base_store:store ~base_ledger:ledger
+          ~proof_mode:Core.Rule_graph.Prior ~fold:X.prior_fold ~epoch_id:12
+          ~proposal_id:"window-renew" (fun backend ->
+            X.run_core ~reward:None ~preverify:None ~backend ~env ~txs
+              ~process_tx:(fun ~backend ~env:_ tx ->
+                if tx = slow then now := start;
+                Work.run ~hash:(Transaction.hash tx) (fun () ->
+                  let open Lwt.Syntax in
+                  expect "renewal debit failed" (L.debit backend.X.ledger tx.from (Z.of_int 10) tx.nonce = Ok ());
+                  let* () = S.set_meta backend.store tx.from "visited" in
+                  Work.work (fun () -> now := !now +. (if tx = slow then seconds else 0.1));
+                  Lwt.return_ok (X.Confirmed Z.zero)))) in
+        let deps, probe = make_proposal_deps ~staging:inputs ~ledger_root:root
+          ~cached_head:(Some (proposal_head root)) () in
+        let preview request = Lwt.map (fun result -> captured := Some result; result)
+          (execute request.C.txs) in
+        let deps = {deps with C.preview} in
+        let prepare = if not prepared then None else Some (fun (request : C.build_preview_request) ->
+          Lwt.map (Result.map (fun execution -> C.{execution; preverify = request.preverify})) (preview request)) in
+        let result = Lwt_main.run (C.make_proposal ?prepare ~clock:(fun () -> !now) ~budget:15. deps
+          ~chain_id:"octra-test" ~root_to_raw32:P.root_raw ~limits:generous_limits ~epoch_id:12L) in
+        expect "renewal lost ordinary sender" (Option.map
+          (fun (plan : C_driver.proposal_plan) -> plan.tx_hashes) result = Some [Transaction.hash ordinary]);
+        expect "completion grew allowance" (Pool.preview_limit (Transaction.hash slow) 3.75 = 15.);
+        expect "completion used growing hold" (!(probe.holds) = []);
+        expect "completion cooldown differs" (entry.preview = Some (if renew then renewed else prior));
+        expect "completion readiness differs"
+          (Result.is_ok (Pool.Preview.send (Pool.Preview.Ready (Some 11L, Transaction.hash slow))) = not renew);
+        let selected = Option.get !captured |> Result.get_ok in
+        let replay = Lwt_main.run (execute [ordinary]) |> Result.get_ok in
+        expect "completion rollback differs" (selected = replay && selected.artifacts.rejected = []);
+        expect "completion changed ledger" (Lwt_main.run (L.hash ledger) = root);
+        expect "completion retained write" (Lwt_main.run (S.get_meta store slow.from) = None);
+        let _, eic = Core.Epoch_index_commitment.next_root_from_hashes
+          ~prev:(deps.prev_eic_root ()) ~epoch_id:12 ~start_txid:7L [Transaction.hash ordinary] in
+        let expected = Core.Epoch_index_commitment.folded_state_root
+          ~ledger_state_root:replay.post_state_root ~epoch_index_root:eic |> P.root_raw in
+        expect "completion published another root" ((Option.get result).header.proposed_state_root = expected))))
+    [Transaction.ProgramExec, 0.1, 8.25, true;
+      Transaction.ProgramExec, 4.5, 3.75, false;
+      Transaction.Standard, 5.5, 3.6, false]) [false; true]
+
+let test_sender_reserve () =
+  let module Core = Octra_core in
+  let module Pool = Core.Tx_staging in
+  let module Work = Core.Exec_resource in
+  let module S = Core.Store_irmin in
+  let module L = Core.Ledger in
+  let module X = Core.Epoch_exec in
+  let module P = Circle_proposal in
+  Pool.clear ();
+  Test_workspace.with_dir "sender_reserve" (fun dir ->
+    let store = Lwt_main.run (S.open_store (Filename.concat dir "store")) in
+    Fun.protect ~finally:(fun () -> Pool.clear (); Lwt_main.run (S.close store)) (fun () ->
+      let people = List.init 6 (fun i -> P.identity (i + 1))
+        |> List.sort (fun a b -> String.compare a.P.address b.P.address) in
+      let ledger = L.create store in
+      List.iter (fun who -> L.add_account ledger who.P.address (Z.of_int 1_000_000)
+        |> Result.get_ok |> ignore) people;
+      Lwt_main.run (L.flush_dirty_lwt ledger);
+      Lwt_main.run (S.set_meta store "total_supply" (Z.to_string (L.get_total_supply ledger)));
+      Lwt_main.run (S.set_meta store "emission_remaining" "0");
+      let root = Lwt_main.run (L.hash ledger) in
+      let inputs = List.map (fun who -> P.signed who ~ou:1000 ~op_type:Transaction.Standard
+        ~to_:(List.hd people).address ~nonce:1 ~message:"" ~method_:None) people in
+      List.iter (fun tx -> Pool.add_smart ~lookup:(fun _ -> Some (Z.of_int 1_000_000, 0)) tx
+        |> Result.get_ok |> ignore) inputs;
+      let retained = List.filteri (fun i _ -> i >= 4) inputs in
+      let env = X.{chain_id = "octra-test"; epoch_id = 12; proposer_addr = (List.hd inputs).from;
+        validator_addrs = []; validator_pubkeys = []; prev_state_root = root;
+        epoch_ts = 99.; ready_state_root_at = None; ready_max_lag = -1} in
+      let execute txs = Core.State_preview.with_preview ~base_store:store ~base_ledger:ledger
+        ~proof_mode:Core.Rule_graph.Prior ~fold:X.prior_fold ~epoch_id:12
+        ~proposal_id:"sender-reserve" (fun backend ->
+          X.run_core ~reward:None ~preverify:None ~backend ~env ~txs
+            ~process_tx:(fun ~backend ~env:_ tx ->
+              expect "sender reserve debit failed" (L.debit backend.X.ledger tx.from (Z.of_int 10) tx.nonce = Ok ());
+              Lwt.return_ok (X.Confirmed Z.zero))) in
+      let received = ref [] and captured = ref None in
+      let deps, probe = make_proposal_deps ~staging:inputs ~ledger_root:root () in
+      let prepare (request : C.build_preview_request) =
+        received := request.txs :: !received;
+        if List.length !received <= 4 then
+          Lwt.fail (Work.Exhausted (Transaction.hash (List.hd request.txs), Work.Host))
+        else Lwt.map (Result.map (fun execution ->
+          captured := Some execution; C.{execution; preverify = request.preverify})) (execute request.txs) in
+      let result = Lwt_main.run (C.make_proposal ~prepare ~clock:(fun () -> 0.) ~budget:15. deps
+        ~chain_id:"octra-test" ~root_to_raw32:P.root_raw ~limits:generous_limits ~epoch_id:12L) in
+      expect "sender reserve did not use final attempt"
+        (List.rev !received = List.init 5 (fun cut -> List.filteri (fun i _ -> i >= cut) inputs));
+      let held = List.filteri (fun i _ -> i < 4) inputs
+        |> List.map Transaction.hash |> List.sort String.compare in
+      expect "sender reserve held retained sender"
+        (List.sort String.compare !(probe.holds) = held);
+      expect "sender reserve lost retained sender" (Option.map
+        (fun (plan : C_driver.proposal_plan) -> plan.tx_hashes) result = Some (List.map Transaction.hash retained));
+      let replay = Lwt_main.run (execute retained) |> Result.get_ok in
+      expect "sender reserve execution differs" (!captured = Some replay);
+      expect "sender reserve changed ledger" (Lwt_main.run (L.hash ledger) = root);
+      expect "sender reserve changed pool" (Pool.all () = inputs);
+      let _, eic = Core.Epoch_index_commitment.next_root_from_hashes
+        ~prev:(deps.prev_eic_root ()) ~epoch_id:12 ~start_txid:7L (List.map Transaction.hash retained) in
+      let expected = Core.Epoch_index_commitment.folded_state_root
+        ~ledger_state_root:replay.post_state_root ~epoch_index_root:eic |> P.root_raw in
+      expect "sender reserve published another root" ((Option.get result).header.proposed_state_root = expected)))
+
+let test_budget_growth () =
+  let module Work = Octra_core.Exec_resource in
+  let module Pool = Octra_core.Tx_staging in
+  let who = Circle_proposal.identity 1 in
+  List.iter (fun op_type ->
+  let item = Circle_proposal.signed who ~ou:1000 ~op_type
+    ~to_:(Circle_proposal.identity 2).address ~nonce:1 ~message:"" ~method_:None in
+  Pool.clear ();
+  Fun.protect ~finally:Pool.clear (fun () ->
+    ignore (Pool.add_smart ~lookup:(fun _ -> Some (Z.of_int 100_000, 0)) item |> Result.get_ok);
+    let attempt ?(spent = 0.) seconds =
+      let now = ref 0. in
+      let deps, _ = make_proposal_deps ~staging:[item] () in
+      let deps = {deps with C.preview = (fun request ->
+        if request.C.txs = [] then deps.preview request else
+        let () = now := !now +. spent in
+        Work.run ~hash:(Transaction.hash item) (fun () ->
+          Work.work (fun () -> now := !now +. seconds;
+            deps.preview request)))} in
+      Lwt_main.run (C.make_proposal ~budget:15. ~clock:(fun () -> !now) deps
+        ~chain_id:"octra-test" ~root_to_raw32:Fun.id ~limits:generous_limits ~epoch_id:12L) in
+    expect "first slow execution accepted" (Option.fold ~none:true
+      ~some:(fun (plan : C_driver.proposal_plan) -> plan.tx_hashes = []) (attempt 6.));
+    let entry = Hashtbl.find Pool.hash_index (Transaction.hash item) in
+    entry.preview <- Some (Pool.hold_after 11L None);
+    expect "held execution budget did not grow" (Option.map
+      (fun (plan : C_driver.proposal_plan) -> plan.tx_hashes) (attempt 6.)
+      = Some [Transaction.hash item]);
+    expect "execution used completion reserve" (Option.fold ~none:true
+      ~some:(fun (plan : C_driver.proposal_plan) -> plan.tx_hashes = []) (attempt ~spent:8. 1.2));
+    expect "lane completion reserve differs" (Option.map
+      (fun (plan : C_driver.proposal_plan) -> plan.tx_hashes) (attempt ~spent:7.5 0.8)
+      = Some (if op_type = Transaction.Standard then [Transaction.hash item] else []));
+    expect "growing budget bypassed deadline" (attempt 11. = None)))
+    Transaction.[Standard; ProgramExec]
+
+let test_round_window () =
+  let module Gate = Octra_consensus.C_proposal_work_gate in
+  let gate = Gate.create () in
+  Gate.start gate ~delay:0. ~duration:0.08;
+  let deps, probe = make_proposal_deps ~staging:[tx 1] () in
+  let result = Lwt_main.run (let open Lwt.Syntax in
+    let* () = Lwt_unix.sleep 0.05 in
+    Gate.run gate ~relevant:(fun () -> true) (fun () ->
+      C.make_proposal deps ~chain_id:"octra-test" ~root_to_raw32:Fun.id
+        ~limits:generous_limits ~epoch_id:12L)) in
+  expect "round wait restarted budget" (result = None && !(probe.preview_requests) = [])
 
 let test_make_preview_error_defer () =
   let deps, probe =
@@ -2337,6 +3444,114 @@ let test_verify_local_preview () =
   expect "verify accept shared" (!shared = [[item]]);
   expect "verify accept stores twice" (List.length !stores = 2)
 
+let test_prepare_reuse () =
+  List.iter (fun cached ->
+    let item = tx 1 in
+    let proposal = proposal_for_txs [item] in
+    let calls = ref 0 in
+    let signatures = ref 0 in
+    let prepare request =
+      incr calls;
+      Lwt.return_ok C.{preverify = request.preverify;
+        execution = Result.get_ok (exec_result ~confirmed:request.txs
+          ~rejected:[] ~post_state_root:(raw 'l'))} in
+    let deps, _, _, _, _, _, proposals, previews = verify_proposal_deps
+      ~staging:[item] ~cached_bundle:(fun ~proposal_id:_ ->
+        if cached then Some (received [item]) else None) () in
+    let deps = {deps with verify_tx_signature = (fun ~signing:_ _ ~pubkey:_ ->
+      incr signatures; true)} in
+    for round = 0 to 1 do
+      expect "prepared proposal accepted" (verdict_accepts (Lwt_main.run
+        (C.verify_proposal ~prepare deps ~chain_id:"octra-test" {proposal with round})));
+      expect "prepared execution repeated" (!calls = round + 1);
+      expect "prepared signature omitted" (!signatures = round + 1)
+    done;
+    expect "prepared preview repeated" (!previews = []);
+    expect "prepared proposals published" (List.length !proposals = 2);
+    let bad_signature = {deps with verify_tx_signature =
+      (fun ~signing:_ _ ~pubkey:_ -> false)} in
+    expect "prepared signature refusal" (verdict_rejects (Lwt_main.run
+      (C.verify_proposal ~prepare bad_signature ~chain_id:"octra-test" proposal)));
+    let wrong_root = {proposal with header = {proposal.header with proposed_state_root = raw 'x'}} in
+    expect "prepared root refusal" (verdict_rejects (Lwt_main.run
+      (C.verify_proposal ~prepare deps ~chain_id:"octra-test" wrong_root)));
+    expect "prepared refusals not published" (List.length !proposals = 2)) [false; true]
+
+let test_prepare_cancel () =
+  List.iter (fun cached -> List.iter (fun cancel ->
+    let item = tx 1 in
+    let current = ref true in
+    let release, finish = Lwt.wait () in
+    let calls = ref 0 in
+    let prepare request =
+      incr calls;
+      let open Lwt.Syntax in
+      let* () = Lwt.protected release in
+      Lwt.return_ok C.{preverify = request.preverify;
+        execution = Result.get_ok (exec_result ~confirmed:request.txs
+          ~rejected:[] ~post_state_root:(raw 'l'))} in
+    let deps, quarantines, _, _, _, _, proposals, _ = verify_proposal_deps
+      ~current:(fun () -> !current) ~staging:[item]
+      ~cached_bundle:(fun ~proposal_id:_ -> if cached then Some (received [item]) else None) () in
+    let verify () = C.verify_proposal ~prepare deps ~chain_id:"octra-test" (proposal_for_txs [item]) in
+    let pending = verify () in
+    expect "prepare pending" (Lwt.is_sleeping pending && !calls = 1);
+    if cancel then begin
+      Lwt.cancel pending;
+      expect "prepare cancellation lost" (match Lwt.state pending with
+        | Lwt.Fail Lwt.Canceled -> true | _ -> false);
+      Lwt.wakeup_later finish ();
+      Lwt_main.run (Lwt.pause ())
+    end else begin
+      current := false;
+      Lwt.wakeup_later finish ();
+      expect "prepare after head change waits" (verdict_waits (Lwt_main.run pending))
+    end;
+    expect "prepare after head change no effects" (!proposals = [] && !quarantines = []);
+    current := true;
+    expect "prepare new context accepts" (verdict_accepts (Lwt_main.run (verify ())));
+    expect "prepare new context executed" (!calls = 2)) [false; true]) [false; true]
+
+let test_verify_host_cancel () =
+  let module Work = Octra_core.Exec_resource in
+  List.iter (fun changed ->
+    let item = tx 1 in
+    let current = ref true in
+    let cancelled = ref false in
+    let deps, quarantines, _, _, _, _, published, _ = verify_proposal_deps
+      ~current:(fun () -> !current) ~staging:[item] () in
+    let prepare request = Work.interrupt (fun () ->
+      let pending = Lwt_unix.sleep 0.05 in
+      Lwt.on_cancel pending (fun () -> cancelled := true);
+      Lwt.map (fun () -> Ok C.{preverify = request.C.preverify;
+        execution = Result.get_ok (exec_result ~confirmed:request.txs
+          ~rejected:[] ~post_state_root:(raw 'l'))}) pending) in
+    let timer = Lwt.bind (Lwt_unix.sleep 0.01) (fun () ->
+      if changed then current := false;
+      Lwt.return_unit) in
+    let result = Lwt_main.run (C.verify_proposal ~prepare deps ~chain_id:"octra-test"
+      (proposal_for_txs [item])) in
+    Lwt.cancel timer;
+    expect "validator host cancellation differs" (!cancelled = changed);
+    expect "validator host quarantined" (!quarantines = []);
+    if changed then begin
+      expect "changed context was rejected" (verdict_waits result);
+      expect "changed host result published" (!published = [])
+    end else expect "validator used local time limit" (verdict_accepts result)) [false; true]
+
+let test_prepare_closed () =
+  let item = tx 1 in
+  let current = ref true in
+  let calls = ref 0 in
+  let deps, _, _, _, _, _, proposals, _ = verify_proposal_deps
+    ~current:(fun () -> !current) ~staging:[item]
+    ~validate_preverify_once:(fun ~state_root:_ ~tx_hashes:_ items ->
+      current := false; fake_batch items) () in
+  let prepare _ = incr calls; Lwt.return_error "unexpected execution" in
+  expect "closed context waits" (verdict_waits (Lwt_main.run
+    (C.verify_proposal ~prepare deps ~chain_id:"octra-test" (proposal_for_txs [item]))));
+  expect "closed context executed" (!calls = 0 && !proposals = [])
+
 let test_verify_worker_retry () =
   List.iter (fun partial ->
     let first = tx 1 in
@@ -2578,6 +3793,26 @@ let outcome_preview ~accepted ~rejected ~reason request =
       ~post_state_root:(raw 'l')
   | _ -> Stdlib.Error "unexpected_preview_input"
 
+let test_prepare_inputs () =
+  let accepted = tx 1 in
+  let rejected = tx 2 in
+  let proposal, bundle = proposal_outcome ~accepted ~rejected ~reason:"method not found" in
+  let calls = ref [] in
+  let prepare request =
+    calls := request.C.txs :: !calls;
+    Lwt.return (Result.map (fun execution -> C.{execution; preverify = request.preverify})
+      (outcome_preview ~accepted ~rejected ~reason:"method not found" request)) in
+  let deps, _, _, _, _, _, _, _ = verify_proposal_deps
+    ~cached_bundle:(fun ~proposal_id:_ -> Some bundle) () in
+  expect "different execution inputs accepted" (verdict_accepts (Lwt_main.run
+    (C.verify_proposal ~prepare deps ~chain_id:"octra-test" proposal)));
+  expect "different execution inputs reused" (!calls = [[accepted; rejected]; [accepted]]);
+  let failed request =
+    if List.length request.C.txs = 2 then Lwt.return_error "worker unavailable"
+    else prepare request in
+  expect "failed execution not replaced" (verdict_waits (Lwt_main.run
+    (C.verify_proposal ~prepare:failed deps ~chain_id:"octra-test" proposal)))
+
 let test_verify_reproduced_rejection () =
   let accepted = tx 1 in
   let rejected = tx 2 in
@@ -2641,7 +3876,7 @@ let test_verify_paid () =
     ~preview_result:(fun _ -> fail "validator skipped prepared execution") () in
   expect "ordered validator refused paid outcome"
     (verdict_accepts (Lwt_main.run (C.verify_proposal ~prepare deps ~chain_id proposal)));
-  expect "ordered paid execution not checked" (!calls >= 2) in
+  expect "ordered paid execution repeated" (!calls = 1) in
   Unix.putenv key "devnet_full_v1";
   Fun.protect check ~finally:(fun () -> Unix.putenv key (Option.value prior ~default:""))
 
@@ -2718,6 +3953,56 @@ let test_receipt_order () =
         ~validate_preverify_once:(fun ~state_root:_ ~tx_hashes:_ txs -> Lwt.return (batch txs)) () in
       expect "validator refused execution-ordered receipts"
         (verdict_accepts (Lwt_main.run (C.verify_proposal ~prepare deps ~chain_id proposal)));
+      if count = 2 && not with_paid then
+        List.iter (fun changed ->
+          let checks = ref 0 in
+          let calls = ref 0 in
+          let checked ~state_root:_ ~tx_hashes:_ inputs =
+            incr checks;
+            let result = batch inputs in
+            let ready = List.map (fun (entry : W.ready) ->
+              if not changed || !checks <> 2 then entry else
+              let receipt = Option.map (fun (receipt : Receipt.t) ->
+                {receipt with reason = "second verification"}) entry.receipt in
+              {entry with receipt}) result.ready in
+            Lwt.return W.{result with ready} in
+          let deps = {deps with cached_bundle = (fun ~proposal_id:_ -> None);
+            validate_preverify_once = checked} in
+          let prepare request = incr calls; prepare request in
+          expect "receipt input change refused" (verdict_accepts (Lwt_main.run
+            (C.verify_proposal ~prepare deps ~chain_id proposal)));
+          expect "receipt input change reused" (!calls = if changed then 2 else 1)) [false; true];
+      if count = 2 && not with_paid then begin
+        let calls = ref 0 in
+        let queries = ref 0 in
+        let prior = ref None in
+        let prepare request =
+          incr calls;
+          let key = request.C.txs, request.preverify.receipts in
+          if !calls = 1 then begin
+            prior := Some key;
+            Lwt.return_error "worker unavailable"
+          end else begin
+            expect "retry execution inputs changed" (!prior = Some key);
+            prepare request
+          end in
+        let response = Octra_consensus.C_driver.{responder_addr = "oct_peer";
+          tx_hashes = proposal.tx_hashes;
+          txs_json = List.map (fun item -> Transaction.to_yojson item |> Yojson.Safe.to_string) bundle.txs;
+          receipts_json = bundle.receipts_json} in
+        let deps = {deps with cached_bundle = (fun ~proposal_id:_ -> None);
+          driver_available = (fun () -> true);
+          validate_bundle = (fun ~header:_ ~expected_hashes:_ _ ->
+            Some Octra_node_runtime.Consensus_bundle_validation.{tx_hashes = List.map Transaction.hash bundle.txs;
+              txs = bundle.txs; receipts_json = bundle.receipts_json; rejections = []});
+          query_bundle = (fun ~epoch_id:_ ~proposal_id:_ ~validate ->
+            incr queries;
+            expect "retry bundle refused" (validate response);
+            Lwt.return_some response)} in
+        expect "same execution did not recover" (verdict_accepts (Lwt_main.run
+          (C.verify_proposal ~prepare deps ~chain_id proposal)));
+        expect "failed execution was cached" (!calls = 2 && !queries = 1)
+      end;
       let artifacts = Octra_core.Tx_outcome.split_admit bundle.receipts_json |> Result.get_ok in
       let expected = List.map (fun item -> Receipt.canonical (make_receipt item)) confirmed in
       expect "proposal receipts differ from execution order" (artifacts.preverify = expected);
@@ -3464,7 +4749,126 @@ let test_precommit_write_failure () =
   expect "write failure unsynced" (!unsynced = 1);
   expect "write failure no pending" (!pending = [])
 
+let test_circle_path ?(focus = false) () =
+  Circle_proposal.run ~focus ~limits:generous_limits
+    ~make_deps:(fun ~epoch ~staging ~root ->
+      fst (make_proposal_deps ~current_epoch:epoch ~staging ~ledger_root:root ()))
+    ~verify_deps:(fun ~staging ~root ~ledger_root ->
+      let deps, _, _, _, _, _, _, _ =
+        verify_proposal_deps ~staging ~root ~ledger_root () in
+      deps) ()
+
+let test_circle_host ?(cut_only = false) () =
+  Circle_host.run ~cut_only
+    ~make_deps:(fun ~epoch ~staging ~root ->
+      fst (make_proposal_deps ~current_epoch:epoch ~staging ~ledger_root:root ()))
+    ~verify_deps:(fun ~staging ~root ~ledger_root ->
+      let deps, _, _, _, _, _, _, _ =
+        verify_proposal_deps ~staging ~root ~ledger_root () in
+      deps) ()
+
 let () =
+  Circle_host.worker ();
+  if Array.length Sys.argv = 3 && Sys.argv.(1) = "--hfhe-checks" then begin
+    List.iter (fun accepted -> Test_workspace.with_dir "proof_routes" (fun output ->
+      Circle_host.proof_path ~retry:true ~range:true ~cold:true ~accepted
+        ~input:Sys.argv.(2) ~output
+        ~make_deps:(fun ~epoch ~staging ~root ->
+          fst (make_proposal_deps ~current_epoch:epoch ~staging ~ledger_root:root ()))
+        ~verify_deps:(fun ~staging ~root ~ledger_root ->
+          let deps, _, _, _, _, _, _, _ = verify_proposal_deps ~staging ~root ~ledger_root () in deps) ()))
+      [false; true];
+    print_endline "event = proof_routes status = passed";
+    exit 0
+  end;
+  if Array.length Sys.argv = 4 && List.mem Sys.argv.(1)
+      ["--hfhe-window"; "--hfhe-retry"; "--hfhe-chain"; "--hfhe-late"; "--hfhe-cold"; "--hfhe-large"] then begin
+    Printexc.record_backtrace true;
+    Circle_host.proof_path ~retry:(Sys.argv.(1) <> "--hfhe-window")
+      ~range:(Sys.argv.(1) = "--hfhe-large")
+      ~accepted:(Sys.argv.(1) <> "--hfhe-late")
+      ~cold:(Sys.argv.(1) = "--hfhe-cold")
+      ~calls:(if List.mem Sys.argv.(1) ["--hfhe-chain"; "--hfhe-cold"] then 2 else 1)
+      ~input:Sys.argv.(2) ~output:Sys.argv.(3)
+      ~make_deps:(fun ~epoch ~staging ~root ->
+        fst (make_proposal_deps ~current_epoch:epoch ~staging ~ledger_root:root ()))
+      ~verify_deps:(fun ~staging ~root ~ledger_root ->
+        let deps, _, _, _, _, _, _, _ = verify_proposal_deps ~staging ~root ~ledger_root () in deps) ();
+    print_endline "event = hfhe_window status = passed";
+    exit 0
+  end;
+  if Array.length Sys.argv = 2 && Sys.argv.(1) = "--active-cut" then begin
+    test_circle_host ~cut_only:true ();
+    exit 0
+  end;
+  if Array.length Sys.argv = 2 && Sys.argv.(1) = "--preview-selection" then begin
+    test_window_renew ();
+    test_sender_reserve ();
+    test_repeat_window ();
+    test_completion_window ();
+    test_refill_core ();
+    test_refill_saved ();
+    test_publish_failure ();
+    test_proposal_prefix ();
+    test_preview_selection ();
+    test_preview_replay ();
+    test_program_window ();
+    test_budget_growth ();
+    print_endline "event = preview_selection status = passed";
+    exit 0
+  end;
+  if Array.length Sys.argv = 2 && Sys.argv.(1) = "--host-budget" then begin
+    test_window_renew ();
+    test_sender_reserve ();
+    test_repeat_window ();
+    test_completion_window ();
+    test_refill_core ();
+    test_refill_saved ();
+    test_publish_failure ();
+    test_paid_proposal ();
+    test_preview_moved ();
+    test_paid_change ();
+    test_preview_expiry ();
+    test_program_window ();
+    test_budget_growth ();
+    test_circle_host ();
+    test_circle_path ~focus:true ();
+    test_round_window ();
+    test_proposal_prefix ();
+    test_preview_selection ();
+    test_preview_replay ();
+    test_build_budget ();
+    test_host_budget ();
+    test_preview_duration ();
+    test_prepare_cancel ();
+    test_prepare_reuse ();
+    test_verify_host_cancel ();
+    print_endline "event = host_budget status = passed";
+    exit 0
+  end;
+  if Array.length Sys.argv = 2 && Sys.argv.(1) = "--prepare" then begin
+    test_prepare_reuse ();
+    test_prepare_cancel ();
+    test_prepare_closed ();
+    test_prepare_inputs ();
+    test_verify_paid ();
+    test_receipt_order ();
+    print_endline "event = proposal_prepare status = passed";
+    exit 0
+  end;
+  if Array.length Sys.argv = 2 && Sys.argv.(1) = "--preview-time" then begin
+    test_preview_duration ();
+    test_preview_time ();
+    test_preview_resources ();
+    test_build_head_progress ();
+    print_endline "event = preview_time status = passed";
+    exit 0
+  end;
+  if Array.exists (fun value -> value = "--time" || value = "selection") Sys.argv then begin
+    test_preview_time ();
+    print_endline "status = pass test = proposal_time";
+    exit 0
+  end;
   if Array.length Sys.argv = 2 && Sys.argv.(1) = "--cell" then begin
     test_cell_retry ();
     print_endline "status = pass test = cell_proposal";
@@ -3478,19 +4882,20 @@ let () =
   if Array.length Sys.argv = 2 && Sys.argv.(1) = "--compute" then begin
     test_compute_budget ();
     test_paid_proposal ();
+    test_preview_moved ();
+    test_paid_change ();
     test_verify_paid ();
     print_endline "status = pass test = compute_proposal";
     exit 0
   end;
   if Array.length Sys.argv = 6 && Sys.argv.(1) = "circle-store" then
     Circle_store.child ();
-  Circle_proposal.run ~limits:generous_limits
-    ~make_deps:(fun ~epoch ~staging ~root ->
-      fst (make_proposal_deps ~current_epoch:epoch ~staging ~ledger_root:root ()))
-    ~verify_deps:(fun ~staging ~root ~ledger_root ->
-      let deps, _, _, _, _, _, _, _ =
-        verify_proposal_deps ~staging ~root ~ledger_root () in
-      deps);
+  test_window_renew ();
+  test_sender_reserve ();
+  test_completion_window ();
+  test_repeat_window ();
+  test_circle_host ();
+  test_circle_path ();
   Circle_store.run ();
   test_totals ();
   test_within_limits ();
@@ -3527,7 +4932,12 @@ let () =
   test_circle_budget ();
   test_compute_budget ();
   test_paid_proposal ();
+  test_preview_moved ();
+  test_paid_change ();
   test_make_preview_rejections ();
+  test_refill_saved ();
+  test_publish_failure ();
+  test_refill_core ();
   test_private_apply_slot ();
   test_private_refill_cap ();
   test_private_refill_steps ();
@@ -3536,6 +4946,18 @@ let () =
   test_make_dependency_chain ();
   test_make_preview_error_defer ();
   test_preview_resources ();
+  test_preview_time ();
+  test_preview_duration ();
+  test_round_window ();
+  test_proposal_prefix ();
+  test_preview_selection ();
+  test_preview_replay ();
+  test_preview_expiry ();
+  test_program_window ();
+  test_budget_growth ();
+  test_build_budget ();
+  test_host_budget ();
+  test_verify_host_cancel ();
   test_make_partition_error_defer ();
   test_verify_bundle_success ();
   test_circle_receipt ();
@@ -3572,6 +4994,10 @@ let () =
   test_prev_time_retry ();
   test_verify_missing_bundle_wait ();
   test_verify_local_preview ();
+  test_prepare_reuse ();
+  test_prepare_cancel ();
+  test_prepare_closed ();
+  test_prepare_inputs ();
   test_verify_worker_retry ();
   test_verify_worker_refusal ();
   test_verify_head_progress ();

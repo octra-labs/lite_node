@@ -142,6 +142,31 @@ let test_encrypt_missing () =
   P.encrypt_plan ~registered:false ~keyed:false ~strict:true ~field_policy:P.Unique_fields (ledger "encrypt_missing") (tx ())
   |> expect_error "malformed_transaction" "encrypt: malformed encrypted_data"
 
+let test_key_memory () =
+  let module M = Octra_core.Compute_memory in
+  let store = ledger "key_memory" in
+  let operation = tx ~op:T.KeySwitch ?encrypted_data:(key_switch_json "invalid") () in
+  List.iter (fun field_policy ->
+    List.iter (fun (name, action) ->
+      let before = M.stats M.shared in
+      let held = M.reserve M.shared ~speculative:false
+        (M.limit_of_getenv Sys.getenv_opt - 3) |> Option.get in
+      let refused = Fun.protect ~finally:(fun () -> M.release held) (fun () ->
+        Lwt_main.run (Lwt.catch (fun () -> Lwt.map (fun _ -> false) (action ()))
+          (function Octra_core.Exec_resource.Unavailable Host -> Lwt.return_true
+            | error -> Lwt.fail error))) in
+      ok (name ^ " key decode bypassed memory") refused;
+      ok "key decode memory retained" (M.stats M.shared = before);
+      let result = Lwt_main.run (action ()) in
+      ok "key decode invalid input changed" (match result with
+        | Error error -> error.P.tag = "key_switch_rejected"
+        | Ok _ -> false);
+      ok "key decode memory not released" (M.stats M.shared = before))
+      ["verify", (fun () -> P.key_switch_plan ~registered:false ~keyed:false
+          ~strict:true ~field_policy store operation);
+       "prepare", (fun () -> P.prepare_key_switch_plan ~registered:false ~keyed:false
+          ~field_policy store operation)]) [P.First_field; P.Unique_fields]
+
 let test_decrypt_invalid_amount () =
   P.decrypt_plan ~registered:false ~keyed:false ~strict:true
     ~field_policy:P.Unique_fields
@@ -784,6 +809,7 @@ let () =
     print_endline "status = pass test = private_json"
   else begin
   test_encrypt_missing ();
+  test_key_memory ();
   test_decrypt_invalid_amount ();
   test_key_switch_bad_json ();
   test_private_version_wrong_type ();

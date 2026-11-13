@@ -23,6 +23,7 @@ type t = {
   active_validator_list : Octra_consensus.C_types.validator_info list;
   stake_vs : Octra_consensus.C_types.validator_set;
   active_vs : Octra_consensus.C_types.validator_set;
+  active_update : Octra_core.Validator_set_update.t option;
   scheduled_driver_config : Octra_consensus.C_driver.scheduled_validator_set_config option;
   light_scheduled_validator_set : Octra_consensus.C_config.scheduled option;
   consensus_config_hash : string;
@@ -77,6 +78,7 @@ let driver_config_of_update update =
       activate_epoch = update.activate_epoch;
       validator_set;
       fingerprint = update.fingerprint;
+      eviction = update.eviction;
     }
 
 let pending_entries_of_raw = function
@@ -91,7 +93,7 @@ let pending_entries_of_raw = function
         update.validators
     | Ok _ -> []
 
-let load_persistent_update (deps : persistent_update_deps) =
+let load_persistent_update ?check (deps : persistent_update_deps) =
   let open Lwt.Syntax in
   let* pending_opt = deps.read_pending () in
   match pending_opt with
@@ -104,7 +106,14 @@ let load_persistent_update (deps : persistent_update_deps) =
     | Ok update when update.weighted ->
       begin
         match driver_config_of_update update with
-        | Some config -> Lwt.return_some config
+        | Some config ->
+          let checked = match check, config.eviction with
+            | Some check, _ -> check config
+            | None, None -> Ok ()
+            | None, Some _ -> Error "validator eviction requires trusted source" in
+          (match checked with
+           | Ok () -> Lwt.return_some config
+           | Error reason -> deps.log_invalid reason; Lwt.return_none)
         | None ->
           deps.log_invalid "weighted validator set is invalid";
           Lwt.return_none
@@ -113,14 +122,14 @@ let load_persistent_update (deps : persistent_update_deps) =
       deps.log_invalid "manual validator updates are disabled";
       Lwt.return_none
 
-let load_node_persistent_update (deps : persistent_update_node_deps) =
+let load_node_persistent_update ?check (deps : persistent_update_node_deps) =
   let update_deps = {
     read_pending = deps.read_pending;
     log_invalid = (fun e ->
       deps.warn
         (Printf.sprintf "persistent validator_set_update ignored: %s" e));
   } in
-  load_persistent_update update_deps
+  load_persistent_update ?check update_deps
 
 let fingerprint_of_validator_set vs =
   let entries =
@@ -164,6 +173,22 @@ let required_driver_config label update =
   match driver_config_of_update update with
   | Some config -> Ok config
   | None -> Error (label ^ " validator set cannot build consensus config")
+
+let checked_update_set ?policy ~chain_id ~epoch update =
+  let module C = Octra_consensus.C_types in
+  let ( let* ) = Result.bind in
+  let* config = required_driver_config "persistent" update in
+  match config.eviction with
+  | None ->
+    let* _ = C.checked_validator_set_for_epoch ?policy ~chain_id
+      ~epoch_id:config.activate_epoch config.validator_set in
+    C.structural_validator_set_for_epoch ?policy ~chain_id ~epoch_id:epoch config.validator_set
+    |> Result.map_error C.set_error_message
+  | Some eviction ->
+    let* _ = Octra_consensus.C_driver.check_eviction_set ?policy ~chain_id
+      ~activate_epoch:config.activate_epoch ~validator_set:config.validator_set eviction in
+    C.structural_validator_set_for_epoch ?policy ~chain_id ~epoch_id:epoch config.validator_set
+    |> Result.map_error C.set_error_message
 
 let validate_active_update ~current_height update =
   if not update.Octra_core.Validator_set_update.weighted then
@@ -212,8 +237,9 @@ let transition_of_persistent ~active_config ~scheduled_config =
     Already_active { activate_epoch = active.Octra_consensus.C_driver.activate_epoch }
   | None, None -> No_transition
 
-let bind_persistent_updates ?policy ~chain_id ~consensus_mode ~current_height
+let bind_persistent_updates ?policy ?eviction_source ~chain_id ~consensus_mode ~current_height
     ~active_raw ~pending_raw cfg =
+  let ( let* ) = Result.bind in
   match
     persistent_update "active" active_raw,
     persistent_update "pending" pending_raw
@@ -224,6 +250,8 @@ let bind_persistent_updates ?policy ~chain_id ~consensus_mode ~current_height
     Error "manual validator updates are disabled"
   | Ok None, Ok None ->
     let policy = Option.value policy ~default:(Octra_consensus.C_quorum_policy.for_chain chain_id) in
+    let* _ = Octra_consensus.C_types.checked_validator_set_for_epoch
+      ~policy ~chain_id ~epoch_id:current_height cfg.stake_vs in
     if Octra_consensus.C_types.weights_valid
       (Octra_consensus.C_quorum_policy.select policy current_height) cfg.stake_vs then Ok cfg
     else Error "stake weights are missing"
@@ -251,27 +279,74 @@ let bind_persistent_updates ?policy ~chain_id ~consensus_mode ~current_height
           match pending_config with
           | Error error -> Error error
           | Ok pending_config ->
-            let stake_vs =
+            let marker_vs =
               match active_config with
               | None -> cfg.stake_vs
               | Some active -> active.validator_set
             in
-            let active_vs =
-              Octra_consensus.C_types.validator_set_for_epoch
-                ?policy
-                ~chain_id
-                ~epoch_id:current_height
-                stake_vs
+            let* marked_vs = match active_update with
+              | Some update -> checked_update_set ?policy ~chain_id ~epoch:current_height update
+              | None -> Octra_consensus.C_types.checked_validator_set_for_epoch
+                ?policy ~chain_id ~epoch_id:current_height marker_vs
             in
+            let policy = Option.value policy
+              ~default:(Octra_consensus.C_quorum_policy.for_chain chain_id) in
+            let trusted_height = Octra_consensus.C_quorum_policy.seatless policy current_height
+              || (current_height < Int64.max_int
+                && Octra_consensus.C_quorum_policy.seatless policy (Int64.succ current_height)) in
+            let* active_vs = match eviction_source with
+              | Some resolve when trusted_height ->
+                let* current = resolve current_height in
+                Octra_consensus.C_types.structural_validator_set_for_epoch ~policy ~chain_id
+                  ~epoch_id:current_height current
+                |> Result.map_error Octra_consensus.C_types.set_error_message
+              | _ -> Ok marked_vs in
+            let stake_vs = if Option.is_some eviction_source && trusted_height
+              then active_vs else marker_vs in
             let scheduled_driver_config_raw =
               match pending_config with
               | Some scheduled -> Some scheduled
               | None when Option.is_some active_config -> None
               | None -> cfg.scheduled_driver_config
             in
-            let scheduled_driver_config = scheduled_driver_config_raw in
+            let* scheduled_driver_config = match scheduled_driver_config_raw with
+              | Some scheduled when scheduled.eviction = None ->
+                (match Octra_consensus.C_types.validate_validator_set_for_epoch ~policy ~chain_id
+                  ~epoch_id:scheduled.activate_epoch scheduled.validator_set with
+                 | Ok _ -> Ok scheduled_driver_config_raw
+                 | Error Octra_consensus.C_types.Seat_cap
+                   when Octra_consensus.C_quorum_policy.seatless policy current_height ->
+                   if Option.is_some eviction_source
+                      && Octra_consensus.C_types.same_voting_set active_vs scheduled.validator_set
+                   then Ok scheduled_driver_config_raw else Ok None
+                 | Error Octra_consensus.C_types.Seat_cap -> Ok scheduled_driver_config_raw
+                 | Error error -> Error (Octra_consensus.C_types.set_error_message error))
+              | _ -> Ok scheduled_driver_config_raw in
+            let* () = match scheduled_driver_config with
+              | Some scheduled when Option.is_some scheduled.eviction ->
+                let eviction = Option.get scheduled.eviction in
+                let* () = match active_update with
+                  | Some active when eviction.epoch < active.activate_epoch ->
+                    Error "validator eviction precedes durable active set"
+                  | _ -> Ok () in
+                let* current =
+                  if eviction.epoch > current_height then
+                    Error "validator eviction source is not durable"
+                  else match eviction_source with
+                    | None -> Ok (Octra_consensus.C_types.validator_set_for_epoch
+                        ~policy ~chain_id ~epoch_id:eviction.epoch stake_vs)
+                    | Some resolve ->
+                      let* source = resolve eviction.epoch in
+                      Octra_consensus.C_types.structural_validator_set_for_epoch
+                        ~policy ~chain_id ~epoch_id:eviction.epoch source
+                      |> Result.map_error Octra_consensus.C_types.set_error_message
+                in
+                Octra_consensus.C_driver.check_validator_plan ~policy ~chain_id
+                  ~head:current_height ~current_epoch:eviction.epoch ~current
+                  ~finalized:None scheduled
+              | _ -> Ok () in
             let light_scheduled_validator_set =
-              light_scheduled_of_driver ?policy ~chain_id scheduled_driver_config
+              light_scheduled_of_driver ~policy ~chain_id scheduled_driver_config
             in
             let active_validator_list = active_vs.validators in
             let next_validator_list =
@@ -308,6 +383,7 @@ let bind_persistent_updates ?policy ~chain_id ~consensus_mode ~current_height
               active_validator_list;
               stake_vs;
               active_vs;
+              active_update;
               scheduled_driver_config;
               light_scheduled_validator_set;
               consensus_config_hash;
@@ -370,7 +446,13 @@ let scheduled_self_warning ~address ~voting cfg =
 
 let quorum_check ~allow_unsafe cfg =
   let vs = cfg.active_vs in
-  if vs.n >= 4 then Quorum_ok
+  let evicted = match cfg.active_update with
+    | Some update when Option.is_some update.eviction ->
+      (match Octra_core.Validator_set_update.validator_set update with
+       | Ok set -> Octra_consensus.C_types.same_voting_set vs set
+       | Error _ -> false)
+    | _ -> false in
+  if vs.n >= 4 || (vs.n > 0 && evicted) then Quorum_ok
   else if allow_unsafe then
     Quorum_unsafe_allowed
       (Printf.sprintf
@@ -489,6 +571,7 @@ let build_full ~chain_id ~consensus_mode ~current_height ~current_entries
         activate_epoch;
         validator_set = next_vs;
         fingerprint;
+        eviction = None;
       },
       Scheduled {
         activate_epoch;
@@ -530,6 +613,7 @@ let build_full ~chain_id ~consensus_mode ~current_height ~current_entries
     active_validator_list;
     stake_vs;
     active_vs;
+    active_update = None;
     scheduled_driver_config;
     light_scheduled_validator_set;
     consensus_config_hash;

@@ -50,6 +50,7 @@ type check_job = {
   ticket : unit ref;
   result : Octra_core.Preverify_worker.checked Lwt.t;
   mutable bytes : int;
+  mutable users : int;
 }
 
 type t = {
@@ -280,7 +281,7 @@ let decode (tx_hashes, txs_json, receipts_json as raw) =
             match
               Octra_core.Preverify_commit.check_strings
                 artifacts.preverify
-                parsed
+                (Octra_core.Tx_outcome.executed ~confirmed:parsed artifacts.rejections)
             with
             | Error error -> Error ("bundle preverify: " ^ error)
             | Ok () ->
@@ -462,15 +463,29 @@ let run_preverify_item_once t ~epoch ~purpose ~state_root ~tx_hash verify =
     (try verify () with exn -> Lwt.fail exn)
   else
   let key = preverify_item_key ~epoch ~purpose ~state_root ~tx_hash in
+  let borrow job =
+    job.users <- job.users + 1;
+    let observed, notify = Lwt.task () in
+    Lwt.on_any job.result
+      (fun value -> if Lwt.is_sleeping observed then Lwt.wakeup_later notify value)
+      (fun error -> if Lwt.is_sleeping observed then Lwt.wakeup_later_exn notify error);
+    Lwt.finalize (fun () -> observed) (fun () ->
+      job.users <- job.users - 1;
+      if job.users = 0 && Lwt.is_sleeping job.result then begin
+        forget_preverify t key job.ticket;
+        Lwt.cancel job.result
+      end;
+      Lwt.return_unit) in
   match Hashtbl.find_opt t.preverify key with
   | Some job ->
-    Lwt.protected job.result
+    borrow job
   | None ->
     let ticket = ref () in
     let job =
       try verify () with exn -> Lwt.fail exn
     in
-    Hashtbl.add t.preverify key { ticket; result = job; bytes = 0 };
+    let entry = { ticket; result = job; bytes = 0; users = 0 } in
+    Hashtbl.add t.preverify key entry;
     Queue.push (key, ticket) t.preverify_fifo;
     Lwt.on_success job (fun checked ->
       match Hashtbl.find_opt t.preverify key with
@@ -486,7 +501,7 @@ let run_preverify_item_once t ~epoch ~purpose ~state_root ~tx_hash verify =
       | Some _ | None -> ());
     Lwt.on_failure job (fun _ -> forget_preverify t key ticket);
     evict_preverify t;
-    Lwt.protected job
+    borrow entry
 
 let run_preverify_once ?(epoch=0) t ~purpose ~state_root ~tx_hashes ~txs verify =
   let recomputed = List.map Transaction.hash txs in

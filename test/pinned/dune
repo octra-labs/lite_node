@@ -1,0 +1,4 @@
+(library
+ (name octra_quorum_pinned)
+ (wrapped false)
+ (libraries octra_consensus octra_net zarith))

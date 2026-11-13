@@ -100,12 +100,22 @@ let positions txs result =
       (position >= 0 && Option.map T.hash (List.nth_opt txs position) = Some (T.hash tx))
   ) result.artifacts.confirmed
 
-let artifacts txs result =
-  positions txs result;
-  require "replay confirmed order differs"
-    (hashes (List.map fst result.X.artifacts.confirmed) = hashes txs);
-  require "replay confirmed execution rejected a transaction"
-    (result.artifacts.rejected = [])
+let execution (prepared : J.prepared) =
+  let outcomes = get (O.decode_final ~confirmed:prepared.txs prepared.record.receipts_json) in
+  let paid = List.filter (fun (item : O.rejection) -> item.charged) outcomes.rejections in
+  let inputs = O.executed ~confirmed:prepared.txs paid in
+  let rejections = get (O.build ~inputs
+    ~charged:(List.map (fun (item : O.rejection) -> item.tx) paid)
+    (List.map (fun (item : O.rejection) -> item.tx, item.error_type, item.reason) paid)) in
+  inputs, rejections
+
+let artifacts prepared result =
+  let inputs, rejections = execution prepared in
+  positions inputs result;
+  get (P.verify_preview_partition ~inputs ~confirmed:prepared.txs ~rejections (Ok result));
+  require "replay executed rejection order differs"
+    (hashes (List.map (fun (item : X.tx_reject) -> item.tx) result.X.artifacts.rejected)
+      = hashes (List.map (fun (item : O.rejection) -> item.tx) rejections))
 
 let stable deps expected =
   let open Lwt.Syntax in
@@ -147,9 +157,10 @@ let run deps ~cursor ~(prepared : J.prepared) =
   let actual_receipts = W.receipt_json_for_hashes batch.ready confirmed_hashes in
   require "replay preverify receipts differ" (actual_receipts = outcomes.preverify);
   let input_gate = G.create (W.receipts_for_hashes batch.ready (hashes inputs)) in
-  let confirmed_gate = G.create (W.receipts_for_hashes batch.ready confirmed_hashes) in
+  let executed, _ = execution prepared in
+  let execution_gate = G.create (W.receipts_for_hashes batch.ready (hashes executed)) in
   get (G.check input_gate inputs);
-  get (G.check confirmed_gate prepared.txs);
+  get (G.check execution_gate executed);
   let* () = stable deps initial in
   let* checked = deps.preview input_gate inputs in
   get (P.verify_preview_partition ~inputs ~confirmed:prepared.txs
@@ -161,14 +172,16 @@ let run deps ~cursor ~(prepared : J.prepared) =
       = hashes (List.map (fun (item : O.rejection) -> item.tx) outcomes.rejections));
   let rejections =
     get (O.build ~inputs
+      ~charged:(List.filter_map (fun (item : X.tx_reject) ->
+        if item.charged then Some item.tx else None) checked.artifacts.rejected)
       (List.map (fun (item : X.tx_reject) -> item.tx, item.error_type, item.reason)
         checked.artifacts.rejected))
     |> List.map O.encode_rejection
   in
   let* () = stable deps initial in
-  let* preview = deps.preview confirmed_gate prepared.txs in
+  let* preview = deps.preview execution_gate executed in
   let preview = get preview in
-  artifacts prepared.txs preview;
+  artifacts prepared preview;
   let* () = stable deps initial in
   let _, index_root = E.next_root_from_hashes_i64 ~prev:cursor.eic
     ~epoch_id:record.epoch_id ~start_txid:cursor.txid confirmed_hashes in
@@ -177,8 +190,8 @@ let run deps ~cursor ~(prepared : J.prepared) =
     ~ledger_state_root:ledger_root ~epoch_index_root:index_root in
   require "replay confirmed preview root differs"
     (fold preview.post_state_root = record.state_root);
-  let* applied = deps.apply confirmed_gate prepared in
-  artifacts prepared.txs applied.result;
+  let* applied = deps.apply execution_gate prepared in
+  artifacts prepared applied.result;
   require "replay apply differs from confirmed preview"
     (applied.result.post_state_root = preview.post_state_root);
   require "replay applied index differs" (applied.index_root = index_root);

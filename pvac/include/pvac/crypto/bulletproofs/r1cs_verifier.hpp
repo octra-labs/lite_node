@@ -10,6 +10,7 @@
 #include "transcript.hpp"
 #include "generators.hpp"
 #include "inner_product.hpp"
+#include "ready_points.hpp"
 #include "r1cs_limits.hpp"
 #include "r1cs_types.hpp"
 #include "../ristretto255.hpp"
@@ -120,12 +121,16 @@ inline bool ipp_verify_with_y(
     const RistrettoPoint& Q,
     const InnerProductProof& proof,
     size_t n,
-    const std::vector<Scalar>& y_inv_n
+    const std::vector<Scalar>& y_inv_n,
+    const std::vector<Scalar>& g_terms = {},
+    const std::vector<Scalar>& h_terms = {}
 ) {
     if (!rist_valid(P)) return false;
     if (!rist_valid(Q)) return false;
     if (!ipp_points_valid(proof)) return false;
     if (n == 0 || n > BP_MAX_VECTOR_SIZE || y_inv_n.size() != n) return false;
+    if ((!g_terms.empty() && g_terms.size() != n) ||
+        (!h_terms.empty() && h_terms.size() != n)) return false;
 
     size_t lg = proof.L.size();
     if (proof.R.size() != lg) return false;
@@ -139,26 +144,29 @@ inline bool ipp_verify_with_y(
         challenges[k] = transcript.challenge_scalar("u");
     }
 
-    auto s = ipp_verification_scalars(challenges, transcript.ops);
-
-    auto s_inv = batch_sc_inv(s, transcript.ops);
-
+    const auto ready = ready_table().get(n);
     std::vector<Scalar> scalars;
     std::vector<RistrettoPoint> points;
     scalars.reserve(2 * n + 2 * lg + 2);
-    points.reserve(2 * n + 2 * lg + 2);
+    points.reserve((ready ? 0 : 2 * n) + 2 * lg + 2);
 
     Scalar ab = transcript.ops.mul(proof.a, proof.b);
 
     const auto& gen = generators();
-    for (size_t i = 0; i < n; i++) {
-        scalars.push_back(transcript.ops.mul(proof.a, s[i]));
-        points.push_back(gen.G(i));
-    }
+    {
+        auto s = ipp_verification_scalars(challenges, transcript.ops);
+        auto s_inv = batch_sc_inv(s, transcript.ops);
+        for (size_t i = 0; i < n; i++) {
+            const auto coefficient = transcript.ops.mul(proof.a, s[i]);
+            scalars.push_back(g_terms.empty() ? coefficient : sc_sub(coefficient, g_terms[i]));
+            if (!ready) points.push_back(gen.G(i));
+        }
 
-    for (size_t i = 0; i < n; i++) {
-        scalars.push_back(transcript.ops.mul(transcript.ops.mul(proof.b, s_inv[i]), y_inv_n[i]));
-        points.push_back(gen.H(i));
+        for (size_t i = 0; i < n; i++) {
+            const auto coefficient = transcript.ops.mul(transcript.ops.mul(proof.b, s_inv[i]), y_inv_n[i]);
+            scalars.push_back(h_terms.empty() ? coefficient : sc_sub(coefficient, h_terms[i]));
+            if (!ready) points.push_back(gen.H(i));
+        }
     }
 
     scalars.push_back(ab);
@@ -177,8 +185,11 @@ inline bool ipp_verify_with_y(
         points.push_back(proof.R[k]);
     }
 
-    RistrettoPoint expected = multi_scalar_mul(scalars, points);
-    return expected == P;
+    RistrettoPoint expected = ready ? ready_sum(*ready, scalars, n, points)
+        : multi_scalar_mul(scalars, points);
+    const bool accepted = expected == P;
+    if (ready && !accepted) ready_table().reject();
+    return accepted;
 }
 
 inline bool r1cs_verify(
@@ -236,6 +247,7 @@ inline bool r1cs_verify(
         y_inv_n[i] = transcript.ops.mul(y_inv_n[i-1], y_inv);
 
     RistrettoPoint P, Q;
+    std::vector<Scalar> g_terms, h_terms;
     {
         std::vector<Scalar> wL(N, sc_zero()), wR(N, sc_zero()), wO(N, sc_zero());
         std::vector<Scalar> wV(m, sc_zero());
@@ -307,12 +319,13 @@ inline bool r1cs_verify(
 
         std::vector<Scalar> sc;
         std::vector<RistrettoPoint> pt;
-        sc.reserve(2*N + 5);
-        pt.reserve(2*N + 5);
+        sc.reserve(5);
+        pt.reserve(5);
+        g_terms.reserve(N);
+        h_terms.reserve(N);
 
         for (size_t i = 0; i < N; i++) {
-            sc.push_back(transcript.ops.mul(xc, transcript.ops.mul(y_inv_n[i], wR[i])));
-            pt.push_back(gen.G(i));
+            g_terms.push_back(transcript.ops.mul(xc, transcript.ops.mul(y_inv_n[i], wR[i])));
         }
 
         for (size_t i = 0; i < N; i++) {
@@ -320,8 +333,7 @@ inline bool r1cs_verify(
                 transcript.ops.mul(y_inv_n[i], sc_add(wO[i], transcript.ops.mul(wL[i], xc))),
                 Scalar{{1,0,0,0}}
             );
-            sc.push_back(h_coeff);
-            pt.push_back(gen.H(i));
+            h_terms.push_back(h_coeff);
         }
 
         sc.push_back(xc);
@@ -342,7 +354,7 @@ inline bool r1cs_verify(
         P = multi_scalar_mul(sc, pt);
     }
 
-    return ipp_verify_with_y(transcript, P, Q, proof.ipp, N, y_inv_n);
+    return ipp_verify_with_y(transcript, P, Q, proof.ipp, N, y_inv_n, g_terms, h_terms);
 }
 
 }

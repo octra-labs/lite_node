@@ -104,6 +104,13 @@ let queue_fields = function
       "stage_status", `String "ready";
       "expires_at", `Float expires_at;
     ]
+  | Some (Staging.Wait_preview { after; attempts; expires_at }) ->
+    [
+      "stage_status", `String "waiting_preview";
+      "resume_after_epoch", `Intlit (Int64.to_string after);
+      "preview_attempts", `Int attempts;
+      "expires_at", `Float expires_at;
+    ]
   | Some (Staging.Wait_nonce { expected; expires_at }) ->
     [
       "stage_status", `String "waiting_nonce";
@@ -365,11 +372,15 @@ let requires_heavy_preverify tx =
   | Transaction.KeySwitch -> true
   | _ -> false
 
+let decode_network_tx tx_json =
+  Result.bind (Transaction.of_network_yojson tx_json) (fun tx ->
+    Octra_core.Tx_payload.admit tx |> Result.map (fun () -> tx))
+
 let decode_submit_tx tx_json =
-  try Octra_core.Tx_payload.decode_admit tx_json with _ -> Error "invalid tx JSON"
+  try decode_network_tx tx_json with _ -> Error "invalid tx JSON"
 
 let decode_submit_batch_tx tx_json =
-  try Octra_core.Tx_payload.decode_admit tx_json with _ -> Error "invalid tx"
+  try decode_network_tx tx_json with _ -> Error "invalid tx"
 
 let submit_params params =
   match Rpc.param_json params 0 with
@@ -811,10 +822,15 @@ let call_params_ok tx =
     end
   | _ -> true
 
+let payload_parse_failed = function
+  | (Out_of_memory | Stack_overflow | Lwt.Canceled
+    | Octra_core.Exec_resource.Unavailable _) as error -> raise error
+  | _ -> false
+
 let base64_decodes_to_len expected_len encoded =
   try
     String.length (Base64.decode_exn encoded) = expected_len
-  with _ -> false
+  with error -> payload_parse_failed error
 
 let hex_len n s =
   String.length s = n
@@ -837,7 +853,7 @@ let range_proof_payload_ok encoded_proof =
       String.sub encoded_proof prefix_len (String.length encoded_proof - prefix_len)
       |> Base64.decode_exn in
     String.length raw > 0
-  with _ -> false
+  with error -> payload_parse_failed error
 
 let cipher_payload_ok encoded_cipher =
   match Crypto.FheBalance.decode_cipher ~strict:true encoded_cipher with
@@ -865,7 +881,7 @@ let encrypt_decrypt_payload_ok s =
       && zero_proof_payload_ok zp
       && base64_decodes_to_len 32 bl
     | _ -> false
-  with _ -> false
+  with error -> payload_parse_failed error
 
 let stealth_payload_ok json =
   try
@@ -888,7 +904,7 @@ let stealth_payload_ok json =
         | Error _ -> false
       end
     | _ -> false
-  with _ -> false
+  with error -> payload_parse_failed error
 
 let preverify_stealth_payload tx =
   match tx.Transaction.op_type, tx.Transaction.encrypted_data with
@@ -927,12 +943,13 @@ let preverify_unavailable_message = function
 
 let max_compute_queue_waits = 40
 
-let run_preverify_compute task =
+let run_preverify_compute ~bytes task =
   let rec wait attempts =
     let open Lwt.Syntax in
     let* result =
       Octra_core.Proof_pool.try_run
         ~priority:Octra_core.Compute_pool.Speculative
+        ~bytes
         task
     in
     match result with
@@ -993,6 +1010,7 @@ let preverify_stealth_ranges ~keyed ~math ~strict ~pubkey_blob ~sender_enc ptd =
   else
     let* new_enc =
       run_preverify_compute
+        ~bytes:(Octra_core.Compute_memory.strings [pubkey_blob; sender_enc; delta_cipher])
         (fun () ->
         match Crypto.FheBalance.load_pubkey_result pubkey_blob with
         | Error e -> Error e
@@ -1044,7 +1062,7 @@ let claim_payload_ok json =
         | Error _ -> false
       end
     | _ -> false
-  with _ -> false
+  with error -> payload_parse_failed error
 
 let key_switch_payload_ok json =
   try
@@ -1064,10 +1082,10 @@ let key_switch_payload_ok json =
               | Ok _ -> true
               | Error _ -> false
             end
-        with _ -> false
+        with error -> payload_parse_failed error
       end
     | _ -> false
-  with _ -> false
+  with error -> payload_parse_failed error
 
 let encrypted_payload_ok tx =
   match tx.Transaction.op_type, tx.Transaction.encrypted_data with
@@ -1119,15 +1137,53 @@ let payload_size_check ~limits tx =
     | Error e -> Error ("malformed_transaction", e)
     | Ok () -> Ok ()
 
+let payload_parse_bytes tx =
+  match Octra_core.Tx_payload.parse_kind tx.Transaction.op_type, tx.Transaction.encrypted_data with
+  | ((Octra_core.Tx_payload.Encrypted | Octra_core.Tx_payload.Program) as kind), Some body ->
+    let open Octra_core.Compute_memory in
+    let wire = String.length body in
+    let decoded = add wire 3 / 4 * 3 in
+    let expanded = if kind = Octra_core.Tx_payload.Program then decoded
+      else if decoded > 32 * 1024 * 1024 / 64 then 32 * 1024 * 1024
+      else decoded * 64 in
+    let native = max decoded expanded in
+    let retained = match Octra_core.Staging_bytes.measure tx with
+      | Ok bytes -> bytes
+      | Error _ -> max_int in
+    Some (List.fold_left add retained [wire; wire; decoded; decoded; native; native; native])
+  | _ -> None
+
 let payload_check ~limits tx =
+  let check () =
+    if not (encrypted_payload_ok tx) then
+      Error ("malformed_transaction", "malformed or oversized encrypted_data")
+    else if not (call_params_ok tx) then
+      Error ("malformed_transaction", "contract call params contain invalid characters")
+    else Ok () in
   match payload_size_check ~limits tx with
-  | Error _ as error -> error
+  | Error _ as error -> Lwt.return error
   | Ok () ->
-      if not (encrypted_payload_ok tx) then
-        Error ("malformed_transaction", "malformed or oversized encrypted_data")
-      else if not (call_params_ok tx) then
-        Error ("malformed_transaction", "contract call params contain invalid characters")
-      else Ok ()
+    match payload_parse_bytes tx with
+    | None -> Lwt.return (check ())
+    | Some bytes ->
+      if tx.Transaction.op_type = Transaction.KeySwitch then
+        ignore (Pvac_registry.expected_kat ());
+      Lwt.catch
+        (fun () ->
+          let open Lwt.Syntax in
+          let* result = Octra_core.Proof_pool.try_run
+            ~priority:Octra_core.Proof_pool.Speculative ~bytes check in
+          match result with
+          | Some result -> Lwt.return result
+          | None -> Lwt.return_error ("pre_verify_busy", "payload parse queue is full"))
+        (function
+          | Lwt.Canceled as error -> Lwt.fail error
+          | Out_of_memory -> Lwt.return_error ("pre_verify_unavailable", "payload parse memory unavailable")
+          | Stack_overflow -> Lwt.return_error ("pre_verify_unavailable", "payload parse stack unavailable")
+          | Octra_core.Exec_resource.Unavailable resource ->
+            Lwt.return_error ("pre_verify_unavailable",
+              "payload parse " ^ Octra_core.Exec_resource.name resource ^ " unavailable")
+          | error -> Lwt.fail error)
 
 let bft_op_check ~bft_mode tx =
   if
@@ -1192,6 +1248,28 @@ let sender_check ~sender_exists tx =
   else if not sender_exists then
     Error ("sender_not_found", "sender account does not exist")
   else Ok ()
+
+let payload_account_check ~bft_mode ~bft_window ~min_ou ~min_relay_fee ~account tx =
+  match payload_parse_bytes tx with
+  | None -> Ok ()
+  | Some _ ->
+    let ( let* ) = Result.bind in
+    let* () = bft_op_check ~bft_mode tx in
+    let* account = match account with
+      | Some account -> Ok account
+      | None -> Error ("sender_not_found", "sender account does not exist") in
+    let* () = staging_submit_check ~min_ou ~min_relay_fee tx
+      |> Result.map_error (fun reason -> "malformed_transaction", reason) in
+    if tx.Transaction.nonce <= account.Octra_core.Ledger.nonce then
+      Error ("invalid_nonce", "nonce already used")
+    else if bft_mode && Z.gt (Z.of_int tx.nonce)
+        (Z.add (Z.of_int account.nonce) (Z.of_int bft_window)) then
+      Error ("nonce_too_far", "nonce exceeds pending window")
+    else if Z.gt (Octra_core.Tx_staging.public_balance_cost tx) account.balance then
+      Error ("insufficient_balance", "public balance does not cover operation")
+    else Octra_core.Tx_staging.pending_balance_check
+      ~balance:account.balance ~confirmed:account.nonce tx
+      |> Result.map_error staging_error
 
 let submit_pre_signature_check
     ?(duty = None)
@@ -1260,23 +1338,7 @@ let post_signature_check
 let submit_signature_check
     ~signing
     ~account_public_key
-    ~preverify_has_capacity
-    ~preverify_pending
-    ~preverify_pending_max
-    ~bft_mode
-    ~confirmed_nonce
-    ~bft_window
     tx =
   match signature_check ~signing ~account_public_key tx with
-  | Error e -> Error e
-  | Ok () ->
-    match payload_check ~limits:payload_limits tx with
-    | Error _ as error -> error
-    | Ok () -> post_signature_check
-      ~preverify_has_capacity
-      ~preverify_pending
-      ~preverify_pending_max
-      ~bft_mode
-      ~confirmed_nonce
-      ~bft_window
-      tx
+  | Error e -> Lwt.return_error e
+  | Ok () -> payload_check ~limits:payload_limits tx

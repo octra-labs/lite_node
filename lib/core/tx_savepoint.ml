@@ -10,8 +10,9 @@ let restore ledger store savepoint =
   | Error error, _
   | _, Error error -> failwith error
 
-let run ~ledger ~store apply =
+let run ?checkpoint ~ledger ~store apply =
   let ( let* ) = Exec_resource.bind in
+  let rewind = match checkpoint with None -> Fun.id | Some save -> save () in
   match Ledger.begin_journal ledger with
   | Error error -> Lwt.fail_with error
   | Ok () ->
@@ -21,22 +22,24 @@ let run ~ledger ~store apply =
         ignore (Ledger.abort_journal ledger);
         Lwt.fail_with error
       | Ok savepoint ->
-        Exec_resource.catch
+        let rollback () =
+          match restore ledger store savepoint with
+          | () -> rewind ()
+          | exception error -> rewind (); raise error
+        in
+        Lwt.try_bind
           (fun () ->
-            let* result = apply () in
-            begin
-              match result with
-              | Error _ ->
-                restore ledger store savepoint;
-                Lwt.return result
-              | Ok _ ->
-                begin
-                  match Ledger.commit_journal ledger with
-                  | Ok () -> Lwt.return result
-                  | Error error -> Lwt.fail_with error
-                end
-            end)
+            Exec_resource.protect (fun () ->
+              let* result = apply () in
+              Lwt.return result) ())
+          (fun result ->
+            match result with
+            | Error _ -> rollback (); Lwt.return result
+            | Ok _ ->
+              match Ledger.commit_journal ledger with
+              | Ok () -> Lwt.return result
+              | Error error -> rollback (); Lwt.fail_with error)
           (fun exn ->
-            restore ledger store savepoint;
+            rollback ();
             Lwt.fail exn)
     end

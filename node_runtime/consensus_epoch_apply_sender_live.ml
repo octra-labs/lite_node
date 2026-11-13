@@ -54,6 +54,14 @@ let run ?compute deps sender_txs =
   let had_encrypted_debit = ref false in
   let handle_sender_tx (raw_ctx : Sender.tx_context) =
     let open Lwt.Syntax in
+    let proof_mode, program_mode, program_overlap, math, fhe_work, wasm_float, proof_exec, proof_key, vm_bytes, program_records =
+      match deps.fold (deps.current_epoch ()) with
+      | Ok fold ->
+        fold.Octra_core.Epoch_exec.standard_mode, fold.program_mode,
+        fold.program_overlap, fold.math, fold.fhe_work, fold.wasm_float, fold.proof_exec,
+        fold.proof_key, fold.vm_bytes, fold.program_records
+      | Error reason -> failwith reason
+    in
     let completed = ref false in
     let accepted = ref false in
     let persist_state = ref false in
@@ -73,13 +81,20 @@ let run ?compute deps sender_txs =
         raw_ctx.confirm ());
       reject = (fun ?consume_nonce ?notify_reason ?(persist_state = false)
           tag reason ->
-        complete ~accept:false ~persist:persist_state;
-        raw_ctx.reject
-          ?consume_nonce
-          ?notify_reason
-          ~persist_state
-          tag
-          reason);
+        if proof_mode = Octra_core.Rule_graph.Active
+          && Transaction.bft_crypto_op raw_ctx.tx.Transaction.op_type
+          && Octra_core.Private_ledger.failure_action
+            {tag; reason; user_reason = reason} = Octra_core.Private_ledger.Retry
+        then Lwt.fail (Octra_core.Private_ledger.Worker_stopped reason)
+        else begin
+          complete ~accept:false ~persist:persist_state;
+          raw_ctx.reject
+            ?consume_nonce
+            ?notify_reason
+            ~persist_state
+            tag
+            reason
+        end);
       continue_after_reject = (fun ~consume_nonce ->
         complete ~accept:false ~persist:false;
         raw_ctx.continue_after_reject ~consume_nonce);
@@ -117,21 +132,22 @@ let run ?compute deps sender_txs =
         tag
         reason
     in
-    let proof_mode, program_mode, program_overlap, math, fhe_work, wasm_float, proof_exec, proof_key, vm_bytes, program_records =
-      match deps.fold (deps.current_epoch ()) with
-      | Ok fold ->
-        fold.Octra_core.Epoch_exec.standard_mode, fold.program_mode,
-        fold.program_overlap, fold.math, fold.fhe_work, fold.wasm_float, fold.proof_exec,
-        fold.proof_key, fold.vm_bytes, fold.program_records
-      | Error reason -> failwith reason
-    in
     let keyed = proof_key = Octra_core.Rule_graph.Active in
+    let scalar_work = Octra_core.Rule_graph.scalar_work_at
+      ~chain_id:(deps.standard_env ()).Octra_core.Epoch_exec.chain_id
+      ~epoch:(deps.current_epoch ()) = Octra_core.Rule_graph.Active in
     let program_inputs =
       Octra_core.Rule_graph.program_inputs_at
         ~chain_id:(deps.standard_env ()).Octra_core.Epoch_exec.chain_id
         ~epoch:(deps.current_epoch ()) = Octra_core.Rule_graph.Active in
     let vm_tx_deps =
       Consensus_epoch_vm_shell.make_live_sender_vm_tx_deps
+        ~source_create:(Octra_core.Rule_graph.source_create_at
+          ~chain_id:(deps.standard_env ()).Octra_core.Epoch_exec.chain_id
+          ~epoch:(deps.current_epoch ()))
+        ~scalar_work:(Octra_core.Rule_graph.scalar_work_at
+          ~chain_id:(deps.standard_env ()).Octra_core.Epoch_exec.chain_id
+          ~epoch:(deps.current_epoch ()) = Octra_core.Rule_graph.Active)
         Consensus_epoch_vm_shell.{
           program_inputs;
           value_journal = vm_value.value_journal;
@@ -196,6 +212,7 @@ let run ?compute deps sender_txs =
     let handle_circle_tx () =
       let* admitted =
         Consensus_circle_code_check.admit
+          ~scalar_work
           ~resource_errors:(proof_exec = Octra_core.Rule_graph.Active)
           ~store:deps.store
           ~program_trust:deps.program_trust
@@ -404,6 +421,7 @@ let run ?compute deps sender_txs =
               | Error (tag, reason) -> reject_current_tx tag reason)
             | ContractUpgrade ->
               Consensus_epoch_vm_shell.run_program_upgrade_tx
+                ~scalar_work
                 ~metered:program_inputs
                 ~records:program_records
                 vm_tx_deps.runtime

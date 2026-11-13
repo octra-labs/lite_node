@@ -33,6 +33,26 @@ type error = Invalid | Resource of Octra_core.Exec_resource.resource
 
 module Worker = Octra_core.Pvac_verify_worker
 module Calc = Octra_core.Fhe_calc
+module Memory = Octra_core.Compute_memory
+
+let input_bytes = function
+  | Load_key raw | Read_key raw | Write_secret raw | Read_cipher (_, _, raw) -> String.length raw
+  | Write_key key -> String.length key.data
+  | Write_cipher cipher -> String.length cipher.data
+  | Add (key, left, right) | Sub (key, left, right) ->
+    Memory.strings [key.data; left.data; right.data]
+  | Mul (_, _, key, left, right, seed) -> Memory.strings [key.data; left.data; right.data; seed]
+  | Scale (_, key, cipher, _) | Divide (key, cipher, _)
+  | Add_int (_, key, cipher, _) | Sub_int (_, key, cipher, _) | Commit (key, cipher) ->
+    Memory.strings [key.data; cipher.data]
+  | Pack (kind, key, cipher, proof) -> Memory.strings
+      [key.data; cipher.data; proof; (match kind with Claim value -> value | _ -> "")]
+  | Verify (_, request) -> Octra_core.Pvac_verify_protocol.input_bytes request
+
+let measured request action =
+  match Memory.reserve Memory.shared ~speculative:false (input_bytes request) with
+  | None -> Error (Resource Memory)
+  | Some ticket -> Fun.protect ~finally:(fun () -> Memory.release ticket) action
 
 module Native = Ephemeron.K1.Make (struct
   type t = string
@@ -102,7 +122,7 @@ let accept request = function
     | Commit _, Calc.Digest raw -> Ok (Text (Base64.encode_exn raw))
     | _ -> Error (Resource Host)
 
-let direct state request =
+let direct state request = measured request (fun () ->
   let save table capacity bytes value =
     if not (Native.mem table bytes) && Native.length table >= capacity then
       Native.clear table;
@@ -133,7 +153,7 @@ let direct state request =
   with
   | Out_of_memory -> Error (Resource Memory)
   | Stack_overflow -> Error (Resource Stack)
-  | Invalid_argument _ | Failure _ -> Error Invalid
+  | Invalid_argument _ | Failure _ -> Error Invalid)
 
 let key_effort = function
   | Add (key, _, _) | Sub (key, _, _) | Mul (_, _, key, _, _, _)
@@ -216,17 +236,18 @@ let isolated ?session ~control ~deadline request =
   | Stack_overflow -> Error (Resource Stack)
   | _ -> Error (Resource Host)
 
-let eval request =
+let eval request = measured request (fun () ->
   let now = Mtime_clock.elapsed_ns () in
   let span = Int64.of_float (Worker.timeout_seconds () *. 1e9) in
   let deadline = Int64.add now span in
   if deadline <= now then Error (Resource Host)
-  else isolated ~control:(Atomic.make Worker.Continue) ~deadline request
+  else isolated ~control:(Atomic.make Worker.Continue) ~deadline request)
 
 type job = {
   ticket : Proof_wait.ticket;
   urgent : bool;
   request : request;
+  memory : Memory.ticket;
   reply : (value, error) result Lwt.t;
   wake : (value, error) result Lwt.u;
   control : Worker.control Atomic.t;
@@ -240,6 +261,7 @@ type job = {
 
 type actor = {
   owner : int;
+  memory : Memory.t;
   clock : unit -> int64;
   reap : Worker.session -> unit Lwt.t;
   mutable closing : unit Lwt.t list;
@@ -253,8 +275,9 @@ type actor = {
   mutable failures : int;
 }
 
-let create ?(clock = Mtime_clock.elapsed_ns) ?(reap = Worker.retire_session) () = {
+let create ?(memory = Memory.shared) ?(clock = Mtime_clock.elapsed_ns) ?(reap = Worker.retire_session) () = {
   owner = Thread.id (Thread.self ());
+  memory;
   clock;
   reap;
   closing = [];
@@ -289,7 +312,9 @@ let retire_closed actor =
     actor.state <- fst (Fhe_queue.delta actor.state (Int64.min_int, Fhe_queue.Complete entry.ticket))
   | _ -> ()
   end;
-  actor.jobs <- List.filter (fun job -> not job.settled) actor.jobs
+  actor.jobs <- List.filter (fun job ->
+    if job.settled then Memory.release job.memory;
+    not job.settled) actor.jobs
 
 let resource = function
   | Out_of_memory | Octra_core.Exec_resource.Unavailable Memory -> Octra_core.Exec_resource.Memory
@@ -312,6 +337,7 @@ let fail actor error =
       Atomic.set job.finished true;
       job.settled <- true
     end;
+    if job.settled then Memory.release job.memory;
     try deliver job (Error (Resource (resource error)))
     with _ -> Lwt.cancel job.reply) actor.jobs;
   retire_closed actor
@@ -362,6 +388,7 @@ let rec effects actor actions =
             | Some entry -> entry.ticket = ticket && not entry.abandoned
                 && now < entry.deadline
             | None -> false in
+          Memory.release job.memory;
           if accepted then deliver job value;
           effects actor actions;
           if actor.state.active = None && Option.is_none actor.idle
@@ -445,9 +472,13 @@ let rec effects actor actions =
     | Fhe_queue.Fail (ticket, _) ->
       Option.iter (fun job ->
         Atomic.set job.control Worker.Cancel;
+        if not (Option.fold ~none:false ~some:(fun entry -> entry.Fhe_queue.ticket = ticket) actor.state.active) then
+          Memory.release job.memory;
         deliver job (Error (Resource Host))) (find actor ticket)
     | Fhe_queue.Retire ticket ->
-      actor.jobs <- List.filter (fun job -> job.ticket <> ticket) actor.jobs
+      actor.jobs <- List.filter (fun job ->
+        if job.ticket = ticket then Memory.release job.memory;
+        job.ticket <> ticket) actor.jobs
     | Fhe_queue.Refuse _ -> ()) actions
 and transition actor message =
   if Thread.id (Thread.self ()) <> actor.owner then
@@ -461,12 +492,12 @@ and send actor message =
   effects actor actions;
   actions
 
-let submit actor urgent ticket deadline request =
+let submit actor urgent ticket deadline memory owned request =
   actor.sequence <- Int64.succ actor.sequence;
   let ticket = {ticket with Proof_wait.generation =
     ticket.Proof_wait.generation ^ ":" ^ Int64.to_string actor.sequence} in
   let reply, wake = Lwt.task () in
-  let job = {ticket; urgent; request; reply; wake; deadline;
+  let job = {ticket; urgent; request; memory; reply; wake; deadline;
     control = Atomic.make Worker.Continue;
     result = Atomic.make (Error (Resource Host)); finished = Atomic.make false;
     process = Atomic.make None;
@@ -474,7 +505,7 @@ let submit actor urgent ticket deadline request =
   let jobs = job :: actor.jobs in
   let actions = transition actor (Fhe_queue.Submit {ticket; deadline; abandoned = false; urgent}) in
   let accepted = not (List.exists (function Fhe_queue.Refuse _ -> true | _ -> false) actions) in
-  if accepted then actor.jobs <- jobs;
+  if accepted then begin actor.jobs <- jobs; owned := true end;
   effects actor actions;
   if not accepted then Lwt.return (Error (Resource Host))
   else begin
@@ -500,9 +531,14 @@ let run ?(actor = shared) ?(urgent = true) ~ticket ~deadline request =
   else
     try
       if actor.clock () >= deadline then Lwt.return (Error (Resource Host))
-      else match prepare request with
-      | Local value -> Lwt.return (Ok value)
-      | Native _ | Proof _ -> submit actor urgent ticket deadline request
+      else match Memory.reserve actor.memory ~speculative:(not urgent) (input_bytes request) with
+      | None -> Lwt.return (Error (Resource Memory))
+      | Some memory ->
+        let owned = ref false in
+        Fun.protect ~finally:(fun () -> if not !owned then Memory.release memory) (fun () ->
+          match prepare request with
+          | Local value -> Lwt.return (Ok value)
+          | Native _ | Proof _ -> submit actor urgent ticket deadline memory owned request)
     with error ->
       fail actor error;
       Lwt.return (Error (Resource (resource error)))

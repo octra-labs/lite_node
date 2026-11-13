@@ -252,6 +252,7 @@ let check_outcome ~epoch_id receipts txs =
   | Error error -> Error ("outcome:" ^ error)
   | Ok partition ->
     Octra_core.Preverify_receipt_policy.check
+      ~rejections:partition.rejections
       ~epoch_id
       ~receipts:partition.preverify
       txs

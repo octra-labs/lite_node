@@ -16,5 +16,5 @@ else
 fi
 build=${OCTRA_BUILD_DIR:-_build}
 python3 -B test/test_compat_source.py
-opam exec -- dune build --root . --build-dir "$build" test/test_sync_mark.exe
+opam exec -- python3 "$root/controls/lib/gc_build.py" -- dune build --root . --build-dir "$build" test/test_sync_mark.exe
 python3 -B test/compat_role.py "$old" "$work" "$build/default/test/test_sync_mark.exe"

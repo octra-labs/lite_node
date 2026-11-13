@@ -27,6 +27,8 @@ let view base store =
     split_epoch = base.split_epoch;
     gc_planning = true;
     gc_need = None;
+    gc_job = None;
+    gc_closed = false;
     tag_lock = Lwt_mutex.create ();
     store_path = base.store_path;
     pvac_dir = base.pvac_dir;
@@ -113,6 +115,9 @@ let with_preview ?compute ~(base_store : Store_irmin.t) ?base_ledger ~proof_mode
         flush_dirty = (fun () -> Ledger.flush_dirty_lwt ledger);
         get_head_hash = (fun () -> Store_irmin.get_head_hash store);
         set_meta = (fun key value -> Store_irmin.set_meta store key value);
+        execution_profile = (fun ~chain_id:_ ~epoch:_ -> None);
+        voting_set = None;
+        fold_parent = None;
       } in
       f backend)
 

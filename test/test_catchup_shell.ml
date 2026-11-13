@@ -473,6 +473,7 @@ let health_deps active events =
     quarantine_active = (fun () -> true);
     replay_stashed = (fun ~source:_ -> active := true; Lwt.return_unit);
     probe_health = (fun () -> add events "probe"; Lwt.return_unit);
+    reset_ahead_streak = (fun () -> ());
     reset_liveness = (fun ~source:_ -> add events "reset"; Lwt.return_unit);
   }
 
@@ -627,13 +628,31 @@ let test_poll_rechecks_owner () =
 module Health = Octra_node_runtime.Consensus_health_shell
 
 let probe_config = Health.{
-    active_f = 1; validator_count = 4; state_attest_configured = 2;
+    state_attest_configured = 2;
     snapshot_policy_threshold = 4096; soft_catchup_max_lag = 4;
     quarantine_ahead_streak_threshold = 3; quarantine_ahead_grace_epochs = 2;
     quarantine_ahead_drift_tolerance = 1;
   }
 
+let probe_weights ?(epoch_id = 10L) ?(count_floor = 2)
+    ?(count_required = 2) ?(count_limit = 3) () = Octra_consensus.C_driver.{
+  epoch_id;
+  stamp = "probe_weights";
+  weight = (function
+    | "left" | "right" -> Some (Z.of_int 40)
+    | address when String.starts_with ~prefix:"dust" address -> Some Z.one
+    | _ -> None);
+  agrees = (fun ~count ~weight -> count >= count_floor && Z.geq weight (Z.of_int 30));
+  ahead = (fun weight -> Z.geq weight (Z.of_int 30));
+  required = (fun ~configured ->
+    if count_limit = 0 then 0 else min count_limit (max count_required configured));
+  attested = (fun ~required ~count ~weight:_ -> count >= required);
+}
+
 let probe_state active change = Health.{
+    head_time = (fun _ -> Some 100.);
+    now = (fun () -> 100100.);
+    root_weights = (fun ~epoch_id -> Some (probe_weights ~epoch_id ()));
     normalize_next_epoch_for_head = (fun ~source:_ -> ());
     committed_head_epoch = (fun () -> 10); current_epoch = (fun () -> 11);
     catchup_next_target = (fun () -> None); attested_head = (fun _ -> false);
@@ -651,6 +670,7 @@ let probe_state active change = Health.{
     run_catchup_to_target = (fun ~target_epoch:_ ~reason:_ -> change (); Lwt.return_unit);
     quarantine_active = (fun () -> false); quarantine_reason = (fun () -> "");
     ahead_streak = (fun () -> 0); incr_ahead_streak = change;
+    reset_ahead_streak = (fun () -> ());
   }
 
 let probe_peer head address = Octra_consensus.C_driver.{
@@ -667,6 +687,1001 @@ let test_probe_keeps_owner () =
   } in
   run (Health.run probe_config state);
   assert_true "probe cannot alter active catchup" (!active && !changes = 0)
+
+let test_probe_light_roots () =
+  let active = ref false and quarantine = ref [] in
+  let dust = List.init 4 (fun i ->
+    { (probe_peer 10L ("dust" ^ string_of_int i)) with state_root = Some wrong_root }) in
+  let state = { (probe_state active (fun () -> ())) with
+    query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+      Lwt.return (dust @ [probe_peer 10L "left"; probe_peer 10L "right"]));
+    mark_quarantine = (fun reason -> quarantine := reason :: !quarantine);
+  } in
+  run (Health.run probe_config state);
+  assert_true "light roots forced quarantine" (!quarantine = [])
+
+let test_probe_light_target () =
+  List.iter (fun target ->
+    let active = ref false and effects = ref [] in
+    let dust = List.init 4 (fun i -> probe_peer target ("dust" ^ string_of_int i)) in
+    let state = { (probe_state active (fun () -> ())) with
+      query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+        Lwt.return (dust @ [probe_peer 10L "left"; probe_peer 10L "right"]));
+      mark_quarantine = (fun _ -> effects := "quarantine" :: !effects);
+      require_sync = (fun _ -> effects := "sync" :: !effects);
+      run_catchup_to_target = (fun ~target_epoch:_ ~reason:_ ->
+        effects := "catchup" :: !effects; Lwt.return_unit);
+    } in
+    run (Health.run probe_config state);
+    assert_true "light heads forced recovery" (!effects = [])
+  ) [20L; 5010L; Int64.max_int]
+
+let test_probe_weight_rules () =
+  let module P = Octra_node_runtime.Consensus_health_probe in
+  let answer head root name = { (probe_peer head name) with state_root = root } in
+  let dust root = List.init 4 (fun i -> answer 10L root ("dust" ^ string_of_int i)) in
+  let check floor replies expect =
+    let result = P.peer_root_quorum ~weights:(probe_weights ~count_floor:floor ())
+      ~required:4 ~local_root:base_root replies in
+    assert_true "weighted root decision differs" (expect result) in
+  let mismatch = function P.Mismatching_quorum _ -> true | _ -> false in
+  let waiting = function P.Missing_quorum _ | P.No_root -> true | _ -> false in
+  let matching = function P.Matching_quorum _ -> true | _ -> false in
+  let heavy root = [answer 10L root "left"; answer 10L root "right"] in
+  check 0 (heavy (Some wrong_root)) mismatch;
+  check 4 (heavy (Some wrong_root)) waiting;
+  check 4 (heavy (Some wrong_root) @ dust (Some wrong_root)) mismatch;
+  check 4 (dust (Some base_root)) matching;
+  check 4 (dust (Some wrong_root) @ heavy None) waiting;
+  check 0 [answer 10L (Some wrong_root) "left";
+    answer 10L (Some base_root) "right"] waiting;
+  check 0 [answer 10L (Some wrong_root) "left";
+    answer 10L (Some other_root) "right"] waiting;
+  check 4 (List.init 6 (fun _ -> answer 10L (Some wrong_root) "left")) waiting;
+  check 0 [answer 10L (Some wrong_root) "outsider"] waiting;
+  let replies = heavy (Some base_root) @ dust (Some wrong_root) in
+  let expected = P.peer_roots ~weights:(probe_weights ()) replies in
+  let rec permutations = function
+    | [] -> [[]]
+    | values -> List.concat_map (fun value ->
+      let rest = List.filter (fun other -> other <> value) values in
+      List.map (fun suffix -> value :: suffix) (permutations rest)) values in
+  List.iter (fun replies ->
+    assert_true "root order depends on arrival"
+      (P.peer_roots ~weights:(probe_weights ()) replies = expected);
+    check 4 replies waiting) (permutations replies);
+  let conflicting = [answer 10L (Some wrong_root) "left";
+    answer 10L (Some other_root) "left"] in
+  check 0 conflicting waiting;
+  check 0 (List.rev conflicting) waiting;
+  let conflicting = [answer 10L (Some wrong_root) "left";
+    answer 9L (Some wrong_root) "left"] in
+  check 0 conflicting waiting;
+  check 0 (List.rev conflicting) waiting
+
+let test_probe_target_confirm () =
+  List.iter (fun variant ->
+    let active = ref false and calls = ref 0 and need = ref None in
+    let head = ref 10 and root = ref base_root in
+    let weights = ref (Some (probe_weights ())) in
+    let state = { (probe_state active (fun () -> ())) with
+      root_weights = (fun ~epoch_id -> Option.map (fun (weights : Octra_consensus.C_driver.root_weights) ->
+        {weights with Octra_consensus.C_driver.epoch_id}) !weights);
+      committed_head_epoch = (fun () -> !head);
+      current_epoch = (fun () -> !head + 1);
+      read_local_root_raw = (fun () -> Lwt.return !root);
+      query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+        incr calls;
+        if !calls = 2 && variant = "owner" then active := true;
+        if !calls = 2 && variant = "set" then
+          weights := Some { (probe_weights ()) with stamp = "other" };
+        if !calls = 2 && variant = "head" then head := 11;
+        if !calls = 2 && variant = "root" then root := wrong_root;
+        let height = if !calls = 2 && variant = "weak" then 10L else 5010L in
+        Lwt.return [probe_peer height "left"; probe_peer height "right"]);
+      require_sync = (fun value -> need := Some value);
+    } in
+    run (Health.run probe_config state);
+    assert_true "sync target lacked a second observation"
+      (!calls = 2 && Option.is_some !need = (variant = "same"))
+  ) ["same"; "weak"; "owner"; "set"; "head"; "root"]
+
+let test_probe_time_limits () =
+  let module P = Octra_node_runtime.Consensus_health_probe in
+  assert_true "target clock exact" (P.target_ceiling ~head:10L
+    ~head_time:(Some 100.) ~now:111. ~allowance:2 = Some 14L);
+  List.iter (fun time ->
+    assert_true "invalid clock produced target" (P.target_ceiling ~head:10L
+      ~head_time:time ~now:110. ~allowance:2 = None)
+  ) [None; Some nan; Some infinity; Some (-1.); Some 111.];
+  assert_true "target overflow" (P.target_ceiling ~head:Int64.max_int
+    ~head_time:(Some 0.) ~now:10. ~allowance:2 = None);
+  assert_true "future claims were clamped into votes"
+    (P.peer_target ~weights:(probe_weights ()) ~ceiling:20L
+      [probe_peer Int64.max_int "left"; probe_peer Int64.max_int "right"] = None)
+
+let test_probe_root_recovery () =
+  let module State = Octra_node_runtime.Consensus_runtime_state in
+  List.iter (fun reason ->
+    assert_true "count cleared root protection"
+      (State.root_recovery_evidence ~reason ~evidence:"in_sync" ~source_proved:false = None);
+    let evidence = State.root_recovery_evidence ~reason ~evidence:"in_sync" ~source_proved:true in
+    assert_true "source agreement did not restore root" (Option.is_some evidence);
+    let state = State.create () in
+    ignore (State.enter_quarantine state ~epoch:10 ~reason);
+    assert_true "ordinary root evidence cleared protection"
+      (match State.clear_quarantine state ~evidence:"in_sync" with
+       | State.Refused _ -> true | _ -> false);
+    assert_true "weighted root evidence rejected"
+      (State.clear_quarantine state ~evidence:(Option.get evidence) = State.Cleared)
+  ) ["catchup_failed:test"; "catchup_apply_failed:test";
+    "prev_state_root_mismatch_streak = 3"; "state_root_mismatch_streak = 3"]
+
+let test_probe_missing_weights () =
+  let active = ref false and changes = ref 0 in
+  let state = { (probe_state active (fun () -> incr changes)) with
+    root_weights = (fun ~epoch_id:_ -> None);
+    query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+      Lwt.return [probe_peer 5010L "left"; probe_peer 5010L "right"]);
+  } in
+  run (Health.run probe_config state);
+  assert_true "unknown weights changed health state" (!changes = 0);
+  run (Health.run probe_config {state with read_local_root_raw = (fun () -> Lwt.return wrong_root)});
+  assert_true "unknown weights hid local corruption" (!changes = 2)
+
+let test_probe_reason_strength () =
+  let module State = Octra_node_runtime.Consensus_runtime_state in
+  let state = State.create () in
+  ignore (State.enter_quarantine state ~epoch:10 ~reason:"lag_20");
+  ignore (State.enter_quarantine state ~epoch:11
+    ~reason:"state_root_mismatch_streak = 3");
+  assert_true "root fault lost behind earlier quarantine"
+    (State.quarantine_reason state = "state_root_mismatch_streak = 3");
+  ignore (State.enter_quarantine state ~epoch:12 ~reason:"lag_25");
+  assert_true "weak observation replaced root fault"
+    (State.quarantine_reason state = "state_root_mismatch_streak = 3");
+  assert_true "count evidence cleared promoted root fault"
+    (match State.clear_quarantine state ~evidence:"in_sync" with
+     | State.Refused _ -> true | _ -> false);
+  ignore (State.enter_quarantine state ~epoch:13 ~reason:"finality_conflict");
+  assert_true "local safety fault was not preserved"
+    (State.quarantine_reason state = "finality_conflict");
+  assert_true "source agreement cleared finality conflict"
+    (match State.clear_quarantine state ~evidence:"in_sync_source_agreement" with
+     | State.Refused _ -> true | _ -> false)
+
+let test_probe_genesis () =
+  List.iter (fun height ->
+    let attested = ref false in
+    let state = { (probe_state (ref false) (fun () -> ())) with
+      committed_head_epoch = (fun () -> -1);
+      current_epoch = (fun () -> 0);
+      committed_epoch_root_raw = (fun _ -> None);
+      set_state_attested = (fun ~head:_ ~root:_ -> attested := true);
+      query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+        Lwt.return (List.map (fun name ->
+          { (probe_peer height name) with state_root = None }) ["left"; "right"]));
+    } in
+    run (Health.run probe_config state);
+    assert_true "unproved genesis target opened readiness" (!attested = (height = -1L))
+  ) [-1L; 100L]
+
+let test_probe_range_recovery () =
+  List.iter (fun reason ->
+    let targets = ref [] in
+    let state = { (probe_state (ref false) (fun () -> ())) with
+      quarantine_active = (fun () -> true);
+      quarantine_reason = (fun () -> reason);
+      run_catchup_to_target = (fun ~target_epoch ~reason:_ ->
+        targets := target_epoch :: !targets; Lwt.return_unit);
+    } in
+    run (Health.run ~http_target:(fun () -> Lwt.return_some 12L) probe_config state);
+    assert_true "certified range recovery was disabled"
+      (!targets = if reason = "finality_conflict" then [] else [12L])
+  ) ["prev_state_root_mismatch_streak = 3"; "state_root_mismatch_streak = 3";
+    "catchup_failed:test"; "finality_conflict"]
+
+let test_probe_second_root () =
+  List.iter (fun variant ->
+    let calls = ref 0 and attested = ref false and quarantine = ref false in
+    let state = { (probe_state (ref false) (fun () -> ())) with
+      query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+        incr calls;
+        let root = if !calls = 1 then None
+          else Some (if variant = "foreign" then wrong_root else base_root) in
+        Lwt.return (List.map (fun name ->
+          { (probe_peer (if !calls = 1 then 5L else 10L) name) with state_root = root })
+          ["left"; "right"]));
+      read_local_root_raw = (fun () ->
+        Lwt.return (if !calls = 2 && variant = "changed" then wrong_root else base_root));
+      set_state_attested = (fun ~head:_ ~root:_ -> attested := true);
+      mark_quarantine = (fun _ -> quarantine := true);
+    } in
+    run (Health.run probe_config state);
+    assert_true "second root query was not used" (!calls = 2);
+    assert_true "changed root entered attested state" (!attested = (variant = "same"));
+    assert_true "second foreign root lost protection" (!quarantine = (variant = "foreign"))
+  ) ["same"; "changed"; "foreign"]
+
+let test_probe_streak_reset () =
+  let streak = ref 4 in
+  let state = { (probe_state (ref false) (fun () -> ())) with
+    query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+      Lwt.return [probe_peer 10L "left"; probe_peer 10L "right"]);
+    ahead_streak = (fun () -> !streak);
+    incr_ahead_streak = (fun () -> incr streak);
+    reset_ahead_streak = (fun () -> streak := 0);
+  } in
+  run (Health.run probe_config state);
+  assert_true "in sync observation retained ahead streak" (!streak = 0)
+
+let probe_low_heads root =
+  let module P = Octra_node_runtime.Consensus_health_probe in
+  let weights = probe_weights ~count_floor:4 ~count_required:4 ~count_limit:9 () in
+  let config = probe_config in
+  let repeats = config.quarantine_ahead_streak_threshold + 1 in
+  assert_true "peer target lost its count floor"
+    (P.peer_target ~weights ~ceiling:20L [probe_peer 10L "left"; probe_peer 10L "right"] = None);
+  let sample head root =
+    let quarantine = ref [] and streak = ref 0 and attested = ref 0 in
+    let responses = [probe_peer 10L "left"; probe_peer 10L "right"]
+      @ List.init 2 (fun i ->
+        { (probe_peer head ("dust" ^ string_of_int i)) with state_root = root }) in
+    assert_true "peer target count floor changed"
+      (P.peer_target ~weights ~ceiling:20L responses =
+        if head < 10L && Option.is_some root then None else Some head);
+    let state = { (probe_state (ref false) (fun () -> ())) with
+      root_weights = (fun ~epoch_id -> Some {weights with epoch_id});
+      query_epoch_root = (fun ~epoch_id ~timeout_seconds:_ ->
+        assert_true "low heads queried another epoch" (epoch_id = 10L);
+        Lwt.return responses);
+      ahead_streak = (fun () -> !streak);
+      incr_ahead_streak = (fun () -> incr streak);
+      reset_ahead_streak = (fun () -> streak := 0);
+      set_state_attested = (fun ~head:_ ~root:_ -> incr attested);
+      mark_quarantine = (fun reason -> quarantine := reason :: !quarantine);
+      require_sync = (fun _ -> failwith "low heads required sync");
+      run_catchup_to_target = (fun ~target_epoch:_ ~reason:_ ->
+        failwith "low heads started catchup");
+    } in
+    for _ = 1 to repeats do run (Health.run config state) done;
+    !quarantine, !streak, !attested in
+  assert_true "current peer heads did not attest" (sample 10L (Some base_root) = ([], 0, repeats));
+  let quarantine, streak, attested = sample 7L root in
+  assert_true "low peer heads forced quarantine" (quarantine = []);
+  assert_true "low peer heads retained ahead streak" (streak = 0);
+  assert_true "below epoch roots supplied attestation" (attested = 0)
+
+let test_probe_low_heads () = probe_low_heads (Some base_root)
+
+let test_probe_low_empty () = probe_low_heads None
+
+let test_probe_heavy_low () =
+  let quarantine = ref [] and streak = ref 0 in
+  let responses = List.map (fun name ->
+    { (probe_peer 7L name) with state_root = None }) ["left"; "right"]
+    @ List.init 4 (fun i -> probe_peer 10L ("dust" ^ string_of_int i)) in
+  let config = probe_config in
+  let state = { (probe_state (ref false) (fun () -> ())) with
+    root_weights = (fun ~epoch_id -> Some
+      (probe_weights ~epoch_id ~count_floor:4 ~count_required:4 ~count_limit:9 ()));
+    query_epoch_root = (fun ~epoch_id ~timeout_seconds:_ ->
+      assert_true "heavy low heads queried another epoch" (epoch_id = 10L);
+      Lwt.return responses);
+    ahead_streak = (fun () -> !streak);
+    incr_ahead_streak = (fun () -> incr streak);
+    reset_ahead_streak = (fun () -> streak := 0);
+    mark_quarantine = (fun reason -> quarantine := reason :: !quarantine);
+  } in
+  let threshold = config.quarantine_ahead_streak_threshold in
+  for step = 1 to threshold + 1 do
+    run (Health.run config state);
+    let expected = if step < threshold then [] else
+      List.init (step - threshold + 1) (fun i ->
+        Printf.sprintf "ahead_of_target_by_3_streak_%d" (step - i)) in
+    assert_true "heavy low heads lost ahead protection"
+      (!streak = step && !quarantine = expected)
+  done
+
+let test_probe_ahead_weight () =
+  List.iter (fun (below, current, ahead) ->
+    let streak = ref 0 and queries = ref 0 and step = ref 0 and marks = ref [] in
+    let responses = [probe_peer 10L "left"; probe_peer 10L "right"]
+      @ List.init 4 (fun i ->
+        { (probe_peer 7L ("dust" ^ string_of_int i)) with state_root = None }) in
+    let config = probe_config in
+    let state = { (probe_state (ref false) (fun () -> ())) with
+      root_weights = (fun ~epoch_id -> Some {
+        (probe_weights ~epoch_id ~count_floor:4 ~count_required:4 ~count_limit:9 ()) with
+        weight = (function
+          | "left" -> Some (Z.of_int (current - 1))
+          | "right" | "dust1" | "dust2" | "dust3" -> Some Z.one
+          | "dust0" -> Some (Z.of_int (below - 3))
+          | _ -> None);
+      });
+      query_epoch_root = (fun ~epoch_id ~timeout_seconds:_ ->
+        assert_true "ahead weight queried another epoch" (epoch_id = 10L);
+        incr queries;
+        Lwt.return responses);
+      ahead_streak = (fun () -> !streak);
+      incr_ahead_streak = (fun () -> incr streak);
+      reset_ahead_streak = (fun () -> streak := 0);
+      mark_quarantine = (fun reason -> marks := (!step, reason) :: !marks);
+    } in
+    let threshold = config.quarantine_ahead_streak_threshold in
+    let repeats = threshold + 1 in
+    for index = 1 to repeats do
+      step := index;
+      run (Health.run config state)
+    done;
+    assert_true "ahead weight threshold differs"
+      (!streak = (if ahead then repeats else 0)
+        && !queries = repeats * (if ahead then 2 else 1));
+    assert_true "ahead weight threshold did not quarantine"
+      (if ahead then List.nth_opt (List.rev !marks) 0 = Some
+        (threshold, Printf.sprintf "ahead_of_target_by_3_streak_%d" threshold)
+       else !marks = []);
+    assert_true "ahead weight quarantined without threshold"
+      (List.for_all (fun (at, reason) -> at >= threshold
+        && reason = Printf.sprintf "ahead_of_target_by_3_streak_%d" at) !marks)
+  ) [29, 29, false; 30, 29, true; 30, 30, false; 29, 30, false]
+
+let probe_streak_gap missing_weights =
+  let available = ref true and streak = ref 0 and quarantine = ref [] in
+  let responses = List.map (fun name ->
+    { (probe_peer 7L name) with state_root = None }) ["left"; "right"]
+    @ List.init 4 (fun i -> probe_peer 10L ("dust" ^ string_of_int i)) in
+  let config = probe_config in
+  let state = { (probe_state (ref false) (fun () -> ())) with
+    root_weights = (fun ~epoch_id ->
+      if not !available && missing_weights then None
+      else Some (probe_weights ~epoch_id ~count_floor:4 ~count_required:4 ~count_limit:9 ()));
+    query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+      Lwt.return (if !available || missing_weights then responses else []));
+    ahead_streak = (fun () -> !streak);
+    incr_ahead_streak = (fun () -> incr streak);
+    reset_ahead_streak = (fun () -> streak := 0);
+    mark_quarantine = (fun reason -> quarantine := reason :: !quarantine);
+  } in
+  let threshold = config.quarantine_ahead_streak_threshold in
+  for _ = 1 to threshold - 1 do run (Health.run config state) done;
+  assert_true "ahead sequence did not reach pre-quarantine streak"
+    (!streak = threshold - 1 && !quarantine = []);
+  available := false;
+  run (Health.run config state);
+  assert_true "unsupported probe retained ahead streak" (!streak = 0 && !quarantine = []);
+  available := true;
+  for step = 1 to threshold do
+    run (Health.run config state);
+    let expected = if step < threshold then [] else
+      [Printf.sprintf "ahead_of_target_by_3_streak_%d" threshold] in
+    assert_true "ahead sequence crossed unsupported probe"
+      (!streak = step && !quarantine = expected)
+  done
+
+let test_probe_weights_gap () = probe_streak_gap true
+
+let test_probe_empty_gap () = probe_streak_gap false
+
+let probe_poll_gap replay =
+  let active = ref false and streak = ref 0 and quarantine = ref [] in
+  let responses = List.map (fun name ->
+    { (probe_peer 7L name) with state_root = None }) ["left"; "right"]
+    @ List.init 4 (fun i -> probe_peer 10L ("dust" ^ string_of_int i)) in
+  let config = probe_config in
+  let state = { (probe_state active (fun () -> ())) with
+    root_weights = (fun ~epoch_id -> Some
+      (probe_weights ~epoch_id ~count_floor:4 ~count_required:4 ~count_limit:9 ()));
+    query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ -> Lwt.return responses);
+    ahead_streak = (fun () -> !streak);
+    incr_ahead_streak = (fun () -> incr streak);
+    reset_ahead_streak = (fun () -> streak := 0);
+    mark_quarantine = (fun reason -> quarantine := reason :: !quarantine);
+  } in
+  let poll = { (health_deps active (ref [])) with
+    quarantine_active = (fun () -> false);
+    probe_health = (fun () -> Health.run config state);
+    reset_ahead_streak = (fun () -> streak := 0);
+  } in
+  let module W = Octra_node_runtime.Consensus_health_wiring in
+  for _ = 1 to config.quarantine_ahead_streak_threshold - 1 do
+    run (W.poll_step poll)
+  done;
+  assert_true "poll did not collect ahead observations"
+    (!streak = config.quarantine_ahead_streak_threshold - 1 && !quarantine = []);
+  let paused = if replay then {poll with
+    quarantine_active = (fun () -> true);
+    replay_stashed = (fun ~source:_ -> active := true; Lwt.return_unit);
+  } else (active := true; poll) in
+  run (W.poll_step paused);
+  assert_true "skipped poll retained ahead streak" (!streak = 0);
+  active := false;
+  run (W.poll_step poll);
+  assert_true "poll gap forced ahead quarantine" (!streak = 1 && !quarantine = [])
+
+let test_probe_poll_gap () = probe_poll_gap false
+
+let test_probe_replay_gap () = probe_poll_gap true
+
+let ahead_config = {probe_config with
+  quarantine_ahead_grace_epochs = 32; quarantine_ahead_drift_tolerance = 2}
+
+let ahead_peers head target count =
+  List.map (fun name -> { (probe_peer target name) with state_root = None }) ["left"; "right"]
+  @ List.init count (fun index -> probe_peer (Int64.of_int head) ("dust" ^ string_of_int index))
+
+let ahead_state head streak quarantine =
+  { (probe_state (ref false) (fun () -> ())) with
+    committed_head_epoch = (fun () -> !head);
+    current_epoch = (fun () -> !head + 1);
+    root_weights = (fun ~epoch_id -> Some
+      (probe_weights ~epoch_id ~count_floor:4 ~count_required:4 ~count_limit:9 ()));
+    query_epoch_root = (fun ~epoch_id ~timeout_seconds:_ ->
+      assert_true "ahead query epoch differs" (epoch_id = Int64.of_int !head);
+      Lwt.return (ahead_peers !head (Int64.of_int (!head - 10)) 4));
+    ahead_streak = (fun () -> !streak);
+    incr_ahead_streak = (fun () -> incr streak);
+    reset_ahead_streak = (fun () -> streak := 0);
+    mark_quarantine = (fun reason -> quarantine := reason :: !quarantine);
+    run_catchup_to_target = (fun ~target_epoch:_ ~reason:_ -> Lwt.return_unit);
+  }
+
+let trace_probe emit (state : Health.deps) =
+  {state with
+    query_epoch_root = (fun ~epoch_id ~timeout_seconds ->
+      emit (Printf.sprintf "query:%Ld" epoch_id);
+      state.query_epoch_root ~epoch_id ~timeout_seconds);
+    read_local_root_raw = (fun () -> emit "root"; state.read_local_root_raw ());
+    set_state_attested = (fun ~head ~root -> emit "attest"; state.set_state_attested ~head ~root);
+    clear_state_attested = (fun () -> emit "clear"; state.clear_state_attested ());
+    mark_quarantine = (fun reason -> emit ("quarantine:" ^ reason); state.mark_quarantine reason);
+    drain_pending_finalized = (fun () -> emit "drain"; state.drain_pending_finalized ());
+    wake_ready = (fun () -> emit "wake"; state.wake_ready ());
+    require_sync = (fun need ->
+      emit (Printf.sprintf "snapshot:%Ld" (Option.get need.Octra_node_runtime.Sync_need.target));
+      state.require_sync need);
+    run_catchup_to_target = (fun ~target_epoch ~reason ->
+      emit (Printf.sprintf "catchup:%Ld:%s" target_epoch reason);
+      state.run_catchup_to_target ~target_epoch ~reason);
+  }
+
+let seed_ahead state streak quarantine count =
+  for _ = 1 to count do run (Health.run ahead_config state) done;
+  assert_true "ahead seed did not produce observations" (!streak = count && !quarantine = [])
+
+let follow_ahead label state streak quarantine =
+  assert_true (label ^ " retained ahead streak") (!streak = 0);
+  quarantine := [];
+  run (Health.run ahead_config state);
+  assert_true (label ^ " contaminated next ahead") (!streak = 1 && !quarantine = [])
+
+let probe_ahead_route target dust_head =
+  let head = ref 100 and streak = ref 0 and quarantine = ref [] and trace = ref [] in
+  let emit value = trace := value :: !trace in
+  let responses = ahead_peers 100 target 1
+    @ [{ (probe_peer dust_head "dust1") with state_root = None }] in
+  let proof = List.map (probe_peer target) ["left"; "right"; "dust0"; "dust1"] in
+  let state = { (ahead_state head streak quarantine) with
+    query_epoch_root = (fun ~epoch_id ~timeout_seconds:_ ->
+      Lwt.return (if epoch_id = 100L then responses
+        else if epoch_id = target then proof else []));
+    root_consensus_quorum = (fun ~epoch_id ~root records ->
+      emit (Printf.sprintf "proof:%Ld" epoch_id);
+      epoch_id = target && root = base_root && records = proof);
+  } in
+  let repair ~target_epoch ~target_root ~required ~current_root_quorum =
+    emit (Printf.sprintf "repair:%Ld" target_epoch);
+    assert_true "repair proof context differs"
+      (target_epoch = target && target_root = base_root && required = 4 && not current_root_quorum);
+    Lwt.return_false in
+  let threshold = ahead_config.quarantine_ahead_streak_threshold in
+  for step = 1 to threshold do
+    trace := [];
+    run (Health.run ~repair ahead_config (trace_probe emit state));
+    let reason = Printf.sprintf "ahead_of_target_by_10_streak_%d" step in
+    let expected = if target = 99L then ["query:100"; "root"; "proof:100"] else
+      ["query:100"; "root"; "proof:100"; "query:100"; "root"; "proof:100"]
+      @ (if step < threshold then [] else
+          ["query:90"; "proof:90"; "repair:90"; "quarantine:" ^ reason]) in
+    assert_true "ahead target followed count instead of weight" (List.rev !trace = expected);
+    assert_true "ahead target changed quarantine"
+      (!quarantine = if target = 99L || step < threshold then [] else [reason]);
+    assert_true "ahead target changed observation count" (!streak = if target = 99L then 0 else step)
+  done
+
+let test_ahead_target () =
+  let module P = Octra_node_runtime.Consensus_health_probe in
+  let weights = probe_weights ~epoch_id:100L ~count_floor:4 ~count_required:4 ~count_limit:9 () in
+  let heavy = ahead_peers 100 99L 0 in
+  let replies = heavy @ [probe_peer 100L "dust0";
+    { (probe_peer 2L "dust1") with state_root = None }] in
+  assert_true "lag target lost its source count floor"
+    (P.peer_target ~weights ~ceiling:120L heavy = None
+      && P.peer_target ~weights ~ceiling:120L replies = Some 2L);
+  List.iter (fun responses ->
+    assert_true "ahead target did not use independent weight"
+      (P.peer_ahead ~weights ~head:100L ~ceiling:120L responses = Some 99L)) [heavy; replies];
+  let closer = ahead_peers 100 90L 0
+    @ [{ (probe_peer 99L "dust0") with state_root = None }] in
+  assert_true "light peer replaced weighted ahead target"
+    (P.peer_ahead ~weights ~head:100L ~ceiling:120L closer = Some 90L);
+  List.iter (probe_ahead_route 99L) [99L; 2L]
+
+let test_ahead_repair () = List.iter (probe_ahead_route 90L) [90L; 2L]
+
+let test_ahead_alternation () =
+  let head = ref 100 and streak = ref 0 and quarantine = ref [] in
+  let matching = ref true and observed = ref [] and attested = ref false in
+  let held = ref false and reason = ref "" and step = ref 0 and marks = ref [] in
+  let quarantined = ref [] in
+  let state = { (ahead_state head streak quarantine) with
+    query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+      Lwt.return (ahead_peers !head 90L (if !matching then 4 else 3)));
+    set_state_attested = (fun ~head:_ ~root:_ -> attested := true);
+    clear_state_attested = (fun () -> attested := false);
+    attested_head = (fun head -> head = 100 && !attested);
+    quarantine_active = (fun () -> !held);
+    quarantine_reason = (fun () -> !reason);
+    mark_quarantine = (fun value ->
+      held := true; reason := value; marks := (!step, value) :: !marks);
+    clear_quarantine = (fun _ -> held := false; reason := "");
+  } in
+  let threshold = ahead_config.quarantine_ahead_streak_threshold in
+  let count = threshold + 1 in
+  for index = 1 to count do
+    step := index;
+    matching := index mod 2 = 1;
+    run (Health.run ahead_config state);
+    observed := !streak :: !observed;
+    quarantined := !held :: !quarantined
+  done;
+  assert_true "missing root quorum broke ahead sequence"
+    (List.rev !observed = List.init count (fun index -> index + 1));
+  assert_true "alternating ahead observations escaped quarantine"
+    (List.rev !quarantined = List.init count (fun index -> index + 1 >= threshold));
+  assert_true "ahead quarantine first threshold differs"
+    (List.nth_opt (List.rev !marks) 0 = Some (threshold, "ahead_of_target_by_10_streak_3"));
+  assert_true "ahead quarantine repeated with invalid evidence"
+    (List.for_all (fun (at, value) -> at >= threshold
+      && value = Printf.sprintf "ahead_of_target_by_10_streak_%d" at) !marks)
+
+let missing_state runtime =
+  let module S = Octra_node_runtime.Consensus_runtime_state in
+  { (ahead_state (ref 100) (ref 0) (ref [])) with
+    attested_head = S.attested_head runtime;
+    set_state_attested = S.set_state_attested runtime;
+    clear_state_attested = (fun () -> S.clear_state_attested runtime);
+    quarantine_active = (fun () -> S.quarantine_active runtime);
+    quarantine_reason = (fun () -> S.quarantine_reason runtime);
+    mark_quarantine = (fun reason -> ignore (S.enter_quarantine runtime ~epoch:101 ~reason));
+    clear_quarantine = (fun evidence -> ignore (S.clear_quarantine runtime ~evidence));
+    ahead_streak = (fun () -> S.ahead_streak runtime);
+    incr_ahead_streak = (fun () -> S.incr_ahead_streak runtime);
+    reset_ahead_streak = (fun () -> S.reset_ahead_streak runtime);
+  }
+
+let probe_missing_step route runtime step =
+  let module S = Octra_node_runtime.Consensus_runtime_state in
+  let label = "continuous missing " ^ route in
+  let threshold = ahead_config.quarantine_ahead_streak_threshold in
+  let held = step > threshold in
+  let queries = ref 0 and reads = ref 0 and trace = ref [] in
+  let query, reply = Lwt.wait () and root, release = Lwt.wait () in
+  let target, provide = Lwt.wait () and result, finish = Lwt.wait () in
+  let responses = ahead_peers 100 90L 3 in
+  let proof = List.map (probe_peer 90L) ["left"; "right"; "dust0"; "dust1"] in
+  let base = missing_state runtime in
+  let state = {base with
+    clear_quarantine = (fun evidence ->
+      if step >= threshold then trace := "release" :: !trace;
+      base.clear_quarantine evidence);
+    query_epoch_root = (fun ~epoch_id ~timeout_seconds:_ ->
+      incr queries;
+      if epoch_id = 90L then target
+      else if !queries = 2 then query else Lwt.return responses);
+    read_local_root_raw = (fun () ->
+      incr reads;
+      if !reads = 2 then root else Lwt.return base_root);
+    root_consensus_quorum = (fun ~epoch_id ~root records ->
+      epoch_id = 90L && root = base_root && records = proof);
+  } |> trace_probe (fun value -> trace := value :: !trace) in
+  let repair ~target_epoch ~target_root ~required ~current_root_quorum =
+    assert_true (label ^ " repair context differs")
+      (target_epoch = 90L && target_root = base_root && required = 4 && not current_root_quorum);
+    trace := "repair:90" :: !trace;
+    result in
+  let with_repair = route = "no proof" || route = "repair false" in
+  let with_proof = with_repair && step >= threshold in
+  let pending = Health.run ?repair:(if with_repair then Some repair else None) ahead_config state in
+  let waiting () = Lwt.is_sleeping pending && S.quarantine_active runtime = held
+    && S.attested_head runtime 100 = not held && S.ahead_streak runtime = step in
+  let query_wait = waiting () in
+  Lwt.wakeup reply (if route = "matching" then ahead_peers 100 90L 4 else responses);
+  let root_wait = waiting () in
+  Lwt.wakeup release base_root;
+  let proof_wait = not with_proof || waiting () in
+  Lwt.wakeup provide (if route = "repair false" then proof else []);
+  let repair_wait = not with_proof || route <> "repair false" || waiting () in
+  Lwt.wakeup finish false;
+  run pending;
+  assert_true (label ^ " quarantined before validation")
+    (query_wait && root_wait && proof_wait && repair_wait);
+  let reason = Printf.sprintf "ahead_of_target_by_10_streak_%d" step in
+  let expected = ["query:100"; "root"; "query:100"; "root"]
+    @ (if with_proof then ["query:90"] else [])
+    @ (if with_proof && route = "repair false" then ["repair:90"] else [])
+    @ (if route = "matching" && step < threshold then ["attest"; "drain"] else [])
+    @ (if held then [] else if step >= threshold then ["quarantine:" ^ reason]
+       else if route = "matching" then ["wake"] else []) in
+  assert_true (label ^ " released ahead quarantine")
+    (not held || (S.quarantine_active runtime && not (S.state_attested runtime)
+      && not (List.mem "release" !trace)));
+  assert_true (label ^ " lost ahead sequence") (S.ahead_streak runtime = step);
+  assert_true (label ^ " did not quarantine after validation")
+    (S.quarantine_active runtime = (step >= threshold));
+  assert_true (label ^ " attestation differs")
+    (S.attested_head runtime 100 = (step < threshold));
+  assert_true (label ^ " reason differs")
+    (step < threshold || S.quarantine_reason runtime =
+      Printf.sprintf "ahead_of_target_by_10_streak_%d" threshold);
+  assert_true (label ^ " path differs")
+    (List.rev !trace = expected
+      || (held && List.rev !trace = expected @ ["quarantine:" ^ reason]))
+
+let probe_missing_case route =
+  let module S = Octra_node_runtime.Consensus_runtime_state in
+  let runtime = S.create () in
+  S.set_state_attested runtime ~head:100 ~root:base_root;
+  let count = ahead_config.quarantine_ahead_streak_threshold
+    + if route = "matching" then 2 else 0 in
+  for step = 1 to count do
+    probe_missing_step route runtime step
+  done
+
+let probe_ahead_recovery mode =
+  let module S = Octra_node_runtime.Consensus_runtime_state in
+  let runtime = S.create () in
+  S.set_state_attested runtime ~head:100 ~root:base_root;
+  let threshold = ahead_config.quarantine_ahead_streak_threshold in
+  for step = 1 to threshold do probe_missing_step "matching" runtime step done;
+  let held = mode = "delay" in
+  if held then S.reset_ahead_streak runtime;
+  let head = if mode = "grace" then 31 else 100 in
+  let target = Int64.of_int (head - if mode = "drift" then 2 else 10) in
+  let queries = ref 0 and trace = ref [] in
+  let base = missing_state runtime in
+  let state = {base with
+    committed_head_epoch = (fun () -> head);
+    current_epoch = (fun () -> head + 1);
+    clear_quarantine = (fun evidence ->
+      trace := "release" :: !trace;
+      base.clear_quarantine evidence);
+    query_epoch_root = (fun ~epoch_id ~timeout_seconds:_ ->
+      assert_true "ahead recovery query differs" (epoch_id = Int64.of_int head);
+      incr queries;
+      Lwt.return (ahead_peers head target (if !queries = 1 then 3 else 4)));
+  } |> trace_probe (fun value -> trace := value :: !trace) in
+  run (Health.run ahead_config state);
+  let label = "ahead recovery " ^ mode in
+  assert_true (label ^ " quarantine differs") (S.quarantine_active runtime = held);
+  assert_true (label ^ " attestation differs") (S.attested_head runtime head = not held);
+  assert_true (label ^ " streak differs") (S.ahead_streak runtime = if held then 1 else 0);
+  assert_true (label ^ " reason differs")
+    (S.quarantine_reason runtime = if held then
+      Printf.sprintf "ahead_of_target_by_10_streak_%d" threshold else "");
+  let query = Printf.sprintf "query:%d" head in
+  let expected = [query; "root"; query; "root"]
+    @ (if held then [] else ["attest"; "release"; "drain"; "wake"]) in
+  assert_true (label ^ " path differs") (List.rev !trace = expected)
+
+let probe_grace_case grace =
+  let head = ref 100 and streak = ref 0 and quarantine = ref [] in
+  let state = ahead_state head streak quarantine in
+  seed_ahead state streak quarantine 2;
+  if grace then head := 31;
+  let allowed = if grace then state else {state with
+    query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ -> Lwt.return (ahead_peers !head 98L 4));
+  } in
+  let observed = ref [] in
+  for _ = 1 to ahead_config.quarantine_ahead_streak_threshold + 1 do
+    run (Health.run ahead_config allowed);
+    observed := !streak :: !observed
+  done;
+  let allowed_clean = List.for_all (fun value -> value = 0) !observed && !quarantine = [] in
+  head := 100;
+  run (Health.run ahead_config state);
+  assert_true "ahead allowance retained a quarantine sequence" allowed_clean;
+  assert_true "first ahead outside allowance quarantined" (!streak = 1 && !quarantine = [])
+
+let test_ahead_grace () = probe_grace_case true
+
+let test_ahead_drift () = probe_grace_case false
+
+let test_ahead_missing_grace () =
+  let module S = Octra_node_runtime.Consensus_runtime_state in
+  List.iter (fun (head, target) ->
+    let runtime = S.create () in
+    ignore (S.enter_quarantine runtime ~epoch:(head + 1) ~reason:"ahead_of_target_by_10_streak_3");
+    let repairs = ref 0 and wakes = ref 0 in
+    let state = { (missing_state runtime) with
+      committed_head_epoch = (fun () -> head);
+      current_epoch = (fun () -> head + 1);
+      query_epoch_root = (fun ~epoch_id ~timeout_seconds:_ ->
+        Lwt.return (List.map (fun name ->
+          { (probe_peer target name) with
+            state_root = if epoch_id = target then Some base_root else None })
+          ["left"; "right"; "dust0"; "dust1"]));
+      root_consensus_quorum = (fun ~epoch_id ~root records ->
+        epoch_id = target && root = base_root && List.length records = 4);
+      wake_ready = (fun () -> incr wakes; Lwt.return_unit);
+    } in
+    let repair ~target_epoch:_ ~target_root:_ ~required:_ ~current_root_quorum:_ =
+      incr repairs; Lwt.return_false in
+    for _ = 1 to 5 do run (Health.run ~repair ahead_config state) done;
+    assert_true "missing head inside allowance requested repair" (!repairs = 0);
+    assert_true "missing head released quarantine" (S.quarantine_active runtime && !wakes = 0);
+    assert_true "allowed drift accumulated evidence" (S.ahead_streak runtime = 0)
+  ) [100, 99L; 31, 21L]
+
+let test_ahead_ready_change () =
+  List.iter (fun change ->
+    let held = ref false and epoch = ref 101 and wakes = ref 0 in
+    let state = { (ahead_state (ref 100) (ref 0) (ref [])) with
+      current_epoch = (fun () -> !epoch);
+      quarantine_active = (fun () -> !held);
+      drain_pending_finalized = (fun () ->
+        let open Lwt.Syntax in
+        let+ () = Lwt.pause () in
+        if change = "quarantine" then held := true else if change = "epoch" then incr epoch);
+      wake_ready = (fun () -> incr wakes; Lwt.return_unit);
+      query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+        Lwt.return (ahead_peers 100 90L 3));
+    } in
+    let calls = ref 0 in
+    let state = {state with query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+      incr calls; Lwt.return (ahead_peers 100 90L (if !calls = 1 then 3 else 4)))} in
+    run (Health.run ahead_config state);
+    assert_true "ahead wake ignored state change" (!wakes = if change = "same" then 1 else 0)
+  ) ["same"; "quarantine"; "epoch"]
+
+let test_probe_equal_target () =
+  let http = ref 0 in
+  let state = { (probe_state (ref false) (fun () -> ())) with
+    query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+      Lwt.return (List.map (fun name ->
+        { (probe_peer 10L name) with state_root = None }) ["left"; "right"]));
+  } in
+  run (Health.run ~http_target:(fun () -> incr http; Lwt.return_none)
+    {probe_config with state_attest_configured = 4} state);
+  assert_true "equal weighted target requested HTTP recovery" (!http = 0)
+
+let probe_reset_case label seed change error expected =
+  let head = ref 100 and streak = ref 0 and quarantine = ref [] and trace = ref [] in
+  let state = ahead_state head streak quarantine in
+  seed_ahead state streak quarantine seed;
+  let changed = change head state |> trace_probe (fun value -> trace := value :: !trace) in
+  let escaped = try run (Health.run ~stale_retries:0 ahead_config changed); None
+    with actual -> Some actual in
+  assert_true (label ^ " exception routing differs") (escaped = error);
+  assert_true (label ^ " reset path differs") (List.rev !trace = expected);
+  follow_ahead label state streak quarantine
+
+let probe_reset_cases = [
+  "stop", 2, (fun _ state -> {state with Health.catchup_active = (fun () -> true)}), None, [];
+  "move query", 2, (fun head (state : Health.deps) -> {state with
+    query_epoch_root = (fun ~epoch_id ~timeout_seconds ->
+      let replies = state.query_epoch_root ~epoch_id ~timeout_seconds in
+      incr head; replies)}), None, ["query:100"];
+  "move root", 2, (fun head (state : Health.deps) -> {state with
+    read_local_root_raw = (fun () -> incr head; Lwt.return base_root)}), None, ["query:100"; "root"];
+  "epoch query", 2, (fun _ (state : Health.deps) ->
+    let epoch = ref 101 in {state with current_epoch = (fun () -> !epoch);
+      query_epoch_root = (fun ~epoch_id ~timeout_seconds ->
+        epoch := 102; state.query_epoch_root ~epoch_id ~timeout_seconds)}), None, ["query:100"];
+  "epoch root", 2, (fun _ (state : Health.deps) ->
+    let epoch = ref 101 in {state with current_epoch = (fun () -> !epoch);
+      read_local_root_raw = (fun () -> epoch := 102; Lwt.return base_root)}),
+    None, ["query:100"; "root"];
+  "local root", 2, (fun _ (state : Health.deps) -> {state with
+    read_local_root_raw = (fun () -> Lwt.return wrong_root)}),
+    None, ["query:100"; "root"; "quarantine:local_state_root_mismatch_at_head_100"; "clear"];
+  "ahead mismatch", 2, (fun _ (state : Health.deps) -> {state with
+    root_weights = (fun ~epoch_id -> Some
+      (probe_weights ~epoch_id ~count_floor:0 ~count_required:4 ~count_limit:9 ()));
+    query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ -> Lwt.return
+      [{ (probe_peer 90L "right") with state_root = None };
+       { (probe_peer Int64.max_int "left") with state_root = Some wrong_root }])}),
+    None, ["query:100"; "root"; "quarantine:peer_root_mismatch_at_head count = 1 epoch = 100"];
+  "snapshot", 2, (fun _ (state : Health.deps) -> {state with
+    query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+      Lwt.return (List.map (probe_peer 5100L) ["left"; "right"; "dust0"; "dust1"]))}),
+    None, ["query:100"; "root"; "query:100"; "root"; "snapshot:5100"];
+  "catchup", 2, (fun _ (state : Health.deps) -> {state with
+    query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+      Lwt.return (List.map (probe_peer 103L) ["left"; "right"; "dust0"; "dust1"]))}),
+    None, ["query:100"; "root"; "drain"; "catchup:103:lagging"];
+  "wake", 1, (fun head (state : Health.deps) -> {state with
+    drain_pending_finalized = (fun () -> incr head; Lwt.return_unit)}),
+    None, ["query:100"; "root"; "attest"; "drain"];
+  "accept context", 1, (fun head (state : Health.deps) ->
+    let queries = ref 0 and proofs = ref 0 in {state with
+      query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+        incr queries; Lwt.return (ahead_peers 100 90L (if !queries = 1 then 3 else 4)));
+      root_consensus_quorum = (fun ~epoch_id:_ ~root:_ _ ->
+        incr proofs; if !proofs = 2 then incr head; false)}),
+    None, ["query:100"; "root"; "query:100"; "root"];
+  "accept drain", 1, (fun head (state : Health.deps) ->
+    let queries = ref 0 in {state with
+      query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+        incr queries; Lwt.return (ahead_peers 100 90L (if !queries = 1 then 3 else 4)));
+      drain_pending_finalized = (fun () -> incr head; Lwt.return_unit)}),
+    None, ["query:100"; "root"; "query:100"; "root"; "attest"; "drain"];
+  "second mismatch", 2, (fun _ (state : Health.deps) ->
+    let queries = ref 0 in {state with
+      query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
+        incr queries;
+        Lwt.return (if !queries = 1 then ahead_peers 100 90L 3 else
+          List.map (fun name -> { (probe_peer 100L name) with state_root = Some wrong_root })
+            ["left"; "right"; "dust0"; "dust1"]))}),
+    None, ["query:100"; "root"; "query:100"; "root";
+      "quarantine:peer_root_mismatch_at_head count = 4 epoch = 100"];
+  "exception", 2, (fun _ (state : Health.deps) -> {state with
+    query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ -> failwith "probe reset")}),
+    Some (Failure "probe reset"), ["query:100"];
+  "exception root", 2, (fun _ (state : Health.deps) -> {state with
+    read_local_root_raw = (fun () -> Lwt.fail_with "probe reset")}),
+    Some (Failure "probe reset"), ["query:100"; "root"];
+]
+
+let probe_secondary_case phase cause =
+  let head = ref 100 and streak = ref 0 and quarantine = ref [] and trace = ref [] in
+  let state = ahead_state head streak quarantine in
+  seed_ahead state streak quarantine 2;
+  let queries = ref 0 and reads = ref 0 and active = ref false and epoch = ref 101 in
+  let stamp = ref "probe_weights" in
+  let query, reply = Lwt.wait () and root, release = Lwt.wait () in
+  let repair_result, finish = Lwt.wait () in
+  let responses = ahead_peers 100 90L 3 in
+  let proof = List.map (probe_peer 90L) ["left"; "right"; "dust0"; "dust1"] in
+  let changed = {state with
+    catchup_active = (fun () -> !active);
+    current_epoch = (fun () -> !epoch);
+    root_weights = (fun ~epoch_id -> Some {
+      (probe_weights ~epoch_id ~count_floor:4 ~count_required:4 ~count_limit:9 ()) with stamp = !stamp});
+    query_epoch_root = (fun ~epoch_id ~timeout_seconds:_ ->
+      incr queries;
+      if (!queries = 2 && phase = "query") || (!queries = 3 && phase = "proof") then query
+      else Lwt.return (if epoch_id = 90L then proof else responses));
+    read_local_root_raw = (fun () ->
+      incr reads;
+      if !reads = 2 && phase = "root" then root else Lwt.return base_root);
+    root_consensus_quorum = (fun ~epoch_id ~root records ->
+      epoch_id = 90L && root = base_root && records = proof);
+  } |> trace_probe (fun value -> trace := value :: !trace) in
+  let repair ~target_epoch ~target_root:_ ~required:_ ~current_root_quorum:_ =
+    trace := Printf.sprintf "repair:%Ld" target_epoch :: !trace;
+    if phase = "repair" then repair_result else Lwt.return_false in
+  let pending = Health.run ~repair ahead_config changed in
+  let suspended = Lwt.is_sleeping pending and observed = !streak in
+  let premature = !quarantine <> [] in
+  (match cause with
+   | "head" -> incr head; epoch := !head + 1
+   | "epoch" -> epoch := 102
+   | "weights" -> stamp := "changed"
+   | "catchup" -> active := true
+   | "root" | "success" -> ()
+   | _ -> failwith "unknown secondary change");
+  Lwt.wakeup reply (if phase = "proof" then proof else responses);
+  Lwt.wakeup release (if cause = "root" then wrong_root else base_root);
+  Lwt.wakeup finish (cause = "success");
+  run pending;
+  let label = "secondary " ^ phase ^ " " ^ cause in
+  let expected = ["query:100"; "root"; "query:100"] @
+    (if phase = "query" then [] else ["root"]) @
+    (if phase = "proof" || phase = "repair" then ["query:90"] else []) @
+    (if phase = "repair" then ["repair:90"] else []) in
+  assert_true (label ^ " quarantined provisional observation") (not premature && !quarantine = []);
+  assert_true (label ^ " did not suspend on the selected path") (suspended && List.rev !trace = expected);
+  follow_ahead label state streak quarantine;
+  assert_true (label ^ " did not observe ahead before suspension") (observed = 3)
+
+let test_probe_history_count () =
+  List.iter (fun (historical, configured, count, accepted) ->
+    let attested = ref 0 in
+    let required = (historical - 1) / 3 + 1 in
+    let responses = List.init count (fun index ->
+      probe_peer 10L (if index = 0 then "left" else if index = 1 then "right"
+        else "dust" ^ string_of_int index)) in
+    let state = { (probe_state (ref false) (fun () -> ())) with
+      root_weights = (fun ~epoch_id -> Some (probe_weights ~epoch_id
+        ~count_floor:required ~count_required:required ~count_limit:(historical - 1) ()));
+      query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ -> Lwt.return responses);
+      set_state_attested = (fun ~head:_ ~root:_ -> incr attested);
+      mark_quarantine = (fun _ -> failwith "historical count forced quarantine");
+    } in
+    run (Health.run {probe_config with state_attest_configured = configured} state);
+    assert_true "historical attester count differs" (!attested = if accepted then 1 else 0)
+  ) [
+    10, 2, 2, false; 4, 2, 2, true;
+    10, 5, 4, false; 10, 5, 5, true;
+    4, 5, 2, false; 4, 5, 3, true; 1, 5, 0, true;
+  ]
+
+let probe_genesis_roots ?(weights = probe_weights ()) responses =
+  let attested = ref 0 and quarantine = ref [] in
+  let state = { (probe_state (ref false) (fun () -> ())) with
+    committed_head_epoch = (fun () -> -1);
+    current_epoch = (fun () -> 0);
+    committed_epoch_root_raw = (fun _ -> None);
+    root_weights = (fun ~epoch_id -> Some {weights with Octra_consensus.C_driver.epoch_id});
+    set_state_attested = (fun ~head ~root ->
+      assert_true "genesis attested another state" (head = -1 && root = base_root);
+      incr attested);
+    mark_quarantine = (fun reason -> quarantine := reason :: !quarantine);
+    query_epoch_root = (fun ~epoch_id ~timeout_seconds:_ ->
+      assert_true "genesis queried another epoch" (epoch_id = -1L);
+      Lwt.return responses);
+  } in
+  run (Health.run probe_config state);
+  !attested, !quarantine
+
+let test_genesis_mixed_heads () =
+  let weights = { (probe_weights ()) with
+    ahead = (fun weight -> Z.geq weight (Z.of_int 2));
+    weight = (function "left" | "right" | "dust0" | "dust1" -> Some Z.one | _ -> None);
+    agrees = (fun ~count ~weight -> count >= 2 && Z.geq weight (Z.of_int 2));
+  } in
+  let peer head name root = { (probe_peer head name) with state_root = root } in
+  assert_true "genesis head witnesses did not attest"
+    (probe_genesis_roots ~weights [peer (-1L) "left" None; peer (-1L) "right" None] = (1, []));
+  List.iter (fun root ->
+    assert_true "higher heads supplied genesis agreement"
+      (probe_genesis_roots ~weights [peer 100L "left" None; peer (-1L) "right" root] = (0, []))
+  ) [None; Some wrong_root]
+
+let test_genesis_root_noise () =
+  let peers = List.map (fun name ->
+    { (probe_peer (-1L) name) with state_root = None }) ["left"; "right"] in
+  assert_true "empty genesis roots did not attest" (probe_genesis_roots peers = (1, []));
+  let noise = { (probe_peer (-1L) "dust0") with state_root = Some wrong_root } in
+  assert_true "light genesis root blocked attestation"
+    (probe_genesis_roots (peers @ [noise]) = (1, []))
+
+let test_genesis_root_guard () =
+  let answer root name = { (probe_peer (-1L) name) with state_root = Some root } in
+  let foreign = List.map (answer wrong_root) ["left"; "right"] in
+  assert_true "agreeing foreign genesis root lost refusal"
+    (probe_genesis_roots foreign =
+      (0, ["peer_root_mismatch_at_head count = 2 epoch = -1"]));
+  List.iter (fun root ->
+    let responses = List.map (answer wrong_root) ["left"; "dust0"]
+      @ List.map (answer root) ["right"; "dust1"] in
+    let attested, _ = probe_genesis_roots responses in
+    assert_true "conflicting agreeing genesis roots attested" (attested = 0)
+  ) [other_root; base_root]
+
+let test_probe_root_height () =
+  List.iter (fun head ->
+    let quarantine = ref [] and attested = ref false and catchup = ref [] in
+    let state = { (probe_state (ref false) (fun () -> ())) with
+      query_epoch_root = (fun ~epoch_id ~timeout_seconds:_ ->
+        assert_true "foreign root queried another epoch" (epoch_id = 10L);
+        Lwt.return (List.map (fun name ->
+          { (probe_peer head name) with state_root = Some wrong_root }) ["left"; "right"]));
+      set_state_attested = (fun ~head:_ ~root:_ -> attested := true);
+      mark_quarantine = (fun reason -> quarantine := reason :: !quarantine);
+      run_catchup_to_target = (fun ~target_epoch ~reason ->
+        catchup := (target_epoch, reason) :: !catchup;
+        Lwt.return_unit);
+    } in
+    run (Health.run probe_config state);
+    assert_true "foreign root opened attestation" (not !attested);
+    assert_true "foreign root epoch consistency differs"
+      (!quarantine = if head = 10L then
+        ["peer_root_mismatch_at_head count = 2 epoch = 10"] else []);
+    assert_true "foreign root changed catchup selection"
+      (!catchup = if head > 10L then [head, "lagging"] else [])
+  ) [10L; 11L; 9L]
 
 let test_probe_snapshot_cause () =
   List.iter (fun gap ->
@@ -728,7 +1743,9 @@ let test_ready_drain_owner () =
     let active = ref false and wakes = ref 0 in
     let state = { (probe_state active (fun () -> ())) with
       query_epoch_root = (fun ~epoch_id:_ ~timeout_seconds:_ ->
-        Lwt.return [probe_peer 9L "left"; probe_peer 9L "right"]);
+        Lwt.return (List.map (fun name ->
+          { (probe_peer 9L name) with state_root = None }) ["left"; "right"]
+          @ [probe_peer 10L "dust0"; probe_peer 10L "dust1"]));
       drain_pending_finalized = (fun () ->
         Lwt.bind (Lwt.pause ()) (fun () ->
           if change_owner then active := true;
@@ -771,9 +1788,9 @@ let test_probe_saved_target () =
     assert_true "probe did not use verified target" (!target = expected)
   in
   check "finalized_bundle_unavailable:12" ~http:(Some 12L)
-    ~queued:(Some 14L) (Some 14L);
+    ~queued:(Some 14L) (Some 12L);
   check "rule anchor unreadable epoch = 8" ~http:None
-    ~queued:(Some 14L) (Some 14L);
+    ~queued:(Some 14L) None;
   check "operator hold" ~http:(Some 14L)
     ~queued:(Some 15L) None
 
@@ -818,12 +1835,13 @@ let test_repair_probe_owner () =
           end));
       root_consensus_quorum = (fun ~epoch_id ~root:_ _ -> epoch_id = 9L);
       quarantine_active = (fun () -> true);
+      ahead_streak = (fun () -> probe_config.quarantine_ahead_streak_threshold);
     } in
     let repair ~target_epoch:_ ~target_root:_ ~required:_
         ~current_root_quorum:_ =
       incr repairs;
       Lwt.return_true in
-    run (Health.run ~repair probe_config state);
+    run (Health.run ~repair {probe_config with quarantine_ahead_drift_tolerance = 0} state);
     assert_true "repair respects new owner"
       (!repairs = if stop_at = "none" then 1 else 0)
   ) ["none"; "current"; "target"]
@@ -2428,7 +3446,7 @@ let test_anchor_recovery () =
     ignore (State.enter_quarantine state ~epoch:10 ~reason);
     assert_true "peer root cleared a read failure"
       (State.root_recovery_evidence ~reason ~evidence:"in_sync"
-        ~consensus_proved:true = None);
+        ~source_proved:true = None);
     let base = deps events in
     let target = target_wiring ~answer:(Some (chunk ~records:[recd] ()))
       events ~head:10 ~point in
@@ -2851,6 +3869,39 @@ let tests = [
   "ready drain owner", test_ready_drain_owner;
   "HTTP probe owner", test_http_probe_owner;
   "probe saved target", test_probe_saved_target;
+  "probe light roots", test_probe_light_roots;
+  "probe light target", test_probe_light_target;
+  "probe weight rules", test_probe_weight_rules;
+  "probe target confirm", test_probe_target_confirm;
+  "probe time limits", test_probe_time_limits;
+  "probe root recovery", test_probe_root_recovery;
+  "probe missing weights", test_probe_missing_weights;
+  "probe reason strength", test_probe_reason_strength;
+  "probe genesis", test_probe_genesis;
+  "probe range recovery", test_probe_range_recovery;
+  "probe second root", test_probe_second_root;
+  "probe streak reset", test_probe_streak_reset;
+  "probe low heads", test_probe_low_heads;
+  "probe low empty", test_probe_low_empty;
+  "probe heavy low", test_probe_heavy_low;
+  "probe ahead weight", test_probe_ahead_weight;
+  "probe weights gap", test_probe_weights_gap;
+  "probe empty gap", test_probe_empty_gap;
+  "probe history count", test_probe_history_count;
+  "genesis root noise", test_genesis_root_noise;
+  "genesis root guard", test_genesis_root_guard;
+  "genesis mixed heads", test_genesis_mixed_heads;
+  "probe poll gap", test_probe_poll_gap;
+  "probe replay gap", test_probe_replay_gap;
+  "ahead target", test_ahead_target;
+  "ahead missing grace", test_ahead_missing_grace;
+  "ahead ready change", test_ahead_ready_change;
+  "probe equal target", test_probe_equal_target;
+  "ahead repair", test_ahead_repair;
+  "ahead alternation", test_ahead_alternation;
+  "ahead grace", test_ahead_grace;
+  "ahead drift", test_ahead_drift;
+  "probe root height", test_probe_root_height;
   "probe snapshot cause", test_probe_snapshot_cause;
   "soft probe owner", test_soft_probe_owner;
   "repair probe owner", test_repair_probe_owner;
@@ -2925,6 +3976,19 @@ let tests = [
   "node queue target gap", test_node_queue_target_gap;
   "response payload integrity", test_response_payload_integrity;
 ]
+@ List.map (fun (label, seed, change, error, expected) ->
+    "reset " ^ label, (fun () -> probe_reset_case label seed change error expected)) probe_reset_cases
+@ List.map (fun route ->
+    "continuous missing " ^ route, (fun () -> probe_missing_case route))
+    ["missing"; "matching"; "no proof"; "repair false"]
+@ List.map (fun mode ->
+    "ahead recovery " ^ mode, (fun () -> probe_ahead_recovery mode))
+    ["delay"; "drift"; "grace"]
+@ List.concat_map (fun phase -> List.map (fun cause ->
+    "secondary " ^ phase ^ " " ^ cause, (fun () -> probe_secondary_case phase cause))
+    (["head"; "epoch"; "weights"; "catchup"] @
+      if phase = "root" then ["root"] else if phase = "repair" then ["success"] else []))
+    ["query"; "root"; "proof"; "repair"]
 
 let () =
   let failed = ref 0 in

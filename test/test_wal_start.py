@@ -168,7 +168,7 @@ def systemd_cases(root, output):
     for policy, expected in policies:
         with mock.patch.object(upgrade, 'data_pids', return_value=[]), mock.patch.object(
             upgrade, 'inspect_pending', return_value=[]), mock.patch.object(
-            upgrade.shutil, 'disk_usage', return_value=mock.Mock(free=8 * 1024**3)), mock.patch.object(
+            upgrade.shutil, 'disk_usage', return_value = mock.Mock(free = 9 * 1024 ** 3)), mock.patch.object(
             upgrade, 'call') as call, mock.patch.object(upgrade, 'emit'):
             reason = ''
             try:

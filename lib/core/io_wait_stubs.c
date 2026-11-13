@@ -8,6 +8,26 @@
 #include <errno.h>
 #include <poll.h>
 #include <caml/alloc.h>
+#include <caml/fail.h>
+#include <signal.h>
+#include <unistd.h>
+
+CAMLprim value octra_worker_stop(value process)
+{
+  CAMLparam1(process);
+  const pid_t pid = Int_val(process);
+  if (pid <= 1) caml_invalid_argument("worker pid");
+  if (kill(pid, SIGKILL) < 0 && errno != ESRCH) uerror("worker_kill", Nothing);
+  if (kill(-pid, SIGKILL) < 0 && errno != ESRCH) {
+    const int saved = errno;
+    const pid_t group = getpgid(pid);
+    if (saved != EPERM || group == pid || (group < 0 && errno != ESRCH)) {
+      errno = saved;
+      uerror("worker_group_kill", Nothing);
+    }
+  }
+  CAMLreturn(Val_unit);
+}
 
 CAMLprim value octra_io_wait(value input, value output, value error, value mask)
 {

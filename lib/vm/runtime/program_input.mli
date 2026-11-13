@@ -2,6 +2,7 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type error
+val limit_error : error
 
 val error_message : error -> string
 val parse : Program_type_flow.kind list -> Yojson.Safe.t list -> (Contract_vm.v list, error) result

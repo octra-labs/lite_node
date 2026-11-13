@@ -185,11 +185,11 @@ let source_floor data_dir =
   with exn ->
     Error ("source history floor read failed: " ^ Printexc.to_string exn)
 
-let verify_data head data_dir =
+let verify_data ?execution_profile head data_dir =
   match source_floor data_dir with
   | Error _ as error -> error
   | Ok floor ->
-      Lwt_main.run (Verify.verify (checkpoint_of_head head floor) data_dir)
+      Lwt_main.run (Verify.verify ?execution_profile (checkpoint_of_head head floor) data_dir)
 
 let inspect_store data_dir expected_commit expected_root =
   let path = Filename.concat data_dir "irmin_store" in
@@ -236,7 +236,7 @@ let write_ready path report =
       flush output;
       Unix.fsync (Unix.descr_of_out_channel output))
 
-let build ~source_dir ~target_dir =
+let build_with_profile ~execution_profile ~source_dir ~target_dir =
   let source_dir = absolute_path source_dir in
   let target_dir = absolute_path target_dir in
   if source_dir = target_dir then fail "source and target directories are equal"
@@ -261,7 +261,7 @@ let build ~source_dir ~target_dir =
         else
           Ok ()
       in
-      let* () = verify_data head source_dir in
+      let* () = verify_data ~execution_profile head source_dir in
       let* source_stats =
         inspect_store source_dir expected_commit expected_root
       in
@@ -309,7 +309,7 @@ let build ~source_dir ~target_dir =
           if not (State_sync.stable_head source_dir head) then
             failwith "source checkpoint changed during compaction";
           begin
-            match verify_data head staging with
+            match verify_data ~execution_profile head staging with
             | Ok () -> ()
             | Error reason -> failwith reason
           end;
@@ -341,3 +341,7 @@ let build ~source_dir ~target_dir =
         |> Result.map_error (fun reason ->
           (try remove_tree staging with _ -> ());
           reason)
+
+let build ~source_dir ~target_dir =
+  build_with_profile ~execution_profile:(fun ~chain_id:_ ~epoch:_ -> None)
+    ~source_dir ~target_dir

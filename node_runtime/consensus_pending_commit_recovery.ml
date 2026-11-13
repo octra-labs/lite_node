@@ -14,7 +14,7 @@ exception Store_fault of string
 type decision =
   | Confirmed_elsewhere of {
       agreed : int;
-      quorum : int;
+      level : string;
     }
   | All_peers_missing of {
       responses : int;
@@ -23,7 +23,7 @@ type decision =
       agreed : int;
       peers : int;
       responses : int;
-      quorum : int;
+      level : string;
     }
 
 type recovered = {
@@ -71,15 +71,16 @@ let all_missing responses =
     (fun (r : C_driver.epoch_root_response_record) -> r.state_root = None)
     responses
 
-let decide ~validator_count ~peer_quorum ~promised_root_raw responses =
-  let agreed =
+let decide ~validator_count ~reached ~level ~promised_root_raw responses =
+  let matched =
     List.filter (root_matches promised_root_raw) responses
-    |> List.length
+    |> List.map (fun (r : C_driver.epoch_root_response_record) -> r.responder_addr)
   in
+  let agreed = List.length matched in
   let response_count = List.length responses in
   let peers = validator_count - 1 in
-  if agreed >= peer_quorum then
-    Confirmed_elsewhere { agreed; quorum = peer_quorum }
+  if reached matched then
+    Confirmed_elsewhere { agreed; level }
   else if response_count >= peers && all_missing responses then
     All_peers_missing { responses = response_count }
   else
@@ -87,7 +88,7 @@ let decide ~validator_count ~peer_quorum ~promised_root_raw responses =
       agreed;
       peers;
       responses = response_count;
-      quorum = peer_quorum;
+      level;
     }
 
 let recover_record ~chain_id ~validator_set pending =
@@ -210,7 +211,8 @@ type 'driver driver_runtime = {
   delete_pending_commit : epoch_id:int -> round:int -> unit;
   restore_pending : 'driver -> Wal.pending_commit -> restore_result;
   validator_count : int;
-  peer_quorum : int;
+  reached : string list -> bool;
+  level : string;
 }
 
 type node_driver_runtime = {
@@ -230,7 +232,8 @@ type node_driver_runtime = {
     receipts_json:string list ->
     unit;
   validator_count : int;
-  quorum : int;
+  reached : string list -> bool;
+  level : string;
 }
 
 let driver_runtime
@@ -241,7 +244,8 @@ let driver_runtime
     ~delete_pending_commit
     ~restore_pending
     ~validator_count
-    ~quorum =
+    ~reached
+    ~level =
   {
     read_pending_commits;
     head;
@@ -250,7 +254,8 @@ let driver_runtime
     delete_pending_commit;
     restore_pending;
     validator_count;
-    peer_quorum = max 0 (quorum - 1);
+    reached;
+    level;
   }
 
 let node_driver_runtime runtime =
@@ -295,7 +300,8 @@ let node_driver_runtime runtime =
           with exn ->
             Invalid (Printexc.to_string exn))
     ~validator_count:runtime.validator_count
-    ~quorum:runtime.quorum
+    ~reached:runtime.reached
+    ~level:runtime.level
 
 let head_epoch_of_manifest = function
   | Some head -> head.Head_manifest.epoch_id
@@ -334,12 +340,12 @@ let hold_unreadable error =
 let delete (deps : deps) p =
   deps.delete_pending_commit ~epoch_id:p.Wal.epoch_id ~round:p.round
 
-let run_confirmed (deps : deps) p ~agreed ~quorum =
+let run_confirmed (deps : deps) p ~agreed ~level =
   let open Lwt.Syntax in
   let epoch = Int64.of_int p.Wal.epoch_id in
   Octra_log.warn "consensus"
-    "event = pending_commit action = catchup_recovery epoch = %d peer_root_match = %d quorum = %d"
-    p.epoch_id agreed quorum;
+    "event = pending_commit action = catchup_recovery epoch = %d peer_root_match = %d quorum = %s"
+    p.epoch_id agreed level;
   let* () = deps.run_catchup_to_target
     ~target_epoch:epoch
     ~reason:"pending_commit_recovery" in
@@ -363,26 +369,26 @@ let run_all_missing p ~responses =
     p.Wal.epoch_id responses;
   Lwt.return_unit
 
-let run_inconclusive p ~agreed ~peers ~responses ~quorum =
+let run_inconclusive p ~agreed ~peers ~responses ~level =
   Octra_log.warn "consensus"
-    "event = pending_commit action = keep_breadcrumb epoch = %d agreed = %d peers = %d responses = %d quorum = %d reason = inconclusive"
-    p.Wal.epoch_id agreed peers responses quorum;
+    "event = pending_commit action = keep_breadcrumb epoch = %d agreed = %d peers = %d responses = %d quorum = %s reason = inconclusive"
+    p.Wal.epoch_id agreed peers responses level;
   Lwt.return_unit
 
-let run_pending (deps : deps) ~validator_count ~peer_quorum p =
+let run_pending (deps : deps) ~validator_count ~reached ~level p =
   let open Lwt.Syntax in
   let epoch = Int64.of_int p.Wal.epoch_id in
   let* responses = deps.query_epoch_root ~epoch_id:epoch in
   let promised_root_raw = raw32_of_hex p.Wal.proposed_state_root in
-  match decide ~validator_count ~peer_quorum ~promised_root_raw responses with
-  | Confirmed_elsewhere { agreed; quorum } ->
-    run_confirmed deps p ~agreed ~quorum
+  match decide ~validator_count ~reached ~level ~promised_root_raw responses with
+  | Confirmed_elsewhere { agreed; level } ->
+    run_confirmed deps p ~agreed ~level
   | All_peers_missing { responses } ->
     run_all_missing p ~responses
-  | Inconclusive { agreed; peers; responses; quorum } ->
-    run_inconclusive p ~agreed ~peers ~responses ~quorum
+  | Inconclusive { agreed; peers; responses; level } ->
+    run_inconclusive p ~agreed ~peers ~responses ~level
 
-let run_once (deps : deps) ~validator_count ~peer_quorum =
+let run_once (deps : deps) ~validator_count ~reached ~level =
   match unresolved deps with
   | Error error -> hold_unreadable error
   | Ok (_, pending) when pending = [] -> Lwt.return_true
@@ -433,7 +439,7 @@ let run_once (deps : deps) ~validator_count ~peer_quorum =
           head;
         let* () =
           Lwt_list.iter_s
-            (run_pending deps ~validator_count ~peer_quorum)
+            (run_pending deps ~validator_count ~reached ~level)
             pending
         in
         (match unresolved deps with
@@ -444,4 +450,5 @@ let run_with_driver runtime driver =
   run_once
     (deps_of_driver_runtime runtime driver)
     ~validator_count:runtime.validator_count
-    ~peer_quorum:runtime.peer_quorum
+    ~reached:runtime.reached
+    ~level:runtime.level

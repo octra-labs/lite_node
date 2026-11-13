@@ -497,25 +497,31 @@ let wasm_view_method_timing_enabled method_name =
   | _ ->
     false
 
-let vm_value_of_wasm_response = function
-  | Octra_core.Circle_wasm_codec.Resp_null ->
-    Ok (ContractVM.VString "")
-  | Octra_core.Circle_wasm_codec.Resp_bool b ->
-    Ok (ContractVM.VBool b)
-  | Octra_core.Circle_wasm_codec.Resp_int value ->
-    (try Ok (ContractVM.VInt (Z.of_string value)) with
-     | Invalid_argument _
-     | Failure _ ->
-       Error "wasm response integer is invalid")
-  | Octra_core.Circle_wasm_codec.Resp_string value ->
-    Ok (ContractVM.VString value)
-
-let vm_response_value = function
-  | None -> Ok None
-  | Some response ->
-    match vm_value_of_wasm_response response with
-    | Ok value -> Ok (Some value)
-    | Error _ as error -> error
+let vm_response_value ~active ~used ~limit = function
+  | None -> Ok None, used
+  | Some Octra_core.Circle_wasm_codec.Resp_null ->
+    Ok (Some (ContractVM.VString "")), used
+  | Some (Octra_core.Circle_wasm_codec.Resp_bool value) ->
+    Ok (Some (ContractVM.VBool value)), used
+  | Some (Octra_core.Circle_wasm_codec.Resp_string value) ->
+    Ok (Some (ContractVM.VString value)), used
+  | Some (Octra_core.Circle_wasm_codec.Resp_int value) ->
+    if active && not (Octra_vm.Scalar_work.text_ok value) then
+      Error "wasm response integer text exceeds limit", used
+    else
+      let work = if not active then Some used else
+        Octra_vm.Cost.charge_z ~used ~limit
+          ~cost:(Octra_vm.Scalar_work.parse (String.length value)) in
+      match work with
+      | None -> Error "wasm response integer effort exceeds limit", limit
+      | Some used ->
+        let result = try
+          let number = Z.of_string value in
+          if active && not (Octra_vm.Scalar_work.valid number) then
+            Error "wasm response integer width exceeds limit"
+          else Ok (Some (ContractVM.VInt number))
+        with Invalid_argument _ | Failure _ -> Error "wasm response integer is invalid" in
+        result, used
 
 let load_slot_policy ?snapshot store circle_id path_key =
   let read = Octra_core.Circle_policy_store.read_first_inline_value ?snapshot in
@@ -1105,7 +1111,7 @@ let prepare_octb_call ~calls ~ctx ~depth ~limit ~caller ~address ~value ~method_
   match Contract.extract_method_target fixed method_name with
   | None -> Error "method not found"
   | Some target ->
-    match Contract.runtime_params profile target params with
+    match Contract.runtime_params ~scalar_work:ctx.scalar_work profile target params with
     | Error error -> Error (Octra_vm.Program_input.error_message error)
     | Ok values ->
       let storage_kinds = if calls then Contract.storage_kinds profile else [] in
@@ -1215,9 +1221,31 @@ let run_preview_prefetch ~clear task =
       clear ();
       Lwt.return_unit)
 
+let entry_work ?snapshot ~active ~limit store address params =
+  if not active then Lwt.return_some 0 else
+  let* encoded = Octra_core.Store_irmin.get_circle_program_code_b64 ?snapshot store address in
+  let encoded = Option.map (fun value -> "", value) encoded in
+  match Contract.call_work ~active ~limit ~spent:0 encoded params with
+  | None -> Lwt.return_none
+  | Some spent ->
+    let cost = match encoded with
+      | None -> Some Z.zero
+      | Some (_, encoded) ->
+        match Base64.decode encoded with
+        | Error _ -> None
+        | Ok raw when String.length raw >= 4 && String.sub raw 0 4 = "\000asm" -> Some Z.zero
+        | Ok raw -> Octra_vm.Code_check.scalar_cost raw in
+    Lwt.return (Option.bind cost (fun cost ->
+      Octra_vm.Cost.charge_z ~used:spent ~cost ~limit))
+
 let rec execute_view_call_with_execution execution ?snapshot ?running ?(trusted = []) ?(ctx = ContractVM.default_ctx) ?(depth = 0) ?(limit = 2_000_000_000)
     ?(inspect_mode = Octra_core.Rule_graph.Prior)
     store circle_id method_name params caller =
+  let* input_work = entry_work ?snapshot ~active:ctx.scalar_work ~limit store circle_id params in
+  match input_work with
+  | None -> Lwt.return { (failed_receipt "circle input effort exceeds limit") with effort_used = limit }
+  | Some input_work ->
+  let limit = limit - input_work in
   let timing_enabled = wasm_view_method_timing_enabled method_name in
   let timing_started_at = if timing_enabled then Some (Unix.gettimeofday ()) else None in
   let timing_last_at = ref timing_started_at in
@@ -1254,7 +1282,7 @@ let rec execute_view_call_with_execution execution ?snapshot ?running ?(trusted 
         outcome
         phases
     end;
-    Lwt.return receipt in
+    Lwt.return {receipt with effort_used = receipt.effort_used + input_work} in
   let* loaded_result =
     Circle_program.load ?snapshot ~optional:true ~trusted ~point_ops:ctx.point_ops
       ~float_mode:ctx.wasm_float ~inspect_mode ~table_mode:ctx.proof_key store circle_id in
@@ -1411,13 +1439,17 @@ let rec execute_view_call_with_execution execution ?snapshot ?running ?(trusted 
                         begin
                           match wasm_result with
                           | Error (Octra_core.Circle_wasm_host.Rejected e)
+                          | Error (Octra_core.Circle_wasm_host.Refused (e, _))
                           | Error (Octra_core.Circle_wasm_host.Unavailable e) ->
                             finish { (rejected e) with effort_used = limit }
                           | Ok result ->
-                            match vm_response_value result.response_value with
+                            let response, used = vm_response_value
+                              ~active:runtime_hfhe.exec_ctx.scalar_work
+                              ~used:(spent + result.effort_used) ~limit result.response_value in
+                            match response with
                             | Error e ->
                               finish { (rejected e) with
-                                effort_used = min limit (spent + result.effort_used) }
+                                effort_used = min limit used }
                             | Ok return_value ->
                               let events =
                                 List.map
@@ -1429,7 +1461,6 @@ let rec execute_view_call_with_execution execution ?snapshot ?running ?(trusted 
                                       values = [ContractVM.VString event.data];
                                     })
                                   result.events in
-                              let used = key_effort + public_reads.effort_used + result.effort_used in
                               let output = match return_value with
                                 | None -> Some used
                                 | Some value -> ContractVM.output_work runtime_hfhe.exec_ctx
@@ -1629,20 +1660,22 @@ let execute_compute_view_call ?snapshot ?(trusted = []) ?(ctx = ContractVM.defau
     params
     caller
 
-let execute_call ?(trusted = []) ?journal ?(ctx = ContractVM.default_ctx) ?(depth = 0)
+let execute_call_body ?(trusted = []) ?journal ?(ctx = ContractVM.default_ctx) ?(depth = 0)
     ?(limit = 1_000_000)
     ?(hfhe_strict = false)
     ?(hfhe_mode = Octra_core.Circle_hfhe_transcript.Direct)
     ?(update_policy = false)
     ?(manifest_profile = Octra_core.Circle_wasm_host.Manifest)
     ?(inspect_mode = Octra_core.Rule_graph.Prior)
+    ?(program_result = false)
     store circle_id method_name params caller value =
   let* loaded_result =
     Circle_program.load
       ~trusted ~point_ops:ctx.point_ops ~manifest_profile
       ~float_mode:ctx.wasm_float ~inspect_mode ~table_mode:ctx.proof_key store circle_id in
   match loaded_result with
-  | Error (Octra_core.Circle_wasm_host.Rejected e) ->
+  | Error (Octra_core.Circle_wasm_host.Rejected e)
+  | Error (Octra_core.Circle_wasm_host.Refused (e, _)) ->
     Lwt.return (failed_call_result e)
   | Error (Octra_core.Circle_wasm_host.Unavailable e) ->
     Lwt.fail (Execution_unavailable e)
@@ -1838,6 +1871,22 @@ let execute_call ?(trusted = []) ?journal ?(ctx = ContractVM.default_ctx) ?(dept
                           let call = if calls then Some (Wasm_call.dispatch
                             ~ctx ~depth ~address:circle_id ~value ~storage:storage_tbl ~events:nested)
                             else None in
+                          let linked transcript =
+                            hfhe_binding
+                              loaded
+                              circle_id
+                              (public_reads_hash public_reads.snapshots)
+                              (hfhe_context_hash ~keyed:(ctx.proof_key = Octra_core.Rule_graph.Active) ~math:ctx.math
+                                 ~float_mode:ctx.wasm_float
+                                 ~strict:hfhe_strict
+                                 hfhe_caps
+                                 hfhe_pubkeys
+                                 hfhe_active_key)
+                              transcript in
+                          let refused effort error transcript =
+                            let result = rejected effort error in
+                            if program_result then {result with hfhe_binding = linked transcript}
+                            else result in
                           let* wasm_result =
                             Octra_core.Circle_wasm_host.execute
                               ~inspect_mode
@@ -1869,12 +1918,16 @@ let execute_call ?(trusted = []) ?journal ?(ctx = ContractVM.default_ctx) ?(dept
                             match wasm_result with
                             | Error (Octra_core.Circle_wasm_host.Rejected e) ->
                               Lwt.return (rejected limit e)
+                            | Error (Octra_core.Circle_wasm_host.Refused (e, transcript)) ->
+                              Lwt.return (refused limit e transcript)
                             | Error (Octra_core.Circle_wasm_host.Unavailable e) ->
                               Lwt.fail (Execution_unavailable e)
                             | Ok result ->
-                              match vm_response_value result.response_value with
+                              let response, used = vm_response_value ~active:ctx.scalar_work
+                                ~used:(spent + result.effort_used) ~limit result.response_value in
+                              match response with
                               | Error e ->
-                                Lwt.return (rejected (min limit (spent + result.effort_used)) e)
+                                Lwt.return (refused (min limit used) e result.hfhe_transcript)
                               | Ok return_value ->
                                 let own_events =
                                   List.map
@@ -1889,7 +1942,7 @@ let execute_call ?(trusted = []) ?journal ?(ctx = ContractVM.default_ctx) ?(dept
                                 let event_work = List.fold_left (fun work event ->
                                   Option.bind work (fun used ->
                                     ContractVM.event_work ctx ~used ~limit event))
-                                  (Some (spent + result.effort_used)) own_events in
+                                  (Some used) own_events in
                                 let output = Option.bind event_work (fun used ->
                                   match return_value with
                                   | None -> Some used
@@ -1928,18 +1981,7 @@ let execute_call ?(trusted = []) ?journal ?(ctx = ContractVM.default_ctx) ?(dept
                                   encrypted_assets = result.encrypted_assets;
                                   caller;
                                   tx_hash = runtime_hfhe.exec_ctx.tx_hash;
-                                  hfhe_binding =
-                                    hfhe_binding
-                                      loaded
-                                      circle_id
-                                      (public_reads_hash public_reads.snapshots)
-                                      (hfhe_context_hash ~keyed:(ctx.proof_key = Octra_core.Rule_graph.Active) ~math:ctx.math
-                                         ~float_mode:ctx.wasm_float
-                                         ~strict:hfhe_strict
-                                         hfhe_caps
-                                         hfhe_pubkeys
-                                         hfhe_active_key)
-                                      result.hfhe_transcript;
+                                  hfhe_binding = linked result.hfhe_transcript;
                                 }
                           end
                     end
@@ -1949,6 +1991,22 @@ let execute_call ?(trusted = []) ?journal ?(ctx = ContractVM.default_ctx) ?(dept
         end
         end
     end
+
+let execute_call ?trusted ?journal ?(ctx = ContractVM.default_ctx) ?depth
+    ?(limit = 1_000_000) ?hfhe_strict ?hfhe_mode ?update_policy ?manifest_profile ?inspect_mode
+    ?program_result
+    store circle_id method_name params caller value =
+  let* input_work = entry_work ~active:ctx.scalar_work ~limit store circle_id params in
+  match input_work with
+  | None ->
+    let result = failed_call_result "circle input effort exceeds limit" in
+    Lwt.return {result with receipt = {result.receipt with effort_used = limit}}
+  | Some input_work ->
+    let* result = execute_call_body ?trusted ?journal ~ctx ?depth ~limit:(limit - input_work)
+      ?hfhe_strict ?hfhe_mode ?update_policy ?manifest_profile ?inspect_mode ?program_result
+      store circle_id method_name params caller value in
+    Lwt.return {result with receipt =
+      {result.receipt with effort_used = result.receipt.effort_used + input_work}}
 
 let read_storage_key ?snapshot store circle_id key =
   Octra_core.Store_irmin.read_circle_stable_inline_value ?snapshot store circle_id key

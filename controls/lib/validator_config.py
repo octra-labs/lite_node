@@ -91,6 +91,41 @@ BUILD_WORK = TOOLCHAIN_ROOT / "build"
 CARGO_HOME = TOOLCHAIN_ROOT / "cargo"
 RUSTUP_HOME = TOOLCHAIN_ROOT / "rustup"
 OPAM_SWITCH = TOOLCHAIN_ROOT / "ocaml"
+CONSENSUS_INPUTS = frozenset({
+    "OCTRA_BFT_ADMIT_OPS",
+    "OCTRA_BFT_CRYPTO_PROFILE",
+    "OCTRA_BFT_PROPOSAL_MAX_BYTES",
+    "OCTRA_BFT_PROPOSAL_MAX_OU",
+    "OCTRA_BFT_PROPOSAL_MAX_TXS",
+    "OCTRA_BFT_RELEASE_PROFILE",
+    "OCTRA_EMISSION_ACTIVATION_EPOCH",
+    "OCTRA_EMISSION_GUARD",
+    "OCTRA_EMISSION_PROFILE",
+    "OCTRA_FEE_RECIPIENT",
+    "OCTRA_FHE_MAX_PER_EPOCH",
+    "OCTRA_MULTI_EXEC_MAX_CALLS",
+    "OCTRA_PREVERIFY_RECEIPT_ACTIVATION_EPOCH",
+    "OCTRA_PRIVATE_RESULT_ACTIVATION_EPOCH",
+    "OCTRA_PROPOSAL_PROTOCOL_ACTIVATION_EPOCH",
+    "OCTRA_PVAC_MIGRATION_ROOT",
+    "OCTRA_STEALTH_INLINE_VERIFY",
+    "OCTRA_STEALTH_MAX_DEFER",
+    "OCTRA_STEALTH_MAX_PER_EPOCH",
+    "OCTRA_STEALTH_MIN_OU",
+    "OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH",
+})
+
+def require_consensus_inputs(previous, selected):
+    changed = sorted(key for key in CONSENSUS_INPUTS
+        if previous.get(key) != selected.get(key))
+    if changed:
+        raise ValidatorError("consensus input change refused: " + ",".join(changed))
+
+def network_update(values, network):
+    updated = {key: value for key, value in values.items() if key not in NETWORK_KEYS}
+    updated.update(network)
+    require_consensus_inputs(values, updated)
+    return updated
 
 def operator_wallet(config):
     local = Path(config).expanduser().resolve().parent / "wallet.json"
@@ -184,14 +219,9 @@ def adopt_network(config, network, expected_hash):
     bundle, bundle_hash, network_values = load_network(network, expected_hash)
     if values.get("OCTRA_CHAIN_ID") != network_values["OCTRA_CHAIN_ID"]:
         raise ValidatorError("network chain mismatch")
+    updated = network_update(values, network_values)
     installed = Path(config).expanduser().resolve().parent / "network.env"
     copy_private(bundle, installed)
-    updated = {
-        key: value
-        for key, value in values.items()
-        if key not in NETWORK_KEYS
-    }
-    updated.update(network_values)
     updated["OCTRA_OPERATOR_NETWORK_BUNDLE"] = str(installed)
     updated["OCTRA_OPERATOR_NETWORK_SHA256"] = bundle_hash
     write_env(config, updated)
@@ -516,6 +546,9 @@ def build_node():
         "exec",
         "--switch",
         switch,
+        "--",
+        "python3",
+        str(ROOT / "controls/lib/gc_build.py"),
         "--",
         "dune",
         "build",
@@ -1039,6 +1072,8 @@ def main():
         raise ValidatorError("network bundle path is required")
     expected_hash = resolve_digest(args, network)
     bundle, bundle_hash, values = load_network(network, expected_hash)
+    if Path(args.config).exists():
+        require_consensus_inputs(parse_env(args.config), values)
     source = source_commit() or ""
     binary = Path(args.binary).resolve()
     build = args.build

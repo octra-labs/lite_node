@@ -14,8 +14,8 @@ type 'handler dispatch_adapters = {
   ledger_chaindata_params_read :
     (Ledger.t -> Store_chaindata.t -> params:Yojson.Safe.t -> rpc_result) ->
     'handler;
-  chaindata_params_read :
-    (Store_chaindata.t -> params:Yojson.Safe.t -> rpc_result) ->
+  chain_chaindata_params_read :
+    (chain_id:string -> Store_chaindata.t -> params:Yojson.Safe.t -> rpc_result) ->
     'handler;
   no_params : (unit -> rpc_result) -> 'handler;
   epoch_current : 'handler;
@@ -92,13 +92,32 @@ let epoch_current ~tree_ref =
        ~epoch_id:tree.Tree.epoch_id
        ~root_count:(Tree.root_count tree))
 
-let epoch_get chaindata ~params =
+let epoch_reward_view ~chain_id ~epoch_id summary =
+  let module Policy = Octra_consensus.C_quorum_policy in
+  if not (Policy.seatless (Policy.for_chain chain_id) (Int64.of_int epoch_id)) then
+    summary
+  else
+    match summary with
+    | `Assoc fields ->
+      let deprecated = ["proposer_reward"; "validator_reward_each"] in
+      let fields = List.map (fun (name, value) ->
+        name, if List.mem name deprecated then `Null else value) fields in
+      `Assoc (fields @ [
+        "reward_fields_deprecated", `List (List.map (fun name -> `String name) deprecated);
+      ])
+    | _ -> summary
+
+let epoch_summary ~chain_id chaindata epoch_id =
+  Store_chaindata.get_epoch_summary chaindata epoch_id
+  |> Option.map (epoch_reward_view ~chain_id ~epoch_id)
+
+let epoch_get ~chain_id chaindata ~params =
   match Rpc.require_int params 0 "epoch_id" with
   | Error e ->
     err e
   | Ok epoch_id ->
     match Rest_view.epoch_get_response
-            (Store_chaindata.get_epoch_summary chaindata epoch_id) with
+            (epoch_summary ~chain_id chaindata epoch_id) with
     | Ok response ->
       ok response
     | Error e ->
@@ -108,10 +127,10 @@ let epoch_list ~tree_ref ~params =
   let current_epoch = (!tree_ref).Tree.epoch_id in
   ok (Rest_view.epoch_list_response ~current_epoch params)
 
-let epoch_summaries chaindata ~params =
+let epoch_summaries ~chain_id chaindata ~params =
   ok
     (Rest_view.epoch_summaries_response_of_ids
-       ~find_summary:(Store_chaindata.get_epoch_summary chaindata)
+       ~find_summary:(epoch_summary ~chain_id chaindata)
        (Rest_view.epoch_summary_ids params))
 
 let staging_view () =
@@ -172,9 +191,9 @@ let dispatch adapters =
   [
     "octra_search", adapters.ledger_chaindata_params_read search;
     "epoch_current", adapters.epoch_current;
-    "epoch_get", adapters.chaindata_params_read epoch_get;
+    "epoch_get", adapters.chain_chaindata_params_read epoch_get;
     "epoch_list", adapters.epoch_list;
-    "epoch_summaries", adapters.chaindata_params_read epoch_summaries;
+    "epoch_summaries", adapters.chain_chaindata_params_read epoch_summaries;
     "staging_view", adapters.no_params staging_view;
     "staging_stats", adapters.no_params staging_stats;
     "staging_estimateOu", adapters.no_params staging_estimate_ou;

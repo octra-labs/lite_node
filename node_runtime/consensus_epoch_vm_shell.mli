@@ -237,6 +237,7 @@ type vm_tx_deps = {
 }
 
 val prepare_program_package :
+  ?scalar_work:bool ->
   ?metered:bool ->
   ?preview:Octra_core.Rule_graph.mode ->
   ?proof_exec:Octra_core.Rule_graph.mode ->
@@ -354,6 +355,8 @@ type live_sender_vm_tx_args = {
 }
 
 val make_live_vm_tx_deps :
+  ?source_create:Octra_core.Rule_graph.mode ->
+  ?spawn_ctx:(Program_spawn.t -> ContractVM.exec_ctx) ->
   ?metered:bool ->
   ?inspect_mode:Octra_core.Rule_graph.mode ->
   ?records:Octra_core.Rule_graph.mode ->
@@ -370,6 +373,8 @@ val make_live_call_runtime :
   call_runtime
 
 val make_live_contract_ctx :
+  ?spawn:Program_spawn.t ->
+  ?scalar_work:bool ->
   live_contract_ctx_args ->
   ContractVM.exec_ctx
 
@@ -384,10 +389,13 @@ val make_live_value_effects :
   live_value_effects
 
 val make_live_sender_vm_tx_deps :
+  ?source_create:Octra_core.Rule_graph.mode ->
+  ?scalar_work:bool ->
   live_sender_vm_tx_args ->
   vm_tx_deps
 
 val make_contract_ctx :
+  ?scalar_work:bool ->
   ?bytes:Octra_vm.Byte_work.t ->
   ('value_snapshot, 'program_snapshot) deps ->
   ContractVM.exec_ctx
@@ -431,6 +439,7 @@ val run_program_call_tx :
   unit Lwt.t
 
 val run_program_upgrade_tx :
+  ?scalar_work:bool ->
   ?metered:bool ->
   ?records:Octra_core.Rule_graph.mode ->
   call_runtime ->
@@ -439,6 +448,8 @@ val run_program_upgrade_tx :
   store:Octra_core.Store_irmin.t ->
   Transaction.t ->
   unit Lwt.t
+
+val deployment_spent : bool -> Transaction.t -> int
 
 val make_circle_call_deps :
   call_runtime ->

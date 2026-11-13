@@ -24,6 +24,7 @@ let identity stamp =
   ^ stamp
 
 let consensus_id = identity Source_stamp.id
+let prior_id = identity "dc82575c6ce78ea308000118d83b80ba7006fc77cf06c66cc98902cc85382ec5"
 let released_id = identity "b21391865660ba35426eaabc15e8d8a4d5a04a3754b73042bf57d5697fe108b6"
 
 let encode_sources value =
@@ -119,7 +120,7 @@ let check_sources sources =
       | (Out_of_memory | Stack_overflow) as error -> raise error
       | _ -> Error "program source compilation failed")) (Ok ()) sources.files
 
-let compile ?(metered = false) sources =
+let compile ?(view = false) ?(metered = false) sources =
   let main = sources.main in
   let resolver path = List.find_opt (fun (file : Program_package.source) -> file.path = path)
     sources.files |> Option.map (fun file -> file.Program_package.body) in
@@ -138,7 +139,7 @@ let compile ?(metered = false) sources =
       | "package_source" -> Program_package.Source
       | "package_preview" -> Program_package.Preview
       | _ -> Program_package.Protocol in
-    Program_package.compile_sources_at ~metered ~loops:sources.loops ~compiler
+    Program_package.compile_sources_in ~view ~metered ~loops:sources.loops ~compiler
       ~point_ops:(sources.compiler <> "package_historical") ~main ~sources:sources.files
     |> Result.map (fun (value : Program_package.compiled) -> value.envelope, value.result)
     |> Result.map_error (fun _ -> "program source compilation failed")
@@ -227,11 +228,11 @@ let record_scope ~stored record =
   if scope_matches (scope_check ~metered:true ~main ~files) code then Ok ()
   else Error "program source scope differs"
 
-let verify ?(metered = false) sources ~exact ~stored =
+let verify ?(view = false) ?(metered = false) sources ~exact ~stored =
   let ( let* ) = Result.bind in
   let* () = if List.mem (sources.compiler, sources.loops) profiles then Ok ()
     else Error "program source compiler invalid" in
-  let* code, result = compile ~metered sources in
+  let* code, result = compile ~view ~metered sources in
   let* () = if scope_matches (scope_check ~metered ~main:sources.main ~files:sources.files)
       result.Oct_compile.bytecode then Ok ()
     else Error "program source scope differs" in

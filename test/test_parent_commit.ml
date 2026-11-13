@@ -496,7 +496,53 @@ let test_parent_suffix () =
         (try ignore (Source.proposal source ~epoch_id:8193L); false with _ -> true);
       Printf.printf "event = parent_suffix reads = 8 allocated_bytes = %.0f\n" allocated)
 
+let test_import_source () =
+  let module Source = Octra_node_runtime.Consensus_parent_commit in
+  let module Store = Octra_core.Store_chaindata in
+  let module Floor = Octra_core.History_floor in
+  let module Head = Octra_core.Head_manifest in
+  Test_workspace.with_dir "parent-import" (fun base ->
+    let chaindata = Store.open_chaindata (Filename.concat base "chaindata") in
+    Fun.protect ~finally:(fun () -> Store.close chaindata) (fun () ->
+      let ledger = String.make 64 'a' and index = String.make 64 'b' in
+      let state_root = Octra_core.Epoch_index_commitment.folded_state_root
+        ~ledger_state_root:ledger ~epoch_index_root:index in
+      let value = parent_for_header {header with proposed_state_root =
+        Digestif.SHA256.(to_raw_string (of_hex state_root))} ["octA"; "octB"; "octC"] in
+      let floor = Floor.create ~chain_id:"parent-test" ~epoch:17 ~state_root
+        ~ledger_state_root:ledger ~txid_hi:header.txid_hi ~config_hash:(String.make 64 'c')
+        ~validator_set_hash:Digestif.SHA256.(to_hex (of_raw_string
+          (C_config.validator_set_hash validator_set)))
+        ~epoch_index_hash:(String.make 64 'd') ~epoch_index_root:index ~parent_commit:value
+        |> Result.get_ok in
+      let head = Head.{schema_version = schema_version; generation = 17; epoch_id = 17;
+        state_root; ledger_state_root = Some ledger; irmin_commit = None;
+        txid_hi = header.txid_hi; txlog_seg = None; txlog_off = None; epochlog_off = None;
+        commit_id = "parent-import"; ts = 1.; quorum_cert_hash = None;
+        epoch_index_hash = Some (Floor.epoch_index_hash floor); epoch_index_root = Some index} in
+      let source chain_id = Source.create ~chain_id ~data_dir:base ~chaindata (fun _ -> None)
+        |> Result.get_ok in
+      let resolve head = Source.set_at_head (source "parent-test") ~epoch_id:17L head in
+      expect "missing floor supplied validator source" (Result.is_error (resolve head));
+      Store.seed_history_floor chaindata floor |> Result.get_ok;
+      expect "imported floor lost validator source" (resolve head = Ok validator_set);
+      List.iter (fun changed ->
+        expect "imported source accepted different HEAD" (Result.is_error (resolve changed)))
+        [{head with epoch_id = 18}; {head with state_root = String.make 64 '0'};
+         {head with txid_hi = Int64.succ head.txid_hi};
+         {head with ledger_state_root = None};
+         {head with ledger_state_root = Some (String.make 64 '0')};
+         {head with epoch_index_hash = None};
+         {head with epoch_index_hash = Some (String.make 64 '0')};
+         {head with epoch_index_root = None};
+         {head with epoch_index_root = Some (String.make 64 '0')}];
+      expect "imported source accepted another chain"
+        (Result.is_error (Source.set_at_head (source "other-chain") ~epoch_id:17L head));
+      expect "source read created finality journal" (not (Sys.file_exists (Filename.concat base "finality")));
+      expect "source read changed history floor" (Store.history_floor chaindata = Ok (Some floor))))
+
 let () =
+  test_import_source ();
   test_roundtrip ();
   test_validation ();
   test_same_block ();

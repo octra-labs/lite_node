@@ -65,13 +65,14 @@ let const_of_v = function
   | Contract_vm.VPubKey pk -> CBytes pk.data
 
 module Integers : sig
-  val read : string -> Z.t
+  val read : ?view:bool -> string -> Z.t
 end = struct
   type entry = { raw : string; hash : string; value : Z.t; bytes : int }
 
   let max_bytes = 32 * 1024 * 1024
   let max_entries = 512
   let entries = ref []
+  let view_entries = ref []
   let lock = Mutex.create ()
 
   let rec keep slots bytes = function
@@ -79,7 +80,8 @@ end = struct
       entry :: keep (slots - 1) (bytes - entry.bytes) rest
     | _ -> []
 
-  let read raw =
+  let read ?(view = false) raw =
+    let entries = if view then view_entries else entries in
     if String.length raw < 65536 || String.length raw > max_const_len then
       Z.of_string raw
     else begin
@@ -102,8 +104,8 @@ end = struct
     end
 end
 
-let v_of_const = function
-  | CInt s -> Contract_vm.VInt (Integers.read s)
+let v_of_const ?(view = false) = function
+  | CInt s -> Contract_vm.VInt (Integers.read ~view s)
   | CBool b -> Contract_vm.VBool b
   | CStr s -> Contract_vm.VString s
   | CBytes b -> Contract_vm.VBytes b
@@ -771,6 +773,25 @@ let decode_const s pos total_len =
   in
   (c, pos + 5 + len)
 
+let scalar_cost raw =
+  let data = Bytes.unsafe_of_string raw in
+  let size = String.length raw in
+  if size < 12 || String.sub raw 0 4 <> magic then None
+  else
+    let count = get_u16le data 6 in
+    let rec scan index position cost =
+      if index = count then Some cost
+      else if position > size - 5 then None
+      else
+        let tag = get_u8 data position in
+        let length = get_u32le data (position + 1) in
+        if length > size - position - 5 || length < 0 then None
+        else if tag = 0 && length > Scalar_work.text_limit then None
+        else
+          let cost = if tag = 0 then Z.add cost (Scalar_work.parse length) else cost in
+          scan (index + 1) (position + 5 + length) cost in
+    if count > max_consts then None else scan 0 12 Z.zero
+
 let const_at active pc consts index =
   if active && (index < 0 || index >= Array.length consts) then
     failwith (Printf.sprintf "constant reference %d at pc %d" index pc);
@@ -976,7 +997,7 @@ let trim_error msg =
   if String.length msg <= 256 then msg
   else String.sub msg 0 256
 
-let decode_image ?(active = true) raw =
+let decode_image ?(view = false) ?(active = true) raw =
   try
     let s = Bytes.of_string raw in
     let len = Bytes.length s in
@@ -1009,7 +1030,7 @@ let decode_image ?(active = true) raw =
         None, None, None, None
     in
     let consts = Array.map (fun cell -> cell.value) const_cells in
-    let values = Array.map (fun value -> lazy (v_of_const value)) consts in
+    let values = Array.map (fun value -> lazy (v_of_const ~view value)) consts in
     let text_at = !pos in
     let cells = Array.make n_instrs { pc = 0; at = 0; size = 0 } in
     let code : Contract_vm.instr array =
@@ -1045,8 +1066,8 @@ let decode_image ?(active = true) raw =
     | (Stack_overflow | Out_of_memory) as error -> raise error
     | exn -> Error (trim_error (Printexc.to_string exn))
 
-let decode ?(active = true) raw =
-  match decode_image ~active raw with
+let decode ?(view = false) ?(active = true) raw =
+  match decode_image ~view ~active raw with
   | Ok image -> Ok image.code
   | Error error -> Error error
 

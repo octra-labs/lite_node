@@ -168,7 +168,7 @@ val default_join_log :
   join_log
 
 val exit_fatal : unit -> 'a
-val exit_store : ?code:int -> Octra_core.Store_irmin.t -> unit -> 'a
+val exit_store : ?code:int -> ?exit:(int -> 'a) -> Octra_core.Store_irmin.t -> unit -> 'a
 val require_sync : data_dir:string -> chain:string -> store:Octra_core.Store_irmin.t ->
   Sync_need.t -> 'a
 

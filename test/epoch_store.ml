@@ -43,7 +43,7 @@ let network ~getenv ~chain_id ~config_hash ~configured_hash =
 
 let persist_index context (cursor : R.J.cursor) (prepared : R.J.prepared)
     (result : X.exec_result) =
-  R.artifacts prepared.txs result;
+  R.artifacts prepared result;
   let hashes = R.hashes (List.map fst result.artifacts.confirmed) in
   let epoch_hash, root =
     R.E.next_root_from_hashes_i64
@@ -238,14 +238,15 @@ let deps (context : context) ~(cursor : R.J.cursor)
         ~env
         ~txs);
     apply = (fun preverify current ->
+      R.require "replay apply preparation differs" (current = prepared);
+      let txs, _ = R.execution current in
       let preverify =
         Octra_core.Preverify_commit.with_artifacts
-          (N.Consensus_private_preverify.artifacts private_pool current.R.J.txs)
+          (N.Consensus_private_preverify.artifacts private_pool txs)
           preverify
         |> Octra_core.Preverify_commit.with_keys
-             (N.Consensus_key_switch_preverify.artifacts key_pool current.R.J.txs)
+             (N.Consensus_key_switch_preverify.artifacts key_pool txs)
       in
-      R.require "replay apply preparation differs" (current = prepared);
       R.require "replay chaindata is read-only"
         (not context.chaindata.index.readonly);
       R.require "replay chaindata batch is active"
@@ -254,7 +255,7 @@ let deps (context : context) ~(cursor : R.J.cursor)
         (D.get_epoch_index_commitment context.chaindata epoch = (None, None));
       List.iter (fun (tx : R.T.t) ->
         if not (R.T.bft_consensus_admits_op tx.op_type) then
-          failwith (R.T.bft_reject_reason tx.op_type)) prepared.txs;
+          failwith (R.T.bft_reject_reason tx.op_type)) txs;
       let backend =
         X.make_live_backend ~proof_mode ~math ~fold context.store context.ledger
       in
@@ -295,7 +296,7 @@ let deps (context : context) ~(cursor : R.J.cursor)
           ~preverify
           ~backend
           ~env
-          ~txs:prepared.txs
+          ~txs
           ~process_tx
       in
       Lwt.return (persist_index context cursor prepared (R.get result)));

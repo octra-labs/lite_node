@@ -10,6 +10,11 @@ module Proto = Octra_node_runtime.Grpc_proto
 module Service = Octra_node_runtime.Grpc_service
 module Status = Octra_node_runtime.Grpc_status
 module Rpc = Octra_core.Rpc
+module Epoch = Octra_core.Epochlog
+module Exec = Octra_core.Epoch_exec
+module Rest = Octra_node_runtime.Rest_read_rpc
+module Store = Octra_core.Store_chaindata
+module Tree = Octra_core.Tree
 
 let fail reason =
   failwith ("test_grpc: " ^ reason)
@@ -309,7 +314,7 @@ let test_submit_parity () =
   } in
   let read _ _ = fail "submission reached read capability" in
   let seen = ref [] in
-  let validate tx = seen := tx :: !seen; Ok "accepted-7" in
+  let validate tx = seen := tx :: !seen; Lwt.return_ok "accepted-7" in
   let dispatch validate =
     let handler params () = Submit.submit ~validate params in
     fun meta request -> Dispatch.handle_request meta request () ["octra_submit", handler]
@@ -331,7 +336,7 @@ let test_submit_parity () =
     | _ -> fail "submission parity failed")
     Tx.[Standard; EncryptOp; DecryptOp; StealthOp; ClaimOp; KeySwitch];
   List.iter (fun (code, message) ->
-    let submit = dispatch (fun _ -> Error (code, message)) in
+    let submit = dispatch (fun _ -> Lwt.return_error (code, message)) in
     let params = `List [Tx.to_yojson tx] in
     let request = Rpc.{ jsonrpc = "2.0"; method_ = "octra_submit"; params; id = `Null } in
     let expected = Lwt_main.run (submit meta request) in
@@ -421,7 +426,155 @@ let test_submit_depth () =
       [0; Rpc.max_param_depth - 2; Rpc.max_param_depth - 1; 32])
     [(fun value -> `List [value]); (fun value -> `Assoc ["value", value])]
 
+let reward_chain = "octra-devnet-9871-cluster"
+
+let reward_epoch =
+  match Octra_consensus.C_quorum_policy.seatless_activation_for_chain reward_chain with
+  | Some activation -> activation.activation_epoch
+  | None -> fail "reward activation missing"
+
+let reward_cases = [
+  reward_chain, [reward_epoch - 1, false; reward_epoch, true; reward_epoch + 1, true];
+  "reward-other", [reward_epoch - 1, false; reward_epoch, false; reward_epoch + 1, false];
+]
+
+let reward_summary epoch active =
+  let recipients = `List [
+    `Assoc ["address", `String "octA"; "role", `String "proposer_validator"; "amount", `String "93"];
+    `Assoc ["address", `String "octB"; "role", `String "validator"; "amount", `String "7"];
+  ] in
+  `Assoc ([
+    "epoch_id", `Int epoch; "tx_count", `Int 0;
+    "finalized_by", `String "octA"; "finalized_at", `Float 1.0;
+    "parent_commit", `String "parent";
+    "state_root", `String "state"; "tree_hash", `String "state";
+    "fees_total", `String "0"; "fees_burned", `String "0";
+    "base_reward", `String "100"; "total_reward", `String "100";
+    "proposer_reward", (if active then `Null else `String "70");
+    "validator_reward_each", (if active then `Null else `String "15");
+    "reward_recipients", recipients;
+  ] @ if active then [
+    "reward_fields_deprecated", `List [`String "proposer_reward"; `String "validator_reward_each"];
+  ] else [])
+
+let reward_raw epoch =
+  Printf.sprintf
+    {|{"id":%d,"state_root":"state","prev_state_root":"previous","parent_commit":"parent","start_txid":"0","tx_count":0,"finalized_by":"octA","finalized_at":1.0,"creator_addr":"octA","commit_round":0,"fees_total":"0","fees_burned":"0","base_reward":"100","total_reward":"100","proposer_reward":"70","validator_reward_each":"15","reward_recipients":[{"address":"octA","role":"proposer_validator","amount":"93"},{"address":"octB","role":"validator","amount":"7"}],"reward_source":null}|}
+    epoch
+
+let reward_header id =
+  let plan = match Exec.build_reward_plan_with_base
+    ~fee_burn_active:false ~supply_retired:Z.zero ~base_reward:(Z.of_int 100)
+    ~validator_count:2 ~emission_remaining:(Z.of_int 100)
+    ~confirmed_fees:Z.zero ~prev_supply:Z.zero with
+    | Ok plan -> plan
+    | Error reason -> fail reason in
+  let reward = Exec.{
+    proposer_addr = "octA"; proposer_public_key = None;
+    validators = [
+      {address = "octB"; public_key = None; weight = Z.one};
+      {address = "octA"; public_key = None; weight = Z.of_int 3};
+    ];
+  } in
+  let credits = match Exec.reward_credits reward plan with
+    | Ok credits -> credits
+    | Error reason -> fail reason in
+  Epoch.{empty_epoch_header with
+    id; state_root = "state"; prev_state_root = "previous"; parent_commit = "parent";
+    finalized_by = "octA"; finalized_at = 1.0;
+    proposer = {creator_addr = "octA"; commit_round = 0};
+    base_reward = Z.to_string plan.base_reward;
+    total_reward = Z.to_string plan.total_reward;
+    proposer_reward = Z.to_string plan.proposer_total;
+    validator_reward_each = Z.to_string plan.each_validator;
+    reward_recipients = Octra_node_runtime.Consensus_epoch_apply_rewards.recipients credits;
+  }
+
+let test_reward_view () =
+  List.iter (fun (chain_id, cases) ->
+    List.iter (fun (epoch_id, active) ->
+      expect
+        (Rest.epoch_reward_view ~chain_id ~epoch_id (reward_summary epoch_id false)
+          = reward_summary epoch_id active)
+        "reward projection differs") cases) reward_cases
+
+let reward_routes store =
+  Rest.dispatch Rest.{
+    ledger_chaindata_params_read = (fun _ _ _ -> fail "unexpected reward search");
+    chain_chaindata_params_read = (fun f params (chain_id, _) -> f ~chain_id store ~params);
+    no_params = (fun f _ _ -> f ());
+    epoch_current = (fun _ (_, tree_ref) -> Rest.epoch_current ~tree_ref);
+    epoch_list = (fun params (_, tree_ref) -> Rest.epoch_list ~tree_ref ~params);
+    recommended_fee = (fun _ _ -> fail "unexpected reward fee request");
+  }
+
+let reward_call routes ~chain_id ~head meta request =
+  let tree_ref = ref (Tree.create ~epoch_id:head ~parent_commit:"parent") in
+  Dispatch.handle_request meta request (chain_id, tree_ref) routes
+
+let reward_request method_ params =
+  Rpc.{jsonrpc = "2.0"; method_; params; id = `Null}
+
+let check_reward_routes routes chain_id head cases =
+  let call = reward_call routes ~chain_id ~head in
+  let value method_ params =
+    match Lwt_main.run (call meta (reward_request method_ params)) with
+    | Rpc.Result (json, _) -> json
+    | Rpc.Error_ _ -> fail "reward endpoint refused" in
+  expect
+    (value "epoch_current" (`List []) = `Assoc ["epoch_id", `Int head; "roots", `Int 0])
+    "reward test head differs";
+  List.iter (fun (epoch, active) ->
+    let expected = reward_summary epoch active in
+    expect (value "epoch_get" (`List [`Int epoch]) = expected)
+      (Printf.sprintf "reward epoch_get differs epoch = %d head = %d" epoch head);
+    let reply = Lwt_main.run (Service.invoke ~call ~meta ~path:"/octra.node.v1.Node/Epoch"
+      (field_epoch (Int64.of_int epoch))) in
+    expect (reply.status.code = Status.Ok
+      && Option.map decode_json_reply reply.body = Some expected)
+      "reward gRPC reply differs") cases;
+  let order = [reward_epoch + 1; reward_epoch - 1; reward_epoch; reward_epoch] in
+  let ids = `List (List.map (fun epoch -> `Int epoch) (order @ [reward_epoch + 9])) in
+  let expected = `List (List.map (fun epoch ->
+    reward_summary epoch (List.assoc epoch cases)) order) in
+  List.iter (fun params ->
+    expect (value "epoch_summaries" params = expected) "reward epoch_summaries differs")
+    [ids; `List [ids]];
+  expect (value "epoch_summaries" (`List []) = `List []) "empty reward batch differs";
+  expect
+    (Lwt_main.run (call meta (reward_request "epoch_get" (`List [`Int (reward_epoch + 9)])))
+      = Rpc.Error_ (Rpc.not_found "epoch not found", `Null))
+    "missing reward epoch differs"
+
+let check_reward_bytes store epochs =
+  List.iter (fun epoch ->
+    let expected = reward_raw epoch in
+    expect (Octra_core.Chaindata_index.get_epoch (Store.index store) epoch = Some expected)
+      "stored reward index bytes differ";
+    expect (Epoch.read_entry store.Store.epochlog ~max_bytes:4096 epoch = Ok (Some expected))
+      "stored reward journal bytes differ";
+    expect (Store.get_epoch_summary store epoch = Some (reward_summary epoch false))
+      "stored reward scalars differ") epochs
+
+let test_reward_endpoints () =
+  let dir = Printf.sprintf "runtime_data/rpc-reward-%d-%.0f"
+    (Unix.getpid ()) (Unix.gettimeofday () *. 1_000_000.) in
+  let store = Store.open_chaindata dir in
+  Fun.protect ~finally:(fun () -> Store.close store) (fun () ->
+    let epochs = [reward_epoch - 1; reward_epoch; reward_epoch + 1] in
+    Store.begin_batch store;
+    List.iter (fun epoch -> Store.set_epoch store (reward_header epoch)) epochs;
+    Store.commit_batch store;
+    check_reward_bytes store epochs;
+    let routes = reward_routes store in
+    List.iter (fun (chain_id, cases) ->
+      List.iter (fun head -> check_reward_routes routes chain_id head cases)
+        [reward_epoch + 2; reward_epoch + 10_000]) reward_cases;
+    check_reward_bytes store epochs)
+
 let () =
+  test_reward_view ();
+  test_reward_endpoints ();
   test_config ();
   test_submit_config ();
   test_submit_proto ();

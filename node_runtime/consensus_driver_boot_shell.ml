@@ -115,8 +115,17 @@ let make_install (deps : deps) =
 let validator_state_height ~committed_head_epoch =
   Int64.of_int (committed_head_epoch ())
 
+let eviction_source (deps : deps) epoch_id =
+  let ( let* ) = Result.bind in
+  let* source = Consensus_parent_commit.create ~chain_id:deps.chain_id
+    ~data_dir:deps.data_dir ~chaindata:deps.chaindata deps.env in
+  match deps.cached_head () with
+  | None -> Error "validator source durable head is missing"
+  | Some head -> Consensus_parent_commit.set_at_head source ~epoch_id head
+
 let start_p2p (deps : deps) =
   Startup_p2p_shell.start_node
+    ~eviction_source:(eviction_source deps)
     Startup_p2p_shell.{
       getenv = deps.env;
       info = Log.info "init" "%s";
@@ -217,7 +226,8 @@ let validator_anchor (deps : deps) =
 let selected_pending ?repair (deps : deps) =
   Consensus_finality_journal.read_selected ?repair ~chain_id:deps.chain_id
     ~expected_set:(fun epoch ->
-      Consensus_validator_anchor.expected_set (validator_anchor deps) ~epoch)
+      Consensus_validator_anchor.expected_set ~eviction_source:(eviction_source deps)
+        (validator_anchor deps) ~epoch)
     deps.data_dir
 
 let startup_pending (deps : deps) =
@@ -335,7 +345,8 @@ let startup_backlog ?genesis (deps : deps) pending =
           Consensus_finality_journal.read_replay_backlog
             ~chain_id:deps.chain_id
             ~expected_set:(fun epoch ->
-              Consensus_validator_anchor.expected_set (validator_anchor deps) ~epoch)
+              Consensus_validator_anchor.expected_set ~eviction_source:(eviction_source deps)
+                (validator_anchor deps) ~epoch)
             ~head_epoch
             ~head_root
             deps.data_dir);
@@ -408,7 +419,8 @@ let repair_set ?policy (deps : deps) epoch =
     | None -> Int64.max epoch (Int64.of_int !(deps.current_epoch)) in
   if Octra_consensus.C_quorum_policy.select policy current = Octra_consensus.C_quorum_policy.Stake
   then finality_set deps epoch
-  else Consensus_validator_anchor.expected_set (validator_anchor deps) ~epoch
+  else Consensus_validator_anchor.expected_set ~eviction_source:(eviction_source deps)
+    (validator_anchor deps) ~epoch
 
 let attest_committed (deps : deps) validator_set =
   check_conflict deps;
@@ -554,8 +566,6 @@ let check_finality_proof (deps : deps) validator_set finalize =
 
 let finality_runtime (deps : deps) =
   let keep validator_set finalize =
-    if validator_set.Octra_consensus.C_types.authors = None then Lwt.return_unit
-    else
       let chain = Sync_chain.{data_dir = deps.data_dir; chain_id = deps.chain_id;
         store = deps.store; chaindata = deps.chaindata;
         read_finality = (fun epoch -> Consensus_finality_journal.read_committed_epoch
@@ -616,6 +626,7 @@ let run_catchup_to_target (deps : deps) normalize finality_runtime =
         Result.map
           Octra_consensus.C_config.validator_set_hash
           (Consensus_validator_anchor.expected_set
+             ~eviction_source:(eviction_source deps)
              validator_anchor
              ~epoch));
       catchup_active = deps.catchup_active;
@@ -802,6 +813,28 @@ let driver_config (deps : deps) p2p_start p2p gates run_catchup_to_target
       p2p_start.Startup_p2p_shell.load_scheduled_validator_set_config;
   }
 
+let health_root_set (deps : deps) epoch =
+  if not (deps.state_readable ()) || epoch < 0L || epoch > Int64.of_int max_int then None
+  else
+    let root = committed_root_at_epoch deps (Int64.to_int epoch) in
+    let accept finalize set =
+      if finalize.Octra_consensus.C_types.epoch_id = epoch
+          && Some finalize.header.proposed_state_root = root then Some set else None in
+    match deps.finality.find_finalized_with_set (Int64.to_int epoch) with
+    | Some (finalize, set) -> accept finalize set
+    | None -> match Consensus_finality_journal.read_committed_epoch
+        ~chain_id:deps.chain_id ~epoch deps.data_dir with
+      | Consensus_finality_journal.Valid record ->
+        accept record.finalize record.validator_set
+      | Consensus_finality_journal.Missing | Consensus_finality_journal.Invalid _ -> None
+
+let health_head_time (deps : deps) epoch =
+  if not (deps.state_readable ()) then None else
+  match Octra_core.Store_chaindata.get_bound_epoch_header deps.chaindata epoch with
+  | Ok header when Some (deps.root_to_raw32 header.Octra_core.Epochlog.state_root)
+      = deps.committed_epoch_root_raw epoch -> Some header.finalized_at
+  | Ok _ | Error _ -> None
+
 let health (deps : deps) normalize finality_runtime fork_repair_runtime
     run_catchup_to_target =
   let drain_pending =
@@ -815,7 +848,7 @@ let health (deps : deps) normalize finality_runtime fork_repair_runtime
       let allowed () =
         not !(deps.catchup_active) && deps.state_readable ()
         && (not (Consensus_runtime_state.quarantine_active deps.runtime_state)
-          || Consensus_runtime_state.root_attestation_recovers
+          || Consensus_runtime_state.root_range_recovers
             (Consensus_runtime_state.quarantine_reason deps.runtime_state)) in
       let epoch_time = Option.map (fun header -> header.Octra_core.Epochlog.finalized_at)
         (Octra_core.Store_chaindata.get_epoch_header deps.chaindata head) in
@@ -834,12 +867,15 @@ let health (deps : deps) normalize finality_runtime fork_repair_runtime
           verify_http = S.check_qcs ~chain_id:deps.chain_id
             ~expected_validator_set_hash:(fun epoch ->
               Result.map Octra_consensus.C_config.validator_set_hash
-                (Consensus_validator_anchor.expected_set anchor ~epoch))
+                (Consensus_validator_anchor.expected_set ~eviction_source:(eviction_source deps)
+                  anchor ~epoch))
             ~start_txid:(deps.next_txid ());
         } in
         S.probe_range query ~now:deps.now ~head:(Int64.of_int head)
           ~current_head:(fun () -> Int64.of_int (deps.committed_head_epoch ()))
           ~allowed ~run_catchup:(run_catchup_to_target driver));
+    root_set = health_root_set deps;
+    head_time = health_head_time deps;
     env_int = deps.env_int;
     getenv = deps.env;
     soft_catchup_max_lag = deps.soft_catchup_max_lag;
@@ -871,7 +907,7 @@ let health (deps : deps) normalize finality_runtime fork_repair_runtime
     finality = deps.finality;
   }
 
-let pending (deps : deps) run_catchup_to_target ~epoch =
+let pending_runtime (deps : deps) run_catchup_to_target ~epoch =
   let anchor = validator_anchor deps in
   Result.map (fun validator_set -> Consensus_pending_commit_recovery.{
     data_dir = deps.data_dir;
@@ -879,11 +915,16 @@ let pending (deps : deps) run_catchup_to_target ~epoch =
     run_catchup_to_target;
     chain_id = deps.chain_id;
     select_set = (fun ~epoch ~round ->
-      Consensus_validator_anchor.expected_set ~round anchor ~epoch);
+      Consensus_validator_anchor.expected_set ~eviction_source:(eviction_source deps)
+        ~round anchor ~epoch);
     store_bundle = deps.bundle_runtime.store_bundle;
     validator_count = validator_set.Octra_consensus.C_types.n;
-    quorum = validator_set.quorum;
-  }) (Consensus_validator_anchor.expected_set anchor ~epoch)
+    reached = (fun responders ->
+      Octra_consensus.C_types.promise_at ~chain_id:deps.chain_id ~epoch_id:epoch
+        validator_set responders);
+    level = Octra_consensus.C_measure.promise_text
+      (Octra_consensus.C_types.space ~chain_id:deps.chain_id ~epoch_id:epoch validator_set);
+  }) (Consensus_validator_anchor.expected_set ~eviction_source:(eviction_source deps) anchor ~epoch)
 
 let durable_start_height (deps : deps) =
   let current = Int64.of_int !(deps.current_epoch) in
@@ -994,6 +1035,16 @@ let resume_fork (deps : deps) =
       head
       dropped
 
+let validator_set_epoch ~height (config : Validator_config.t) =
+  let active = Option.map (fun update -> update.Octra_core.Validator_set_update.activate_epoch)
+    config.active_update in
+  let pending = Option.map (fun update -> update.Octra_consensus.C_driver.activate_epoch)
+    config.scheduled_driver_config in
+  List.filter_map Fun.id [active; pending]
+  |> List.filter (fun epoch -> epoch >= 0L && epoch <= height)
+  |> List.fold_left (fun current epoch ->
+    Some (Option.fold ~none:epoch ~some:(Int64.max epoch) current)) None
+
 let run_driver (deps : deps) p2p_start p2p normalize finality_runtime
     run_catchup_to_target finality_proof_needed =
   check_conflict deps;
@@ -1008,6 +1059,7 @@ let run_driver (deps : deps) p2p_start p2p normalize finality_runtime
   in
   let stake_set =
     match Consensus_validator_anchor.stake_set
+      ~eviction_source:(eviction_source deps)
       (validator_anchor deps) ~epoch:start_height with
     | Ok selected -> selected
     | Error reason -> refuse reason
@@ -1022,7 +1074,13 @@ let run_driver (deps : deps) p2p_start p2p normalize finality_runtime
    | Ok () -> ()
    | Error reason -> refuse reason);
   let p2p = {p2p with Startup_p2p_shell.stake_vs = stake_set; active_vs = start_set} in
-  ignore (Consensus_driver_launch_shell.run ~resolve:(repair_set deps)
+  let resolve epoch =
+    if epoch = start_height then
+      Consensus_validator_anchor.expected_set ~eviction_source:(eviction_source deps)
+        (validator_anchor deps) ~epoch
+    else repair_set deps epoch in
+  let set_epoch = validator_set_epoch ~height:start_height p2p.validator_config in
+  ignore (Consensus_driver_launch_shell.run ~resolve ?set_epoch
     Consensus_driver_launch_shell.{
       driver_config =
         driver_config deps p2p_start p2p gates run_catchup_to_target
@@ -1044,7 +1102,7 @@ let run_driver (deps : deps) p2p_start p2p normalize finality_runtime
       health =
         health deps normalize finality_runtime fork_repair
           run_catchup_to_target;
-      pending = (match pending deps run_catchup_to_target ~epoch:start_height with
+      pending = (match pending_runtime deps run_catchup_to_target ~epoch:start_height with
         | Ok saved -> saved
         | Error reason -> refuse reason);
       recovery_pending = (fun () ->

@@ -20,4 +20,7 @@ val check_rule :
 val check_outcome :
   chain_id:string -> epoch:int64 -> receipts:string list ->
   Transaction.t list -> (unit, string) result
-val check_charged : Rule_graph.mode -> Tx_outcome.rejection list -> (unit, string) result
+val charged_operation : compute:Rule_graph.mode -> program:Rule_graph.mode ->
+  error_type:string -> Transaction.op_type -> bool
+val check_charged : program:Rule_graph.mode -> Rule_graph.mode ->
+  Tx_outcome.rejection list -> (unit, string) result

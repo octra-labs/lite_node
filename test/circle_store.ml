@@ -35,9 +35,16 @@ let legacy ~epoch:_ ~address:_ ~cipher:_ = failwith "unexpected private replay"
 let result_policy _ = Octra_core.Private_result_policy.Recoverable
 let metadata store key = N.Node_rest_facade.run_s (S.get_meta store key)
 
-let receipts sample = List.map (fun receipt ->
-  Octra_core.Preverify_receipt.to_yojson receipt |> Yojson.Safe.to_string)
-  sample.prepared.preverify.receipts
+let receipts sample =
+  let refused = sample.prepared.execution.artifacts.rejected in
+  let charged = List.filter_map (fun (row : X.tx_reject) ->
+    if row.charged then Some row.tx else None) refused in
+  let rejections = Octra_core.Tx_outcome.build ~charged ~inputs:sample.txs
+    (List.map (fun (row : X.tx_reject) -> row.tx, row.error_type, row.reason) refused)
+    |> P.unwrap in
+  Octra_core.Tx_outcome.encode (List.map (fun receipt ->
+    Octra_core.Preverify_receipt.to_yojson receipt |> Yojson.Safe.to_string)
+    sample.prepared.preverify.receipts) rejections
 
 let seed ?(create = true) dir epoch = C.with_stores dir (fun chaindata store ->
   let identities = List.init 8 (fun i -> P.identity (i + 1))
@@ -58,6 +65,7 @@ let seed ?(create = true) dir epoch = C.with_stores dir (fun chaindata store ->
       "last_epoch", string_of_int (epoch - 1); "current_epoch", string_of_int epoch;
       "total_supply", Z.to_string (L.get_total_supply ledger); "emission_remaining", "0";
     ];
+    P.seed_execution store (epoch - 1);
     let registry = `Assoc [
       "standard", `String Octra_core.Validator_policy.standard_name;
       "candidates", `List [`Assoc [
@@ -141,6 +149,8 @@ let apply dir sample point mode = C.with_stores dir (fun chaindata store ->
   let epoch = env.epoch_id in
   let ledger = L.create store in
   let pending = ref [] and fees = ref Z.zero and processed = ref [] in
+  let rejected = ref [] in
+  let confirmed = List.map fst sample.prepared.execution.artifacts.confirmed in
   let abort () = failwith "unexpected mixed epoch refusal" in
   C.HM.cached := Some sample.head;
   P.unwrap (L.begin_journal ledger);
@@ -148,7 +158,8 @@ let apply dir sample point mode = C.with_stores dir (fun chaindata store ->
     |> Result.map_error G.fault_message |> P.unwrap in
   Lwt_main.run (S.begin_epoch_batch ~mode:account_mode store);
   D.begin_batch chaindata;
-  let preverify = Gate.gate_of_strings ~required:true (receipts sample)
+  let outcomes = Octra_core.Tx_outcome.split (receipts sample) |> P.unwrap in
+  let preverify = Gate.gate_of_strings ~required:true outcomes.preverify
     |> P.unwrap |> Option.get in
   Lwt_main.run @@
   let* applied = N.Consensus_epoch_apply_shared.run_node
@@ -164,11 +175,14 @@ let apply dir sample point mode = C.with_stores dir (fun chaindata store ->
       total_tx_count = ref 0; confirmed_fees = fees; processed_hashes = processed;
       short = Fun.id; log_shared = (fun ~tx_count:_ -> ()); fatal = failwith; exit = abort;
       notify_new_account = (fun _ -> ()); notify_confirmed = (fun _ _ -> ());
-      notify_rejected = (fun _ reason -> failwith reason);
+      notify_rejected = (fun tx reason -> rejected := (tx, reason) :: !rejected);
       legacy_replay = legacy; private_result_policy = result_policy;
     } sample.txs in
   P.expect "mixed apply deferred work" (!(applied.deferred_stealth_txs) = []);
-  P.expect "mixed apply lost inputs" (List.rev_map fst !pending = sample.txs);
+  P.expect "mixed apply lost inputs" (List.rev_map fst !pending = confirmed);
+  P.expect "mixed apply refusals differ"
+    (List.rev !rejected = List.map (fun (row : X.tx_reject) -> row.tx, row.reason)
+      sample.prepared.execution.artifacts.rejected);
   P.expect "mixed apply fees differ"
     (Z.equal !fees sample.prepared.execution.artifacts.confirmed_fees);
   let* finalized = F.run (F.node_effects {store; ledger; get_meta = metadata store}) {
@@ -179,11 +193,11 @@ let apply dir sample point mode = C.with_stores dir (fun chaindata store ->
     validator_addr = env.proposer_addr; validator_pubkeys = env.validator_pubkeys;
     active_validators = env.validator_addrs; reward = sample.reward;
     ready_state_root_at = ready_root; ready_max_lag = 0; confirmed_fees = !fees;
-    confirmed_txs = sample.txs; deferred_count = 0; short = Fun.id;
+    confirmed_txs = confirmed; deferred_count = 0; short = Fun.id;
   } in
   let _, index = C.Eic.next_root_from_hashes_i64
     ~prev:(Option.get sample.head.epoch_index_root) ~epoch_id:(Int64.of_int epoch)
-    ~start_txid:1L (List.map T.hash sample.txs) in
+    ~start_txid:(Int64.succ sample.head.txid_hi) (List.map T.hash confirmed) in
   let expected = C.Eic.folded_state_root
     ~ledger_state_root:sample.prepared.execution.post_state_root ~epoch_index_root:index in
   let effects = A.node_effects {data_dir = dir; store; ledger; chaindata;
@@ -210,7 +224,7 @@ let apply dir sample point mode = C.with_stores dir (fun chaindata store ->
     proposer_info = {creator_addr = env.proposer_addr; commit_round = 0};
     proposer_source = "local"; round = 0; validators = List.length env.validator_addrs;
     validators_sha = ""; ordered_txs_count = List.length sample.txs;
-    confirmed_txs = sample.txs; confirmed_count = List.length sample.txs;
+    confirmed_txs = confirmed; confirmed_count = List.length confirmed;
     confirmed_fees = !fees; plan = finalized.plan;
     prev_supply = finalized.reward_meta.prev_supply;
     emission_remaining = finalized.reward_meta.emission_remaining;
@@ -225,6 +239,7 @@ let apply dir sample point mode = C.with_stores dir (fun chaindata store ->
   Lwt.return_unit)
 
 let inspect dir sample committed = C.with_stores dir (fun chaindata store ->
+  let confirmed = List.map fst sample.prepared.execution.artifacts.confirmed in
   let head = Option.get (C.HM.load dir) in
   let root = if committed then sample.prepared.execution.post_state_root
     else C.HM.ledger_state_root sample.head in
@@ -233,7 +248,8 @@ let inspect dir sample committed = C.with_stores dir (fun chaindata store ->
     (head.epoch_id = sample.env.epoch_id - (if committed then 0 else 1)
      && C.HM.ledger_state_root head = root);
   P.expect "recovery mixed cursor differs"
-    (head.txid_hi = (if committed then Int64.of_int (List.length sample.txs) else 0L)
+    (head.txid_hi = Int64.add sample.head.txid_hi
+      (if committed then Int64.of_int (List.length confirmed) else 0L)
      && D.next_txid chaindata = Int64.succ head.txid_hi);
   P.expect "recovery retained mixed WAL" (C.Wal.read_pending dir = []);
   P.expect "recovery retained mixed auxiliary journal"
@@ -244,27 +260,29 @@ let inspect dir sample committed = C.with_stores dir (fun chaindata store ->
     (record = C.EL.get chaindata.epochlog epoch && Option.is_some record = committed);
   Option.iter (fun (record : C.EL.epoch_header) ->
     P.expect "recovery epoch range differs"
-      (record.start_txid = 1L && record.tx_count = List.length sample.txs
+      (record.start_txid = Int64.succ sample.head.txid_hi && record.tx_count = List.length confirmed
        && record.state_root = head.state_root && record.prev_state_root = sample.head.state_root);
     P.expect "recovery preverify receipts differ"
       (Octra_core.Preverify_receipt_store.read dir ~epoch_id:epoch = Some (receipts sample))) record;
   List.iter (fun tx ->
+    let visible = committed && List.mem tx confirmed in
     P.expect "recovery transaction visibility differs"
-      (Option.is_some (D.get_tx_by_hash chaindata (T.hash tx)) = committed);
+      (Option.is_some (D.get_tx_by_hash chaindata (T.hash tx)) = visible);
     let account = Option.get (Lwt_main.run (S.get_account store tx.T.from)) in
-    P.expect "recovery transaction nonce differs" (account.nonce = if committed then 1 else 0);
-    if tx.T.op_type = T.CircleCall then
+    P.expect "recovery transaction nonce differs" (account.nonce = if committed then tx.nonce else tx.nonce - 1);
+    if tx.T.op_type = T.CircleCall && List.mem tx confirmed then
       P.expect "recovery circle receipt visibility differs"
         (Option.is_some (D.get_contract_receipt chaindata ~tx_hash:(T.hash tx)) = committed)
   ) sample.txs;
   head)
 
 let signed sample head =
+  let confirmed = List.map fst sample.prepared.execution.artifacts.confirmed in
   let header = CT.{
     proto_version = proto_version_current; chain_id = P.chain;
     epoch_id = Int64.of_int head.C.HM.epoch_id;
     prev_state_root = P.root_raw sample.head.state_root;
-    tx_list_hash = N.Consensus_proposal.tx_list_hash (List.map T.hash sample.txs);
+    tx_list_hash = N.Consensus_proposal.tx_list_hash (List.map T.hash confirmed);
     receipt_root = H.receipt_root (receipts sample);
     proposed_state_root = P.root_raw head.state_root;
     parent_commit_hash = H.parent_commit_hash sample.parent;
@@ -282,8 +300,9 @@ let signed sample head =
     proposal_id; precommits; parent_commit = Some sample.parent}
 
 let stage dir sample finalize =
+  let confirmed = List.map fst sample.prepared.execution.artifacts.confirmed in
   Journal.stage dir ~chain_id:P.chain ~validator_set:sample.parent.validator_set
-    ~bundle:{tx_hashes = List.map T.hash sample.txs; txs = sample.txs;
+    ~bundle:{tx_hashes = List.map T.hash confirmed; txs = confirmed;
       receipts_json = receipts sample} finalize |> ignore
 
 let read_range dir sample = C.with_stores dir (fun chaindata _ ->

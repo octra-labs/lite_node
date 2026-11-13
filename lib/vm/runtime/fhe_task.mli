@@ -34,10 +34,11 @@ type actor
 type local
 
 val eval : request -> (value, error) result
+val input_bytes : request -> int
 val local : unit -> local
 val direct : local -> request -> (value, error) result
 val key_effort : request -> int option
-val create : ?clock:(unit -> int64) ->
+val create : ?memory:Octra_core.Compute_memory.t -> ?clock:(unit -> int64) ->
   ?reap:(Octra_core.Pvac_verify_worker.session -> unit Lwt.t) -> unit -> actor
 val run : ?actor:actor -> ?urgent:bool -> ticket:Proof_wait.ticket -> deadline:int64 -> request ->
   (value, error) result Lwt.t

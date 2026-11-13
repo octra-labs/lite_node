@@ -269,7 +269,40 @@ let vm_bytes_activation_for_chain chain_id =
 
 let cipher_activation_for_chain = vm_bytes_activation_for_chain
 
+let devnet_work_activation = {
+  anchor_epoch = 1_829_338;
+  anchor_state_root = "621bc1164a85fc654cc8aeb34e8b23e8146edbc8448c4fbba5e8f9debcdd70af";
+  activation_epoch = 1_842_000;
+}
+
+let scalar_work_activation_for_chain chain_id =
+  if String.equal chain_id devnet_chain_id then Some devnet_work_activation else None
+
 let settle_activation_for_chain _ : activation option = None
+
+let source_create_activation_for_chain = scalar_work_activation_for_chain
+
+let program_result_activation_for_chain = scalar_work_activation_for_chain
+
+let program_result_order ~result ~program ~envelope ~bytes =
+  match result with
+  | None -> Ok ()
+  | Some result ->
+    ["program_source", program; "tx_envelope", envelope; "vm_bytes", bytes]
+    |> List.fold_left (fun checked (name, plan) -> Result.bind checked (fun () ->
+      match plan with
+      | Some plan when plan.activation_epoch <= result.activation_epoch -> Ok ()
+      | Some _ -> Error ("program_result precedes " ^ name)
+      | None -> Error ("program_result requires " ^ name))) (Ok ())
+
+let program_result_plan chain_id =
+  let result = program_result_activation_for_chain chain_id in
+  match program_result_order ~result
+    ~program:(program_source_activation_for_chain chain_id)
+    ~envelope:(tx_envelope_activation_for_chain chain_id)
+    ~bytes:(vm_bytes_activation_for_chain chain_id) with
+  | Ok () -> result
+  | Error reason -> invalid_arg reason
 
 let stake_activation_for_chain chain_id : activation option =
   Option.map (fun (plan : Octra_consensus.C_quorum_policy.activation) -> {
@@ -280,12 +313,44 @@ let stake_activation_for_chain chain_id : activation option =
 
 let program_records_activation_for_chain = stake_activation_for_chain
 
+let seatless_activation_for_chain chain_id : activation option =
+  Option.map (fun (plan : Octra_consensus.C_quorum_policy.activation) -> {
+    anchor_epoch = plan.anchor_epoch;
+    anchor_state_root = plan.anchor_state_root;
+    activation_epoch = plan.activation_epoch;
+  }) (Octra_consensus.C_quorum_policy.seatless_activation_for_chain chain_id)
+
 let duty_marks_activation_for_chain = stake_activation_for_chain
 
 let proof_key_activation_for_chain = stake_activation_for_chain
 
+let source_order ~source ~program ~records ~scalar ~proof ~fhe ~bytes ~points =
+  match source with
+  | None -> Ok ()
+  | Some source ->
+    ["program_source", program; "program_records", records; "scalar_work", scalar;
+     "proof_exec", proof; "fhe_work", fhe; "vm_bytes", bytes; "standard", points]
+    |> List.fold_left (fun result (name, plan) -> Result.bind result (fun () ->
+      match plan with
+      | Some plan when plan.activation_epoch <= source.activation_epoch -> Ok ()
+      | Some _ -> Error ("source_create precedes " ^ name)
+      | None -> Error ("source_create requires " ^ name))) (Ok ())
+
+let source_plan chain_id =
+  let source = source_create_activation_for_chain chain_id in
+  match source_order ~source ~program:(program_source_activation_for_chain chain_id)
+    ~records:(program_records_activation_for_chain chain_id)
+    ~scalar:(scalar_work_activation_for_chain chain_id) ~proof:(proof_activation_for_chain chain_id)
+    ~fhe:(fhe_work_activation_for_chain chain_id) ~bytes:(vm_bytes_activation_for_chain chain_id)
+    ~points:(standard_activation_for_chain chain_id) with
+  | Ok () -> source
+  | Error reason -> invalid_arg reason
+
 let profile_epochs ~chain_id =
-  [tx_network_activation_for_chain chain_id;
+  [program_result_plan chain_id;
+   source_plan chain_id;
+   scalar_work_activation_for_chain chain_id;
+   tx_network_activation_for_chain chain_id;
    standard_activation_for_chain chain_id;
    set_plan_activation_for_chain chain_id;
    math_activation_for_chain chain_id;
@@ -302,7 +367,8 @@ let profile_epochs ~chain_id =
    settle_activation_for_chain chain_id;
    program_records_activation_for_chain chain_id;
    duty_marks_activation_for_chain chain_id;
-   proof_key_activation_for_chain chain_id]
+   proof_key_activation_for_chain chain_id;
+   seatless_activation_for_chain chain_id]
   |> List.filter_map (Option.map (fun value -> value.activation_epoch))
   |> List.sort_uniq Int.compare
 
@@ -442,6 +508,22 @@ let consensus_id ~chain_id ~epoch =
     match tx_network_activation_for_chain chain_id with
     | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
     | Some _ | None -> plans)
+  |> (fun plans ->
+    match scalar_work_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
+  |> (fun plans ->
+    match source_plan chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
+  |> (fun plans ->
+    match program_result_plan chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
+  |> (fun plans ->
+    match seatless_activation_for_chain chain_id with
+    | Some plan when epoch >= plan.activation_epoch -> plans @ [Some plan]
+    | Some _ | None -> plans)
   |> List.map activation_id
   |> String.concat "|"
 
@@ -499,56 +581,6 @@ let set_plan_activation t = t.set_plan_activation
 let math_activation t = t.math_activation
 let exit_activation t = t.exit_activation
 let ready_config_hash t = t.ready_config_hash
-
-let root_after_floor ~chain_id ~floor_epoch ~epoch =
-  if String.equal chain_id devnet_chain_id
-     && epoch = devnet_circle_activation.anchor_epoch
-     && floor_epoch >= devnet_circle_activation.activation_epoch then
-    Some devnet_circle_activation.anchor_state_root
-  else
-    let activations = [
-      validator_quorum_activation_for_chain chain_id;
-      epoch_time_activation_for_chain chain_id;
-      owner_migration_activation_for_chain chain_id;
-      wasm_compute_activation_for_chain chain_id;
-      private_payload_activation_for_chain chain_id;
-      set_fold_activation_for_chain chain_id;
-      validator_ready_activation_for_chain chain_id;
-      ready_ref_activation_for_chain chain_id;
-      set_live_activation_for_chain chain_id;
-      set_fold_cap_activation_for_chain chain_id;
-      set_open_activation_for_chain chain_id;
-      object_cost_activation_for_chain chain_id;
-      account_pack_activation_for_chain chain_id;
-      standard_activation_for_chain chain_id;
-      set_plan_activation_for_chain chain_id;
-      math_activation_for_chain chain_id;
-      exit_activation_for_chain chain_id;
-      ready_exec_activation_for_chain chain_id;
-      program_source_activation_for_chain chain_id;
-      tx_envelope_activation_for_chain chain_id;
-      fhe_work_activation_for_chain chain_id;
-      wasm_float_activation_for_chain chain_id;
-      batch_activation_for_chain chain_id;
-      proof_activation_for_chain chain_id;
-      vm_bytes_activation_for_chain chain_id;
-      cipher_activation_for_chain chain_id;
-      settle_activation_for_chain chain_id;
-      stake_activation_for_chain chain_id;
-      program_records_activation_for_chain chain_id;
-      duty_marks_activation_for_chain chain_id;
-      proof_key_activation_for_chain chain_id;
-      tx_network_activation_for_chain chain_id;
-    ] in
-    List.find_map
-      (function
-        | Some activation
-          when epoch = activation.anchor_epoch
-               && floor_epoch >= activation.anchor_epoch ->
-          Some activation.anchor_state_root
-        | Some _
-        | None -> None)
-      activations
 
 let verify_anchor root_at activation =
   match root_at activation.anchor_epoch with
@@ -684,9 +716,22 @@ let proof_exec t ~epoch = mode t (proof_activation_for_chain t.chain_id) ~epoch
 
 let vm_bytes t ~epoch = mode t (vm_bytes_activation_for_chain t.chain_id) ~epoch
 
+let scalar_work t ~epoch = mode t (scalar_work_activation_for_chain t.chain_id) ~epoch
+
+let source_create t ~epoch = mode t (source_plan t.chain_id) ~epoch
+
+let program_result t ~epoch = mode t (program_result_plan t.chain_id) ~epoch
+
 let settle t ~epoch = mode t (settle_activation_for_chain t.chain_id) ~epoch
 
 let stake t ~epoch = mode t (stake_activation_for_chain t.chain_id) ~epoch
+
+let seatless t ~epoch = mode t (seatless_activation_for_chain t.chain_id) ~epoch
+
+let seatless_at ~chain_id ~epoch =
+  match seatless_activation_for_chain chain_id with
+  | Some plan when epoch >= plan.activation_epoch -> Active
+  | Some _ | None -> Prior
 
 let program_records t ~epoch =
   mode t (program_records_activation_for_chain t.chain_id) ~epoch
@@ -732,6 +777,21 @@ let cipher_migration_at ~chain_id ~epoch =
 
 let vm_bytes_at ~chain_id ~epoch =
   match vm_bytes_activation_for_chain chain_id with
+  | Some plan when epoch >= plan.activation_epoch -> Active
+  | Some _ | None -> Prior
+
+let scalar_work_at ~chain_id ~epoch =
+  match scalar_work_activation_for_chain chain_id with
+  | Some plan when epoch >= plan.activation_epoch -> Active
+  | Some _ | None -> Prior
+
+let source_create_at ~chain_id ~epoch =
+  match source_plan chain_id with
+  | Some plan when epoch >= plan.activation_epoch -> Active
+  | Some _ | None -> Prior
+
+let program_result_at ~chain_id ~epoch =
+  match program_result_plan chain_id with
   | Some plan when epoch >= plan.activation_epoch -> Active
   | Some _ | None -> Prior
 
@@ -799,6 +859,74 @@ let standard_at ~chain_id ~epoch =
   | Some activation when epoch >= activation.activation_epoch -> Active
   | Some _
   | None -> Prior
+
+type check = {
+  name : string;
+  activation : activation option;
+  evaluate : epoch:int -> (mode, fault) result;
+}
+
+type start = Awaiting of activation | Checked of mode
+
+let check_specs = [
+  "circle", circle_activation_for_chain, circle;
+  "validator_quorum", validator_quorum_activation_for_chain, validator_quorum;
+  "epoch_time", epoch_time_activation_for_chain, epoch_time;
+  "owner_migration", owner_migration_activation_for_chain, owner_migration;
+  "wasm_compute", wasm_compute_activation_for_chain, wasm_compute;
+  "private_payload", private_payload_activation_for_chain, private_payload;
+  "set_fold", set_fold_activation_for_chain, set_fold;
+  "validator_ready", validator_ready_activation_for_chain, validator_ready;
+  "ready_ref", ready_ref_activation_for_chain, ready_ref;
+  "set_live", set_live_activation_for_chain, set_live;
+  "set_fold_cap", set_fold_cap_activation_for_chain, set_fold_cap;
+  "set_open", set_open_activation_for_chain, set_open;
+  "object_cost", object_cost_activation_for_chain, object_cost;
+  "account_pack", account_pack_activation_for_chain, account_pack;
+  "standard", standard_activation_for_chain, standard;
+  "set_plan", set_plan_activation_for_chain, set_plan;
+  "math", math_activation_for_chain, math;
+  "exit", exit_activation_for_chain, exit;
+  "ready_exec", ready_exec_activation_for_chain, ready_exec;
+  "program_source", program_source_activation_for_chain, program_source;
+  "tx_envelope", tx_envelope_activation_for_chain, tx_envelope;
+  "fhe_work", fhe_work_activation_for_chain, fhe_work;
+  "wasm_float", wasm_float_activation_for_chain, wasm_float;
+  "circle_batch", batch_activation_for_chain, circle_batch;
+  "proof_exec", proof_activation_for_chain, proof_exec;
+  "vm_bytes", vm_bytes_activation_for_chain, vm_bytes;
+  "scalar_work", scalar_work_activation_for_chain, scalar_work;
+  "source_create", source_plan, source_create;
+  "program_result", program_result_plan, program_result;
+  "cipher_migration", cipher_activation_for_chain, cipher_migration;
+  "settle", settle_activation_for_chain, settle;
+  "stake", stake_activation_for_chain, stake;
+  "program_records", program_records_activation_for_chain, program_records;
+  "duty_marks", duty_marks_activation_for_chain, duty_marks;
+  "proof_key", proof_key_activation_for_chain, proof_key;
+  "tx_network", tx_network_activation_for_chain, tx_network;
+  "seatless", seatless_activation_for_chain, seatless;
+]
+
+let startup_checks t = List.map (fun (name, plan, evaluate) ->
+  {name; activation = plan t.chain_id; evaluate = evaluate t}) check_specs
+
+let check_start check ~epoch = match check.activation with
+  | Some activation when epoch <= activation.anchor_epoch -> Ok (Awaiting activation)
+  | activation ->
+    let at = Option.fold ~none:0 ~some:(fun plan -> plan.activation_epoch) activation in
+    Result.map (fun mode -> Checked mode) (check.evaluate ~epoch:at)
+
+let root_after_floor ~chain_id ~floor_epoch ~epoch =
+  if String.equal chain_id devnet_chain_id
+     && epoch = devnet_circle_activation.anchor_epoch
+     && floor_epoch >= devnet_circle_activation.activation_epoch then
+    Some devnet_circle_activation.anchor_state_root
+  else List.find_map (fun (name, plan, _) ->
+    match if name = "circle" then None else plan chain_id with
+    | Some activation when epoch = activation.anchor_epoch
+        && floor_epoch >= activation.anchor_epoch -> Some activation.anchor_state_root
+    | Some _ | None -> None) check_specs
 
 let fault_message = function
   | Anchor_missing epoch ->

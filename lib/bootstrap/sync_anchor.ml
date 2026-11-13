@@ -54,6 +54,26 @@ let max_update_bytes = 1_000_000
 let max_proof_bytes = 4_000_000
 let max_root_bytes = 256
 
+let max_eviction_set_bytes = Update.eviction_source_limit
+
+let max_eviction_update_bytes =
+  let epoch = `String (Int64.to_string Int64.max_int) in
+  let entry = `Assoc ["address", `String ""; "pubkey", `String ""; "weight", `String ""] in
+  let fields = `Assoc [
+    "activate_epoch", epoch; "fingerprint", `String (String.make 64 '0');
+    "validators", `List []; "standard", `String Octra_core.Validator_policy.standard_name;
+    "weighted", `Bool true; "source_epoch", epoch;
+    "eviction", `Assoc ["epoch", epoch; "source", `String ""; "offenders", `List []];
+  ] in
+  String.length (Yojson.Safe.to_string fields)
+  + 4 * ((max_eviction_set_bytes + 2) / 3)
+  + C_codec.max_validators *
+    (String.length (Yojson.Safe.to_string entry) + C_codec.max_addr_bytes + 44 + 256 + 1)
+  + C_codec.max_validators * (C_codec.max_addr_bytes + 3)
+
+let max_eviction_proof_bytes =
+  max_proof_bytes + 4 * ((max_eviction_update_bytes + 2) / 3)
+
 let make ~steps ~finalize ~validator_set =
   { steps; finalize; validator_set; stake = None }
 
@@ -95,6 +115,45 @@ let ( let* ) value f =
 let protect f =
   try Ok (f ()) with exn -> Error (Printexc.to_string exn)
 
+let future_eviction source (finalize : C_types.finalize) raw =
+  match Update.of_string raw with
+  | Ok update when Update.to_string update = raw ->
+    begin match update.eviction with
+    | Some witness when C_quorum_policy.seatless (C_quorum_policy.for_chain finalize.chain_id)
+        witness.epoch ->
+      begin match source with
+      | Pending -> witness.epoch = finalize.epoch_id
+        && update.activate_epoch = Int64.succ finalize.epoch_id
+      | Active -> update.activate_epoch <= finalize.epoch_id
+      | Relief _ -> false
+      end
+    | _ -> false
+    end
+  | _ -> false
+
+let proof_size_error ~bytes ~max =
+  Printf.sprintf "validator transition proof exceeds size limit bytes = %d limit = %d" bytes max
+
+let check_step_size (step : step) =
+  let future = future_eviction step.source step.finalize step.update in
+  let max_update = if future then max_eviction_update_bytes else max_update_bytes in
+  let max_proof = if future then max_eviction_proof_bytes else max_proof_bytes in
+  if String.length step.update > max_update then
+    Error "validator transition update exceeds size limit"
+  else if String.length step.proof > max_proof then
+    Error (proof_size_error ~bytes:(String.length step.proof) ~max:max_proof)
+  else Ok ()
+
+let get_proof ?(max = max_proof_bytes) cursor =
+  let bytes = O.get_u32_int cursor in
+  if bytes < 0 || bytes > max then failwith (proof_size_error ~bytes ~max);
+  O.get_raw cursor bytes
+
+let set_size_limit steps =
+  if List.exists (fun (step : step) ->
+    future_eviction step.source step.finalize step.update) steps then
+      max max_set_bytes max_eviction_set_bytes else max_set_bytes
+
 let source_to_u8 = function
   | Pending -> 1
   | Active -> 2
@@ -106,6 +165,7 @@ let source_of_u8 = function
   | _ -> failwith "validator transition source is invalid"
 
 let put_step buffer (step : step) =
+  (match check_step_size step with Ok () -> () | Error reason -> invalid_arg reason);
   O.put_u8 buffer (source_to_u8 step.source);
   (match step.source with
    | Relief mark -> O.put_bytes buffer (C_relief_log.encode mark)
@@ -130,15 +190,21 @@ let get_step cursor =
   in
   let ledger_state_root = O.get_string_bounded ~max:max_root_bytes cursor in
   let epoch_index_root = O.get_string_bounded ~max:max_root_bytes cursor in
-  let update = O.get_bytes_bounded ~max:max_update_bytes cursor in
-  let proof = O.get_bytes_bounded ~max:max_proof_bytes cursor in
+  let update = O.get_bytes_bounded ~max:(max max_update_bytes max_eviction_update_bytes) cursor in
+  let future = future_eviction source finalize update in
+  if String.length update > max_update_bytes && not future then
+    failwith "validator transition update exceeds legacy size limit";
+  let proof = if future then get_proof ~max:max_eviction_proof_bytes cursor else get_proof cursor in
   { source; finalize; ledger_state_root; epoch_index_root; update; proof }
 
 let raw t =
+  let validator_set = C_codec.encode_validator_set t.validator_set in
+  if String.length validator_set > set_size_limit t.steps then
+    invalid_arg "validator finality set exceeds size limit";
   O.encode (fun buffer ->
     O.put_list put_step buffer t.steps;
     O.put_bytes buffer (C_codec.encode_finalize t.finalize);
-    O.put_bytes buffer (C_codec.encode_validator_set t.validator_set))
+    O.put_bytes buffer validator_set)
 
 let encode t =
   raw t |> Base64.encode_exn
@@ -159,7 +225,7 @@ let decode encoded =
               |> C_codec.decode_finalize
             in
             let validator_set =
-              O.get_bytes_bounded ~max:max_set_bytes cursor
+              O.get_bytes_bounded ~max:(set_size_limit steps) cursor
               |> C_codec.decode_validator_set
             in
             { steps; finalize; validator_set; stake = None })
@@ -201,7 +267,11 @@ let raw_validator_set validator_set =
         let* pubkey = Checkpoint.raw_pubkey member.C_types.pubkey in
         Ok ((C_types.{member with pubkey}, weight) :: result)) (Ok []) entries in
       Ok (Some (height, List.rev entries)) in
-  Ok {result with authors}
+  if validator_set.weighted then
+    C_types.validate_validator_set_shape
+      C_types.{validator_set with validators = List.map fst entries; authors}
+    |> Result.map_error C_types.set_error_message
+  else Ok {result with authors}
 
 let encoded_validator_set validator_set =
   let* validators =
@@ -242,6 +312,36 @@ let finalize_hash finalize =
 let same_set left right =
   C_config.validator_set_hash left = C_config.validator_set_hash right
 
+let same_voters left right =
+  same_set C_types.{left with authors = None} C_types.{right with authors = None}
+
+let structural_set ?policy ~chain_id ~epoch_id set =
+  C_types.structural_validator_set_for_epoch ?policy ~chain_id ~epoch_id set
+  |> Result.map_error C_types.set_error_message
+
+let proof_value ~ledger_state_root ~path ~proof expected =
+  let* value = Irmin.verify_merkle_proof_det ~ledger_state_root ~path ~proof in
+  if value <> Some expected then Error "validator transition state proof mismatch"
+  else Ok ()
+
+let eviction_set ?policy ~chain_id ~epoch ~current update (witness : C_types.eviction) =
+  let policy = Option.value policy ~default:(C_quorum_policy.for_chain chain_id) in
+  if epoch < 0L || epoch = Int64.max_int
+      || not (C_quorum_policy.seatless policy epoch) then
+    Error "validator eviction source epoch is invalid"
+  else if witness.epoch <> epoch || update.Update.source_epoch <> Some epoch
+      || update.activate_epoch <> Int64.succ epoch then
+    Error "validator eviction source epoch differs"
+  else
+    let* current = structural_set ~policy ~chain_id ~epoch_id:epoch current in
+    let* source = C_types.validate_validator_set_shape witness.source
+      |> Result.map_error C_types.set_error_message in
+    if not (same_voters source current) then Error "validator eviction source set differs"
+    else
+      let* next, _ = Update.check_eviction ~source_epoch:epoch
+        ~offenders:witness.offenders ~current update in
+      structural_set ~policy ~chain_id ~epoch_id:update.activate_epoch next
+
 let lower_hex lengths value =
   List.mem (String.length value) lengths
   && String.for_all
@@ -257,8 +357,9 @@ let verify_finalize ?policy ~chain_id ~validator_set finalize =
   else if finalize.epoch_id <> finalize.header.epoch_id then
     Error "finality epoch mismatch"
   else
+    let* validator_set = structural_set ?policy ~chain_id ~epoch_id:finalize.epoch_id validator_set in
     match
-      C_qc.validate_persisted_finalize_strict
+      C_qc.validate_persisted_finalize
         ?policy
         ~chain_id
         ~validator_set
@@ -280,10 +381,12 @@ let verify_anchor_finalize ?policy ~chain_id ~validator_set finalize =
   let signers =
     List.map (fun (vote : C_types.vote) -> vote.C_types.validator) finalize.C_types.precommits
   in
-  if C_types.has_quorum vote_set signers then Ok ()
+  if C_types.pair_at ?policy ~chain_id ~epoch_id:finalize.C_types.epoch_id vote_set signers
+  then Ok ()
   else Error "finality qc signer quorum"
 
 let step_input ?policy ~chain_id ~prior_epoch validator_set (step : step) =
+  let* () = check_step_size step in
   let epoch = step.finalize.C_types.epoch_id in
   match prior_epoch with
   | Some prior when Int64.compare epoch prior <= 0 ->
@@ -335,14 +438,34 @@ let step_input ?policy ~chain_id ~prior_epoch validator_set (step : step) =
         Error "validator transition folded root mismatch"
       else
         let* next = Update.validator_set update in
+        let use_epoch = match step.source with
+          | Pending -> update.activate_epoch
+          | Active -> epoch
+          | Relief mark -> mark.height in
+        let* next = match step.source, update.eviction with
+          | Pending, Some witness ->
+            eviction_set ?policy ~chain_id ~epoch ~current:validator_set update witness
+          | Relief _, Some _ -> Error "validator eviction requires pending proof"
+          | Active, eviction ->
+            let* current = structural_set ?policy ~chain_id ~epoch_id:use_epoch validator_set in
+            let* checked = structural_set ?policy ~chain_id ~epoch_id:use_epoch next in
+            if same_voters checked current then Ok next
+            else (match eviction with
+              | Some _ -> Error "active validator eviction is not trusted"
+              | None ->
+                let* _ = C_types.checked_validator_set_for_epoch ?policy ~chain_id ~epoch_id:use_epoch next in
+                Ok next)
+          | Pending, None | Relief _, None ->
+            let* _ = C_types.checked_validator_set_for_epoch ?policy ~chain_id ~epoch_id:use_epoch next in
+            Ok next in
         let* next = match step.source with
           | Pending | Active -> Ok next
           | Relief mark ->
-            let current = C_types.validator_set_for_epoch ?policy ~chain_id
+            let* current = C_types.checked_validator_set_for_epoch ?policy ~chain_id
               ~epoch_id:mark.height validator_set in
             let target = C_types.validator_set_for_epoch ?policy ~chain_id
               ~epoch_id:update.activate_epoch next in
-            let* selected = C_relief.restore ~chain_id ~height:mark.height ~current
+            let* selected = C_relief.restore ?policy ~chain_id ~height:mark.height ~current
               ~activate_epoch:update.activate_epoch ~target
               ~fingerprint:update.fingerprint mark in
             (match selected with Some set -> Ok set
@@ -350,18 +473,15 @@ let step_input ?policy ~chain_id ~prior_epoch validator_set (step : step) =
         Ok (epoch, next, path)
 
 let step_output step (epoch, next, path) =
-  let* value = Irmin.verify_merkle_proof_det
-    ~ledger_state_root:step.ledger_state_root ~path ~proof:step.proof in
-  if value <> Some step.update then Error "validator transition state proof mismatch"
-  else
-    Ok (Some epoch, next)
+  let* () = proof_value ~ledger_state_root:step.ledger_state_root ~path ~proof:step.proof step.update in
+  Ok (Some epoch, next)
 
 let verify_step ?policy ~chain_id ~prior_epoch validator_set step =
   let* input = step_input ?policy ~chain_id ~prior_epoch validator_set step in
   step_output step input
 
 let effective ?policy value stake =
-  C_types.validator_set_for_epoch ?policy ~chain_id:value.finalize.chain_id
+  structural_set ?policy ~chain_id:value.finalize.chain_id
     ~epoch_id:value.finalize.epoch_id stake
 
 let derived_set ?policy value stake =
@@ -369,17 +489,18 @@ let derived_set ?policy value stake =
   if C_quorum_policy.select policy value.finalize.epoch_id = C_quorum_policy.Stake then
     effective ~policy value stake
   else match List.rev value.steps with
-    | [] -> stake
+    | [] -> Ok stake
     | step :: _ ->
-      let update = Update.of_string step.update |> Result.get_ok in
-      C_types.validator_set_for_epoch ~policy ~chain_id:value.finalize.chain_id
+      let* update = Update.of_string step.update in
+      C_types.checked_validator_set_for_epoch ~policy ~chain_id:value.finalize.chain_id
         ~epoch_id:update.activate_epoch stake
 
 let derive_stake ?policy ~validator_set:trusted value =
   let* trusted = raw_validator_set trusted in
   let rec loop prior_epoch current = function
     | [] ->
-        if same_set (derived_set ?policy value current) value.validator_set then Ok current
+        let* ending = derived_set ?policy value current in
+        if same_set ending value.validator_set then Ok current
         else Error "finality validator transition is incomplete"
     | (step : step) :: rest ->
         if Int64.compare step.finalize.epoch_id value.finalize.epoch_id >= 0 then
@@ -398,7 +519,7 @@ let derive_stake ?policy ~validator_set:trusted value =
   loop None trusted value.steps
 
 let derive ?policy ~validator_set value =
-  Result.map (derived_set ?policy value) (derive_stake ?policy ~validator_set value)
+  Result.bind (derive_stake ?policy ~validator_set value) (derived_set ?policy value)
 
 let verify_path ?policy ~validator_set encoded =
   let* value = decode encoded in
@@ -456,7 +577,8 @@ let verify_checkpoint ?policy checkpoint value =
 let verify ?policy ~validator_set checkpoint encoded =
   let* value = decode encoded in
   let* stake = derive_stake ?policy ~validator_set value in
-  if not (same_set (derived_set ?policy value stake) value.validator_set) then
+  let* ending = derived_set ?policy value stake in
+  if not (same_set ending value.validator_set) then
     Error "finality validator transition mismatch"
   else
     let* () = verify_checkpoint ?policy checkpoint value in
@@ -500,9 +622,11 @@ let derive_stake_lwt ?policy ?(cancelled = fun () -> false) ~validator_set value
         | [] ->
           let* () = Lwt.pause () in
           if cancelled () then Lwt.return_error "state sync verification cancelled"
-          else if not (same_set (derived_set ?policy value current) value.validator_set) then
+          else begin match derived_set ?policy value current with
+          | Error reason -> Lwt.return_error reason
+          | Ok ending when not (same_set ending value.validator_set) ->
             Lwt.return_error "finality validator transition is incomplete"
-          else Lwt.return_ok current
+          | Ok _ -> Lwt.return_ok current end
         | (step : step) :: rest ->
           let* () = Lwt.pause () in
           if cancelled () then Lwt.return_error "state sync verification cancelled"
@@ -521,11 +645,11 @@ let derive_stake_lwt ?policy ?(cancelled = fun () -> false) ~validator_set value
       loop None trusted value.steps
 
 let derive_lwt ?policy ?cancelled ~validator_set value =
-  Lwt.map (Result.map (derived_set ?policy value))
+  Lwt.map (fun result -> Result.bind result (derived_set ?policy value))
     (derive_stake_lwt ?policy ?cancelled ~validator_set value)
 
 module Paths = Map.Make(struct
-  type t = string * string
+  type t = string * string option
   let compare = Stdlib.compare
 end)
 
@@ -562,9 +686,11 @@ let extend_path ?policy ~chain_id path (step : step) =
   match restrict path.validators step.finalize with
   | None -> None
   | Some finalize ->
-    let voters = C_types.validator_set_for_epoch ?policy ~chain_id
-      ~epoch_id:finalize.epoch_id path.validators in
-    if not (C_types.has_quorum voters
+    match structural_set ?policy ~chain_id
+      ~epoch_id:finalize.epoch_id path.validators with
+    | Error _ -> None
+    | Ok voters ->
+    if not (C_types.pair_at ?policy ~chain_id ~epoch_id:finalize.epoch_id voters
       (List.map (fun (vote : C_types.vote) -> vote.validator) finalize.precommits)) then None
     else
       let step = {step with finalize} in
@@ -585,12 +711,14 @@ let compact_lwt ?policy ?(cancelled = fun () -> false) ~validator_set value =
           let path_key path =
             let steps = match path.reversed with [] -> [] | step :: _ -> [step] in
             let ending = derived_set ?policy {value with steps} path.validators in
-            C_config.validator_set_hash path.validators, C_config.validator_set_hash ending in
+            C_config.validator_set_hash path.validators,
+            Result.to_option (Result.map C_config.validator_set_hash ending) in
           let rec loop paths selected prior current = function
             | [] ->
               let selected = Paths.fold (fun _ path best ->
                 let short = {value with steps = List.rev path.reversed; stake = None} in
-                if same_set (derived_set ?policy short path.validators) value.validator_set
+                if Result.fold ~ok:(fun ending -> same_set ending value.validator_set)
+                  ~error:(fun _ -> false) (derived_set ?policy short path.validators)
                   && (path.bytes < best.bytes
                     || (path.bytes = best.bytes && compare path.prior best.prior < 0))
                 then path else best) paths selected in

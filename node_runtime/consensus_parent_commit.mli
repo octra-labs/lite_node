@@ -30,6 +30,12 @@ val proposal :
   epoch_id:int64 ->
   (Octra_consensus.C_types.parent_commit option, string) result
 
+val set_at_head :
+  source ->
+  epoch_id:int64 ->
+  Octra_core.Head_manifest.t ->
+  (Octra_consensus.C_types.validator_set, string) result
+
 val verify :
   source ->
   epoch_id:int64 ->

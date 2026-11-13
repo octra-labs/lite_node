@@ -65,6 +65,10 @@ val compile_sources_at :
   sources:source list ->
   (compiled, error) result
 
+val compile_sources_in :
+  view:bool -> metered:bool -> loops:bool -> compiler:compiler ->
+  point_ops:bool -> main:string -> sources:source list -> (compiled, error) result
+
 val compile :
   main:string ->
   sources:source list ->
@@ -73,6 +77,10 @@ val compile :
 val validate_base64 :
   string ->
   (unit, error) result
+
+val scalar_check : limit:Z.t -> string -> bool
+val scalar_cost : string -> Z.t option
+val source_cost : source list -> Z.t option
 
 val admit_base64 :
   ?metered:bool ->

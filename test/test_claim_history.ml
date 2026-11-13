@@ -159,7 +159,7 @@ let test_read_budget () =
     let cert = certificate ~weighted receiver_wallet head ledger_root pin.index_root in
     chain_read ~first_epoch:1_504_440 ~max_epochs:500_001 ~weighted
       receiver_wallet cert read in
-  rejected "history requires stake weights" "finality qc quorum" (check_budget false);
+  rejected "history requires stake weights" "validator weights are not declared" (check_budget false);
   check "invalid certificate read archive" (!reads = 0);
   rejected "history budget is explicit" "archive read reached" (check_budget true);
   check "history budget reached archive once" (!reads = 1);

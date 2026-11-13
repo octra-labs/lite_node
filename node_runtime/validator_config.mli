@@ -23,6 +23,7 @@ type t = {
   active_validator_list : Octra_consensus.C_types.validator_info list;
   stake_vs : Octra_consensus.C_types.validator_set;
   active_vs : Octra_consensus.C_types.validator_set;
+  active_update : Octra_core.Validator_set_update.t option;
   scheduled_driver_config : Octra_consensus.C_driver.scheduled_validator_set_config option;
   light_scheduled_validator_set : Octra_consensus.C_config.scheduled option;
   consensus_config_hash : string;
@@ -78,10 +79,12 @@ val pending_entries_of_raw :
   string list
 
 val load_persistent_update :
+  ?check:(Octra_consensus.C_driver.scheduled_validator_set_config -> (unit, string) result) ->
   persistent_update_deps ->
   Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t
 
 val load_node_persistent_update :
+  ?check:(Octra_consensus.C_driver.scheduled_validator_set_config -> (unit, string) result) ->
   persistent_update_node_deps ->
   Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t
 
@@ -95,8 +98,16 @@ val light_scheduled_of_driver :
   Octra_consensus.C_driver.scheduled_validator_set_config option ->
   Octra_consensus.C_config.scheduled option
 
+val checked_update_set :
+  ?policy:Octra_consensus.C_quorum_policy.t ->
+  chain_id:string ->
+  epoch:int64 ->
+  Octra_core.Validator_set_update.t ->
+  (Octra_consensus.C_types.validator_set, string) result
+
 val bind_persistent_updates :
   ?policy:Octra_consensus.C_quorum_policy.t ->
+  ?eviction_source:(int64 -> (Octra_consensus.C_types.validator_set, string) result) ->
   chain_id:string ->
   consensus_mode:bool ->
   current_height:int64 ->

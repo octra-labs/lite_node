@@ -448,6 +448,7 @@ let make_policy_driver policy ~chain_id ~my_addr ~initial_vs ~target_vs ~activat
     activate_epoch;
     validator_set = target_vs;
     fingerprint = "transition-fp";
+    eviction = None;
   } in
   let config = Driver.{
     chain_id;
@@ -487,6 +488,89 @@ let make_activation_driver ~chain_id ~my_addr ~initial_vs ~target_vs ~activate_e
   make_policy_driver (C_quorum_policy.for_chain chain_id)
     ~chain_id ~my_addr ~initial_vs ~target_vs ~activate_epoch
 
+let check_set_shape () =
+  let chain_id = "seat-guard" in
+  let policy = C_quorum_policy.make ~count_epoch:0L ~stake_epoch:(Some 10L) ~round_epoch:None
+    |> fun value -> C_quorum_policy.with_seatless_epoch value (Some 30L) in
+  let members = List.init 7 (fun index -> C_types.{address = "seat" ^ string_of_int index;
+    pubkey = String.make 32 (Char.chr (index + 1))}) in
+  let make amount = C_types.make_weighted_validator_set
+    (List.mapi (fun index member -> member, Z.of_int (if index = 0 then amount else 1)) members)
+    |> Result.get_ok in
+  let heavy = make 4 and safe = make 1 in
+  let address = (List.hd members).address in
+  let future = make_policy_driver policy ~chain_id ~my_addr:address ~initial_vs:safe
+    ~target_vs:heavy ~activate_epoch:31L in
+  let planned = Option.get future.config.scheduled_validator_set_config in
+  assert_msg (Driver.relief_target future planned = heavy) "future rule changed relief input";
+  assert_msg (Driver.check_validator_plan ~policy ~chain_id ~head:30L ~current_epoch:30L
+    ~current:safe ~finalized:None {planned with activate_epoch = 30L}
+    = Error "validator weight reaches blocking threshold") "ordinary plan skipped seat cap";
+  let driver = make_policy_driver policy ~chain_id ~my_addr:address ~initial_vs:heavy
+    ~target_vs:heavy ~activate_epoch:29L in
+  let calls = ref 0 in
+  Driver.set_validator_set_activation_handler driver (fun _ _ -> incr calls; Lwt.return_unit);
+  let refused action = try action (); false with
+    | Invalid_argument _ -> true in
+  Lwt_main.run (Driver.maybe_activate_quorum_policy driver ~target_epoch:30L);
+  C_engine.start_height driver.engine 30L;
+  assert_msg (!calls = 0 && driver.engine.vs = heavy && driver.engine.state.height = 30L)
+    "trusted heavy set cannot advance";
+  List.iter (fun epoch ->
+    let node = C_engine.create_for_policy policy ~chain_id ~my_addr:address ~validator_set:heavy
+      ~start_height:epoch ~can_vote:(fun () -> false) in
+    assert_msg (node.vs = heavy) "trusted observer set changed") [30L; 31L];
+  let scheduled = Driver.{activate_epoch = 30L; validator_set = safe; fingerprint = "safe-plan";
+    eviction = None} in
+  let replacement = Driver.create_for_policy policy
+    ~config:{driver.config with scheduled_validator_set_config = Some scheduled}
+    ~validator_set:heavy ~swarm:(make_swarm ~chain_id ~addr:address) ~start_height:29L
+    ~sync_log:(C_sync_log.memory ()) ~relief_log:(C_relief_log.memory ()) ~vote_log:(C_vote_log.memory ()) in
+  Lwt_main.run (Driver.maybe_activate_scheduled_validator_set replacement ~target_epoch:30L);
+  C_engine.start_height replacement.engine 30L;
+  assert_msg (replacement.engine.vs = safe) "valid due set did not replace heavy history";
+  C_engine.replace_validator_set replacement.engine heavy;
+  assert_msg (replacement.engine.vs = heavy) "trusted replacement was clipped";
+  C_engine.reconfigure_validator_set replacement.engine ~round:1 heavy;
+  assert_msg (replacement.engine.vs = heavy) "trusted relief replacement was clipped";
+  let before = replacement.engine.state in
+  let member = List.hd heavy.validators in
+  let wrong_epoch = {heavy with authors = Some (29L, [member, Z.one])} in
+  assert_msg (match C_types.structural_validator_set_for_epoch ~policy ~chain_id
+    ~epoch_id:30L wrong_epoch with Error (C_types.Set_shape _) -> true | _ -> false)
+    "wrong-epoch author shape was projected before validation";
+  let faults = [
+    {heavy with n = heavy.n + 1}; {heavy with f = heavy.f + 1};
+    {heavy with quorum = heavy.quorum + 1};
+    {heavy with total_weight = Z.succ heavy.total_weight};
+    {heavy with quorum_weight = Z.succ heavy.quorum_weight};
+    {heavy with weights = heavy.weights @ ["extra", Z.one]};
+    {heavy with validators = member :: heavy.validators};
+    {heavy with authors = Some (30L, [member, Z.one])};
+    wrong_epoch;
+  ] in
+  List.iter (fun set ->
+    assert_msg (refused (fun () -> ignore (C_engine.create_for_policy policy ~chain_id
+      ~my_addr:address ~validator_set:set ~start_height:30L ~can_vote:(fun () -> false))))
+      "malformed observer set accepted";
+    assert_msg (refused (fun () -> C_engine.replace_validator_set replacement.engine set))
+      "malformed replacement accepted";
+    assert_msg (refused (fun () -> C_engine.reconfigure_validator_set replacement.engine ~round:2 set))
+      "malformed relief set accepted";
+    assert_msg (replacement.engine.vs = heavy && replacement.engine.state = before)
+      "malformed replacement mutated engine";
+    let invalid = make_policy_driver policy ~chain_id ~my_addr:address ~initial_vs:set
+      ~target_vs:set ~activate_epoch:29L in
+    if invalid.engine.vs = set then begin
+      let saved = invalid.engine.state in
+      assert_msg (refused (fun () -> C_engine.start_height invalid.engine 30L))
+        "malformed set advanced height";
+      assert_msg (invalid.engine.state = saved) "malformed height change mutated engine"
+    end;
+    assert_msg (refused (fun () -> Lwt_main.run
+      (Driver.maybe_activate_quorum_policy invalid ~target_epoch:30L)))
+      "malformed trusted policy set accepted") faults
+
 let check_stake_transition () =
   let chain_id = "stake-transition" in
   let policy = C_quorum_policy.make ~count_epoch:0L ~stake_epoch:(Some 30L) ~round_epoch:(Some 30L) in
@@ -517,13 +601,14 @@ let check_stake_transition () =
   assert_msg (hash restarted.engine.vs = hash driver.engine.vs) "restart changed stake";
   assert_msg (hash restarted.stake_vs = hash next) "restart lost raw set";
   let heavy = set 100_000_000 in
-  let plan = Driver.{activate_epoch = 30L; validator_set = heavy; fingerprint = "stake-plan"} in
+  let plan = Driver.{activate_epoch = 30L; validator_set = heavy; fingerprint = "stake-plan";
+    eviction = None} in
   let selected = Driver.planned_set restarted ~epoch:30L (Some plan) in
   assert_msg (hash selected = hash heavy) "catchup plan capped raw stake";
   assert_msg (Z.equal (C_types.round_skip_weight selected) (Z.of_int 37_333_334))
     "catchup plan weight threshold changed";
-  assert_msg (not (Driver.catchup_source_agreement_reached selected ~signer_count:3
-    ~signed_weight:(Z.of_int 6_000_000))) "small responders formed stake agreement";
+  assert_msg (not (Driver.planned_agreement_reached restarted (Some plan) ~epoch_id:30L ~count:3
+    ~weight:(Z.of_int 6_000_000))) "small responders formed stake agreement";
   let repair = Driver.create_for_policy policy
     ~config:{driver.config with local_head_epoch = (fun () -> 29L)}
     ~validator_set:next ~swarm:(make_swarm ~chain_id ~addr:(List.hd members).address)
@@ -677,11 +762,13 @@ let check_live_plan () =
     activate_epoch = 20L;
     validator_set = stale_vs;
     fingerprint = "stale-plan";
+    eviction = None;
   } in
   let live = Driver.{
     activate_epoch = 20L;
     validator_set = live_vs;
     fingerprint = "live-plan";
+    eviction = None;
   } in
   let dynamic = ref (Some live) in
   let config = Driver.{
@@ -914,8 +1001,7 @@ let check_strict_quorum_history () =
       validator = a.address;
       signature = String.make 64 '\x05';
     } in
-    C_qc.validate_certificate_with_policy
-      ~strict_quorum:true
+    C_qc.validate_certificate
       ~chain_id
       ~validator_set
       ~verify_vote:(fun _ -> true)
@@ -936,6 +1022,7 @@ let check_strict_quorum_history () =
     "strict validation skipped active signer floor"
 
 let () =
+  check_set_shape ();
   check_finalize_retention ();
   check_future_validator_cutoff ();
   check_profile_offer ();

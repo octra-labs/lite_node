@@ -179,10 +179,11 @@ let order validator_set
   | None, None ->
     String.compare left.C_codec.validator right.C_codec.validator
 
-let take_witness ~chain_id ~epoch_id validator_set syncs =
+let take_witness ?policy ~chain_id ~epoch_id validator_set syncs =
   let rec take count signed_weight acc = function
     | _ when
         C_types.round_skip_reached_at
+          ?policy
           ~chain_id
           ~epoch_id
           validator_set
@@ -204,7 +205,7 @@ let take_witness ~chain_id ~epoch_id validator_set syncs =
   |> List.sort (order validator_set)
   |> take 0 Z.zero []
 
-let witness t ~chain_id ~epoch_id ~after_round ~through_round ~validator_set =
+let witness ?policy t ~chain_id ~epoch_id ~after_round ~through_round ~validator_set =
   if not (Option.equal Int64.equal t.epoch (Some epoch_id)) then []
   else
     let by_round = Hashtbl.create 8 in
@@ -223,7 +224,7 @@ let witness t ~chain_id ~epoch_id ~after_round ~through_round ~validator_set =
     Hashtbl.fold (fun round syncs rounds -> (round, syncs) :: rounds) by_round []
     |> List.sort (fun (left, _) (right, _) -> Int.compare right left)
     |> List.find_map (fun (_, syncs) ->
-      match take_witness ~chain_id ~epoch_id validator_set syncs with
+      match take_witness ?policy ~chain_id ~epoch_id validator_set syncs with
       | [] -> None
       | proof -> Some proof)
     |> Option.value ~default:[]

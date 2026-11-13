@@ -170,8 +170,8 @@ let node_stack_deps (deps : deps) (network : network) (wallet : wallet) =
     best_root_fn = (fun () -> best_root deps);
   }
 
-let build (deps : deps) (network : network) (wallet : wallet) =
-  P2p_config.node_stack (node_stack_deps deps network wallet)
+let build ?eviction_source (deps : deps) (network : network) (wallet : wallet) =
+  P2p_config.node_stack ?eviction_source (node_stack_deps deps network wallet)
 
 let deps_of_request (request : node_request) =
   {
@@ -214,9 +214,10 @@ let stack_view (stack : P2p_config.node_stack) =
     swarm = swarm_start.swarm;
   }
 
-let build_node_view (request : node_request) =
+let build_node_view ?eviction_source (request : node_request) =
   match
     build
+      ?eviction_source
       (deps_of_request request)
       (network_of_request request)
       (wallet_of_request request)
@@ -260,8 +261,8 @@ let admit_validator_startup (deps : check_deps) ~address ~voting
          refuse = deps.refuse;
        }
 
-let load_persistent_update (deps : persistent_update_deps) =
-  Validator_config.load_node_persistent_update
+let load_persistent_update ?check (deps : persistent_update_deps) =
+  Validator_config.load_node_persistent_update ?check
     Validator_config.{
       read_pending = deps.read_pending;
       warn = deps.warn;
@@ -284,8 +285,8 @@ let persistent_update_deps_of_runtime runtime =
     warn = runtime.warn;
   }
 
-let load_runtime_persistent_update runtime =
-  load_persistent_update (persistent_update_deps_of_runtime runtime)
+let load_runtime_persistent_update ?check runtime =
+  load_persistent_update ?check (persistent_update_deps_of_runtime runtime)
 
 let validator_pubkeys validator_set =
   validator_set.Octra_consensus.C_types.validators
@@ -306,6 +307,7 @@ let same_scheduled
     Int64.equal left.activate_epoch right.activate_epoch
     && String.equal left.fingerprint right.fingerprint
     && same_validator_set left.validator_set right.validator_set
+    && left.eviction = right.eviction
   | None, Some _
   | Some _, None -> false
 
@@ -351,8 +353,8 @@ let install_runtime_validator_config runtime view active scheduled =
   | Ok () -> Lwt.return_unit
   | Error reason -> Lwt.fail_with reason
 
-let start_node runtime =
-  match build_node_view (request_of_runtime runtime) with
+let start_node ?eviction_source runtime =
+  match build_node_view ?eviction_source (request_of_runtime runtime) with
   | Error e ->
     runtime.fatal e;
     failwith e
@@ -367,6 +369,58 @@ let start_node runtime =
     let active = ref view.active_vs in
     let stake = ref view.stake_vs in
     let scheduled = ref view.scheduled_validator_set_config in
+    let check_plan config =
+      let module Driver = Octra_consensus.C_driver in
+      let module Types = Octra_consensus.C_types in
+      let ( let* ) = Result.bind in
+      let head = runtime.current_height () in
+      let* current_epoch, current, persisted = match config.Driver.eviction, eviction_source with
+        | Some eviction, Some resolve ->
+          if eviction.epoch <> head then Error "validator eviction source differs from durable head"
+          else
+            let* source = resolve eviction.epoch in
+            let* source = Types.structural_validator_set_for_epoch ~chain_id:runtime.chain_id
+              ~epoch_id:eviction.epoch source |> Result.map_error Types.set_error_message in
+            Ok (eviction.epoch, source, None)
+        | None, Some resolve when Octra_consensus.C_quorum_policy.seatless
+            (Octra_consensus.C_quorum_policy.for_chain runtime.chain_id) head ->
+          (match Types.validate_validator_set_for_epoch ~chain_id:runtime.chain_id
+            ~epoch_id:config.activate_epoch config.validator_set with
+           | Error Types.Seat_cap ->
+             let* source = resolve head in
+             let* source = Types.structural_validator_set_for_epoch ~chain_id:runtime.chain_id
+               ~epoch_id:head source |> Result.map_error Types.set_error_message in
+             Ok (head, source, None)
+           | _ -> Ok (head, !active, None))
+        | _ ->
+          let persisted = match config.eviction, runtime.read_active_validator_meta () with
+            | Some eviction, Some raw ->
+              (match Octra_core.Validator_set_update.of_string raw with
+               | Ok update when update.activate_epoch <= eviction.epoch
+                   && eviction.epoch <= head ->
+                 (match Validator_config.checked_update_set ~chain_id:runtime.chain_id
+                   ~epoch:eviction.epoch update with
+                  | Ok set -> Some (eviction.epoch, set)
+                  | Error _ -> None)
+               | _ -> None)
+            | _ -> None in
+          Ok (head, !active, persisted)
+      in
+      let* () = Driver.check_validator_plan ~chain_id:runtime.chain_id ~head
+        ~current_epoch ~current ~finalized:persisted config in
+      let prior = Option.map (fun plan -> plan.Driver.activate_epoch, plan.fingerprint) !scheduled in
+      let* () = Driver.check_plan_order ~prior config in
+      match config.eviction with
+      | None -> Ok ()
+      | Some eviction ->
+        if Types.same_voting_set !active config.validator_set then
+          Error "validator eviction is already active"
+        else if config.activate_epoch < head then
+          Error "validator eviction activation precedes durable head"
+        else if eviction.epoch <> head then
+          Error "validator eviction source differs from durable head"
+        else Ok ()
+    in
     let select validator_set fingerprint =
       let next, next_stake =
         match !scheduled with
@@ -418,7 +472,7 @@ let start_node runtime =
         select validator_set fingerprint);
       load_scheduled_validator_set_config = (fun () ->
         let open Lwt.Syntax in
-        let* loaded = load_runtime_persistent_update runtime in
+        let* loaded = load_runtime_persistent_update ~check:check_plan runtime in
         match loaded with
         | None -> Lwt.return_none
         | Some config ->

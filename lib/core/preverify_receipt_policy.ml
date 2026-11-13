@@ -19,8 +19,10 @@ let active ~epoch_id =
 let should_check ~epoch_id ~receipts =
   receipts <> [] || active ~epoch_id
 
-let check ~epoch_id ~receipts txs =
-  if should_check ~epoch_id ~receipts then
-    Preverify_commit.check_strings receipts txs
+let check ~rejections ~epoch_id ~receipts txs =
+  let charged = List.exists (fun (item : Tx_outcome.rejection) ->
+    item.charged && Preverify_commit.heavy item.tx) rejections in
+  if should_check ~epoch_id ~receipts || charged then
+    Preverify_commit.check_strings receipts (Tx_outcome.executed ~confirmed:txs rejections)
   else
     Ok ()

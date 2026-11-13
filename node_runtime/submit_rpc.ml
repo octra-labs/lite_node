@@ -8,7 +8,7 @@ type rpc_result = (Yojson.Safe.t, Rpc.rpc_error) result
 
 type validate =
   Transaction.t ->
-  (string, string * string) result
+  (string, string * string) result Lwt.t
 
 let ok_lwt v =
   Lwt.return (Ok v)
@@ -21,7 +21,9 @@ let submit ~validate params =
   | Error e ->
     err_lwt e
   | Ok tx ->
-    match validate tx with
+    let open Lwt.Syntax in
+    let* result = validate tx in
+    match result with
     | Error (etype, reason) ->
       err_lwt (Tx_view.submit_rpc_error etype reason)
     | Ok tx_hash ->
@@ -32,14 +34,16 @@ let submit_batch ~validate params =
   | Error e ->
     err_lwt e
   | Ok txs_json ->
-    let results =
-      List.map
+    let open Lwt.Syntax in
+    let* results =
+      Lwt_list.map_s
         (fun tx_json ->
           match Tx_view.decode_submit_batch_tx tx_json with
           | Error e ->
-            Tx_view.submit_batch_decode_error e
+            Lwt.return (Tx_view.submit_batch_decode_error e)
           | Ok tx ->
-            Tx_view.submit_batch_row tx (validate tx))
+            let* result = validate tx in
+            Lwt.return (Tx_view.submit_batch_row tx result))
         txs_json
     in
     ok_lwt (Rpc_view.submit_batch results)
@@ -77,11 +81,13 @@ let private_transfer ~validate params =
   | None ->
     err_lwt (Rpc.malformed_tx "expected [tx_json]")
   | Some tx_json ->
-    match Octra_core.Tx_payload.decode_admit tx_json with
+    match Tx_view.decode_network_tx tx_json with
     | Error e ->
       err_lwt (Rpc.malformed_tx e)
     | Ok tx ->
-      match validate tx with
+      let open Lwt.Syntax in
+      let* result = validate tx in
+      match result with
       | Ok tx_hash ->
         ok_lwt (Rpc_view.private_transfer_pending ~tx_hash)
       | Error (etype, reason) ->

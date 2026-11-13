@@ -27,15 +27,15 @@ let accepted signing pub tx =
   check "network envelope differs" (S.check_active signing [tx] = Ok ());
   check "RPC signature differs" (V.signature_check ~signing ~account_public_key:(Some pub) tx = Ok ());
   check "P2P signature differs" (P.sig_valid ~signing tx (Some pub));
-  check "P2P receive differs" (P.admit ~signing ~now:100. ~max_drift:300.
-    ~sender_pk:(Some pub) tx = P.Accept)
+  check "P2P receive differs" (Lwt_main.run (P.admit ~signing ~now:100. ~max_drift:300.
+    ~sender_pk:(Some pub) tx) = P.Accept)
 
 let refused signing pub tx =
   check "signature accepted wrong network" (not (S.verify signing tx pub));
   check "RPC accepted wrong network" (Result.is_error (V.signature_check ~signing ~account_public_key:(Some pub) tx));
   check "P2P accepted wrong network" (not (P.sig_valid ~signing tx (Some pub)));
-  check "P2P receive accepted wrong network" (P.admit ~signing ~now:100. ~max_drift:300.
-    ~sender_pk:(Some pub) tx <> P.Accept);
+  check "P2P receive accepted wrong network" (Lwt_main.run (P.admit ~signing ~now:100. ~max_drift:300.
+    ~sender_pk:(Some pub) tx) <> P.Accept);
   match signing with S.Historical -> () | S.Network _ ->
     check "network envelope accepted wrong network" (Result.is_error (S.check_active signing [tx]))
 

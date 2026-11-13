@@ -118,6 +118,7 @@ type build_preview_plan = {
 
 type build_preview_output = {
   plan : build_preview_plan;
+  executed : Transaction.t list;
   receipts_json : string list;
   rejected_count : int;
 }
@@ -524,6 +525,11 @@ val verify_preview_partition :
   (Octra_core.Epoch_exec.exec_result, string) result ->
   (unit, string) result
 
+val preview_moved :
+  prior:Octra_core.Epoch_exec.exec_result ->
+  result:Octra_core.Epoch_exec.exec_result ->
+  (string list, string) result
+
 val raw32_to_hex : string -> string
 
 val raw_hex8 : string -> string
@@ -642,6 +648,8 @@ val verify_proposal :
   Octra_consensus.C_driver.proposal_verdict Lwt.t
 
 val make_proposal :
+  ?clock:(unit -> float) ->
+  ?budget:float ->
   ?prepare:prepare ->
   ?private_slots:Octra_core.Private_slots.limits ->
   make_proposal_deps ->

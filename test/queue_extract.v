@@ -6,4 +6,4 @@ Require Import fhe_queue.
 
 Extraction Language OCaml.
 Set Extraction Output Directory ".".
-Extraction "queue_model.ml" delta empty capacity view_limit.
+Extraction "queue_model.ml" delta empty capacity view_limit Reserve.step.

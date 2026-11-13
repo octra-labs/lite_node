@@ -677,32 +677,43 @@ let step facts pc env = function
   | _ -> Error (Unsupported pc)
 
 let merge_regs _pc left right =
-  let result = Array.copy left in
-  let rec loop reg =
-    if reg = 64 then Ok result
+  let rec scan index =
+    if index = 64 then Ok left
     else
-      match left.(reg), right.(reg) with
-      | Unset, Unset -> loop (reg + 1)
-      | Unset, Set _
-      | Set _, Unset ->
-        result.(reg) <- Unset;
-        loop (reg + 1)
-      | Set left_kind, Set right_kind when left_kind = right_kind -> loop (reg + 1)
-      | Set left_kind, Set right_kind when numeric left_kind && numeric right_kind ->
-        result.(reg) <- Set Int;
-        loop (reg + 1)
-      | Set _, Set _ ->
-        result.(reg) <- Unset;
-        loop (reg + 1)
-  in
-  loop 0
+      let same = match left.(index), right.(index) with
+        | Unset, _ -> true
+        | Set a, Set b -> a = b || a = Int && numeric b
+        | Set _, Unset -> false in
+      if same then scan (index + 1)
+      else
+        let result = Array.copy left in
+        for reg = index to 63 do
+          result.(reg) <- (match left.(reg), right.(reg) with
+            | Set a, Set b when a = b -> left.(reg)
+            | Set a, Set b when numeric a && numeric b -> Set Int
+            | _ -> Unset)
+        done;
+        Ok result in
+  scan 0
 
 let merge_consts left right =
-  Array.mapi (fun index value ->
-    match value, right.(index) with
-    | Some left, Some right when left = right -> Some left
-    | _ -> None)
-    left
+  let rec scan index =
+    if index = Array.length left then left
+    else
+      let same = match left.(index), right.(index) with
+        | None, _ -> true
+        | Some value, Some other -> value = other
+        | Some _, None -> false in
+      if same then scan (index + 1)
+      else
+        let result = Array.copy left in
+        for slot = index to Array.length left - 1 do
+          result.(slot) <- (match left.(slot), right.(slot) with
+            | Some value, Some other when value = other -> left.(slot)
+            | _ -> None)
+        done;
+        result in
+  scan 0
 
 let merge_mem left right =
   let join _ left right =
@@ -909,7 +920,7 @@ let valid_facts len code facts =
   && List.for_all valid_xcall facts.xcalls
   && acyclic facts.calls
 
-let canonical_facts facts =
+let encode_facts facts =
   let pair_json key (slot, kind) =
     `Assoc [key, `Int slot; "kind", `String (kind_name kind)]
   in
@@ -976,7 +987,7 @@ let canonical_facts facts =
   Yojson.Safe.to_string (`Assoc fields)
 
 let facts_hash facts =
-  Digestif.SHA256.(digest_string (canonical_facts facts) |> to_hex)
+  Digestif.SHA256.(digest_string (encode_facts facts) |> to_hex)
 
 let runtime_entry code =
   let rec find pc =

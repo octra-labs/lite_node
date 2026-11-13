@@ -107,6 +107,20 @@ fn fhe_pair(request: &Request) -> Result<Value, i32> {
     Ok(Value::Bool(true))
 }
 
+fn fhe_number(request: &Request) -> Result<Value, i32> {
+    if request.params.len() > 2 && request.bool_param(2)? {
+        return Host::call(&Host::self_addr()?, "fhe_number", &request.params[..2]);
+    }
+    Host::fhe_load_pk(request.string_param(0)?)?;
+    if request.string_param(1)? == "short" {
+        return Err(Host::respond_manifest_json("abc"));
+    }
+    if request.string_param(1)? == "trap" {
+        panic!("fhe trap");
+    }
+    Ok(Value::Int(request.string_param(1)?.to_owned()))
+}
+
 pub fn execute(request: &Request) -> Option<Result<Value, i32>> {
     match request.method.as_str() {
         "visit" => Some(visit()),
@@ -119,6 +133,7 @@ pub fn execute(request: &Request) -> Option<Result<Value, i32>> {
         "depth" => Some(work(request, true)),
         "fuel" => Some(work(request, false)),
         "fhe_pair" => Some(fhe_pair(request)),
+        "fhe_number" => Some(fhe_number(request)),
         _ => None,
     }
 }
@@ -139,7 +154,8 @@ pub fn manifest() -> i32 {
             {"name": "deny", "view": false},
             {"name": "depth", "view": false},
             {"name": "fuel", "view": false},
-            {"name": "fhe_pair", "view": false}
+            {"name": "fhe_pair", "view": false},
+            {"name": "fhe_number", "view": false}
         ]
     }"#)
 }

@@ -666,7 +666,8 @@ class UpgradeProfileTest(unittest.TestCase):
                 mock.patch.object(upgrade, "membership", return_value = {
                     "active": True, "scheduled": True, "activate_epoch": None}), \
                 mock.patch.object(upgrade, "proc_hash", return_value = "e" * 64), \
-                mock.patch.object(upgrade, "process_alive", return_value = True):
+                mock.patch.object(upgrade, "process_alive", return_value = True), \
+                mock.patch.object(upgrade, "native_tip", return_value = None):
             for change, accepted in (({}, True), ({"consensus_rules_id": "wrong"}, False),
                     ({"consensus_profile": 1}, False), ({"source_commit": "a" * 40}, False),
                     ({"binary_hash": "f" * 64}, False), ({"profile_epoch": 1_654_104}, True),
@@ -757,7 +758,8 @@ class UpgradeProfileTest(unittest.TestCase):
                 calls["sync_plan"].side_effect = lambda vals, view, target: (
                     upgrade.make(MARKER["chain_id"], "range", 1_654_003, 1_654_002, target)
                     if target is not None else None)
-                calls["sync_head"].side_effect = [{"head": 1_686_600, "snapshot": 1_686_500}, None]
+                calls["sync_head"].side_effect = [{"head": 1_686_600, "snapshot": 1_686_500,
+                    "native": {"head": 1_686_600, "local": state["head_epoch"]}}, None]
                 calls["sync_wait"].side_effect = ValidatorError("signed snapshot metadata is unavailable")
                 self.assertEqual(upgrade.diagnose(ROOT, sup, values, MARKER), 2)
                 self.assertEqual(emit.call_args.kwargs["reason"], "signed_snapshot_required")
@@ -773,6 +775,20 @@ class UpgradeProfileTest(unittest.TestCase):
                 ("+64", 64), ("1_000", 4096), ("9" * 20, 4096), ("-9" * 20, 4096)):
             with self.subTest(requested = requested):
                 self.assertEqual(upgrade.sync_limit({"OCTRA_CATCHUP_MAX_LAG": str(requested)}), expected)
+
+    def test_unproved_target(self):
+        work = ROOT / "runtime_data"
+        work.mkdir(exist_ok = True)
+        with TemporaryDirectory(dir = work, prefix = "target-check-") as directory:
+            config = Path(directory) / "node.env"
+            values = {**VALUES, "OCTRA_DATA_DIR": str(Path(directory) / "data")}
+            state = {**STATE, "peer_epoch": STATE["head_epoch"] + 10000}
+            tip = {"head": STATE["head_epoch"] + 10000, "snapshot": STATE["head_epoch"] + 9000}
+            target = upgrade.sync_target(state, tip)
+            self.assertIsNone(target)
+            planned = upgrade.sync_plan(values, state, target)
+            self.assertIsNone(upgrade.remember_plan(config, values, state, planned))
+            self.assertFalse(config.with_name(config.name + ".sync.json").exists())
 
     def test_wait_without_peers(self):
         state = {**STATE, "lag": None, "head_epoch": 1_654_002}
@@ -798,6 +814,107 @@ class UpgradeProfileTest(unittest.TestCase):
                     upgrade.apply(ROOT, SUP, VALUES, ARGS, MARKER)
                 calls["stop"].assert_not_called()
                 calls["call"].assert_not_called()
+
+    def old_native(self):
+        state = {**STATE, "source_match": False, "runtime_match": False,
+            "profile_current": True, "live_source": "d" * 40, "live_binary": "e" * 64,
+            "head_root": "a" * 64, "lag": None, "peer_epoch": None, "sync_target": None}
+        values = {**VALUES, "OCTRA_SOURCE_COMMIT": "d" * 40, "OCTRA_BINARY_HASH": "e" * 64}
+        disk = upgrade.DiskState(state["head_epoch"], state["head_root"], 12, "owner", "public", None)
+        return state, values, disk
+
+    def test_old_native_view(self):
+        state, values, _ = self.old_native()
+        version = {"source_commit": state["live_source"], "binary_hash": state["live_binary"],
+            "chain_id": MARKER["chain_id"], "runtime_profile_hash": "f" * 64,
+            "profile_epoch": state["head_epoch"] + 1,
+            "runtime_profiles": [{"from_epoch": 0, "hash": "f" * 64}],
+            "consensus_profile": MARKER["consensus_profile"],
+            "consensus_rules_id": MARKER["consensus_rules_id"]}
+        self.assertTrue(upgrade.profile_current(version, MARKER, state["head_epoch"]))
+        self.assertFalse(upgrade.profile_match(version, MARKER))
+        with mock.patch.object(upgrade, "rpc_status", return_value = {
+                "head_epoch": state["head_epoch"], "state_root": state["head_root"]}), \
+                mock.patch.object(upgrade, "rpc_method", side_effect = lambda _, method:
+                    version if method == "octra_runtimeVersion" else None), \
+                mock.patch.object(upgrade, "load_wallet", return_value = {}), \
+                mock.patch.object(upgrade, "membership", return_value = {
+                    "active": True, "scheduled": False, "activate_epoch": None}), \
+                mock.patch.object(upgrade, "proc_hash", return_value = state["live_binary"]), \
+                mock.patch.object(upgrade, "process_alive", return_value = True):
+            actual = upgrade.view(values | {"OCTRA_API_PORT": "8080"}, 41, MARKER)
+        self.assertTrue(actual["binary_match"])
+        self.assertTrue(actual["profile_current"])
+        self.assertFalse(actual["source_match"])
+        self.assertIsNone(actual["sync_target"])
+        for change in ({"chain_id": "other"}, {"profile_epoch": state["head_epoch"] - 1},
+                {"runtime_profile_hash": "a" * 64}, {"consensus_rules_id": "other"}):
+            self.assertFalse(upgrade.profile_current(version | change, MARKER, state["head_epoch"]))
+
+    def test_old_native_upgrade(self):
+        state, values, disk = self.old_native()
+        unknown = {**STATE, "head_root": state["head_root"], "peer_epoch": None,
+            "sync_target": None, "lag": None, "voting": True, "validator_member": True}
+        agreed = {**unknown, "sync_target": state["head_epoch"],
+            "peer_epoch": state["head_epoch"], "lag": 0}
+        next_values = values | {"OCTRA_SOURCE_COMMIT": MARKER["source_commit"]}
+        run_wait, run_restore = upgrade.wait_node, upgrade.restore_cycle
+        with effects([state, state, state, unknown, agreed]) as calls, \
+                mock.patch.object(upgrade, "pm2_entries", return_value = []), \
+                mock.patch.object(upgrade, "current", return_value = SUP | {"pid": 42}), \
+                mock.patch.object(upgrade, "restore_plan", return_value = None), \
+                mock.patch.object(upgrade, "start") as start, \
+                mock.patch.object(upgrade.time, "sleep") as sleep:
+            calls["release_sync_values"].return_value = values
+            calls["parse_env"].return_value = next_values
+            calls["disk_state"].return_value = disk
+            calls["wait_node"].side_effect = run_wait
+            calls["restore_cycle"].side_effect = run_restore
+            self.assertEqual(upgrade.apply(ROOT, SUP, values, ARGS, MARKER), 0)
+            self.assertEqual([Path(call.args[0][1]).name for call in calls["call"].call_args_list][:2],
+                ["check.sh", "build.sh"])
+            calls["stop"].assert_called_once()
+            start.assert_called_once()
+            calls["sync_wait"].assert_not_called()
+            self.assertIsNone(calls["sync_plan"].call_args.args[-1])
+            self.assertTrue(calls["wait_node"].call_args.kwargs["require_target"])
+            self.assertEqual(calls["disk_state"].call_count, 3)
+            sleep.assert_called_once()
+
+    def test_old_native_refused(self):
+        state, values, disk = self.old_native()
+        changes = [{"binary_match": False}, {"profile_current": False},
+            {"live_source": "0" * 40}, {"head_epoch": True}, {"head_root": "b" * 64}]
+        for change in changes:
+            with self.subTest(change = change), effects([state | change]) as calls:
+                calls["release_sync_values"].return_value = values
+                calls["disk_state"].return_value = disk
+                with self.assertRaises(ValidatorError):
+                    upgrade.apply(ROOT, SUP, values, ARGS, MARKER)
+                calls["call"].assert_not_called()
+                calls["stop"].assert_not_called()
+        changed = state | {"profile_current": False}
+        with effects([state, state, changed]) as calls:
+            calls["release_sync_values"].return_value = values
+            calls["parse_env"].return_value = values
+            calls["disk_state"].return_value = disk
+            with self.assertRaisesRegex(ValidatorError, "local upgrade state changed"):
+                upgrade.apply(ROOT, SUP, values, ARGS, MARKER)
+            calls["stop"].assert_not_called()
+
+    def test_native_wait_required(self):
+        state = {**STATE, "peer_epoch": None, "sync_target": None, "lag": None,
+            "voting": True, "validator_member": True}
+        release = MARKER | {"notice_code": "consensus_recovery"}
+        args = SimpleNamespace(wait_seconds = 0, interval = 0)
+        self.assertTrue(upgrade.recovery_installed("validator", state, release))
+        with mock.patch.object(upgrade, "pm2_entries", return_value = []), \
+                mock.patch.object(upgrade, "current", return_value = SUP), \
+                mock.patch.object(upgrade, "view", return_value = state), \
+                mock.patch.object(upgrade, "emit") as emit:
+            self.assertEqual(upgrade.wait_node(ROOT, SUP, VALUES, args, release,
+                ROOT / "unused-node", require_target = True), 2)
+        self.assertEqual(emit.call_args.kwargs["reason"], "native_target_unavailable")
 
     def test_saved_plan_busy(self):
         plan = upgrade.make(MARKER["chain_id"], "range", 101, 100, 10_000)
@@ -948,6 +1065,30 @@ class UpgradeProfileTest(unittest.TestCase):
                 ):
                     state = upgrade.view(values, 41, MARKER)
                     self.assertEqual(upgrade.matches(state), row == version)
+
+    def test_apply_env_refusal(self):
+        select = upgrade.release_sync_values
+        values = {**VALUES, "OCTRA_BFT_PROPOSAL_MAX_OU": "8000"}
+        network = {"OCTRA_BFT_PROPOSAL_MAX_OU": "4000"}
+        with effects([STATE]) as calls, mock.patch.object(upgrade, "load_network",
+                return_value = (ROOT / "unused.env", "f" * 64, network)):
+            calls["release_sync_values"].side_effect = select
+            with self.assertRaisesRegex(ValidatorError,
+                    "consensus input change refused: OCTRA_BFT_PROPOSAL_MAX_OU"):
+                upgrade.apply(ROOT, SUP, values, ARGS, MARKER)
+            for name in ("sync_head", "remember_plan", "call", "stop", "restore_cycle", "wait_node"):
+                calls[name].assert_not_called()
+
+    def test_release_route_change(self):
+        values = {**VALUES, "OCTRA_BFT_PROPOSAL_MAX_OU": "8000",
+            "OCTRA_JOIN_RPC": "https://old.example"}
+        network = {"OCTRA_BFT_PROPOSAL_MAX_OU": "8000",
+            "OCTRA_JOIN_RPC": "https://new.example"}
+        with mock.patch.object(upgrade, "load_network",
+                return_value = (ROOT / "unused.env", "f" * 64, network)):
+            selected = upgrade.release_sync_values(ROOT, values, MARKER)
+        self.assertEqual(selected["OCTRA_JOIN_RPC"], "https://new.example")
+        self.assertEqual(selected["OCTRA_BFT_PROPOSAL_MAX_OU"], "8000")
 
     def test_apply_profile_refusal(self):
         for runtime in (False, None):
@@ -1150,6 +1291,19 @@ class UpgradeProfileTest(unittest.TestCase):
             emit.assert_called_once_with(fault = fault[0], path = path,
                 detail = "invalid", action = "do_not_delete")
             disk.assert_not_called()
+
+    def test_build_space(self):
+        with mock.patch.object(upgrade, "data_pids", return_value = []), \
+                mock.patch.object(upgrade, "durable_faults", return_value = []), \
+                mock.patch.object(upgrade, "emit"):
+            for free in (4 * 1024 ** 3, 8 * 1024 ** 3, 9 * 1024 ** 3 - 1):
+                with self.subTest(free = free), mock.patch.object(upgrade.shutil,
+                        "disk_usage", return_value = SimpleNamespace(free = free)):
+                    with self.assertRaises(ValidatorError):
+                        upgrade.preflight(ROOT, SUP, VALUES, False)
+            with mock.patch.object(upgrade.shutil, "disk_usage",
+                    return_value = SimpleNamespace(free = 9 * 1024 ** 3)):
+                upgrade.preflight(ROOT, SUP, VALUES, False)
 
     def test_wal_types(self):
         data = ROOT / "runtime_data" / ("wal_" + uuid.uuid4().hex)

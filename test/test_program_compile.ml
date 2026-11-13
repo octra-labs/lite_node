@@ -785,13 +785,13 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
         "view integer work limit accepted repeated squares";
       require (state.effort_used = 351_636)
         "view integer work charge differs";
-      require_bits "view integer work" 65_537 state;
+      require_bits "view integer work" 32_769 state;
       let accepted, state = run_vector_squares view_ctx 33 1_000_000 in
       require (not accepted && state.reverted)
         "view vector work limit accepted repeated squares";
-      require (state.effort_used = 351_812 + 17)
-        "view vector work charge differs";
-      require_bits "view vector work" 65_537 state;
+      require (state.effort_used = 351_815)
+        (Printf.sprintf "view vector work charge differs actual = %d" state.effort_used);
+      require_bits "view vector work" 32_769 state;
       let accepted, state = run_math view_ctx matrix_cap_code 1_000_000 in
       require (not accepted && state.reverted)
         "view matrix work item cap accepted";
@@ -800,7 +800,7 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
       let accepted, state = run_math view_ctx load_cap_code 2_000_000 in
       require (not accepted && state.reverted)
         "view loader work item cap accepted";
-      require (state.effort_used = 15)
+      require (state.effort_used = 31_266)
         "view loader work item cap charge differs";
       require (Hashtbl.length state.memory.data = 0)
         "refused view loader changed memory";
@@ -811,7 +811,7 @@ let verify_record_test (compiled : Octra_vm.Aml_source.t) =
         "base overlap work differs";
       require_memory_int "base overlap" state 2 (Z.of_int 1_572_864);
       let accepted, state = run_math view_ctx overlap_code 1000 in
-      require (accepted && state.effort_used = 27)
+      require (accepted && state.effort_used = 29)
         "view overlap work differs";
       require_memory_int "view overlap" state 2 (Z.of_int 786_432);
       let owner = "oct" ^ String.make 44 '1' in

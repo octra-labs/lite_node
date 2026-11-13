@@ -153,6 +153,24 @@ let test_view_lane () =
   | Ok 9 -> ()
   | _ -> fail "view lane did not reset"
 
+let test_view_work () =
+  let run elapsed =
+    let now = ref 0. in
+    Lwt_main.run (Octra_vm.Contract_rpc.run_view ~seconds:1.
+      ~clock:(fun () -> !now) (fun () -> now := elapsed; Lwt.return 7)) in
+  begin match run 0.2 with
+  | Ok 7 -> ()
+  | _ -> fail "view inherited selection limit"
+  end;
+  begin match run 1.1 with
+  | Error error when error.Octra_core.Rpc.code = -32005 -> ()
+  | _ -> fail "view work exceeded explicit limit"
+  end;
+  if !(Octra_vm.Contract_rpc.view_active) then fail "view work retained slot";
+  match run 0.2 with
+  | Ok 7 -> ()
+  | _ -> fail "view work did not recover"
+
 let test_view_timeout () =
   let busy seconds value () =
     let work = Lwt.map (fun () -> value) (Lwt_unix.sleep seconds) in
@@ -734,6 +752,17 @@ let test_nested_view_stop () =
         (fun () -> ctx.call_contract address address "echo" [] {depth = 0; limit = None; memory = ctx.fhe_memory; bytes = None}) ())
     in
     begin match run (fun () -> true) with
+    | Error _ -> ()
+    | Ok _ -> fail "oversized nested image accepted"
+    end;
+    let small = V.Bytecode.encode (Array.concat [prefix;
+      [|V.Contract_vm.LDI (0, V.Contract_vm.VInt (Z.of_int 7)); V.Contract_vm.STOP|];
+      Array.make 6000 (V.Contract_vm.ADD (2, 0, 0))]) in
+    Lwt_main.run (Octra_core.Store_irmin.deploy_contract store ~address
+      ~code_hash:Digestif.SHA256.(digest_string small |> to_hex)
+      ~version:"1" ~owner:address ~ctype:"CUSTOM" ~check:"bytecode"
+      ~bytecode_b64:(Base64.encode_exn small));
+    begin match run (fun () -> true) with
     | Ok value when value.Octra_vm.Contract_vm.return_value = Octra_vm.Contract_vm.VInt (Z.of_int 7) -> ()
     | _ -> fail "nested view control"
     end;
@@ -984,6 +1013,16 @@ program WorkRead {
       | Ok _ -> fail "work view result differs" in
     answer "1024" (read "copy" [`String "abcd"; `Int 8]);
     answer "7" (read "square" [`Int 4]);
+    let overhead = String.length (Yojson.Safe.to_string (`List [`String ""; `Int 0])) in
+    let maximum = V.Contract_rpc.view_params_limit - overhead in
+    answer (string_of_int maximum) (read "copy" [`String (String.make maximum 'a'); `Int 0]);
+    begin match read "copy" [`String (String.make (maximum + 1) 'a'); `Int 0] with
+    | Error error when error.Octra_core.Rpc.code = -32602
+        && error.data = Some (`String "program view params exceed limit") -> ()
+    | Error error -> fail ("view params refusal differs: " ^ error.message)
+    | _ -> fail "oversized view params accepted"
+    end;
+    answer "4" (read "copy" [`String "abcd"; `Int 0]);
     let refused reason = function
       | Error error when error.Octra_core.Rpc.code = -32000 -> ()
       | Error error -> fail ("work view technical error: " ^ error.Octra_core.Rpc.message)
@@ -1006,7 +1045,7 @@ program WorkRead {
       let space = V.Byte_work.available budget in
       if V.Byte_work.charge budget ~used:0 ~limit:max_int ~base:0
         [V.Byte_work.Allocate (space - 256 - 26)] = None then fail "view reservation failed";
-      let scope = V.Contract_vm.{depth = 0; limit = Some 1000;
+      let scope = V.Contract_vm.{depth = 0; limit = Some 1_000_000;
         memory = ctx.fhe_memory; bytes = if shared then ctx.byte_work else None} in
       let args = V.Contract_vm.[VString (String.make 128 'a'); VInt Z.one] in
       let call () =
@@ -1024,6 +1063,10 @@ program WorkRead {
     answer "1024" (read "copy" [`String "abcd"; `Int 8]))
 
 let () =
+  if Array.exists (String.equal "--work") Sys.argv then begin
+    test_view_work ();
+    exit 0
+  end;
   if Array.exists (String.equal "--overlap") Sys.argv then begin
     test_view_overlap ();
     exit 0
@@ -1051,6 +1094,7 @@ let () =
   test_receipt_hash_gate ();
   test_view_fhe_capability_gate ();
   test_view_lane ();
+  test_view_work ();
   test_view_timeout ();
   test_view_steps ();
   test_nested_view_stop ();

@@ -52,6 +52,7 @@ except (OSError, UnicodeError):
     refuse("manifest_unreadable", manifest)
 if not lines:
     refuse("manifest_invalid", manifest)
+listed = set()
 for line in lines:
     entry = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
     if entry is None:
@@ -62,6 +63,7 @@ for line in lines:
         refuse("manifest_invalid", manifest)
     if path.suffix.lower() == ".md":
         refuse("manifest_document", path)
+    listed.add(path)
     digest = hashlib.sha256()
     try:
         with path.open("rb") as source:
@@ -73,7 +75,9 @@ for line in lines:
         refuse("manifest_unreadable", path)
     if digest.hexdigest() != expected:
         refuse("manifest_mismatch", path)
-for name in ("nodes.config", "octra_node.opam.locked"):
+for name in ("nodes.config", "octra_node.opam.locked", "test/cases/hfhe_range.bin"):
+    if Path(name) not in listed:
+        refuse("manifest_missing", name)
     if not Path(name).is_file():
         refuse("file_missing", name)
 PY
@@ -101,12 +105,18 @@ if ! PYTHONDONTWRITEBYTECODE=1 python3 -c 'import nacl' >/dev/null 2>&1; then
 fi
 
 PYTHONDONTWRITEBYTECODE=1 python3 controls/lib/surface.py "$ROOT"
+sh controls/print_style_gate.sh --layout
+sh controls/measure_gate.sh
 PYTHONPATH="$ROOT/controls/lib" PYTHONDONTWRITEBYTECODE=1 python3 -c 'import sync_need, upgrade, validator_bundle, validator_config, validator_enroll, validator_guard, validator_process, validator_recover, validator_rejoin, validator_rpc, validator_status, validator_store'
 if [ "$TESTS" -eq 1 ]; then
-  PYTHONPATH="$ROOT/controls/lib" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest controls/lib/test_validator_tools.py
+  PYTHONPATH="$ROOT/controls/lib" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest test_gc_source test_gc_build test_measure_scan
+  PYTHONPATH="$ROOT/controls/lib" PYTHONDONTWRITEBYTECODE=1 python3 -m unittest test_validator_tools test_sync_tip test_sync_http test_sync_start test_upgrade_profile
   sh controls/print_style_gate.sh
   sh controls/image_gate.sh
   sh controls/proof_gate.sh
+  python3 controls/lib/gc_build.py -- dune build --root . --force \
+    @test/session_checks @test/hfhe_checks @test/cipher_cost @test/token_checks \
+    @test/paid_commit @test/preview_checkpoint @test/runtest-test_polc_cache @test/runtest-test_relief_path
 fi
 if [ -f config/network.env ]; then
   PYTHONPATH="$ROOT/controls/lib" PYTHONDONTWRITEBYTECODE=1 python3 controls/lib/validator_bundle.py \

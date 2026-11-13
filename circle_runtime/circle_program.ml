@@ -47,10 +47,13 @@ type loaded = {
 type loaded_cache_entry = {
   loaded : loaded;
   updated_at : float;
+  bytes : int;
 }
 
 let loaded_cache : (string, loaded_cache_entry) Hashtbl.t =
   Hashtbl.create 16
+
+let view_loaded_cache : (string, loaded_cache_entry) Hashtbl.t = Hashtbl.create 16
 
 let loaded_cache_ttl_secs = 300.0
 let loaded_cache_limit = 64
@@ -73,7 +76,7 @@ let loaded_cache_key ?(float_mode=Octra_core.Rule_graph.Prior)
     | Octra_core.Rule_graph.Prior -> key
     | Octra_core.Rule_graph.Active -> key ^ ":table"
 
-let prune_loaded_cache () =
+let prune_loaded_cache loaded_cache =
   let now = Unix.gettimeofday () in
   let expired = ref [] in
   Hashtbl.iter
@@ -82,14 +85,20 @@ let prune_loaded_cache () =
         expired := key :: !expired)
     loaded_cache;
   List.iter (fun key -> Hashtbl.remove loaded_cache key) !expired;
-  if Hashtbl.length loaded_cache > loaded_cache_limit then
-    Hashtbl.reset loaded_cache
+  let entries = Hashtbl.to_seq loaded_cache |> List.of_seq
+    |> List.sort (fun (_, left) (_, right) -> Float.compare right.updated_at left.updated_at) in
+  let rec keep slots bytes = function
+    | [] -> ()
+    | (key, entry) :: rest ->
+      if slots > 0 && entry.bytes <= bytes then keep (slots - 1) (bytes - entry.bytes) rest
+      else begin Hashtbl.remove loaded_cache key; keep slots bytes rest end in
+  keep loaded_cache_limit (32 * 1024 * 1024) entries
 
-let decode_bytecode ?(trusted = []) ?(point_ops = false) code_b64 =
+let decode_bytecode ?(view = false) ?(trusted = []) ?(point_ops = false) code_b64 =
   try
     match
       Octra_vm.Code_check.decode_deploy
-        ~trusted ~point_ops (Base64.decode_exn code_b64)
+        ~view ~trusted ~point_ops (Base64.decode_exn code_b64)
     with
     | Ok admitted ->
       Ok {
@@ -330,8 +339,12 @@ let load
     Lwt.return
       (Error (Octra_core.Circle_wasm_host.Rejected "circle not found"))
   | Some info ->
-    prune_loaded_cache ();
-    let cache_key = loaded_cache_key ~float_mode ~inspect_mode ~table_mode ~manifest_profile circle_id info in
+    let* code_opt = Octra_core.Store_irmin.get_circle_program_code_b64 ?snapshot store circle_id in
+    let loaded_cache = if optional then view_loaded_cache else loaded_cache in
+    prune_loaded_cache loaded_cache;
+    let cache_key = loaded_cache_key ~float_mode ~inspect_mode ~table_mode ~manifest_profile circle_id info
+      ^ ":" ^ Option.fold ~none:"missing"
+        ~some:(fun code -> Digestif.SHA256.(digest_string code |> to_hex)) code_opt in
     begin
       match Hashtbl.find_opt loaded_cache cache_key with
       | Some entry ->
@@ -339,10 +352,9 @@ let load
         Hashtbl.replace
           loaded_cache
           cache_key
-          { loaded; updated_at = Unix.gettimeofday () };
+          { entry with loaded; updated_at = Unix.gettimeofday () };
         Lwt.return (Ok loaded)
       | None ->
-    let* code_opt = Octra_core.Store_irmin.get_circle_program_code_b64 ?snapshot store circle_id in
     begin
       match code_opt with
       | None ->
@@ -365,7 +377,7 @@ let load
               | Octra_core.Circles.Octb ->
                 begin
                   let* checked = Octra_core.Exec_resource.joined ?launch
-                    (fun () -> decode_bytecode ~trusted ~point_ops code_b64) () in
+                    (fun () -> decode_bytecode ~view:optional ~trusted ~point_ops code_b64) () in
                   match checked with
                   | Ok admitted ->
                     Lwt.return (Ok {
@@ -427,7 +439,9 @@ let load
                             Hashtbl.replace
                               loaded_cache
                               cache_key
-                              { loaded; updated_at = Unix.gettimeofday () };
+                              { loaded; updated_at = Unix.gettimeofday ();
+                                bytes = 1024 + (Sys.word_size / 8) * Obj.reachable_words (Obj.repr loaded) };
+                            prune_loaded_cache loaded_cache;
                             Lwt.return (Ok loaded)
                         end
                     end

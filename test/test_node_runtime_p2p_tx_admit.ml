@@ -4,6 +4,7 @@
 let fail msg = failwith ("test_node_runtime_p2p_tx_admit: " ^ msg)
 
 let assert_verdict msg expected actual =
+  let actual = Lwt_main.run actual in
   if expected <> actual then fail msg
 
 let assert_true msg v =
@@ -243,17 +244,38 @@ let test_reject_shared_payload () =
 
 let test_signature_before_payload () =
   let from, priv, pub = key () in
-  let value =
-    tx ~from ~to_:from ~timestamp:1000.0 ~op_type:Octra_core.Transaction.EncryptOp
-  in
   let admit value =
     Octra_node_runtime.P2p_tx_admit.admit ~signing:Octra_core.Tx_signature.Historical ~now:1001.0 ~max_drift:300.0
       ~sender_pk:(Some pub) value
   in
-  assert_verdict "signature precedes proof parsing"
-    Octra_node_runtime.P2p_tx_admit.Invalid_signature (admit value);
-  assert_verdict "signed payload still validated"
-    Octra_node_runtime.P2p_tx_admit.Invalid_payload (admit (signed ~priv value))
+  let key_body = Yojson.Safe.to_string (`Assoc ["new_pubkey", `String "AA==";
+    "aes_kat", `String (Octra_core.Pvac_registry.expected_kat ())]) in
+  List.iter (fun (op_type, encrypted_data) ->
+    let value = { (tx ~from ~to_:from ~timestamp:1000.0 ~op_type) with
+      amount = Z.zero; encrypted_data } in
+    assert_verdict "signature precedes proof parsing"
+      Octra_node_runtime.P2p_tx_admit.Invalid_signature (admit value);
+    assert_verdict "signed payload still validated"
+      Octra_node_runtime.P2p_tx_admit.Invalid_payload (admit (signed ~priv value)))
+    [Octra_core.Transaction.EncryptOp, None; Octra_core.Transaction.KeySwitch, Some key_body]
+
+let test_payload_busy () =
+  let module Admit = Octra_node_runtime.P2p_tx_admit in
+  let module Memory = Octra_core.Compute_memory in
+  let from, priv, pub = key () in
+  let item = {(tx ~from ~to_:from ~timestamp:1000. ~op_type:Octra_core.Transaction.KeySwitch) with
+    encrypted_data = Some "{}"} in
+  let admit value = Admit.admit ~signing:Octra_core.Tx_signature.Historical
+    ~now:1001. ~max_drift:300. ~sender_pk:(Some pub) value in
+  let before = Memory.stats Memory.shared in
+  let ticket = Memory.reserve Memory.shared ~speculative:true
+    (Memory.limit_of_getenv Sys.getenv_opt / 4) |> Option.get in
+  Fun.protect ~finally:(fun () -> Memory.release ticket) (fun () ->
+    assert_verdict "signature before saturated payload queue" Admit.Invalid_signature (admit item);
+    assert_verdict "saturation is not invalid payload"
+      (Admit.Payload_unavailable "payload parse queue is full") (admit (signed ~priv item)));
+  assert_verdict "malformed outcome survives queue" Admit.Invalid_payload (admit (signed ~priv item));
+  assert_true "payload parse leaked reservation" (Memory.stats Memory.shared = before)
 
 let test_program_package_shape () =
   let from, priv, pub = key () in
@@ -333,7 +355,7 @@ let test_duty_retry () =
     [100L; 101L; 102L];
   let rejects ?(bft_mode = true) label duty value =
     assert_true (label ^ ": P2P timestamp rejected")
-      (match admit ~bft_mode duty value with Admit.Timestamp_drift _ -> true | _ -> false);
+      (match Lwt_main.run (admit ~bft_mode duty value) with Admit.Timestamp_drift _ -> true | _ -> false);
     assert_true (label ^ ": REST timestamp rejected")
       (Result.is_error (rest ~bft_mode duty value))
   in
@@ -368,8 +390,8 @@ let test_duty_retry () =
     assert_true (label ^ ": clock cannot claim retry")
       (not (View.duty_retry ~now ~duty ~bft_mode:true item));
     assert_true (label ^ ": P2P clock rejected")
-      (match Admit.admit ~signing:Octra_core.Tx_signature.Historical ~duty ~bft_mode:true ~now ~max_drift:300.
-        ~sender_pk:(Some pub) item with Admit.Timestamp_drift _ -> true | _ -> false);
+      (match Lwt_main.run (Admit.admit ~signing:Octra_core.Tx_signature.Historical ~duty ~bft_mode:true ~now ~max_drift:300.
+        ~sender_pk:(Some pub) item) with Admit.Timestamp_drift _ -> true | _ -> false);
     assert_true (label ^ ": REST clock rejected")
       (Result.is_error (View.pre_route_check ~duty ~bft_mode:true ~now
         ~max_timestamp_drift:300. ~observer_rpc_mode:false item)))
@@ -386,7 +408,7 @@ let test_duty_retry () =
   assert_verdict "old duty still requires sender key" Admit.Invalid_signature
     (Admit.admit ~signing:Octra_core.Tx_signature.Historical ~duty ~bft_mode:true ~now:1000. ~max_drift:300. ~sender_pk:None item);
   assert_true "old caller has no implicit duty exception"
-    (match Admit.admit ~signing:Octra_core.Tx_signature.Historical ~now:1000. ~max_drift:300. ~sender_pk:(Some pub) item with
+    (match Lwt_main.run (Admit.admit ~signing:Octra_core.Tx_signature.Historical ~now:1000. ~max_drift:300. ~sender_pk:(Some pub) item) with
      | Admit.Timestamp_drift _ -> true | _ -> false)
 
 let () =
@@ -399,6 +421,7 @@ let () =
   test_reject_invalid_claim_secret ();
   test_reject_shared_payload ();
   test_signature_before_payload ();
+  test_payload_busy ();
   test_program_package_shape ();
   test_duty_retry ();
   print_endline "status = pass test = p2p_tx_accept"

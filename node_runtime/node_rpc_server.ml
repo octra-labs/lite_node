@@ -411,7 +411,8 @@ let rest_dispatch =
   in
   Rest_read_rpc.dispatch Rest_read_rpc.{
     ledger_chaindata_params_read;
-    chaindata_params_read;
+    chain_chaindata_params_read = (fun f params ctx ->
+      chaindata_params_read (f ~chain_id:ctx.chain_id) params ctx);
     no_params;
     epoch_current = rest_epoch_current;
     epoch_list = rest_epoch_list;
@@ -579,6 +580,8 @@ let start (cfg : config) =
     deps = cfg.deps;
   } in
   let page_lock = Lwt_mutex.create () in
+  let sync_target = Status_read_rpc.create_sync_target ~chain_id:cfg.chain_id
+    ~data_dir:cfg.data_dir ~chaindata:cfg.chaindata ~driver_ref:cfg.consensus_driver_ref in
   let routes = dispatch ~page_lock cfg.epoch_visibility in
   let read_routes = read_dispatch ~page_lock cfg.epoch_visibility in
   let rpc_handler =
@@ -620,8 +623,8 @@ let start (cfg : config) =
       ~rpc_handler
       ~fallback_handler:state_http_handler
   in
-  let http = Rpc_http.create_server ~port:cfg.port ~callback in
-  let serve =
+  let serve () =
+    let http = Rpc_http.create_server ~port:cfg.port ~callback in
     match cfg.grpc with
     | Grpc_config.Disabled -> http
     | Grpc_config.Enabled config ->
@@ -634,9 +637,12 @@ let start (cfg : config) =
       Grpc_http2.serve config ~call ~submit ~http
   in
   Lwt.finalize
-    (fun () -> serve)
+    (fun () -> Rpc_http.with_sync_control ~data_dir:cfg.data_dir
+      ~query:(fun () -> Status_read_rpc.sync_target sync_target) serve)
     (fun () ->
       let open Lwt.Syntax in
+      let* stopped = Status_read_rpc.close_sync_target sync_target in
+      if not stopped then Log.warn "rpc" "event = sync_control status = draining";
       let* () = Sync_range.shutdown ranges in
       let* () = Pvac_status_actor.shutdown pvac_status in
       Octra_vm.Token_rpc_actor.shutdown token_rpc)

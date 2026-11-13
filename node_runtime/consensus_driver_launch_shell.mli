@@ -94,6 +94,8 @@ val prepare_votes :
   bool
 
 val create_driver :
+  ?resolve:(int64 -> (Octra_consensus.C_types.validator_set, string) result) ->
+  ?set_epoch:int64 ->
   runtime ->
   Octra_consensus.C_driver.t
 
@@ -105,5 +107,6 @@ val publish :
 
 val run :
   ?resolve:(int64 -> (Octra_consensus.C_types.validator_set, string) result) ->
+  ?set_epoch:int64 ->
   runtime ->
   Octra_consensus.C_driver.t

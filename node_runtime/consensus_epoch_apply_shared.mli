@@ -153,6 +153,7 @@ val run_node :
   ?compute:Octra_core.Compute_bill.verifier ->
   ?preverify:Octra_core.Preverify_commit.t ->
   ?parent_commit:Octra_consensus.C_types.parent_commit ->
+  ?voting_set:(int * Octra_consensus.C_types.validator_set) ->
   node_runtime ->
   Transaction.t list ->
   node_result Lwt.t

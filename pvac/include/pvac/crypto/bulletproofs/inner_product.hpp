@@ -21,31 +21,44 @@ struct InnerProductProof {
     Scalar b;
 };
 
+inline size_t msm_digit(const std::array<uint8_t, 32>& bytes, size_t bit, size_t width) {
+    if (bit >= 256 || width == 0 || width > 16)
+        throw std::runtime_error("pvac: scalar window rejected");
+    const size_t byte = bit / 8;
+    uint32_t word = 0;
+    for (size_t index = 0; index < 3 && byte + index < bytes.size(); ++index)
+        word |= uint32_t{bytes[byte + index]} << (8 * index);
+    return (word >> (bit % 8)) & ((size_t{1} << width) - 1);
+}
+
 inline RistrettoPoint multi_scalar_mul(
     const std::vector<Scalar>& scalars,
     const std::vector<RistrettoPoint>& points
 ) {
-    assert(scalars.size() == points.size());
+    if (scalars.size() != points.size())
+        throw std::runtime_error("pvac: scalar and point counts differ");
     size_t n = scalars.size();
     if (n == 0) return rist_identity();
 
-    std::vector<ExtPoint> pts(n);
-    for (size_t i = 0; i < n; i++)
-        pts[i] = rist_decode_or_throw(points[i]);
-
-    std::vector<std::array<uint8_t, 32>> sbytes(n);
-    for (size_t i = 0; i < n; i++)
-        sc_tobytes(sbytes[i].data(), scalars[i]);
-
     if (n <= 2) {
+        std::vector<ExtPoint> pts(n);
+        for (size_t i = 0; i < n; i++)
+            pts[i] = rist_decode_or_throw(points[i]);
         ExtPoint acc = ext_identity();
         for (size_t i = 0; i < n; i++)
             acc = ext_add(acc, ext_scalarmul(pts[i], scalars[i]));
         return rist_encode(acc);
     }
 
+    std::vector<ProverPoint> pts;
+    pts.reserve(n);
+    for (const auto& point : points) pts.push_back(prover_point(point));
+    std::vector<std::array<uint8_t, 32>> sbytes(n);
+    for (size_t i = 0; i < n; i++)
+        sc_tobytes(sbytes[i].data(), scalars[i]);
+
     size_t w = 1;
-    { size_t tmp = n; while (tmp >>= 1) w++; }
+    { size_t count = n; while (count >>= 1) w++; }
     if (w > 16) w = 16;
 
     size_t num_buckets = (1ULL << w) - 1;
@@ -53,30 +66,23 @@ inline RistrettoPoint multi_scalar_mul(
     size_t num_windows = (256 + w - 1) / w;
 
     ExtPoint result = ext_identity();
+    std::vector<ExtPoint> buckets(num_buckets);
 
     for (size_t win_idx = num_windows; win_idx > 0; win_idx--) {
 
         for (size_t d = 0; d < w; d++)
             result = ext_double(result);
 
-        std::vector<ExtPoint> buckets(num_buckets, ext_identity());
+        std::fill(buckets.begin(), buckets.end(), ext_identity());
 
         size_t bit_start = (win_idx - 1) * w;
 
         for (size_t i = 0; i < n; i++) {
 
-            uint32_t bucket_idx = 0;
-            for (size_t b = 0; b < w; b++) {
-                size_t bit = bit_start + b;
-                if (bit >= 256) break;
-                size_t byte_idx = bit >> 3;
-                size_t bit_in_byte = bit & 7;
-                if ((sbytes[i][byte_idx] >> bit_in_byte) & 1)
-                    bucket_idx |= (1U << b);
-            }
+            const auto bucket_idx = msm_digit(sbytes[i], bit_start, w);
 
             if (bucket_idx == 0) continue;
-            buckets[bucket_idx - 1] = ext_add(buckets[bucket_idx - 1], pts[i]);
+            buckets[bucket_idx - 1] = prover_add(buckets[bucket_idx - 1], pts[i]);
         }
 
         ExtPoint running_sum = ext_identity();
@@ -107,7 +113,8 @@ inline InnerProductProof ipp_prove(
     std::vector<Scalar> a,
     std::vector<Scalar> b,
     std::vector<RistrettoPoint> G_vec,
-    std::vector<RistrettoPoint> H_vec
+    std::vector<RistrettoPoint> H_vec,
+    const std::vector<Scalar>& h_scale = {}
 ) {
     const auto& ops = transcript.ops;
     size_t n = a.size();
@@ -115,6 +122,8 @@ inline InnerProductProof ipp_prove(
     assert(n == G_vec.size());
     assert(n == H_vec.size());
     assert(n > 0 && (n & (n - 1)) == 0);
+    if (!h_scale.empty() && h_scale.size() != n)
+        throw std::runtime_error("pvac: generator scale count differs");
 
     size_t lg = log2_size(n);
     InnerProductProof proof;
@@ -142,7 +151,9 @@ inline InnerProductProof ipp_prove(
                 points.push_back(G_vec[half + i]);
             }
             for (size_t i = 0; i < half; i++) {
-                scalars.push_back(b[half + i]);
+                scalars.push_back(k == 0 && !h_scale.empty()
+                    ? sc_mul(b[half + i], h_scale[i], ScalarRule::Wide)
+                    : b[half + i]);
                 points.push_back(H_vec[i]);
             }
             scalars.push_back(c_L);
@@ -162,7 +173,9 @@ inline InnerProductProof ipp_prove(
                 points.push_back(G_vec[i]);
             }
             for (size_t i = 0; i < half; i++) {
-                scalars.push_back(b[i]);
+                scalars.push_back(k == 0 && !h_scale.empty()
+                    ? sc_mul(b[i], h_scale[half + i], ScalarRule::Wide)
+                    : b[i]);
                 points.push_back(H_vec[half + i]);
             }
             scalars.push_back(c_R);
@@ -190,8 +203,12 @@ inline InnerProductProof ipp_prove(
                 {G_vec[i], G_vec[half + i]}
             );
 
+            const auto h_left = k == 0 && !h_scale.empty()
+                ? sc_mul(u_k, h_scale[i], ScalarRule::Wide) : u_k;
+            const auto h_right = k == 0 && !h_scale.empty()
+                ? sc_mul(u_k_inv, h_scale[half + i], ScalarRule::Wide) : u_k_inv;
             H_new[i] = prover_msm(
-                {u_k, u_k_inv},
+                {h_left, h_right},
                 {H_vec[i], H_vec[half + i]}
             );
         }

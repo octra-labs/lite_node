@@ -4,6 +4,50 @@
 From Stdlib Require Import List Arith Bool Lia.
 Import ListNotations.
 
+Module ProofMemory.
+
+Definition keep hash rows := hash :: firstn 63 (filter (fun item => negb (item =? hash)) rows).
+
+Lemma firstn_subset : forall n (rows : list nat) item,
+  In item (firstn n rows) -> In item rows.
+Proof.
+  induction n as [|n IH]; intros [|head rest] item found; simpl in *; try contradiction.
+  destruct found as [same|found]; [now left|right; now apply IH in found].
+Qed.
+
+Theorem keep_size : forall hash rows, length (keep hash rows) <= 64.
+Proof. intros. unfold keep. rewrite length_cons, length_firstn. lia. Qed.
+
+Theorem keep_origin : forall hash rows item,
+  In item (keep hash rows) -> item = hash \/ In item rows.
+Proof.
+  intros hash rows item [same|found]; [now left|].
+  right. apply firstn_subset in found. apply filter_In in found. exact (proj1 found).
+Qed.
+
+Theorem keep_sound : forall check hash rows,
+  check hash = true -> Forall (fun item => check item = true) rows ->
+  Forall (fun item => check item = true) (keep hash rows).
+Proof.
+  intros check hash rows checked prior. apply Forall_forall. intros item found.
+  apply keep_origin in found. destruct found as [same|found]; [now subst|].
+  rewrite Forall_forall in prior. now apply prior.
+Qed.
+
+Definition reuse check hash rows := if existsb (Nat.eqb hash) rows then true else check hash.
+
+Theorem reuse_exact : forall check rows hash,
+  Forall (fun item => check item = true) rows -> reuse check hash rows = check hash.
+Proof.
+  intros check rows hash prior. unfold reuse.
+  destruct (existsb (Nat.eqb hash) rows) eqn:found; [|reflexivity].
+  apply existsb_exists in found. destruct found as [item [inside same]].
+  apply Nat.eqb_eq in same. subst item. rewrite Forall_forall in prior.
+  symmetry. now apply prior.
+Qed.
+
+End ProofMemory.
+
 Record entry := { key : nat; weight : nat; value : nat }.
 
 Fixpoint total (rows : list entry) :=

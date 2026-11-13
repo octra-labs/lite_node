@@ -139,7 +139,7 @@ let check_rpc ~known forms =
     List.iter (fun input ->
       Pool.clear ();
       let checked = ref [] in
-      let result = Rest.validate_and_submit_tx (runtime checked) ledger input in
+      let result = Lwt_main.run (Rest.validate_and_submit_tx (runtime checked) ledger input) in
       expect "RPC returns normalized identity" (result = Ok hash);
       expect "queue stores normalized envelope" (Pool.find_by_hash hash = Some tx);
       expect "preverify sees normalized envelope" (!checked = [tx]);
@@ -183,7 +183,7 @@ let test_rpc_refusals () =
       List.iter (fun input ->
         let checked = ref [] in
         expect "invalid envelope refused"
-          (Result.is_error (Rest.validate_and_submit_tx (runtime checked) ledger input));
+          (Result.is_error (Lwt_main.run (Rest.validate_and_submit_tx (runtime checked) ledger input)));
         expect "refusal has no queue effects" (Pool.staging_size () = 0 && !checked = [])) inputs))
     [false; true]
 
@@ -197,6 +197,7 @@ let peer_io ledger tx seen sent = Handler.{
   has_tx = (fun hash -> Pool.find_by_hash hash <> None);
   find_tx = Pool.find_by_hash;
   sender_pk = Octra_node_runtime.Tx_sender_key.resolve ~find_account:(Ledger.find_opt ledger);
+  find_account = Ledger.find_opt ledger;
   add_tx = (fun input -> seen := input :: !seen;
     Rest.add_tx_to_staging ~relay:false (runtime (ref [])) ledger input);
   send_payload = (fun payload -> sent := payload :: !sent);
@@ -213,7 +214,7 @@ let check_p2p legacy =
     let seen, sent = ref [], ref [] in
     let io = peer_io ledger tx seen sent in
     let forms = List.rev (sig_forms tx) @ key_forms tx in
-    List.iter (fun input -> Handler.handle {io with payload = wire legacy input}) forms;
+    List.iter (fun input -> Lwt_main.run (Handler.handle {io with payload = wire legacy input})) forms;
     let hash = Tx.hash tx in
     expect "P2P adds one normalized envelope" (!seen = [tx]);
     expect "P2P stores one normalized hash"
@@ -233,7 +234,7 @@ let test_wire_hash () =
     let payload = Gossip.encode (Gossip.Tx {
       hash = Tx.hash tx; tx_json = Tx.to_yojson input |> Yojson.Safe.to_string;
     }) in
-    Handler.handle {io with payload};
+    Lwt_main.run (Handler.handle {io with payload});
     expect "wire identity checked before normalization" (!seen = [] && !sent = []);
     let old_hash = Tx.hash input in
     let serve = {io with
@@ -241,7 +242,7 @@ let test_wire_hash () =
       has_tx = (fun hash -> hash = old_hash);
       find_tx = (fun hash -> if hash = old_hash then Some input else None);
     } in
-    Handler.handle serve;
+    Lwt_main.run (Handler.handle serve);
     expect "serving prior identity preserves bytes"
       (List.map Gossip.decode !sent = [Gossip.Tx {
         hash = old_hash; tx_json = Tx.to_yojson input |> Yojson.Safe.to_string;

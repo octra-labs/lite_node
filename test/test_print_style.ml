@@ -64,11 +64,22 @@ let name value =
 let test_name value =
   String.starts_with ~prefix:"test_" value || String.starts_with ~prefix:"check_" value
 
+let refused_word text =
+  let text = String.lowercase_ascii text in
+  let term = "fixt" ^ "ure" in
+  let rec scan index =
+    index + String.length term <= String.length text
+    && (String.sub text index (String.length term) = term || scan (index + 1))
+  in
+  scan 0
+
 let errors path tree =
   let base = Filename.remove_extension (Filename.basename path) in
   let rows = ref (if name base then [] else [0, "file_name"]) in
   let expr self value =
     (match value.pexp_desc with
+     | Pexp_constant (Pconst_string (text, _, _)) when refused_word text ->
+       rows := (value.pexp_loc.loc_start.pos_lnum, "literal_name") :: !rows
      | Pexp_apply ({pexp_desc = Pexp_ident name; _}, (_, arg) :: _) ->
        let diagnostic = match name.txt with
          | Longident.Lident ("print_endline" | "prerr_endline") -> true
@@ -118,6 +129,9 @@ let check_cases () =
   let ipc = ast "let () = print_endline \"ready\"" in
   if errors "test_store_lock.ml" ipc <> [] || errors "case.ml" ipc = [] then
     failwith "ipc selection differs";
+  let literal = ast ("let case = \"fixt" ^ "\\117re\"") in
+  if errors "case.ml" literal <> [1, "literal_name"] then
+    failwith "escaped name accepted";
   let short = "test_" ^ String.make 27 'a' in
   let long = short ^ "a" in
   let binding id = ast ("let " ^ id ^ " () = ()") in

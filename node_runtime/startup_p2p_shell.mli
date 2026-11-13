@@ -140,6 +140,7 @@ val node_stack_deps :
   P2p_config.node_stack_deps
 
 val build :
+  ?eviction_source:(int64 -> (Octra_consensus.C_types.validator_set, string) result) ->
   deps ->
   network ->
   wallet ->
@@ -162,6 +163,7 @@ val stack_view :
   node_view
 
 val build_node_view :
+  ?eviction_source:(int64 -> (Octra_consensus.C_types.validator_set, string) result) ->
   node_request ->
   (node_view, string) result
 
@@ -178,6 +180,7 @@ val admit_validator_startup :
   unit
 
 val load_persistent_update :
+  ?check:(Octra_consensus.C_driver.scheduled_validator_set_config -> (unit, string) result) ->
   persistent_update_deps ->
   Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t
 
@@ -190,9 +193,11 @@ val persistent_update_deps_of_runtime :
   persistent_update_deps
 
 val load_runtime_persistent_update :
+  ?check:(Octra_consensus.C_driver.scheduled_validator_set_config -> (unit, string) result) ->
   node_start_runtime ->
   Octra_consensus.C_driver.scheduled_validator_set_config option Lwt.t
 
 val start_node :
+  ?eviction_source:(int64 -> (Octra_consensus.C_types.validator_set, string) result) ->
   node_start_runtime ->
   node_start

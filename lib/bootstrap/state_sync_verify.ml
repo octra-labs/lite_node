@@ -13,7 +13,31 @@ open Lwt.Infix
 let fail reason =
   Lwt.return_error reason
 
-let verify_irmin checkpoint data_dir =
+let check_marker ~epoch = function
+  | None -> Error "execution profile marker is missing"
+  | Some raw ->
+      Result.bind (Octra_core.Epoch_exec.execution_marker_of_string raw) (fun marker ->
+        if marker.epoch = epoch then Ok ()
+        else Error "execution profile epoch differs")
+
+let verify_execution ?execution_profile ~chain_id ~epoch store =
+  let module E = Octra_core.Epoch_exec in
+  match execution_profile, Octra_core.Rule_graph.seatless_at ~chain_id ~epoch with
+  | Some profile, Octra_core.Rule_graph.Active when profile ~chain_id ~epoch = None ->
+      fail "restored execution profile is not configured"
+  | Some profile, _ -> E.check_execution_state ~profile ~chain_id ~epoch store
+  | None, Octra_core.Rule_graph.Prior ->
+      E.check_execution_state ~profile:(fun ~chain_id:_ ~epoch:_ -> None) ~chain_id ~epoch store
+  | None, Octra_core.Rule_graph.Active ->
+      Octra_core.Store_irmin.get_meta store E.execution_meta_key >>= fun marker ->
+      match check_marker ~epoch marker with
+      | Error reason -> fail reason
+      | Ok () ->
+          Octra_core.Store_irmin.get_meta store "last_epoch" >>= fun last ->
+          Octra_core.Store_irmin.get_meta store "current_epoch" >|= fun current ->
+          E.check_execution_epochs ~epoch ~last ~current
+
+let verify_irmin ?execution_profile checkpoint data_dir =
   let path = Filename.concat data_dir "irmin_store" in
   Lwt.catch
     (fun () ->
@@ -22,7 +46,13 @@ let verify_irmin checkpoint data_dir =
         (fun () ->
           Octra_core.Store_irmin.get_head_hash store >>= function
           | Some root when root = checkpoint.Checkpoint.ledger_state_root ->
-              Lwt.return_ok root
+              if checkpoint.epoch > Int64.of_int max_int then
+                fail "restored epoch exceeds platform limit"
+              else
+                let epoch = Int64.to_int checkpoint.epoch in
+                let chain_id = checkpoint.chain_id in
+                verify_execution ?execution_profile ~chain_id ~epoch store
+                >|= Result.map (fun () -> root)
           | Some _ -> fail "restored Irmin root does not match checkpoint"
           | None -> fail "restored Irmin store has no head")
         (fun () -> Octra_core.Store_irmin.close store))
@@ -63,7 +93,7 @@ let verify_chaindata checkpoint ledger_root data_dir =
   with exn ->
     Error ("restored chaindata verification failed: " ^ Printexc.to_string exn)
 
-let verify checkpoint data_dir =
+let verify ?execution_profile checkpoint data_dir =
   match Checkpoint.validate checkpoint with
   | Error reason -> fail reason
   | Ok () ->
@@ -75,7 +105,7 @@ let verify checkpoint data_dir =
         when not (Checkpoint.matches_head checkpoint head) ->
           fail "restored HEAD.json does not match checkpoint"
       | Octra_core.Head_manifest.Present _ ->
-          verify_irmin checkpoint data_dir >>= function
+          verify_irmin ?execution_profile checkpoint data_dir >>= function
           | Error _ as error -> Lwt.return error
           | Ok ledger_root -> Lwt.return (verify_chaindata checkpoint ledger_root data_dir)
 

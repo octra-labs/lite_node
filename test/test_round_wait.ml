@@ -59,7 +59,7 @@ let test_activation_clock () =
       ((timers C.PrevoteStep engine = []) = enabled)
   ) [9L, false; 10L, true; 11L, true]
 
-let test_two_stages () =
+let test_plan_stages () =
   let chain_id = "octra-devnet-9871-cluster" in
   let plan = C_quorum_policy.for_chain chain_id in
   let released = C_quorum_policy.with_round_epoch plan None in
@@ -80,8 +80,15 @@ let test_two_stages () =
     check "published clock compatibility differs" ((left = right) = not waiting))
     [1_737_332L, false, false; 1_737_333L, true, false;
      1_739_999L, true, false; 1_740_000L, true, true];
-  check "second stage omitted from profile plan"
-    (C_quorum_policy.epochs plan = [1_737_333L; 1_740_000L]);
+  check "historical profile stages differ"
+    (C_quorum_policy.epochs (C_quorum_policy.with_seatless_epoch plan None)
+      = [1_737_333L; 1_740_000L]);
+  let activation = Option.get (C_quorum_policy.seatless_activation_for_chain chain_id) in
+  let epoch = Int64.of_int activation.activation_epoch in
+  check "seatless stage omitted from profile plan"
+    (C_quorum_policy.epochs plan = [1_737_333L; 1_740_000L; epoch]);
+  check "rewind crossed seatless stage"
+    (not (C_quorum_policy.rewind_allowed ~chain_id ~from_epoch:epoch ~to_epoch:(Int64.pred epoch)));
   check "rewind crossed second stage"
     (not (C_quorum_policy.rewind_allowed ~chain_id ~from_epoch:1_740_000L ~to_epoch:1_739_999L))
 
@@ -298,7 +305,7 @@ let test_delayed_quorum ?(relief = false) ?(ahead = false) offset =
 let () =
   test_single_clock ();
   test_activation_clock ();
-  test_two_stages ();
+  test_plan_stages ();
   test_quorum_timer ();
   test_relief_clock ();
   test_relief_phase ();

@@ -420,7 +420,7 @@ let subcall_result (r : Contract.exec_result) =
   | Error e ->
     Error e
 
-let make_contract_ctx ?bytes (deps : (_, _) deps) =
+let make_contract_ctx ?(scalar_work = false) ?bytes (deps : (_, _) deps) =
   let fhe_memory = match deps.fhe_work with
     | Octra_core.Rule_graph.Prior -> None
     | Octra_core.Rule_graph.Active -> Some (Octra_vm.Fhe_memory.create ()) in
@@ -474,6 +474,7 @@ let make_contract_ctx ?bytes (deps : (_, _) deps) =
       math = deps.math;
       object_cost = deps.object_cost;
       int_work = deps.int_work;
+      scalar_work;
       fhe_work = deps.fhe_work;
       proof_exec = deps.proof_exec;
       proof_key = deps.proof_key;
@@ -489,12 +490,12 @@ let make_contract_ctx ?bytes (deps : (_, _) deps) =
   in
   ctx
 
-let make_live_contract_ctx (args : live_contract_ctx_args) =
+let make_live_contract_ctx ?spawn ?(scalar_work = false) (args : live_contract_ctx_args) =
   let bytes = match args.vm_bytes with
     | Octra_core.Rule_graph.Prior -> None
     | Octra_core.Rule_graph.Active ->
       Some (Octra_vm.Byte_work.create Octra_vm.Byte_work.consensus_limits) in
-  let ctx = make_contract_ctx ?bytes
+  let ctx = make_contract_ctx ~scalar_work ?bytes
     {
       get_balance = Value_journal.effective args.value_journal;
       transfer = (fun ~from_addr ~to_addr ~amount ->
@@ -632,7 +633,13 @@ let make_live_contract_ctx (args : live_contract_ctx_args) =
           | None -> Error "call effort exceeds limit"
           | Some effort_used -> Ok {result with effort_used})));
     deploy_async = (fun deployer bytecode_raw nonce scope params ->
-      protect scope (fun scope -> Contract.deploy_inner_async
+      protect scope (fun scope -> match spawn with
+      | Some checked -> Program_spawn.execute checked
+        ~journal:args.program_journal
+        ~ctx:{ctx with fhe_memory = scope.memory; byte_work = scope.bytes}
+        ~depth:scope.depth ~limit:(Option.value ~default:1_000_000 scope.limit)
+        ~params args.store ~deployer ~bytecode_raw ~nonce
+      | None -> Contract.deploy_inner_async
         ~trusted:(Program_trust.keys args.trusted_program_keys)
         ~journal:args.program_journal
         ~ctx:{ ctx with fhe_memory = scope.memory; byte_work = scope.bytes }
@@ -776,7 +783,7 @@ let run_program_call_tx (deps : program_call_deps) tx =
     ~reject_domain:Call_plan.Program_exec
     tx
 
-let run_program_source_tx ~metered (runtime : call_runtime) ~program_journal ~store
+let run_program_source_tx ~scalar_work ~metered (runtime : call_runtime) ~program_journal ~store
     (tx : Transaction.t) =
   let open Lwt.Syntax in
   let reject reason = runtime.reject_after_fee tx.ou "program_source_rejected" reason in
@@ -784,6 +791,10 @@ let run_program_source_tx ~metered (runtime : call_runtime) ~program_journal ~st
   | Error reason -> reject reason
   | Ok (_, sources) when Z.lt tx.ou (Program_record.source_fee sources) ->
     reject "program source fee below byte cost"
+  | Ok (_, sources) when scalar_work && not (Option.fold ~none:false
+      ~some:(fun cost -> Z.leq (Z.mul (Z.of_int 4) cost) tx.ou)
+      (Program_package.source_cost sources.Program_record.files)) ->
+    reject "program source work refused"
   | Ok (expected, sources) ->
     let* meta = Octra_core.Store_irmin.get_contract_meta store tx.to_ in
     begin match meta with
@@ -794,6 +805,11 @@ let run_program_source_tx ~metered (runtime : call_runtime) ~program_journal ~st
       let* stored = Octra_core.Store_irmin.read store ["contracts"; tx.to_; "bytecode"] in
       begin match stored with
       | None -> Lwt.fail (Octra_core.Exec_resource.Unavailable Host)
+      | Some encoded when scalar_work && not (Option.fold ~none:false
+          ~some:(fun cost -> Z.leq (Z.add (Z.mul (Z.of_int 4) cost)
+            (Octra_vm.Scalar_work.load (String.length encoded))) tx.ou)
+          (Program_package.source_cost sources.Program_record.files)) ->
+        reject "program source work refused"
       | Some encoded ->
         let* checked = Octra_core.Exec_resource.detach (fun () ->
           match Base64.decode encoded with
@@ -819,16 +835,23 @@ let run_program_source_tx ~metered (runtime : call_runtime) ~program_journal ~st
       end
     end
 
-let run_program_upgrade_tx ?(metered = false) ?(records = Octra_core.Rule_graph.Prior)
+let run_program_upgrade_tx ?(scalar_work = false) ?(metered = false) ?(records = Octra_core.Rule_graph.Prior)
     (runtime : call_runtime) ~trusted_program_keys
     ~program_journal ~store (tx : Transaction.t) =
   runtime.with_debited_fee tx.ou (fun () ->
     if records = Octra_core.Rule_graph.Active && Program_upgrade.is_source tx then
-      run_program_source_tx ~metered runtime ~program_journal ~store tx
+      run_program_source_tx ~scalar_work ~metered runtime ~program_journal ~store tx
+    else if scalar_work && not (Option.fold ~none:false
+      ~some:(fun encoded -> Z.leq (Octra_vm.Scalar_work.load (String.length encoded)) tx.ou)
+      tx.encrypted_data) then
+      runtime.reject_after_fee tx.ou "program_upgrade_rejected" "program upgrade work refused"
     else
     match Program_upgrade.parse tx with
     | Error error ->
       runtime.reject_after_fee tx.ou "program_upgrade_rejected" error
+    | Ok payload when scalar_work && Contract.creation_work true
+        (Octra_vm.Scalar_work.allowance true tx.ou 10_000_000) payload.bytecode_raw [] = None ->
+      runtime.reject_after_fee tx.ou "program_upgrade_rejected" "program upgrade work refused"
     | Ok payload ->
       begin
         match
@@ -995,13 +1018,22 @@ let run_program_deploy_tx (deps : vm_tx_deps) tx =
             runtime.log_constructor_failed result.contract_addr reason;
             runtime.reject_after_fee tx.ou "constructor_failed" reason)
 
-let prepare_program_package ?(metered = false) ?(preview = Octra_core.Rule_graph.Prior)
+let deployment_spent active (tx : Transaction.t) =
+  if not active || tx.op_type <> Transaction.ProgramDeploy then 0
+  else match Option.bind tx.encrypted_data Program_package.scalar_cost with
+    | Some cost when Z.fits_int cost -> Z.to_int cost
+    | _ -> max_int
+
+let prepare_program_package ?(scalar_work = false) ?(metered = false) ?(preview = Octra_core.Rule_graph.Prior)
     ?(proof_exec = Octra_core.Rule_graph.Prior)
     ?(records = Octra_core.Rule_graph.Prior)
     ~overlap ~program_mode ~point_ops (tx : Transaction.t) =
   match tx.encrypted_data with
   | None -> Lwt.return_error "Program package missing"
   | Some encoded ->
+    if scalar_work && not (Program_package.scalar_check
+      ~limit:(Z.of_int (Octra_vm.Scalar_work.allowance true tx.ou 1_000_000)) encoded) then
+      Lwt.return_error "Program compilation work exceeds limit" else
     let compiler = Program_package.compiler_mode ~preview program_mode in
     let loops = proof_exec = Octra_core.Rule_graph.Active in
     let consts = records = Octra_core.Rule_graph.Active in
@@ -1026,7 +1058,8 @@ let run_multi_exec (deps : multi_exec_deps) ~max_calls ~epoch ~tx_hash
   | None ->
     deps.reject_malformed "multi_exec requires calls payload"
   | Some calls_json ->
-    match Call_plan.parse_multi_exec_calls ~max_calls calls_json with
+    let scalar_work = (deps.make_ctx tx_hash).scalar_work in
+    match Call_plan.parse_multi_exec_calls ~scalar_work ~max_calls calls_json with
     | Error err ->
       deps.reject_malformed err
     | Ok calls ->
@@ -1038,7 +1071,7 @@ let run_multi_exec (deps : multi_exec_deps) ~max_calls ~epoch ~tx_hash
             Multi_exec.run_async
               ~from_addr
               ~calls
-              ~effort_limit:(Call_plan.effort_limit fee)
+              ~effort_limit:(Octra_vm.Scalar_work.allowance ctx.scalar_work fee (Call_plan.effort_limit fee))
               ~balance:deps.balance
               ~exec:(fun step ->
                 deps.apply_value_effect step.value_effect;
@@ -1206,7 +1239,8 @@ let stage_program_record ~mode ~journal tx package =
       Program_journal.add_record journal tx.to_ record;
       Ok ()
 
-let make_live_vm_tx_deps ?(metered = false) ?(inspect_mode = Octra_core.Rule_graph.Prior)
+let make_live_vm_tx_deps ?(source_create = Octra_core.Rule_graph.Prior) ?spawn_ctx
+    ?(metered = false) ?(inspect_mode = Octra_core.Rule_graph.Prior)
     ?(records = Octra_core.Rule_graph.Prior)
     (args : live_vm_tx_args) =
   let save_receipt =
@@ -1228,6 +1262,8 @@ let make_live_vm_tx_deps ?(metered = false) ?(inspect_mode = Octra_core.Rule_gra
       let ( let* ) = Octra_core.Exec_resource.bind in
       let* contract_addr, receipt =
         Contract.deploy_async
+          ~spent:(deployment_spent ctx_for_tx.scalar_work tx)
+          ~limit:(Octra_vm.Scalar_work.allowance ctx_for_tx.scalar_work tx.ou 1_000_000)
           ~trusted:(Program_trust.keys args.trusted_program_keys)
           ?admitted
           ~journal:args.program_journal ~ctx:ctx_for_tx ~params
@@ -1236,6 +1272,7 @@ let make_live_vm_tx_deps ?(metered = false) ?(inspect_mode = Octra_core.Rule_gra
       save_receipt ~tx_hash ~contract_addr ~method_name:"constructor" receipt;
       Lwt.return { contract_addr; receipt });
     program_prepare = (fun tx -> prepare_program_package
+      ~scalar_work:(args.ctx_for_hash (Transaction.hash tx)).scalar_work
       ~metered
       ~records
       ~proof_exec:(args.ctx_for_hash (Transaction.hash tx)).proof_exec
@@ -1255,7 +1292,7 @@ let make_live_vm_tx_deps ?(metered = false) ?(inspect_mode = Octra_core.Rule_gra
         ~trusted:(Program_trust.keys args.trusted_program_keys)
         ~journal:args.program_journal
         ~ctx
-        ~limit:call.effort_limit
+        ~limit:(Octra_vm.Scalar_work.allowance ctx.scalar_work tx.ou call.effort_limit)
         ~hfhe_strict:(args.proof_mode = Octra_core.Rule_graph.Active)
         args.store tx.to_
         call.method_name call.params tx.from tx.amount);
@@ -1274,11 +1311,18 @@ let make_live_vm_tx_deps ?(metered = false) ?(inspect_mode = Octra_core.Rule_gra
         call_result);
     circle_log_ok = (fun tx -> log_circle_call_ok tx.to_);
     program_exec = (fun tx ~ctx call ->
+      Program_spawn.run ~mode:source_create ~metered ~ctx ~tx ~call
+        ~rules:(fun () -> args.program_mode, records)
+        ~make_ctx:(fun checked -> match spawn_ctx with
+          | Some make -> make checked
+          | None -> raise (Octra_core.Exec_resource.Unavailable Host))
+        ~exec:(fun ~ctx ~limit ~params ->
         Contract.execute_call_async
            ~trusted:(Program_trust.keys args.trusted_program_keys)
            ~journal:args.program_journal ~ctx
-           ~limit:call.effort_limit args.store tx.to_ call.method_name
-           call.params tx.from tx.amount);
+           ~limit
+           args.store tx.to_ call.method_name
+           params tx.from tx.amount));
     program_save = (fun tx ~tx_hash call receipt ->
       save_receipt ~program:true ~tx_hash ~contract_addr:tx.to_
         ~method_name:call.method_name receipt);
@@ -1300,6 +1344,11 @@ let make_live_vm_tx_deps ?(metered = false) ?(inspect_mode = Octra_core.Rule_gra
 
 let run_vm_tx (deps : vm_tx_deps) tx =
   match tx.Transaction.op_type with
+  | Transaction.ContractDeploy when
+      (deps.runtime.make_ctx (Transaction.hash tx)).scalar_work ->
+    deps.runtime.with_debited_fee tx.ou (fun () ->
+      deps.runtime.reject_after_fee tx.ou "program_profile_required"
+        "ProgramDeploy is required for new programs")
   | Transaction.ProgramDeploy ->
     run_program_deploy_tx deps tx
   | Transaction.ContractDeploy ->
@@ -1362,9 +1411,10 @@ let max_multi_exec_calls ~env =
     opt = env;
   }
 
-let make_live_sender_vm_tx_deps (args : live_sender_vm_tx_args) =
-  let ctx_for_hash tx_hash =
-    make_live_contract_ctx
+let make_live_sender_vm_tx_deps ?(source_create = Octra_core.Rule_graph.Prior)
+    ?(scalar_work = false) (args : live_sender_vm_tx_args) =
+  let context ?spawn tx_hash =
+    make_live_contract_ctx ?spawn ~scalar_work
       {
         value_journal = args.value_journal;
         program_journal = args.program_journal;
@@ -1386,6 +1436,7 @@ let make_live_sender_vm_tx_deps (args : live_sender_vm_tx_args) =
         tx_hash;
       }
   in
+  let ctx_for_hash = context ?spawn:None in
   let runtime =
     make_live_call_runtime {
       reject = args.reject;
@@ -1400,7 +1451,9 @@ let make_live_sender_vm_tx_deps (args : live_sender_vm_tx_args) =
       confirm = args.confirm;
     }
   in
-  make_live_vm_tx_deps ~metered:args.program_inputs ~inspect_mode:args.vm_bytes ~records:args.program_records {
+  make_live_vm_tx_deps ~source_create
+    ~spawn_ctx:(fun spawn -> context ~spawn (Transaction.hash args.tx))
+    ~metered:args.program_inputs ~inspect_mode:args.vm_bytes ~records:args.program_records {
     runtime;
     trusted_program_keys = args.trusted_program_keys;
     program_journal = args.program_journal;

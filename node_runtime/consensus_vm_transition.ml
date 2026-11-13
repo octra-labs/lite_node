@@ -55,13 +55,14 @@ let tree_hash root =
     end
   | _ -> raise (Policy_unavailable "previous state root is invalid")
 
-let context ~program_trust ~object_cost backend env
+let context ?spawn ~program_trust ~object_cost backend env
     (tx : Transaction.t) effects tx_hash =
   let fhe_work, wasm_float, proof_exec, proof_key, vm_bytes =
     match backend.Epoch_exec.fold env.Epoch_exec.epoch_id with
     | Ok fold -> fold.fhe_work, fold.wasm_float, fold.proof_exec, fold.proof_key, fold.vm_bytes
     | Error reason -> raise (Policy_unavailable reason) in
-  Vm.make_live_contract_ctx
+  Vm.make_live_contract_ctx ?spawn
+    ~scalar_work:(Rule_graph.scalar_work_at ~chain_id:env.chain_id ~epoch:env.epoch_id = Active)
     {
       value_journal = Tx_effects.value effects;
       program_journal = Tx_effects.program effects;
@@ -94,10 +95,13 @@ let wasm_load_profile = function
   | Rule_graph.Prior -> Octra_core.Circle_wasm_host.Compute
   | Rule_graph.Active -> Octra_core.Circle_wasm_host.Manifest
 
-let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
+let run ?source_create
+    ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
     ?(save_receipt_raw = (fun ~tx_hash:_ ~json:_ -> ()))
     ~circle_mode ~wasm_compute_mode ~program_trust ~object_cost backend env
     (tx : Transaction.t) =
+  let source_create = Option.value source_create
+    ~default:(Rule_graph.source_create_at ~chain_id:env.Epoch_exec.chain_id ~epoch:env.epoch_id) in
   let effects =
     Tx_effects.create
       ~ledger:backend.Epoch_exec.ledger
@@ -171,7 +175,7 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
         reject;
         debit = Tx_effects.debit effects;
         tx;
-        make_ctx = context ~program_trust ~object_cost backend env tx effects;
+        make_ctx = context ?spawn:None ~program_trust ~object_cost backend env tx effects;
         balance = Tx_effects.balance effects;
         apply_value_effect = (fun effect ->
           ignore (Tx_effects.apply effects effect));
@@ -186,6 +190,11 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
     let ( let* ) = Octra_core.Exec_resource.bind in
     let* contract_addr, receipt =
       Contract.deploy_async
+        ~spent:(Vm.deployment_spent
+          (Rule_graph.scalar_work_at ~chain_id:env.Epoch_exec.chain_id ~epoch:env.epoch_id = Active) tx)
+        ~limit:(Octra_vm.Scalar_work.allowance
+          (Rule_graph.scalar_work_at ~chain_id:env.Epoch_exec.chain_id ~epoch:env.epoch_id = Active)
+          tx.ou 1_000_000)
         ~trusted:(Program_trust.keys program_trust)
         ?admitted
         ~journal:(Tx_effects.program effects)
@@ -234,6 +243,7 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
         | Error reason -> Lwt.fail (Policy_unavailable reason)
         | Ok fold ->
           Vm.prepare_program_package
+            ~scalar_work:(Rule_graph.scalar_work_at ~chain_id:env.chain_id ~epoch:env.epoch_id = Active)
             ~metered:(program_inputs env)
             ~records:fold.program_records
             ~proof_exec:fold.proof_exec
@@ -260,11 +270,12 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
             ~trusted:(Program_trust.keys program_trust)
             ~journal:(Tx_effects.program effects)
             ~ctx
-            ~limit:call.Call_plan.effort_limit
+            ~limit:(Octra_vm.Scalar_work.allowance ctx.scalar_work current.ou call.Call_plan.effort_limit)
             ~hfhe_strict:(backend.proof_mode = Rule_graph.Active)
             ~hfhe_mode
             ~update_policy:(circle_mode = Rule_graph.Active)
             ~manifest_profile:(wasm_load_profile wasm_compute_mode)
+            ~program_result:(Rule_graph.program_result_at ~chain_id:env.chain_id ~epoch:env.epoch_id = Active)
             backend.store
             current.to_
             call.method_name
@@ -272,6 +283,19 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
             current.from
             current.amount
         in
+        let* result =
+          if Rule_graph.program_result_at ~chain_id:env.chain_id ~epoch:env.epoch_id = Active
+              && not result.receipt.success
+              && Circle_exec.hfhe_binding_equal result.hfhe_binding
+                (Circle_exec.failed_call_result "").hfhe_binding then
+            let* info = Octra_core.Store_irmin.get_circle_info backend.store current.to_ in
+            let code_hash, stable_root = match info with
+              | Some info -> info.code_hash, info.stable_root
+              | None -> String.make 64 '0', String.make 64 '0' in
+            let hfhe_binding = {result.hfhe_binding with circle_id = current.to_;
+              code_hash; stable_root; public_reads_hash = Circle_exec.public_reads_hash []} in
+            Lwt.return {result with hfhe_binding}
+          else Lwt.return result in
         Option.iter
           (fun capture -> capture := Some result.Circle_exec.hfhe_binding)
           circle_capture;
@@ -322,17 +346,25 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
           result);
       circle_log_ok = (fun _ _ _ _ -> ());
       program_exec = (fun current ~ctx call ->
+        Program_spawn.run ~mode:source_create ~metered:(program_inputs env)
+          ~rules:(fun () -> match backend.fold env.Epoch_exec.epoch_id with
+            | Ok fold -> fold.program_mode, fold.program_records
+            | Error reason -> raise (Policy_unavailable reason))
+          ~ctx ~tx:current ~call
+          ~make_ctx:(fun spawn -> context ~spawn ~program_trust ~object_cost
+            backend env current effects (Transaction.hash current))
+          ~exec:(fun ~ctx ~limit ~params ->
           Contract.execute_call_async
              ~trusted:(Program_trust.keys program_trust)
              ~journal:(Tx_effects.program effects)
              ~ctx
-             ~limit:call.effort_limit
+             ~limit
              backend.store
              current.to_
              call.method_name
-             call.params
+             params
              current.from
-             current.amount);
+             current.amount));
       program_save = (fun current ~tx_hash call receipt ->
         stage_direct_receipt
           ~program:true
@@ -375,6 +407,7 @@ let run ?(hfhe_mode = Transcript.Direct) ?circle_capture ?expected_circle
               | Ok fold -> fold.program_records
               | Error reason -> raise (Policy_unavailable reason) in
             Vm.run_program_upgrade_tx
+              ~scalar_work:(Rule_graph.scalar_work_at ~chain_id:env.chain_id ~epoch:env.epoch_id = Active)
               ~metered:(program_inputs env)
               ~records
               runtime
@@ -500,7 +533,7 @@ let preverify_circle
   | Ok (Epoch_exec.Confirmed _), None ->
     Lwt.return_error "circle_receipt_capture_missing"
 
-let process_tx ?preverify ?save_receipt_raw ~backend
+let process_tx ?source_create ?preverify ?save_receipt_raw ~backend
     ~(env : Epoch_exec.env) ~circle_mode ~wasm_compute_mode ~program_trust
     ~object_cost tx =
   match tx.Transaction.op_type with
@@ -557,6 +590,7 @@ let process_tx ?preverify ?save_receipt_raw ~backend
   | Transaction.MultiExec
   | Transaction.ContractUpgrade ->
     run
+      ?source_create
       ?save_receipt_raw
       ~circle_mode
       ~wasm_compute_mode
@@ -569,6 +603,7 @@ let process_tx ?preverify ?save_receipt_raw ~backend
     let open Lwt.Syntax in
     let* admitted =
       Consensus_circle_code_check.admit
+        ~scalar_work:(Rule_graph.scalar_work_at ~chain_id:env.chain_id ~epoch:env.epoch_id = Active)
         ~resource_errors:((Epoch_exec.fold_at backend env.epoch_id).proof_exec = Rule_graph.Active)
         ~store:backend.Epoch_exec.store
         ~program_trust
@@ -597,6 +632,7 @@ let process_tx ?preverify ?save_receipt_raw ~backend
     let open Lwt.Syntax in
     let* admitted =
       Consensus_circle_code_check.admit
+        ~scalar_work:(Rule_graph.scalar_work_at ~chain_id:env.chain_id ~epoch:env.epoch_id = Active)
         ~resource_errors:((Epoch_exec.fold_at backend env.epoch_id).proof_exec = Rule_graph.Active)
         ~store:backend.Epoch_exec.store
         ~program_trust

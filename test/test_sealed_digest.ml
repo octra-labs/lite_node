@@ -33,7 +33,8 @@ let check_vector value =
   check (name ^ " prior salt") (salt = Yojson.Safe.to_string (`List [
     `String "octra:circle:sealed_digest"; `String circle_id; `String key_id]));
   check (name ^ " digest") (Sealed.digest ~circle_id ~key_id ~passphrase plaintext = field value "digest_hex");
-  check (name ^ " default") (Sealed.write_digest ~circle_id ~key_id ~passphrase plaintext = field value "plaintext_hash");
+  check (name ^ " default") (Sealed.write_digest ~circle_id ~key_id ~passphrase plaintext = field value "digest_hex");
+  check (name ^ " compatible") (Sealed.write_digest ~mode:Sealed.Compatible ~circle_id ~key_id ~passphrase plaintext = field value "plaintext_hash");
   check (name ^ " keyed") (Sealed.write_digest ~mode:Sealed.Keyed ~circle_id ~key_id ~passphrase plaintext = field value "digest_hex");
   List.iter (fun key ->
     check (name ^ " read " ^ key)
@@ -59,9 +60,11 @@ let check_vector value =
   check (name ^ " envelope") (String.sub envelope 0 5 = "OCRS1");
   check (name ^ " decrypt") (Mirage_crypto.AES.GCM.authenticate_decrypt ~key ~nonce ciphertext = Some frame);
   check (name ^ " encrypt") (Mirage_crypto.AES.GCM.authenticate_encrypt ~key ~nonce frame = ciphertext);
-  let changed = Bytes.of_string ciphertext in
-  Bytes.set changed 0 (Char.chr (Char.code (Bytes.get changed 0) lxor 1));
-  check (name ^ " cipher") (Mirage_crypto.AES.GCM.authenticate_decrypt ~key ~nonce (Bytes.to_string changed) = None);
+  List.iter (fun index ->
+    let changed = Bytes.of_string ciphertext in
+    Bytes.set changed index (Char.chr (Char.code (Bytes.get changed index) lxor 1));
+    check (name ^ " cipher") (Mirage_crypto.AES.GCM.authenticate_decrypt ~key ~nonce (Bytes.to_string changed) = None))
+    [0; String.length ciphertext - 1];
   let wrong_key = Sealed.read_key ~circle_id ~key_id ~passphrase:"wrong" |> Mirage_crypto.AES.GCM.of_secret in
   check (name ^ " authentication") (Mirage_crypto.AES.GCM.authenticate_decrypt ~key:wrong_key ~nonce ciphertext = None)
 

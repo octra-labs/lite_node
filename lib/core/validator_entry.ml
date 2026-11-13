@@ -154,6 +154,34 @@ let source_epoch (parameters : parameters) activate_epoch =
   else
     Ok (Int64.sub activate_epoch parameters.activation_delay)
 
+let select_members ?(incumbents = []) (parameters : parameters) ~source_epoch entries =
+  let incumbents = List.fold_left
+    (fun set address -> String_set.add address set) String_set.empty incumbents in
+  entries
+  |> List.filter (eligible ~parameters ~source_epoch)
+  |> List.sort (compare_selected incumbents)
+  |> take parameters.max_validators
+  |> List.map (fun (entry : entry) -> {
+    address = entry.address; pubkey = entry.pubkey; weight = entry.bond;
+  })
+
+let check_weight_change ~before ~after =
+  let total members = List.fold_left
+    (fun sum (member : member) -> Z.add sum member.weight) Z.zero members in
+  let before_total = total before and after_total = total after in
+  if List.length after < 4 then Ok ()
+  else
+    let increased (member : member) =
+      let excess = Z.sub (Z.mul (Z.of_int 3) member.weight) after_total in
+      Z.sign excess >= 0 &&
+      (List.length before < 4 ||
+        match List.find_opt (fun (old : member) -> old.address = member.address) before with
+        | None -> true
+        | Some old -> Z.gt excess (Z.sub (Z.mul (Z.of_int 3) old.weight) before_total))
+    in
+    if List.exists increased after then Error "validator change increases blocking weight"
+    else Ok ()
+
 let snapshot ?(incumbents=[]) (parameters : parameters) ~activate_epoch
     (entries : entry list) =
   match validate_parameters parameters with
@@ -180,23 +208,8 @@ let snapshot ?(incumbents=[]) (parameters : parameters) ~activate_epoch
               match validate_unique entries with
               | Error _ as error -> error
               | Ok () ->
-                let incumbents =
-                  List.fold_left
-                    (fun set address -> String_set.add address set)
-                    String_set.empty
-                    incumbents
-                in
                 let validators =
-                  entries
-                  |> List.filter (eligible ~parameters ~source_epoch)
-                  |> List.sort (compare_selected incumbents)
-                  |> take parameters.max_validators
-                  |> List.map
-                    (fun (entry : entry) -> {
-                      address = entry.address;
-                      pubkey = entry.pubkey;
-                      weight = entry.bond;
-                    })
+                  select_members ~incumbents parameters ~source_epoch entries
                 in
                 if List.length validators < 4 then
                   Error "validator snapshot has fewer than four eligible members"
@@ -227,37 +240,6 @@ let snapshot ?(incumbents=[]) (parameters : parameters) ~activate_epoch
             end
         end
     end
-
-let signed_weight snapshot signers =
-  let weights = Hashtbl.create (List.length snapshot.validators) in
-  List.iter
-    (fun validator ->
-      Hashtbl.add weights validator.address validator.weight)
-    snapshot.validators;
-  let seen = Hashtbl.create (List.length signers) in
-  let rec loop total = function
-    | [] -> Ok total
-    | signer :: rest ->
-      if Hashtbl.mem seen signer then
-        loop total rest
-      else
-        match Hashtbl.find_opt weights signer with
-        | None -> Error "validator signature is not in snapshot"
-        | Some weight ->
-          Hashtbl.add seen signer ();
-          loop (Z.add total weight) rest
-  in
-  loop Z.zero signers
-
-let has_quorum snapshot signers =
-  match signed_weight snapshot signers with
-  | Error _ as error -> error
-  | Ok weight ->
-    let n = List.length snapshot.validators in
-    let f = (n - 1) / 3 in
-    let quorum = if n < 4 then n else n - f in
-    let signer_count = List.length (List.sort_uniq String.compare signers) in
-    Ok (signer_count >= quorum && Z.geq weight snapshot.quorum_weight)
 
 let leader_hash ~seed ~epoch_id ~round =
   let buffer = Buffer.create 128 in

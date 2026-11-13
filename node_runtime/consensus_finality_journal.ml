@@ -703,6 +703,44 @@ let read_committed_epoch ~chain_id ~epoch base =
   with exn ->
     Invalid (Printexc.to_string exn)
 
+let read_at_head ~chain_id ~epoch ~state_root ~txid_hi base =
+  let ( let* ) = Result.bind in
+  let read pending target =
+    match Option.map Yojson.Safe.from_string (read_bytes target) with
+    | None -> Ok None
+    | Some json ->
+      let record = record_of_json ~read_bundle:false json in
+      if record.finalize.C_types.epoch_id <> epoch then Ok None
+      else
+      let record = record_of_json json in
+      let* () = validate_record ~chain_id record in
+      if pending && Option.is_none record.bundle then
+        Error "durable head pending journal has no bundle"
+      else if Text.hash32_hex record.finalize.header.proposed_state_root <> state_root
+           || record.finalize.header.txid_hi <> txid_hi then
+        Error "finality journal differs from durable head"
+      else Ok (Some record)
+  in
+  let merge selected (pending, target) =
+    let* selected = selected in
+    let* record = read pending target in
+    match selected, record with
+    | Some prior, Some record when not (same_record prior record) ->
+      Error "conflicting finality journals at durable head"
+    | Some prior, Some record when prior.bundle = None -> Ok (Some record)
+    | None, record -> Ok record
+    | selected, _ -> Ok selected
+  in
+  if epoch < 0L || epoch = Int64.max_int then Invalid "durable head epoch is invalid"
+  else
+    try
+      match List.fold_left merge (Ok None)
+        [false, committed_path base; false, history_path base epoch; true, path base] with
+      | Error reason -> Invalid reason
+      | Ok None -> Missing
+      | Ok (Some record) -> Valid record
+    with exn -> Invalid (Printexc.to_string exn)
+
 let read_committed_epoch_validated ~chain_id ~validator_set ~epoch base =
   match read_committed_epoch ~chain_id ~epoch base with
   | Missing -> Missing

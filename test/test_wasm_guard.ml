@@ -127,7 +127,87 @@ let commit_guard balance before_tbl changed_tbl =
           (Hashtbl.find_opt values balance = Hashtbl.find_opt before_tbl balance)
           "circle commit guard changed storage")
 
+let test_response_cost () =
+  let module VM = Octra_vm.Contract_vm in
+  let module Work = Octra_vm.Scalar_work in
+  let read active used limit text =
+    Exec.vm_response_value ~active ~used ~limit (Some (Wire.Resp_int text)) in
+  let check text =
+    let cost = Work.parse (String.length text) |> Z.to_int in
+    let expected = Ok (Some (VM.VInt (Z.of_string text))) in
+    need (read false 17 17 text = (expected, 17)) "prior response work changed";
+    need (read true 17 (17 + cost) text = (expected, 17 + cost))
+      "response parse effort differs";
+    need (read true 17 (16 + cost) text =
+      (Error "wasm response integer effort exceeds limit", 16 + cost))
+      "response parsed without effort" in
+  List.iter check [""; "0x"; "42"; "-0x2a"; "+42"; "0b10_1010"; "000000000";
+    "0x" ^ String.make 16_384 'f'; String.make Work.text_limit '0'];
+  let wide = "0x1" ^ String.make 16_384 '0' in
+  let cost = Work.parse (String.length wide) |> Z.to_int in
+  need (read true 17 (17 + cost) wide =
+    (Error "wasm response integer width exceeds limit", 17 + cost))
+    "response width or effort differs";
+  List.iter (fun length ->
+    need (read true 17 max_int (String.make length '0') =
+      (Error "wasm response integer text exceeds limit", 17))
+      "response text limit bypassed") [Work.text_limit + 1; 2_097_142];
+  List.iter (fun text ->
+    let cost = Work.parse (String.length text) |> Z.to_int in
+    need (read true 17 (17 + cost) text =
+      (Error "wasm response integer is invalid", 17 + cost))
+      "invalid response lost parsing cost";
+    need (read false 17 17 text = (Error "wasm response integer is invalid", 17))
+      "prior invalid response changed") ["invalid"; "1,2"];
+  List.iter (fun (input, output) ->
+    List.iter (fun active ->
+      need (Exec.vm_response_value ~active ~used:17 ~limit:17 input = (Ok output, 17))
+        "nonnumeric response changed") [false; true])
+    [None, None; Some Wire.Resp_null, Some (VM.VString "");
+     Some (Wire.Resp_bool true), Some (VM.VBool true);
+     Some (Wire.Resp_string wide), Some (VM.VString wide)];
+  List.iter (fun number ->
+    let value = VM.VInt number in
+    let cost = Work.decimal number |> Z.to_int in
+    need (VM.output_work VM.default_ctx ~used:17 ~limit:17 value = Some 17)
+      "prior response decimal changed";
+    let ctx = {VM.default_ctx with scalar_work = true} in
+    need (VM.output_work ctx ~used:17 ~limit:(17 + cost) value = Some (17 + cost))
+      "response decimal effort differs";
+    need (VM.output_work ctx ~used:17 ~limit:(16 + cost) value = None)
+      "response decimal exceeded effort") [Z.zero; Z.minus_one; Z.shift_left Z.one 65_535];
+  need (VM.output_work {VM.default_ctx with scalar_work = true} ~used:0 ~limit:max_int
+    (VM.VInt (Z.shift_left Z.one 65_536)) = None) "wide output accepted"
+
+let test_child_number () =
+  let module VM = Octra_vm.Contract_vm in
+  List.iter (fun active -> List.iter (fun async_exec -> List.iter (fun bits ->
+    let number = Z.shift_left Z.one (bits - 1) in
+    let child = Ok VM.{return_value = VInt number; effort_used = 7; events = []} in
+    let ctx = {VM.default_ctx with scalar_work = active; async_exec;
+      call_contract = (fun _ _ _ _ _ -> child);
+      call_async = (fun _ _ _ _ _ -> Lwt.return child)} in
+    let state = VM.create_state ~ctx ~limit:20_000_000 ~caller:"owner" ~origin:"owner"
+      ~address:"program" ~value:Z.zero ~storage:(Hashtbl.create 0) () in
+    let code = VM.[|LDI (1, VString "target"); LDI (2, VString "value");
+      XCALL (0, 1, 2, 3, 0); STOP|] in
+    let result = if async_exec then Lwt_main.run (VM.run_async state code)
+      else VM.run state code in
+    let accepted = not active || bits <= Octra_vm.Scalar_work.bit_limit in
+    need (result = accepted && state.reverted = not accepted)
+      (Printf.sprintf "child scalar outcome differs active = %b async = %b bits = %d result = %b reverted = %b"
+        active async_exec bits result state.reverted);
+    if accepted then need (state.regs.(0) = VM.VInt number) "child scalar value changed"
+    else need (state.regs.(0) = VM.VInt Z.zero) "child scalar wrote wide value")
+    [65_536; 65_537]) [false; true]) [false; true]
+
 let () =
+  if Array.exists (String.equal "--child") Sys.argv then begin
+    test_child_number ();
+    exit 0
+  end;
+  test_response_cost ();
+  test_child_number ();
   let module R = Octra_core.Rule_graph in
   let chain_id = "octra-devnet-9871-cluster" in
   let plan = Option.get (R.wasm_float_activation_for_chain chain_id) in
@@ -186,17 +266,17 @@ let () =
        "circle_storage:cell_owner:standard")
     "circle storage consensus id changed";
   begin
-    match Exec.vm_response_value (Some (Wire.Resp_int "invalid")) with
-    | Error "wasm response integer is invalid" -> ()
-    | Error reason -> failwith reason
-    | Ok _ -> failwith "invalid wasm integer accepted"
+    match Exec.vm_response_value ~active:false ~used:0 ~limit:100 (Some (Wire.Resp_int "invalid")) with
+    | Error "wasm response integer is invalid", 0 -> ()
+    | Error reason, _ -> failwith reason
+    | Ok _, _ -> failwith "invalid wasm integer accepted"
   end;
   begin
-    match Exec.vm_response_value (Some (Wire.Resp_int "42")) with
-    | Ok (Some (Octra_vm.Contract_vm.VInt value)) ->
+    match Exec.vm_response_value ~active:false ~used:0 ~limit:100 (Some (Wire.Resp_int "42")) with
+    | Ok (Some (Octra_vm.Contract_vm.VInt value)), 0 ->
       need (Z.equal value (Z.of_int 42)) "wasm integer changed"
-    | Ok _ -> failwith "wasm integer type changed"
-    | Error reason -> failwith reason
+    | Ok _, _ -> failwith "wasm integer type changed"
+    | Error reason, _ -> failwith reason
   end;
   let cleared = ref false in
   Lwt_main.run

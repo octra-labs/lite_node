@@ -125,9 +125,11 @@ let persist_meta deps ~emission ~total ~force_emission plan =
         plan.Epoch_exec.new_emission_remaining
   in
   let* () =
-    set_missing deps "total_supply" total plan.Epoch_exec.new_total_supply
+    if Z.gt plan.Epoch_exec.reward_burned Z.zero then
+      deps.set_meta "total_supply" (Z.to_string plan.Epoch_exec.new_total_supply)
+    else set_missing deps "total_supply" total plan.Epoch_exec.new_total_supply
   in
-  if plan.Epoch_exec.supply_tracking_active then
+  if plan.Epoch_exec.supply_tracking_active || Z.gt plan.reward_burned Z.zero then
     deps.set_meta
       Emission_schedule.retired_key
       (Z.to_string plan.Epoch_exec.new_supply_retired)
@@ -278,6 +280,16 @@ let run_node deps request =
     | Error error -> failwith error
   in
   let plan, schedule_binding = plan in
+  let registry =
+    match Octra_core.Rule_graph.seatless_at ~chain_id:request.chain_id ~epoch:request.epoch_id with
+    | Octra_core.Rule_graph.Prior -> None
+    | Octra_core.Rule_graph.Active -> deps.get_meta Octra_core.Validator_registry.meta_key in
+  let* penalized = Epoch_exec.validator_penalties ~read:(fun key -> Lwt.return (deps.get_meta key))
+    ~chain_id:request.chain_id ~epoch_id:request.epoch_id (Epoch_exec.reward_addresses request.reward) in
+  let plan = match Epoch_exec.prepare_reward_plan ~penalized ~chain_id:request.chain_id
+    ~epoch_id:request.epoch_id ~registry ~reward:request.reward plan with
+    | Ok plan -> plan
+    | Error error -> failwith error in
   let reward_meta =
     {
       meta with
@@ -296,7 +308,8 @@ let run_node deps request =
       ~ready_max_lag:request.ready_max_lag
   in
   let reward_credits =
-    match Epoch_exec.reward_credits request.reward plan with
+    match Epoch_exec.reward_credits_at ~penalized ~chain_id:request.chain_id ~epoch_id:request.epoch_id
+      ~registry ~reward:request.reward plan with
     | Ok credits -> credits
     | Error error -> failwith error
   in

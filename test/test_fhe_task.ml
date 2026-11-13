@@ -267,12 +267,207 @@ let image_checks worker key secret =
       Read_cipher (false, false, "invalid"); Read_cipher (false, true, "invalid");
       Read_cipher (true, false, "invalid"); Read_cipher (true, true, "invalid")]
 
+let key_read_checks key cipher =
+  let raw = P.serialize_pubkey key |> Bytes.to_string in
+  let execute = Calc.session_eval () in
+  let image = function Ok (Calc.Key value) -> value | _ -> failwith "key image missing" in
+  let cold = execute (Calc.Read_key (false, raw)) |> image in
+  expect "session key image differs" (cold = Image.of_key key);
+  expect "session repeat read did not reuse image"
+    (image (execute (Calc.Read_key (true, raw))) == cold);
+  expect "session key equality check skipped"
+    (execute (Calc.Read_key (false, String.make (String.length raw) '\000')) = Error Calc.Invalid);
+  List.iter (fun registry ->
+    expect "session key reload differs" (execute (Calc.Read_key (false, raw)) = Ok (Calc.Key cold));
+    expect "session reference accepted as key"
+      (execute (Calc.Read_key (registry, Calc.key_ref raw)) = Error Calc.Invalid)) [false; true];
+  let parsed = ref 0 and encoded = ref 0 in
+  let decode raw = incr parsed; P.deserialize_pubkey (Bytes.of_string raw) in
+  let encode key = incr encoded; Image.of_key key in
+  let execute = Calc.session_eval ~decode ~encode ~capacity:(P.pubkey_image_size key) () in
+  for _ = 1 to 2 do
+    expect "session limited read differs" (execute (Calc.Read_key (false, raw)) = Ok (Calc.Key cold))
+  done;
+  expect "session read kept oversized entry" (!parsed = 2);
+  expect "session image exceeded capacity" (!encoded = 2);
+  let bytes = P.serialize_cipher cipher |> Bytes.to_string in
+  let request = Calc.Commit (raw, bytes) in
+  let expected = Calc.eval request in
+  expect "session limited arithmetic differs" (execute request = expected);
+  expect "session key capacity differs from parent"
+    (execute (Calc.map_key Calc.key_ref request) = expected);
+  expect "session limited arithmetic parsed twice" (!parsed = 3)
+
+let pipe_write_checks () =
+  let module W = Octra_core.Pvac_verify_worker in
+  let input, output = Unix.pipe ~cloexec:true () in
+  Fun.protect ~finally:(fun () -> List.iter W.close_noerr [input; output]) (fun () ->
+    Unix.set_nonblock input;
+    Unix.set_nonblock output;
+    let raw = String.init 1_048_576 (fun index -> Char.chr ((index + index / 251) land 255)) in
+    let offset = ref 0 in
+    let deadline = W.monotonic_seconds () +. 20. in
+    expect "pipe partial write failed" (W.write_available output raw offset = Ok false);
+    expect "pipe partial write missing" (!offset > 0 && !offset < String.length raw);
+    let first = !offset in
+    let rec fill () =
+      expect "pipe fill deadline exceeded" (W.monotonic_seconds () < deadline);
+      let before = !offset in
+      expect "pipe filled entire input" (W.write_available output raw offset = Ok false);
+      if !offset <> before then fill () in
+    fill ();
+    let full = !offset in
+    expect "full pipe advanced offset"
+      (W.write_available output raw offset = Ok false && !offset = full);
+    expect "pipe eagain missing"
+      (try
+        ignore (Unix.single_write_substring output raw full (String.length raw - full));
+        false
+      with Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> true);
+    let data = Buffer.create (String.length raw) in
+    let bytes = Bytes.create 65_536 in
+    let rec transfer () =
+      if Buffer.length data < String.length raw then begin
+        expect "pipe transfer deadline exceeded" (W.monotonic_seconds () < deadline);
+        let result = W.write_available output raw offset in
+        expect "pipe write completion differs"
+          (result = Ok (!offset = String.length raw));
+        let count = try Unix.read input bytes 0 (Bytes.length bytes) with
+          Unix.Unix_error ((Unix.EINTR | Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> 0 in
+        Buffer.add_subbytes data bytes 0 count;
+        transfer ()
+      end in
+    transfer ();
+    expect "pipe bytes replayed or lost"
+      (!offset = String.length raw && Buffer.contents data = raw);
+    let previous = Sys.signal Sys.sigpipe Sys.Signal_ignore in
+    Fun.protect ~finally:(fun () -> Sys.set_signal Sys.sigpipe previous) (fun () ->
+      Unix.close input;
+      let offset = ref 7 in
+      expect "pipe epipe ignored"
+        (W.write_available output raw offset = Error "worker_input_closed" && !offset = 7));
+    Printf.printf "event = pipe_write mode = real first = %d bytes = %d status = passed\n%!"
+      first (Buffer.length data))
+
+let session_io ?(stage = "all") ?(wire = Calc.Read_cipher (true, true, String.make 131_072 'x')) worker =
+  let module W = Octra_core.Pvac_verify_worker in
+  let expected = Calc.eval wire in
+  let raw = Calc.request_bytes wire in
+  let process = W.open_session worker in
+  Fun.protect ~finally:(fun () -> W.close_session process) (fun () ->
+    let reads = ref 0 and writes = ref 0 and waits = ref 0 in
+    let sent = ref 0 and faults = ref 0 and partials = ref 0 in
+    let replay = ref None in
+    let interrupt counter call =
+      incr counter;
+      match !counter with
+      | 1 -> raise (Unix.Unix_error (Unix.EINTR, call, ""))
+      | 3 -> raise (Unix.Unix_error (Unix.EAGAIN, call, ""))
+      | 6 -> raise (Unix.Unix_error (Unix.EWOULDBLOCK, call, ""))
+      | _ -> () in
+    let read fd bytes offset length =
+      if stage = "all" || stage = "read" then interrupt reads "read" else incr reads;
+      Unix.read fd bytes offset (min length 7) in
+    let write fd bytes offset length =
+      incr writes;
+      if offset <> !sent then begin
+        replay := Some (!sent, offset);
+        failwith "pipe write offset mismatch"
+      end;
+      if (stage = "all" || stage = "write") && !sent > 0 && !faults < 3 then begin
+        let error = match !faults with
+          | 0 -> Unix.EINTR
+          | 1 -> Unix.EAGAIN
+          | _ -> Unix.EWOULDBLOCK in
+        incr faults;
+        raise (Unix.Unix_error (error, "write", ""))
+      end;
+      let count = Unix.single_write_substring fd bytes offset (min length 113) in
+      if count > 0 && count < length then incr partials;
+      sent := !sent + count;
+      count in
+    let wait left right error mask =
+      incr waits;
+      if stage = "all" && !waits = 1 then raise (Unix.Unix_error (Unix.EINTR, "poll", ""));
+      W.wait_io left right error mask in
+    let control = Atomic.make W.Continue in
+    let deadline = W.monotonic_seconds () +. 20. in
+    let reply = W.session_exchange ~read ~write ~wait ~control ~deadline process raw in
+    Option.iter (fun (expected, actual) ->
+      failwith (Printf.sprintf
+        "event = session_io reason = write_offset_replay expected = %d actual = %d"
+        expected actual)) !replay;
+    expect "transient pipe error became Host" (match reply with
+      | Ok reply -> Calc.response_of_bytes (Calc.hash raw) reply = Ok expected
+      | Error _ -> false);
+    expect "partial pipe paths not exercised" (!reads > 6 && !writes > 6 && !waits > 1);
+    expect "session write bytes lost" (!sent = String.length raw + 8 && !partials > 0);
+    expect "session write faults missing" (!faults = if stage = "read" then 0 else 3);
+    Printf.printf
+      "event = session_write mode = injected stage = %s partials = %d faults = %d bytes = %d status = passed\n%!"
+      stage !partials !faults !sent;
+    expect "session changed after pipe interruption"
+      (match W.session_exchange ~control ~deadline process raw with
+      | Ok reply -> Calc.response_of_bytes (Calc.hash raw) reply = Ok expected
+      | Error _ -> false);
+    expect "expired pipe work accepted"
+      (W.session_exchange ~control ~deadline:(W.monotonic_seconds () -. 1.) process raw
+        = Error W.Timed_out);
+    let wait _ _ _ _ = Atomic.set control W.Cancel; 0 in
+    expect "interrupted pipe ignored cancellation"
+      (W.session_exchange ~wait ~control ~deadline process raw
+        = Error (W.Unavailable "worker_cancelled"));
+    Atomic.set control W.Continue;
+    let attempts = ref 0 in
+    let wait _ _ _ _ =
+      incr attempts;
+      if !attempts = 3 then Atomic.set control W.Cancel;
+      raise (Unix.Unix_error (Unix.EINTR, "poll", "")) in
+    expect "pipe retries ignored cancellation"
+      (W.session_exchange ~wait ~control ~deadline process raw
+        = Error (W.Unavailable "worker_cancelled") && !attempts = 3);
+    Atomic.set control W.Continue;
+    let wait _ _ _ _ =
+      Unix.sleepf 0.02;
+      raise (Unix.Unix_error (Unix.EAGAIN, "poll", "")) in
+    expect "pipe retries extended deadline"
+      (W.session_exchange ~wait ~control ~deadline:(W.monotonic_seconds () +. 0.01)
+         process raw = Error W.Timed_out));
+  List.iter (fun failure ->
+    let process = W.open_session worker in
+    Fun.protect ~finally:(fun () -> W.close_session process) (fun () ->
+      let read _ _ _ _ = match failure with
+        | None -> 0
+        | Some error -> raise (Unix.Unix_error (error, "read", "")) in
+      let reply = W.session_exchange ~read ~control:(Atomic.make W.Continue)
+        ~deadline:(W.monotonic_seconds () +. 20.) process raw in
+      expect "fatal pipe failure ignored" (match reply with Error (W.Failed _) -> true | _ -> false)))
+    [None; Some Unix.EBADF];
+  let process = W.open_session worker in
+  Fun.protect ~finally:(fun () -> W.close_session process) (fun () ->
+    let failures = ref 0 and sent = ref 0 in
+    let write fd bytes offset length =
+      if !sent > 0 then begin
+        incr failures;
+        raise (Unix.Unix_error (Unix.EPIPE, "write", ""))
+      end;
+      let count = Unix.single_write_substring fd bytes offset (min length 113) in
+      sent := !sent + count;
+      count in
+    let reply = W.session_exchange ~write ~control:(Atomic.make W.Continue)
+      ~deadline:(W.monotonic_seconds () +. 20.) process raw in
+    expect "session epipe ignored"
+      (reply = Error (W.Failed (Printexc.to_string (Unix.Unix_error (Unix.EPIPE, "write", "")))));
+    expect "session epipe retried" (!sent > 0 && !failures = 1));
+  print_endline "event = session_io status = passed"
+
 let session_checks worker key cipher =
   let module W = Octra_core.Pvac_verify_worker in
   let pk = P.serialize_pubkey key |> Bytes.to_string in
   let ct = P.serialize_cipher cipher |> Bytes.to_string in
   let request = Calc.Add (pk, ct, ct) in
   let expected = Calc.eval request in
+  session_io ~wire:request worker;
   let opened = ref [] in
   Fun.protect ~finally:(fun () -> List.iter Unix.close !opened) (fun () ->
     for _ = 0 to 1099 do
@@ -583,7 +778,7 @@ let prior_checks key raw cipher =
     st, VM.run_async st program in
   with_env "OCTRA_PVAC_VERIFY_WORKER" "runtime_data/absent_worker" (fun () ->
     let st, result = run Octra_core.Rule_graph.Prior in
-    expect "prior arithmetic used worker" (Lwt.state result = Lwt.Return true);
+    expect "prior arithmetic used worker" (Lwt_main.run result);
     let expected = P.ct_add key cipher (P.ct_add key cipher cipher)
       |> P.serialize_cipher |> Bytes.to_string |> Base64.encode_exn in
     expect "prior arithmetic changed" (st.regs.(6) = VM.VString expected);
@@ -963,18 +1158,25 @@ let () =
     child_sample ();
     exit 0
   end;
+  queue_checks ();
   let worker = match Octra_core.Pvac_verify_worker.worker_path () with
     | Some path -> path
     | None -> failwith "native worker missing" in
   Unix.putenv "OCTRA_PVAC_VERIFY_WORKER" worker;
+  let stage = if Array.length Sys.argv = 2 && Sys.argv.(1) = "--session-read" then "read"
+    else if Array.length Sys.argv = 2 && Sys.argv.(1) = "--session-write" then "write" else "all" in
+  pipe_write_checks ();
+  session_io ~stage worker;
+  if Array.length Sys.argv = 2
+      && List.mem Sys.argv.(1) ["--session-io"; "--session-read"; "--session-write"] then exit 0;
   owner_checks ();
   List.iter owner_cancel ["submit"; "cancel"; "expiry"];
   wire_checks ();
-  queue_checks ();
   let key, secret = P.keygen_from_seed (P.default_params ()) (Bytes.make 32 '\029') in
   image_checks worker key secret;
   let raw = P.serialize_pubkey key |> Bytes.to_string in
   let cipher = P.enc_value_seeded key secret 9L (Bytes.make 32 '\030') in
+  key_read_checks key cipher;
   if Array.length Sys.argv = 2 && Sys.argv.(1) = "--cost" then begin
     key_cost key secret cipher;
     exit 0

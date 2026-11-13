@@ -128,6 +128,18 @@ val node_status :
   validator:string ->
   rpc_result
 
+type sync_target
+
+val create_sync_target :
+  chain_id:string ->
+  data_dir:string ->
+  chaindata:Octra_core.Store_chaindata.t ->
+  driver_ref:Octra_consensus.C_driver.t option ref ->
+  sync_target
+
+val sync_target : sync_target -> rpc_result
+val close_sync_target : sync_target -> bool Lwt.t
+
 val node_stats :
   ledger:Octra_core.Ledger.t ->
   chaindata:Octra_core.Store_chaindata.t ->

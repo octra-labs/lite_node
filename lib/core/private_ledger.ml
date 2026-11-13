@@ -28,9 +28,10 @@ let worker_retry ?(wait = Lwt_unix.sleep) ?(report = fun _ _ -> ()) apply =
   let delays = [|0.25; 0.5; 1.|] in
   let rec loop step =
     Lwt.catch apply (function
-      | (Worker_retry _ | Exec_resource.Unavailable Host) as error ->
+      | (Worker_retry _ | Exec_resource.Unavailable (Host | Memory)) as error ->
         let reason = match error with
           | Worker_retry reason -> reason
+          | Exec_resource.Unavailable Memory -> "memory unavailable"
           | _ -> "host unavailable" in
         if step >= Array.length delays then Lwt.fail (Worker_stopped reason)
         else
@@ -872,14 +873,16 @@ let encrypt_balance_plan
     blob
     current
     (payload : encrypt_payload) =
-  Proof_pool.run ~priority:worker_priority (fun () ->
+  let cipher = payload.cipher in
+  Proof_pool.run ~priority:worker_priority
+    ~bytes:(Compute_memory.strings [blob; current; cipher]) (fun () ->
     match FB.load_pubkey_result blob with
     | Error e ->
       error "bad_zero_proof"
         ("encrypt: " ^ e)
         ~user_reason:("encrypt: bound zero proof failed: " ^ e)
     | Ok pk ->
-      match FB.decode_cipher ~cap payload.cipher with
+      match FB.decode_cipher ~cap cipher with
       | Error e -> error "encrypt_balance_failed" e
       | Ok delta ->
         match
@@ -992,14 +995,16 @@ let decrypt_balance_plan
     blob
     current
     (payload : decrypt_payload) =
-  Proof_pool.run ~priority:worker_priority (fun () ->
+  let cipher = payload.cipher in
+  Proof_pool.run ~priority:worker_priority
+    ~bytes:(Compute_memory.strings [blob; current; cipher]) (fun () ->
     match FB.load_pubkey_result blob with
     | Error e ->
       error "bad_zero_proof"
         ("decrypt: " ^ e)
         ~user_reason:("decrypt: bound zero proof failed: " ^ e)
     | Ok pk ->
-      match FB.decode_cipher ~cap payload.cipher with
+      match FB.decode_cipher ~cap cipher with
       | Error e ->
         error "decrypt_cipher_failed" ("cannot decode delta cipher: " ^ e)
       | Ok delta ->
@@ -1610,9 +1615,10 @@ let verify_key_switch_plan ~registered ~keyed ?(math = false) ?(cipher_mode = Ru
       Lwt.return
         (error "key_switch_rejected" "AES KAT mismatch - incompatible key")
     else begin
+      let encoded_key = payload.new_pubkey_b64 in
       let* new_pubkey_result =
-        Proof_pool.run ~priority:worker_priority (fun () ->
-          match PR.decode_b64 payload.new_pubkey_b64 with
+        Proof_pool.run ~priority:worker_priority ~bytes:(String.length encoded_key) (fun () ->
+          match PR.decode_b64 encoded_key with
           | Error e -> Error e
           | Ok raw -> PR.key_blob ~keyed raw)
       in
@@ -1646,6 +1652,7 @@ let verify_key_switch_plan ~registered ~keyed ?(math = false) ?(cipher_mode = Ru
             let* migration_status =
               Proof_pool.run
                 ~priority:worker_priority
+                ~bytes:(Compute_memory.strings [current_cipher; Option.value old_pk ~default:""])
                 (fun () ->
                   PM.status_of_state
                     ~cap:strict
@@ -1873,9 +1880,10 @@ let prepare_key_switch_plan_uncached ~registered ~keyed ~cipher_mode ~cap field_
     Lwt.return
       (error "key_switch_rejected" "AES KAT mismatch - incompatible key")
   | Ok payload ->
+    let encoded_key = payload.new_pubkey_b64 in
     let* new_pubkey_result =
-      Proof_pool.run (fun () ->
-        match PR.decode_b64 payload.new_pubkey_b64 with
+      Proof_pool.run ~bytes:(String.length encoded_key) (fun () ->
+        match PR.decode_b64 encoded_key with
         | Error e -> Error e
         | Ok raw -> PR.key_blob ~keyed raw)
     in
@@ -1901,6 +1909,7 @@ let prepare_key_switch_plan_uncached ~registered ~keyed ~cipher_mode ~cap field_
         | Ok current_cipher ->
           let* status =
             Proof_pool.run
+              ~bytes:(Compute_memory.strings [current_cipher; Option.value old_pk ~default:""])
               (fun () ->
                 PM.status_of_state
                   ~cap
@@ -2289,7 +2298,11 @@ let prepare_stealth_plan ~registered
         match guard_private_input ~cap current "encrypted_balance_update_failed" "stealth" with
         | Error e -> Lwt.return (Error e)
         | Ok () ->
-          Proof_pool.run ~priority:worker_priority (fun () ->
+          Proof_pool.run ~priority:worker_priority
+            ~bytes:(Compute_memory.strings [blob; current; ptd.PT.delta_cipher;
+              ptd.PT.range_proof_delta; ptd.PT.range_proof_balance; ptd.PT.stealth_tag;
+              ptd.PT.eph_pub; ptd.PT.enc_amount; ptd.PT.claim_pub; ptd.PT.commitment;
+              ptd.PT.amount_commitment; ptd.PT.send_zero_proof]) (fun () ->
             with_loaded_pk blob "bad_pvac_pubkey" (fun pk ->
               match FB.decode_cipher ~cap ptd.PT.delta_cipher with
               | Error e ->
@@ -2353,15 +2366,17 @@ let stealth_plan ~registered
         match blob_result with
         | Error e -> Lwt.return (Error e)
         | Ok blob ->
+          let cipher, commitment = ptd.PT.delta_cipher, ptd.PT.commitment in
           let* commitment =
-            Proof_pool.run ~priority:worker_priority (fun () ->
+            Proof_pool.run ~priority:worker_priority
+              ~bytes:(Compute_memory.strings [blob; cipher; commitment]) (fun () ->
               with_loaded_pk blob "bad_pvac_pubkey" (fun pk ->
                 if
                   FB.verify_commitment
                     ~cap
                     pk
-                    ptd.PT.delta_cipher
-                    ptd.PT.commitment
+                    cipher
+                    commitment
                 then
                   Ok ()
                 else
@@ -2547,15 +2562,17 @@ let claim_plan ~registered ~keyed ?(math = false)
             match blob_result with
             | Error e -> Lwt.return (Error e)
             | Ok blob ->
+              let cipher, commitment = claim.SC.claim_cipher, claim.SC.commitment in
               let* commitment =
-                Proof_pool.run ~priority:worker_priority (fun () ->
+                Proof_pool.run ~priority:worker_priority
+                  ~bytes:(Compute_memory.strings [blob; cipher; commitment]) (fun () ->
                   with_loaded_pk blob "bad_pvac_pubkey" (fun pk ->
                     if
                       FB.verify_commitment
                         ~cap:strict
                         pk
-                        claim.SC.claim_cipher
-                        claim.SC.commitment
+                        cipher
+                        commitment
                     then
                       Ok ()
                     else
@@ -2618,9 +2635,11 @@ let claim_balance_plan ~registered
       match guard_private_input ~cap current "encrypted_balance_update_failed" "claim" with
       | Error e -> Lwt.return (Error e)
       | Ok () ->
-        Proof_pool.run ~priority:worker_priority (fun () ->
+        let cipher = plan.claim_cipher in
+        Proof_pool.run ~priority:worker_priority
+          ~bytes:(Compute_memory.strings [blob; current; cipher]) (fun () ->
           with_loaded_pk blob "bad_pvac_pubkey" (fun pk ->
-            match FB.decode_cipher ~cap plan.claim_cipher with
+            match FB.decode_cipher ~cap cipher with
             | Error e ->
               error "bad_claim_cipher" ("cannot decode claim cipher: " ^ e)
             | Ok delta ->

@@ -42,6 +42,7 @@ let commit dir head = child (fun () ->
     let plan = Octra_core.Epoch_exec.{
       base_reward = Z.zero; fees_burned = Z.zero; fees_rewarded = Z.zero;
       total_reward = Z.zero; proposer_total = Z.zero; each_validator = Z.zero;
+      reward_burned = Z.zero; excluded = [];
       remainder = Z.zero; new_emission_remaining = Z.zero;
       new_total_supply = Z.zero; new_supply_retired = Z.zero;
       supply_tracking_active = false;

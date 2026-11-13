@@ -87,6 +87,20 @@ let load_tags repo =
   in
   loop 0 empty_tags None branches
 
+type gc_size = {
+  floor : int;
+  hash : string;
+  generation : int;
+  need : int64;
+  walked : bool;
+}
+
+type gc_job = {
+  task : unit Lwt.t;
+  finished : unit Lwt.t;
+  stop : unit -> unit;
+}
+
 type t = {
   repo : Store.repo;
   mutable store : Store.t;
@@ -96,7 +110,9 @@ type t = {
   mutable tags : tag_index;
   mutable split_epoch : int option;
   mutable gc_planning : bool;
-  mutable gc_need : (int * string * int64) option;
+  mutable gc_need : gc_size option;
+  mutable gc_job : gc_job option;
+  mutable gc_closed : bool;
   tag_lock : Lwt_mutex.t;
   store_path : string;
   pvac_dir : string;
@@ -192,7 +208,15 @@ let check_split repo store split =
               (Printexc.to_string error);
             Lwt.return_none)
 
-let open_store ?(fresh=false) ?(readonly=false) ?(sync = true) path =
+let log_gc_debt phase repo =
+  let debt = Store.Gc.cleanup_debt repo in
+  if debt <> [] then
+    Octra_log.warn "gc" "event = cleanup_debt phase = %s entries = %d action = inspect"
+      phase (List.length debt)
+
+let open_store ?(fresh = false) ?(readonly = false) ?(sync = true) ?(gc_wait_seconds = 5.) path =
+  if not (Float.is_finite gc_wait_seconds) || gc_wait_seconds < 0. then
+    invalid_arg "GC lease wait is invalid";
   let path = absolute_path path in
   let config = Irmin_pack.Conf.init
     ~fresh
@@ -203,8 +227,22 @@ let open_store ?(fresh=false) ?(readonly=false) ?(sync = true) path =
     ~use_fsync:sync
     path
   in
-  let* repo = Store.Repo.v config in
+  let clock = Mtime_clock.counter () in
+  let rec open_repo waiting =
+    Lwt.catch (fun () -> Store.Repo.v config)
+      (function
+        | Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), "flock GC", _) as error
+          when not readonly ->
+          let left = gc_wait_seconds -. Mtime.Span.to_float_ns (Mtime_clock.count clock) /. 1e9 in
+          if not waiting || left <= 0. then
+            Octra_log.warn "gc" "event = gc_lease status = held path = %s wait_seconds = %.3f"
+              path (max 0. left);
+          if left <= 0. then Lwt.fail error
+          else let* () = Lwt_unix.sleep (min 0.1 left) in open_repo true
+        | error -> Lwt.fail error) in
+  let* repo = open_repo false in
   Lwt.catch (fun () ->
+  log_gc_debt "open" repo;
   let* store = Store.main repo in
   let* tags, split_epoch = load_tags repo in
   let* checked_split = check_split repo store split_epoch in
@@ -234,6 +272,8 @@ let open_store ?(fresh=false) ?(readonly=false) ?(sync = true) path =
     split_epoch = checked_split;
     gc_planning = false;
     gc_need = None;
+    gc_job = None;
+    gc_closed = false;
     tag_lock = Lwt_mutex.create ();
     store_path = path;
     pvac_dir = pvac_dir_of_store_path path;
@@ -243,7 +283,29 @@ let open_store ?(fresh=false) ?(readonly=false) ?(sync = true) path =
     Lwt.fail error)
 
 let close t =
-  Store.Repo.close t.repo
+  t.gc_closed <- true;
+  Lwt.no_cancel (
+    let* () = match t.gc_job with
+      | None -> Lwt.return_unit
+      | Some job -> Lwt.cancel job.task; job.finished in
+    Lwt_mutex.with_lock t.tag_lock (fun () ->
+      t.gc_planning <- false;
+      Store.Repo.close t.repo))
+
+let stop_for_exit t =
+  let module Owner = Irmin_pack_unix.Async.Unix in
+  Owner.mask_for_exit ();
+  t.gc_closed <- true;
+  let actions = [
+    (fun () -> Option.iter (fun job -> job.stop ()) t.gc_job);
+    Owner.stop_for_exit;
+  ] in
+  let error = List.fold_left (fun first action ->
+    let next = try action (); None with error -> Some error in
+    match first with None -> next | Some _ -> first) None actions in
+  match error with None -> Ok () | Some error -> Error error
+
+external retain_for_exit : unit -> 'a = "irmin_exit_retain"
 
 exception Irmin_write_failed of string
 
@@ -2752,7 +2814,7 @@ let pack_gc_status t =
     Lwt.return
       (t.split_epoch, Store.Gc.is_allowed t.repo,
        t.gc_planning || not (Store.Gc.is_finished t.repo),
-       Option.map (fun (_, _, need) -> need) t.gc_need))
+       Option.map (fun size -> size.need) t.gc_need))
 
 type gc_start =
   | Gc_started of { floor : int; removed : int }
@@ -2825,6 +2887,9 @@ let measure_tree tree =
   in
   let* () =
     Store.Tree.fold
+      ~uniq:`True
+      ~pre:(fun path steps () ->
+        Lwt_list.iter_s (fun step -> add (path @ [step]) 64L) steps)
       ~tree:(fun path _ () -> add path 0L)
       ~contents:(fun path value () ->
         add path (Int64.of_int (String.length value + 4)))
@@ -2834,11 +2899,351 @@ let measure_tree tree =
   Lwt.return { records = !records; bytes = !bytes }
 
 let gc_space_need measure =
+  if measure.bytes < 0L || measure.records < 0L then
+    invalid_arg "GC measure is negative";
   sat_add
     gc_reserve
-    (sat_add
-       (sat_mul measure.bytes 2L)
-       (sat_mul measure.records 512L))
+    (sat_add measure.bytes (sat_mul measure.records 24L))
+
+type gc_pack_stamp = {
+  generation : int;
+  suffix_start : int64;
+  end_offset : int64;
+}
+
+let get_pack_stamp t =
+  let fm = Store.Internal.file_manager t.repo in
+  let dispatcher = Store.Internal.dispatcher t.repo in
+  if Option.is_some (Store.Internal.File_manager.lower fm) then
+    failwith "GC measure requires upper storage";
+  {
+    generation = Store.Internal.File_manager.generation fm;
+    suffix_start = Optint.Int63.to_int64
+      (Store.Internal.Dispatcher.suffix_start_offset dispatcher);
+    end_offset = Optint.Int63.to_int64
+      (Store.Internal.Dispatcher.end_offset dispatcher);
+  }
+
+let gc_file_measure ~prefix_bytes stamp =
+  if prefix_bytes < 0L || stamp.suffix_start < 0L
+     || stamp.end_offset < stamp.suffix_start then None
+  else
+    let bytes = sat_add prefix_bytes (Int64.sub stamp.end_offset stamp.suffix_start) in
+    let records = Int64.div bytes (Int64.of_int (Store.Hash.hash_size + 1)) in
+    Some { records; bytes }
+
+let gc_pack_files t stamp =
+  let fm = Store.Internal.file_manager t.repo in
+  let prefix = match Store.Internal.File_manager.prefix fm, stamp.generation with
+    | None, 0 -> Some 0L
+    | None, _ -> None
+    | Some _, generation ->
+      let path = Irmin_pack.Layout.V4.prefix ~root:t.store_path ~generation in
+      begin match Unix.LargeFile.stat path with
+      | stat when stat.Unix.LargeFile.st_kind = Unix.S_REG ->
+        Some stat.Unix.LargeFile.st_size
+      | _ -> None
+      | exception Unix.Unix_error _ -> None
+      end in
+  Option.bind prefix (fun prefix_bytes -> gc_file_measure ~prefix_bytes stamp)
+
+let gc_pack_walk ~path ~stamp ~hash ~offset ~length =
+  let module P = Irmin_pack_unix in
+  let module Fm = Store.Internal.File_manager in
+  let module D = P.Dispatcher.Make (Fm) in
+  let module H = Store.Hash in
+  let module K = P.Pack_key.Make (H) in
+  let module Schema = Irmin.Schema.KV (Irmin.Contents.String) in
+  let module N = Schema.Node (K) (K) in
+  let module I = Irmin_pack.Inode.Make_internal (Conf) (H) (K) (N) in
+  let module Raw = P.Pack_store.Make (Fm) (D) (H) (I.Raw) (Fm.Errs) in
+  let module Nodes = P.Inode.Make_persistent (H) (N) (I) (Raw) in
+  let module C = struct
+    include Schema.Commit (K) (K)
+    module Info = Schema.Info
+  end in
+  let module Value = P.Pack_value.Of_commit (H) (K) (C) in
+  let module Commits = P.Pack_store.Make (Fm) (D) (H) (Value) (Fm.Errs) in
+  let module Offsets = Map.Make (Int64) in
+  let module Late = Set.Make (Int64) in
+  let config = Irmin_pack.Conf.init ~readonly:true ~lru_max_memory:(Some 0)
+    ~indexing_strategy:Irmin_pack.Indexing_strategy.minimal path in
+  let fm = Fm.open_ro config |> Fm.Errs.raise_if_error in
+  Fun.protect
+    ~finally:(fun () -> Fm.close fm |> Fm.Errs.raise_if_error)
+    (fun () ->
+      if Option.is_some (Fm.lower fm) then
+        failwith "GC measure requires upper storage";
+      let dispatcher = D.v fm |> Fm.Errs.raise_if_error in
+      if Fm.generation fm <> stamp.generation
+         || Optint.Int63.to_int64 (D.suffix_start_offset dispatcher) <> stamp.suffix_start
+         || Optint.Int63.to_int64 (D.end_offset dispatcher) < stamp.end_offset then
+        failwith "GC read view changed";
+      let dict = Fm.dict fm in
+      let lru = P.Lru.create config in
+      let nodes = Nodes.v ~config ~fm ~dict ~dispatcher ~lru in
+      let commits = Commits.v ~config ~fm ~dict ~dispatcher ~lru in
+      let check_entry off len =
+        if off < 0L || len < H.hash_size + 1
+           || Int64.of_int len > stamp.end_offset
+           || off > Int64.sub stamp.end_offset (Int64.of_int len) then
+          failwith "GC entry outside captured range" in
+      check_entry offset length;
+      let target = Commits.key_of_offset commits (Optint.Int63.of_int64 offset) in
+      let target_length = Commits.get_length commits target in
+      let target_offset = Optint.Int63.to_int64 (Commits.get_offset commits target) in
+      if target_length <> length || target_offset <> offset
+         || not (Irmin.Type.(unstage (equal H.t)) (P.Pack_key.to_hash target) hash) then
+        failwith "GC target location changed";
+      let pending = ref (Offsets.singleton offset `Commit) in
+      let late = ref Late.empty in
+      let lowest = ref Int64.max_int in
+      let ranges = P.Ranges.make () in
+      let schedule kind key get_offset =
+        let off = Optint.Int63.to_int64 (get_offset key) in
+        if off < 0L || off >= stamp.end_offset then
+          failwith "GC reference outside captured range";
+        let add () =
+          match Offsets.find_opt off !pending with
+          | None -> pending := Offsets.add off kind !pending
+          | Some previous when previous = kind -> ()
+          | Some _ -> failwith "GC reference kind differs" in
+        if off < !lowest then add ()
+        else if not (Late.mem off !late) then begin
+          late := Late.add off !late;
+          add ()
+        end in
+      let child = function
+        | `Contents key -> schedule `Contents key (Nodes.get_offset nodes)
+        | `Node key | `Inode key -> schedule `Node key (Nodes.get_offset nodes) in
+      let rec walk records =
+        if Offsets.is_empty !pending then begin
+          let bytes = ref 0L in
+          P.Ranges.iter (fun ~off:_ ~len ->
+            bytes := sat_add !bytes (Optint.Int63.to_int64 len)) ranges;
+          { records; bytes = !bytes }
+        end
+        else
+          let off, kind = Offsets.max_binding !pending in
+          pending := Offsets.remove off !pending;
+          lowest := min !lowest off;
+          let position = Optint.Int63.of_int64 off in
+          let len = match kind with
+            | `Commit ->
+              let key = Commits.key_of_offset commits position in
+              if Optint.Int63.to_int64 (Commits.get_offset commits key) <> off then
+                failwith "GC commit index location changed";
+              let len = Commits.get_length commits key in
+              check_entry off len;
+              let value = match Commits.unsafe_find ~check_integrity:false commits key with
+                | Some value -> value
+                | None -> failwith "GC commit missing" in
+              List.iter (fun key ->
+                match Commits.get_offset commits key with
+                | _ -> schedule `Contents key (Commits.get_offset commits)
+                | exception P.Pack_store.Dangling_hash -> ()) (C.parents value);
+              child (`Node (C.node value));
+              len
+            | `Node | `Contents ->
+              let key = Nodes.key_of_offset nodes position in
+              if Optint.Int63.to_int64 (Nodes.get_offset nodes key) <> off then
+                failwith "GC node index location changed";
+              let len = Nodes.get_length nodes key in
+              check_entry off len;
+              if kind = `Node then begin
+                let value = match Nodes.unsafe_find_no_prefetch nodes key with
+                  | Some value -> value
+                  | None -> failwith "GC node missing" in
+                List.iter (fun (_, key) -> child key) (Nodes.Val.pred value)
+              end;
+              len in
+          P.Ranges.add ~off:position ~len ranges;
+          walk (sat_add records 1L) in
+      walk 0L)
+
+external pack_child_fd :
+  Unix.file_descr -> int -> int -> Unix.file_descr = "octra_pack_child_fd"
+
+let gc_pack_process ?(timeout = 600.) run =
+  if not (Float.is_finite timeout) || timeout <= 0. then
+    invalid_arg "GC measure timeout is invalid";
+  let seconds = ceil timeout +. 1. in
+  if seconds > min (float_of_int max_int) 2147483647. then
+    invalid_arg "GC measure timeout exceeds child timer";
+  let seconds = int_of_float seconds in
+  let parent = Unix.getpid () in
+  let input, output = Unix.pipe ~cloexec:true () in
+  let close fd = try Unix.close fd with Unix.Unix_error _ -> () in
+  let reader =
+    try Lwt_unix.of_unix_file_descr ~blocking:false input
+    with error -> close input; close output; raise error in
+  let child () =
+    try
+      Irmin_pack_unix.Async.Unix.mask_for_exit ();
+      Sys.set_signal Sys.sigchld Sys.Signal_default;
+      let output = pack_child_fd output parent seconds in
+      Logs.set_reporter_mutex ~lock:(fun () -> ()) ~unlock:(fun () -> ());
+      Logs.set_reporter Logs.nop_reporter;
+      Logs.set_level None;
+      let packet = Bytes.make 256 '\000' in
+      let code =
+        try
+          let size = run () in
+          Bytes.set packet 0 '\001';
+          Bytes.set_int64_be packet 8 size.records;
+          Bytes.set_int64_be packet 16 size.bytes;
+          0
+        with error ->
+          let reason = Printexc.to_string error in
+          let length = min 232 (String.length reason) in
+          Bytes.set packet 0 '\002';
+          Bytes.set packet 1 (Char.chr length);
+          Bytes.blit_string reason 0 packet 24 length;
+          1 in
+      let rec write offset =
+        if offset < Bytes.length packet then
+          match Unix.write output packet offset (Bytes.length packet - offset) with
+          | 0 -> Unix._exit 2
+          | count -> write (offset + count)
+          | exception Unix.Unix_error (Unix.EINTR, _, _) -> write offset in
+      write 0;
+      close output;
+      Unix._exit code
+    with _ -> Unix._exit 2 in
+  let pid =
+    try Lwt_unix.fork ()
+    with error -> close input; close output; raise error in
+  if pid = 0 then child ();
+  close output;
+  let status = ref None in
+  let reaped = ref false in
+  let poll () =
+    match !status with
+    | Some value -> Some value
+    | None when !reaped -> failwith "GC measure child is unavailable"
+    | None ->
+      begin match Unix.waitpid [Unix.WNOHANG] pid with
+      | 0, _ -> None
+      | _, value -> reaped := true; status := Some value; Some value
+      | exception Unix.Unix_error (Unix.EINTR, _, _) -> None
+      | exception Unix.Unix_error (Unix.ECHILD, _, _) ->
+        reaped := true;
+        failwith "GC measure child was reaped elsewhere"
+      end in
+  let rec wait () =
+    match poll () with
+    | Some value -> Lwt.return value
+    | None -> let* () = Lwt_unix.sleep 0.01 in wait () in
+  let receive () =
+    let packet = Bytes.create 256 in
+    let rec read offset =
+      if offset = Bytes.length packet then Lwt.return_unit
+      else
+        let* count = Lwt_unix.read reader packet offset (Bytes.length packet - offset) in
+        if count = 0 then Lwt.fail_with "GC measure packet is incomplete"
+        else read (offset + count) in
+    let* () = read 0 in
+    let* result = wait () in
+    match result, Bytes.get packet 0 with
+    | Unix.WEXITED 0, '\001' ->
+      let size = {
+        records = Bytes.get_int64_be packet 8;
+        bytes = Bytes.get_int64_be packet 16;
+      } in
+      if size.records <= 0L || size.bytes <= 0L then
+        Lwt.fail_with "GC measure packet is invalid"
+      else Lwt.return size
+    | Unix.WEXITED 1, '\002' ->
+      let length = Char.code (Bytes.get packet 1) in
+      if length > 232 then Lwt.fail_with "GC measure error packet is invalid"
+      else Lwt.fail_with (Bytes.sub_string packet 24 length)
+    | _ -> Lwt.fail_with "GC measure child failed" in
+  let stop () =
+    if not !reaped then (
+      let error = Irmin_pack_unix.Async.Unix.reap_for_exit parent pid in
+      if error <> 0 then failwith (Printf.sprintf "GC measure reap errno = %d" error);
+      reaped := true) in
+  let work = Lwt.finalize
+    (fun () ->
+      Lwt.pick [receive (); (let* () = Lwt_unix.sleep timeout in
+        Lwt.fail_with "GC measure timed out")])
+    (fun () -> Lwt.no_cancel (Lwt.finalize
+      (fun () ->
+        if !reaped then Lwt.return_unit
+        else begin
+          begin match poll () with
+          | Some _ -> ()
+          | None ->
+            begin try Unix.kill pid Sys.sigkill with
+            | Unix.Unix_error (Unix.ESRCH, _, _) -> ()
+            end
+          end;
+          let* _ = wait () in
+          Lwt.return_unit
+        end)
+      (fun () -> Lwt_unix.close reader))) in
+  (work, stop)
+
+let gc_pack_child ?timeout run = fst (gc_pack_process ?timeout run)
+
+let run_gc_measure t run = Irmin_pack_unix.Async.Unix.with_spawn (fun () ->
+  if t.gc_closed then Lwt.fail_with "GC store is closed"
+  else if Option.is_some t.gc_job then Lwt.fail_with "GC measure is running"
+  else
+    let finished, complete = Lwt.wait () in
+    let work, stop = gc_pack_process run in
+    let measured = Lwt.finalize (fun () -> work) (fun () ->
+      t.gc_job <- None;
+      Lwt.wakeup_later complete ();
+      Lwt.return_unit) in
+    if Lwt.is_sleeping measured then
+      t.gc_job <- Some { task = Lwt.map ignore measured; finished; stop };
+    measured)
+
+let measure_pack ~free t commit =
+  if t.gc_closed then Lwt.fail_with "GC store is closed"
+  else if Option.is_some t.gc_job then Lwt.fail_with "GC measure is running"
+  else if free < gc_reserve then Lwt.fail_with "GC free space is below reserve"
+  else if not (Store.Gc.is_finished t.repo) then
+    Lwt.fail_with "GC measure blocked by pack collection"
+  else begin
+    Store.flush t.repo;
+    let stamp = get_pack_stamp t in
+    let floor = t.split_epoch in
+    let hash = Store.Commit.hash commit in
+    let offset, length =
+      match Irmin_pack_unix.Pack_key.inspect (Store.Commit.key commit) with
+      | Direct { offset; length; volume_identifier = None; _ } -> offset, length
+      | Direct _ -> failwith "GC target requires upper storage"
+      | Indexed hash ->
+        let fm = Store.Internal.file_manager t.repo in
+        begin match Store.Internal.Index.find (Store.Internal.File_manager.index fm) hash with
+        | Some (offset, length, _) -> offset, length
+        | None -> failwith "GC target missing from index"
+        end in
+    let offset = Optint.Int63.to_int64 offset in
+    if offset < 0L || length < Store.Hash.hash_size + 1
+       || Int64.of_int length > stamp.end_offset
+       || offset > Int64.sub stamp.end_offset (Int64.of_int length) then
+      failwith "GC target outside captured range";
+    let path = t.store_path in
+    let* size, walked = match gc_pack_files t stamp with
+      | Some size when gc_space_need size < Int64.max_int
+          && gc_space_need size <= free -> Lwt.return (size, false)
+      | _ ->
+        let* size = run_gc_measure t (fun () ->
+          gc_pack_walk ~path ~stamp ~hash ~offset ~length) in
+        Lwt.return (size, true) in
+    if t.gc_closed then Lwt.fail_with "GC store closed during measure" else
+    let current = get_pack_stamp t in
+    if current.generation <> stamp.generation
+       || current.suffix_start <> stamp.suffix_start
+       || current.end_offset < stamp.end_offset
+       || t.split_epoch <> floor
+       || not (Store.Gc.is_finished t.repo) then
+      Lwt.fail_with "GC pack changed during measure"
+    else Lwt.return (size, walked)
+  end
 
 let remove_tags_before t floor =
   let rec loop removed seq =
@@ -2866,7 +3271,9 @@ let cleanup_old_tags t current_epoch =
       let* _ = remove_tags_before t floor in
       Lwt.return_unit)
 
-let gc_done epoch = function
+let gc_done repo epoch result =
+  log_gc_debt "settled" repo;
+  match result with
   | Ok stats ->
     let seconds = Irmin_pack_unix.Stats.Latest_gc.total_duration stats in
     Octra_log.info "gc"
@@ -2900,7 +3307,8 @@ let set_split t epoch commit =
 
 let collect_plan t ~keep current_epoch =
   Lwt_mutex.with_lock t.tag_lock (fun () ->
-    if t.gc_planning || not (Store.Gc.is_finished t.repo) then
+    if t.gc_closed then Lwt.return (`Done (Gc_error "GC store is closed"))
+    else if t.gc_planning || not (Store.Gc.is_finished t.repo) then
       Lwt.return (`Done Gc_busy)
     else
       let* head = Store.Head.find t.store in
@@ -2921,23 +3329,29 @@ let collect_plan t ~keep current_epoch =
           Lwt.return (`Measure (floor, commit)))
 
 let clear_gc_plan t =
-  Lwt_mutex.with_lock t.tag_lock (fun () ->
+  Lwt.no_cancel (Lwt_mutex.with_lock t.tag_lock (fun () ->
     t.gc_planning <- false;
+    Lwt.return_unit))
+
+let gc_measure_key t floor commit =
+  floor, Irmin.Type.to_string Store.Hash.t (Store.Commit.hash commit),
+  Store.Internal.File_manager.generation (Store.Internal.file_manager t.repo)
+
+let save_gc_need t ~floor ~commit ~generation ~walked need =
+  Lwt_mutex.with_lock t.tag_lock (fun () ->
+    if t.gc_closed then failwith "GC store closed before saving measure";
+    let floor, hash, current = gc_measure_key t floor commit in
+    if current <> generation then failwith "GC generation changed during measure";
+    t.gc_need <- Some { floor; hash; generation; need; walked };
     Lwt.return_unit)
 
-let gc_measure_key floor commit =
-  floor, Irmin.Type.to_string Store.Hash.t (Store.Commit.hash commit)
-
-let save_gc_need t ~floor ~commit need =
+let start_pack_gc t ~keep ~floor ~commit ~generation current_epoch =
   Lwt_mutex.with_lock t.tag_lock (fun () ->
-    let floor, hash = gc_measure_key floor commit in
-    t.gc_need <- Some (floor, hash, need);
-    Lwt.return_unit)
-
-let start_pack_gc t ~keep ~floor ~commit current_epoch =
-  Lwt_mutex.with_lock t.tag_lock (fun () ->
-    if not t.gc_planning || not (Store.Gc.is_finished t.repo) then
+    if t.gc_closed then Lwt.return (Gc_error "GC store closed before start")
+    else if not t.gc_planning || not (Store.Gc.is_finished t.repo) then
       Lwt.return Gc_busy
+    else if Store.Internal.File_manager.generation (Store.Internal.file_manager t.repo)
+      <> generation then Lwt.return (Gc_error "GC generation changed before start")
     else match t.split_epoch with
     | Some selected when selected = floor ->
       let* selected_commit =
@@ -2953,10 +3367,11 @@ let start_pack_gc t ~keep ~floor ~commit current_epoch =
         | None -> Lwt.return (Gc_missing current_epoch)
         | Some head ->
           let* removed = remove_tags_before t floor in
-          Store.flush t.repo;
+          if t.gc_closed then Lwt.return (Gc_error "GC store closed before worker start") else
+          let () = Store.flush t.repo in
           let* started =
             Store.Gc.run
-              ~finished:(gc_done current_epoch)
+              ~finished:(gc_done t.repo current_epoch)
               t.repo
               (Store.Commit.key commit)
           in
@@ -2973,10 +3388,11 @@ let start_pack_gc t ~keep ~floor ~commit current_epoch =
     | Some selected -> Lwt.return (Gc_wait (selected + keep))
     | None -> Lwt.return (Gc_missing floor))
 
-let collect_pack_at ?free ?(measure = measure_tree) t ~keep current_epoch =
+let collect_pack_at ?free ?(measure = measure_pack) t ~keep current_epoch =
   Lwt.catch
     (fun () ->
-      if current_epoch <= 0 then Lwt.return (Gc_missing current_epoch)
+      if t.gc_closed then Lwt.return (Gc_error "GC store is closed")
+      else if current_epoch <= 0 then Lwt.return (Gc_missing current_epoch)
       else if not (Store.Gc.is_allowed t.repo) then Lwt.return Gc_off
       else if not (Store.Gc.is_finished t.repo) then Lwt.return Gc_busy
       else
@@ -2993,19 +3409,21 @@ let collect_pack_at ?free ?(measure = measure_tree) t ~keep current_epoch =
               if Int64.compare free gc_reserve < 0 then
                 Lwt.return (Gc_space { free; need = gc_reserve })
               else
+              let key = gc_measure_key t floor commit in
+              let _, _, generation = key in
               let* need = match t.gc_need with
-                | Some (saved_floor, hash, need)
-                  when (saved_floor, hash) = gc_measure_key floor commit -> Lwt.return need
+                | Some size when (size.floor, size.hash, size.generation) = key
+                    && (size.walked || size.need <= free) -> Lwt.return size.need
                 | _ ->
-                  let* size = measure (Store.Commit.tree commit) in
+                  let* size, walked = measure ~free t commit in
                   let need = gc_space_need size in
-                  let* () = save_gc_need t ~floor ~commit need in
+                  let* () = save_gc_need t ~floor ~commit ~generation ~walked need in
                   Lwt.return need in
               let free = free_now () in
-              if Int64.compare free need < 0 then
+              if need = Int64.max_int || Int64.compare free need < 0 then
                 Lwt.return (Gc_space { free; need })
               else
-                start_pack_gc t ~keep ~floor ~commit current_epoch)
+                start_pack_gc t ~keep ~floor ~commit ~generation current_epoch)
             (fun () -> clear_gc_plan t))
     (fun exn ->
       Lwt.return (Gc_error (Printexc.to_string exn)))
@@ -3014,6 +3432,14 @@ let collect_pack t current_epoch =
   collect_pack_at t ~keep:gc_keep_epochs current_epoch
 
 let wait_pack_gc t =
+  let rec planned () =
+    if t.gc_closed then Lwt.return_unit
+    else if t.gc_planning then let* () = Lwt_unix.sleep 0.01 in planned ()
+    else match t.gc_job with
+      | None -> Lwt.return_unit
+      | Some job -> job.finished in
+  let* () = planned () in
+  if t.gc_closed then Lwt.return_error "GC store is closed" else
   let* result = Store.Gc.wait t.repo in
   match result with
   | Ok _ -> Lwt.return_ok ()

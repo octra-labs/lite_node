@@ -40,6 +40,12 @@ type policy = {
 
 let policy rules epoch =
   let ( let* ) = Result.bind in
+  let* _ = Octra_core.Rule_graph.scalar_work rules ~epoch
+    |> Result.map_error Octra_core.Rule_graph.fault_message in
+  let* _ = Octra_core.Rule_graph.source_create rules ~epoch
+    |> Result.map_error Octra_core.Rule_graph.fault_message in
+  let* _ = Octra_core.Rule_graph.program_result rules ~epoch
+    |> Result.map_error Octra_core.Rule_graph.fault_message in
   let* _ = Octra_core.Rule_graph.tx_envelope rules ~epoch
     |> Result.map_error Octra_core.Rule_graph.fault_message in
   let* exit_mode = Octra_core.Rule_graph.exit rules ~epoch

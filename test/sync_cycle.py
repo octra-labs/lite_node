@@ -110,14 +110,23 @@ with ExitStack() as scope:
             if tip is not None:
                 assert "required = 7000 available = unknown advertised = 100 lag = 9900" in status["action"]
                 assert 'snapshot_status = unavailable advertised_status = old_epoch manifest_error = "http_503"' in status["action"]
+            else:
+                sync.side_effect = recovery.ValidatorError("snapshot signature refused")
             for minimum in [None, 7000]:
                 try:
                     recovery.recover_state(directory / "node.env", values, True, None, minimum)
                     raise AssertionError("unavailable snapshot changed state")
                 except recovery.ValidatorError as error:
-                    assert "wait for signed snapshot:" in str(error)
-            move.assert_not_called()
-            sync.assert_not_called()
+                    expected = "snapshot signature refused" if tip is None else "wait for signed snapshot:"
+                    assert expected in str(error)
+                if tip is None:
+                    offline_floor = max(need.epoch, (need.target or 0) - recovery.snapshot_lag(values))
+                    assert sync.call_args.kwargs["min_epoch"] == max(offline_floor, minimum or 0)
+            if tip is None:
+                assert move.call_count == 2 and sync.call_count == 2
+            else:
+                move.assert_not_called()
+                sync.assert_not_called()
         assert data.stat().st_ino == inode
         assert json.loads((data / "HEAD.json").read_text()) == old
         assert sorted(path.name for path in directory.iterdir()) == before
@@ -126,12 +135,6 @@ with ExitStack() as scope:
     assert "--replace-state" in emit.call_args.kwargs["action"]
     if cause == "root":
         action = emit.call_args.kwargs["action"]
-        with mock.patch.object(recovery, "sync_head", return_value = None):
-            try:
-                recovery.recover_state(directory / "node.env", values, True, None, None)
-                raise AssertionError("missing network head accepted")
-            except recovery.ValidatorError as error:
-                assert "head = unknown" in str(error)
         def old_snapshot(*args, **kwargs):
             snapshot(floor - 1)
         with mock.patch.object(recovery, "sync_snapshot", side_effect = old_snapshot):
@@ -182,7 +185,9 @@ with ExitStack() as scope:
                 mock.patch.object(recovery.validator_config, "load_wallet", return_value = identity):
             assert recovery.validator_config.bind_wallet(data) == identity
     else:
-        recovery.recover_state(directory / "node.env", values, True, None, None)
+        with mock.patch.object(recovery, "sync_head",
+                return_value = None if cause == "root" else {"head": 5000, "snapshot": floor}):
+            recovery.recover_state(directory / "node.env", values, True, None, floor if cause == "root" else None)
     stored = make(need.chain, "range", need.epoch, need.head, need.target) if carried else need
     assert recovery.read_need(data, need.chain) == stored
     assert not (data / "recovery/sync_conflict.json").exists()

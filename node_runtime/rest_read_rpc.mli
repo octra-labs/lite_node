@@ -10,8 +10,8 @@ type 'handler dispatch_adapters = {
      params:Yojson.Safe.t ->
      rpc_result) ->
     'handler;
-  chaindata_params_read :
-    (Octra_core.Store_chaindata.t -> params:Yojson.Safe.t -> rpc_result) ->
+  chain_chaindata_params_read :
+    (chain_id:string -> Octra_core.Store_chaindata.t -> params:Yojson.Safe.t -> rpc_result) ->
     'handler;
   no_params : (unit -> rpc_result) -> 'handler;
   epoch_current : 'handler;
@@ -29,7 +29,14 @@ val epoch_current :
   tree_ref:Octra_core.Tree.t ref ->
   rpc_result
 
+val epoch_reward_view :
+  chain_id:string ->
+  epoch_id:int ->
+  Yojson.Safe.t ->
+  Yojson.Safe.t
+
 val epoch_get :
+  chain_id:string ->
   Octra_core.Store_chaindata.t ->
   params:Yojson.Safe.t ->
   rpc_result
@@ -40,6 +47,7 @@ val epoch_list :
   rpc_result
 
 val epoch_summaries :
+  chain_id:string ->
   Octra_core.Store_chaindata.t ->
   params:Yojson.Safe.t ->
   rpc_result

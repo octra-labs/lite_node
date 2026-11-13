@@ -63,6 +63,9 @@ let ahead_streak t =
 let incr_ahead_streak t =
   incr t.ahead_of_target_streak
 
+let reset_ahead_streak t =
+  t.ahead_of_target_streak := 0
+
 let clear_state_attested t =
   t.state_attested := false;
   t.state_attested_head := None;
@@ -91,26 +94,29 @@ let root_attestation_recovers reason =
       "peer_root_mismatch_at_head ";
       "ahead_of_target_by_";
       "lag_";
-      "prev_state_root_mismatch_streak = ";
-      "state_root_mismatch_streak = ";
     ]
 
 let consensus_root_attestation_recovers reason =
   starts_with "catchup_failed:" reason
   || starts_with "catchup_apply_failed:" reason
+  || starts_with "prev_state_root_mismatch_streak = " reason
+  || starts_with "state_root_mismatch_streak = " reason
+
+let root_range_recovers reason =
+  root_attestation_recovers reason || consensus_root_attestation_recovers reason
 
 let root_recovery_evidence
     ~reason
     ~evidence
-    ~consensus_proved =
+    ~source_proved =
   if root_attestation_recovers reason then
     Some evidence
   else if
     consensus_root_attestation_recovers reason
     && String.equal evidence "in_sync"
-    && consensus_proved
+    && source_proved
   then
-    Some "in_sync_consensus_quorum"
+    Some "in_sync_source_agreement"
   else
     None
 
@@ -126,6 +132,7 @@ let bundle_epoch reason =
 
 let catchup_recovers reason =
   root_attestation_recovers reason
+  || consensus_root_attestation_recovers reason
   || starts_with "lag_" reason
   || starts_with "catchup_" reason
   || starts_with "rule anchor unreadable epoch = " reason
@@ -159,7 +166,7 @@ let clear_allowed ~reason ~evidence =
   || (Option.is_some (bundle_epoch reason)
       && starts_with "direct_finalized_apply:" evidence)
   || (consensus_root_attestation_recovers reason
-      && String.equal evidence "in_sync_consensus_quorum")
+      && String.equal evidence "in_sync_source_agreement")
 
 let enter_quarantine t ~epoch ~reason =
   let entered = not (quarantine_active t) in
@@ -169,8 +176,12 @@ let enter_quarantine t ~epoch ~reason =
     t.quarantine_since_epoch := epoch;
     t.quarantine_reason := reason
   end else if
-    recoverable_reason (quarantine_reason t)
-    && not (recoverable_reason reason)
+    (let strength reason =
+       if root_attestation_recovers reason then 0
+       else if consensus_root_attestation_recovers reason then 1
+       else if recoverable_reason reason then 2
+       else 3 in
+     strength reason > strength (quarantine_reason t))
   then begin
     t.quarantine_reason := reason;
     clear_state_attested t

@@ -620,7 +620,7 @@ let http_range ?(health = source_health) ?(fetch_json = fun url -> http_get_json
         Int64.to_float (Int64.sub (Mtime_clock.elapsed_ns ()) started)
         /. 1_000_000_000. in
       let left = max 0.0 (budget -. elapsed) in
-      let source_seconds = left /. float_of_int (List.length rest + 1) in
+      let source_seconds = left /. float_of_int (List.length rest + List.length paused + 1) in
       let ticket = Sync_sources.start health Range source in
       let* result =
         fetch (fun () ->
@@ -653,7 +653,7 @@ let http_range ?(health = source_health) ?(fetch_json = fun url -> http_get_json
         Octra_log.warn "catchup"
           "event = range_http_unavailable from = %Ld source = %s error = %s"
           from_epoch source error;
-        next [] rest
+        next paused rest
   in
   next paused ready)
 
@@ -688,6 +688,7 @@ let http_head ?(health = source_health) ?(fetch_json = fun url -> http_get_json 
     ?(budget = 25.0)
     env ~chain_id ~validator_hash ~after =
   let open Lwt.Syntax in
+  let started = Mtime_clock.elapsed_ns () in
   let best = ref None in
   let sources = List.map normalize_base (configured_sources env) in
   let ready, paused = Sync_sources.plan health Head sources in
@@ -699,10 +700,10 @@ let http_head ?(health = source_health) ?(fetch_json = fun url -> http_get_json 
       | Ok parsed -> Lwt.return parsed
       | Error _ -> Lwt.fail (Fetch_retry "invalid JSON range"))
   in
-  let read source =
+  let read ~seconds source =
     let ticket = Sync_sources.start health Head source in
     let* result =
-      fetch (fun () ->
+      fetch (fun () -> Lwt_unix.with_timeout seconds (fun () ->
         let source = normalize_base source in
         let* json = get (head_url source) in
         let head = match decode (fun () -> parse_head json) with
@@ -726,7 +727,7 @@ let http_head ?(health = source_health) ?(fetch_json = fun url -> http_get_json 
                 prefix_head ~chain_id ~validator_hash ~after records
               | Ok _ | Error _ -> None
             in
-            Lwt.return epoch)
+            Lwt.return epoch))
     in
     match result with
     | Ok epoch ->
@@ -739,14 +740,17 @@ let http_head ?(health = source_health) ?(fetch_json = fun url -> http_get_json 
         source error;
       Lwt.return_none
   in
-  let run sources = Lwt_list.iter_p (fun source ->
-    let* head = read source in
+  let run ~share sources = Lwt_list.iter_p (fun source ->
+    let elapsed = Int64.to_float (Int64.sub (Mtime_clock.elapsed_ns ()) started)
+      /. 1_000_000_000. in
+    let seconds = max 0. (budget -. elapsed) /. share in
+    let* head = read ~seconds source in
     best := (match !best, head with
       | None, value | value, None -> value
       | Some left, Some right -> Some (Int64.max left right));
     Lwt.return_unit) sources in
-  let* () = run ready in
-  let* () = if !best = None then run paused else Lwt.return_unit in
+  let* () = run ~share:(if paused = [] then 1. else 2.) ready in
+  let* () = if !best = None then run ~share:1. paused else Lwt.return_unit in
   Lwt.return !best) in
   Lwt.return !best
 
@@ -807,6 +811,7 @@ let prepare_record ~chain_id ~expected_validator_set_hash ~cursor record =
            e)
   in
   (match Octra_core.Preverify_receipt_policy.check
+           ~rejections:partition.rejections
            ~epoch_id:(Int64.to_int record.epoch_id)
            ~receipts:partition.preverify
            txs with

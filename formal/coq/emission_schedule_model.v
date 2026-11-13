@@ -4,6 +4,7 @@
 From Stdlib Require Import ZArith.
 From Stdlib Require Import Lia.
 From Stdlib Require Import Ring.
+From Stdlib Require Import List.
 
 Open Scope Z_scope.
 
@@ -205,3 +206,130 @@ Proof.
   unfold fee_reward.
   ring.
 Qed.
+
+Module Weighted_pay.
+
+Definition total := fold_right Z.add 0.
+
+Definition shares pool weights :=
+  map (fun weight => pool * weight / total weights) weights.
+
+Definition dust pool weights := pool - total (shares pool weights).
+
+Lemma divided_sum pool den weights :
+  den <> 0 ->
+  den * total (map (fun weight => pool * weight / den) weights)
+  + total (map (fun weight => (pool * weight) mod den) weights)
+  = pool * total weights.
+Proof.
+  intros nonzero. induction weights as [|weight more ih]; simpl; [ring|].
+  pose proof (Z.div_mod (pool * weight) den nonzero). nia.
+Qed.
+
+Lemma residual_range pool den weights :
+  0 < den ->
+  0 <= total (map (fun weight => (pool * weight) mod den) weights)
+  /\ total (map (fun weight => (pool * weight) mod den) weights)
+     <= den * Z.of_nat (length weights) - 1 +
+        (if Nat.eqb (length weights) 0 then 1 else 0).
+Proof.
+  intros positive. induction weights as [|weight more ih]; simpl; [lia|].
+  pose proof (Z.mod_pos_bound (pool * weight) den positive).
+  destruct more; simpl in *; nia.
+Qed.
+
+Theorem dust_range pool weights :
+  0 < total weights ->
+  0 <= dust pool weights < Z.of_nat (length weights).
+Proof.
+  intros positive.
+  pose proof (divided_sum pool (total weights) weights ltac:(lia)) as exact.
+  pose proof (residual_range pool (total weights) weights positive) as range.
+  assert (Nat.eqb (length weights) 0 = false) as nonempty.
+  { apply Nat.eqb_neq. destruct weights; simpl in *; lia. }
+  rewrite nonempty in range. unfold dust, shares. nia.
+Qed.
+
+Theorem shares_nonnegative pool weights :
+  0 <= pool -> Forall (fun weight => 0 < weight) weights ->
+  0 < total weights -> Forall (fun amount => 0 <= amount) (shares pool weights).
+Proof.
+  intros amount positive den. unfold shares. rewrite Forall_map.
+  rewrite Forall_forall in *. intros weight inside.
+  specialize (positive weight inside). apply Z.div_pos; nia.
+Qed.
+
+Theorem full_distribution base pool weights :
+  0 <= base -> 0 <= pool ->
+  Forall (fun weight => 0 < weight) weights -> 0 < total weights ->
+  Forall (fun amount => 0 <= amount) (shares pool weights)
+  /\ 0 <= base + dust pool weights
+  /\ total (shares pool weights) + (base + dust pool weights) = base + pool
+  /\ dust pool weights < Z.of_nat (length weights).
+Proof.
+  intros base_positive pool_positive weights_positive den.
+  pose proof (shares_nonnegative pool weights pool_positive weights_positive den).
+  pose proof (dust_range pool weights den).
+  unfold dust in *. repeat split; try assumption; lia.
+Qed.
+
+Definition payout (rows : list (bool * Z)) := total (map snd rows).
+
+Definition retained (rows : list (bool * Z)) := filter (fun row => negb (fst row)) rows.
+
+Definition retired (rows : list (bool * Z)) := filter fst rows.
+
+Theorem payout_partition rows :
+  payout (retained rows) + payout (retired rows) = payout rows.
+Proof.
+  induction rows as [|[excluded amount] more ih]; simpl; [reflexivity|].
+  destruct excluded; simpl in *; unfold payout, retained, retired in *; simpl in *; lia.
+Qed.
+
+Lemma payout_positive rows :
+  Forall (fun row => 0 <= snd row) rows -> 0 <= payout rows.
+Proof.
+  intros positive. unfold payout, total.
+  induction positive; simpl in *; lia.
+Qed.
+
+Theorem retirement_range rows :
+  Forall (fun row => 0 <= snd row) rows ->
+  0 <= payout (retired rows) <= payout rows.
+Proof.
+  intros positive.
+  assert (Forall (fun row => 0 <= snd row) (retained rows)) as kept.
+  { unfold retained. apply Forall_forall. intros row inside.
+    apply filter_In in inside. apply (proj1 (Forall_forall _ _) positive row (proj1 inside)). }
+  assert (Forall (fun row => 0 <= snd row) (retired rows)) as lost.
+  { unfold retired. apply Forall_forall. intros row inside.
+    apply filter_In in inside. apply (proj1 (Forall_forall _ _) positive row (proj1 inside)). }
+  pose proof (payout_positive _ kept).
+  pose proof (payout_positive _ lost).
+  pose proof (payout_partition rows). lia.
+Qed.
+
+Theorem retirement_envelope rows supply reserve burned cap :
+  supply + reserve + burned = cap ->
+  payout (retired rows) <= supply ->
+  0 <= reserve -> 0 <= burned ->
+  Forall (fun row => 0 <= snd row) rows ->
+  0 <= supply - payout (retired rows) /\
+  0 <= burned + payout (retired rows) /\
+  (supply - payout (retired rows)) + reserve
+    + (burned + payout (retired rows)) = cap /\
+  payout (retained rows) + payout (retired rows) = payout rows.
+Proof.
+  intros envelope enough reserve_positive burned_positive positive.
+  pose proof (retirement_range rows positive).
+  pose proof (payout_partition rows). repeat split; lia.
+Qed.
+
+End Weighted_pay.
+
+Print Assumptions Weighted_pay.dust_range.
+Print Assumptions Weighted_pay.shares_nonnegative.
+Print Assumptions Weighted_pay.full_distribution.
+Print Assumptions Weighted_pay.payout_partition.
+Print Assumptions Weighted_pay.retirement_range.
+Print Assumptions Weighted_pay.retirement_envelope.

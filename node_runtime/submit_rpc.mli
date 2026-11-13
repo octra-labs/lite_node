@@ -5,7 +5,7 @@ type rpc_result = (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result
 
 type validate =
   Octra_core.Transaction.t ->
-  (string, string * string) result
+  (string, string * string) result Lwt.t
 
 val submit :
   validate:validate ->

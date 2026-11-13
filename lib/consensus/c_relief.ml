@@ -52,37 +52,24 @@ let same_member current target member =
     && Z.equal old_weight new_weight
   | _ -> false
 
-let lowest_weight count target =
-  target.C_types.weights
-  |> List.map snd
-  |> List.sort Z.compare
-  |> fun weights ->
-    let rec sum left total = function
-      | _ when left <= 0 -> total
-      | [] -> total
-      | weight :: rest -> sum (left - 1) (Z.add total weight) rest
-    in
-    sum count Z.zero weights
-
-let check_intersection current target =
-  let shared = current.C_types.quorum + target.C_types.quorum - current.n in
-  if shared <= current.f then
+let check_intersection ?policy ~chain_id ~height current target =
+  match
+    C_measure.overlap
+      (C_types.space ?policy ~chain_id ~epoch_id:height current)
+      target.C_types.weights
+  with
+  | Ok () -> Ok ()
+  | Error C_measure.Few_seats ->
     Error "validator relief count intersection is unsafe"
-  else
-    let by_count = lowest_weight shared target in
-    let by_weight =
-      Z.sub
-        (Z.add current.quorum_weight target.quorum_weight)
-        current.total_weight
-    in
-    let overlap = Z.max by_count by_weight in
-    let faults = Z.sub current.total_weight current.quorum_weight in
-    if Z.leq overlap faults then
-      Error "validator relief weight intersection is unsafe"
-    else
-      Ok ()
+  | Error C_measure.Low_weight ->
+    Error "validator relief weight intersection is unsafe"
+  | Error C_measure.No_proof ->
+    Error "validator relief has no weight-only intersection proof"
 
-let check_set current target =
+let check_set ?policy ~chain_id ~height current target =
+  let ( let* ) = Result.bind in
+  let* _ = C_types.checked_validator_set_for_epoch ?policy ~chain_id ~epoch_id:height current in
+  let* _ = C_types.checked_validator_set_for_epoch ?policy ~chain_id ~epoch_id:height target in
   if not current.C_types.weighted || not target.C_types.weighted then
     Error "validator relief requires weighted sets"
   else if current.n < 4 || target.n < 4 then
@@ -92,9 +79,9 @@ let check_set current target =
   else if not (List.for_all (same_member current target) target.validators) then
     Error "validator relief target changes a retained member"
   else
-    check_intersection current target
+    check_intersection ?policy ~chain_id ~height current target
 
-let check_plan ~height ~current ~activate_epoch ~target ~fingerprint =
+let check_plan ~policy ~chain_id ~height ~current ~activate_epoch ~target ~fingerprint =
   let lead = Int64.sub activate_epoch height in
   if Int64.compare lead 0L <= 0 then
     Error "validator relief plan is not ahead"
@@ -103,9 +90,9 @@ let check_plan ~height ~current ~activate_epoch ~target ~fingerprint =
   else if not (valid_fingerprint fingerprint) then
     Error "validator relief fingerprint is invalid"
   else
-    check_set current target
+    check_set ?policy ~chain_id ~height current target
 
-let check_proof ~chain_id ~height current proof =
+let check_proof ?policy ~chain_id ~height current proof =
   match proof with
   | [] -> Error "validator relief proof is empty"
   | first :: _ ->
@@ -146,6 +133,7 @@ let check_proof ~chain_id ~height current proof =
             let signer_count = List.length signers in
             if
               C_types.round_skip_reached_at
+                ?policy
                 ~chain_id
                 ~epoch_id:height
                 current
@@ -158,7 +146,9 @@ let check_proof ~chain_id ~height current proof =
 
 let clock_limit ~chain_id ~height ~current ~activate_epoch ~target ~fingerprint =
   if active ~chain_id ~height
-     && Result.is_ok (check_plan ~height ~current ~activate_epoch ~target ~fingerprint)
+     && Result.is_ok
+          (check_plan ~policy:None ~chain_id ~height ~current ~activate_epoch ~target
+             ~fingerprint)
   then Some min_round else None
 
 let decide ~chain_id ~height ~current ~activate_epoch ~target ~fingerprint
@@ -166,7 +156,9 @@ let decide ~chain_id ~height ~current ~activate_epoch ~target ~fingerprint
   if not (active ~chain_id ~height) then Wait
   else if Int64.compare height activate_epoch >= 0 then Wait
   else
-    match check_plan ~height ~current ~activate_epoch ~target ~fingerprint with
+    match
+      check_plan ~policy:None ~chain_id ~height ~current ~activate_epoch ~target ~fingerprint
+    with
     | Error reason -> Refuse reason
     | Ok () ->
       begin
@@ -187,8 +179,13 @@ let decide ~chain_id ~height ~current ~activate_epoch ~target ~fingerprint
             }
       end
 
-let restore ~chain_id ~height ~current ~activate_epoch ~target ~fingerprint
+let restore ?policy ~chain_id ~height ~current ~activate_epoch ~target ~fingerprint
     mark =
+  let ( let* ) = Result.bind in
+  let* _ = C_types.structural_validator_set_for_epoch ?policy ~chain_id ~epoch_id:height current
+    |> Result.map_error C_types.set_error_message in
+  let* _ = C_types.structural_validator_set_for_epoch ?policy ~chain_id ~epoch_id:height target
+    |> Result.map_error C_types.set_error_message in
   if Int64.compare height mark.activate_epoch >= 0 then Ok None
   else if Int64.compare height mark.height < 0 then
     Error "validator relief marker is ahead of local height"
@@ -201,20 +198,20 @@ let restore ~chain_id ~height ~current ~activate_epoch ~target ~fingerprint
   else if
     not
       (String.equal
-         (C_config.validator_set_hash current)
-         mark.source_hash)
-  then
-    Error "validator relief source set differs"
-  else if
-    not
-      (String.equal
          (C_config.validator_set_hash target)
          mark.target_hash)
   then
     Error "validator relief target set differs"
+  else if not (String.equal (C_config.validator_set_hash current) mark.source_hash) then
+    let policy = Option.value policy ~default:(C_quorum_policy.for_chain chain_id) in
+    if height > mark.height && C_quorum_policy.seatless policy height
+       && C_types.same_voting_set current target then Ok None
+    else Error "validator relief source set differs"
   else
     match
       check_plan
+        ~policy
+        ~chain_id
         ~height:mark.height
         ~current
         ~activate_epoch
@@ -224,7 +221,7 @@ let restore ~chain_id ~height ~current ~activate_epoch ~target ~fingerprint
     | Error _ as error -> error
     | Ok () ->
       begin
-        match check_proof ~chain_id ~height:mark.height current mark.proof with
+        match check_proof ?policy ~chain_id ~height:mark.height current mark.proof with
         | Error _ as error -> error
         | Ok (round, _) when round <> mark.round ->
           Error "validator relief marker round differs"

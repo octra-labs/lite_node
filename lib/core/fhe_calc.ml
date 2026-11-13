@@ -222,27 +222,58 @@ let write_frame raw =
   output_string stdout raw;
   flush stdout
 
-let serve_session () =
+let session_eval ?(decode = fun bytes -> Pvac_ffi.deserialize_pubkey (Bytes.of_string bytes))
+    ?(encode = Fhe_image.of_key) ?(capacity = 67_108_864) () =
+  if capacity < 0 then invalid_arg "fhe key capacity";
   let saved = ref None in
-  let key bytes =
+  let key ~reference bytes =
     match !saved with
-    | Some (raw, reference, key) when raw = bytes || reference = bytes -> key
+    | Some (raw, id, key, _) when raw = bytes || (reference && id = bytes) -> key
     | _ ->
       saved := None;
       Gc.full_major ();
-      let key = Pvac_ffi.deserialize_pubkey (Bytes.of_string bytes) in
-      if Pvac_ffi.pubkey_image_size key <= 67_108_864 then
-        saved := Some (bytes, key_ref bytes, key);
+      let key = decode bytes in
+      if Pvac_ffi.pubkey_image_size key <= capacity then
+        saved := Some (bytes, key_ref bytes, key, None);
       key in
+  let image key =
+    match !saved with
+    | Some (_, _, found, Some image) when found == key -> image
+    | entry ->
+      let image = encode key in
+      begin match entry with
+      | Some (raw, id, found, _) when found == key ->
+        let room = capacity - String.length raw - Pvac_ffi.pubkey_image_size key in
+        if String.length image.Fhe_image.data <= room then
+          saved := Some (raw, id, key, Some image)
+        else if room < 0 then saved := None
+      | _ -> ()
+      end;
+      image in
+  fun request ->
+    try
+      match request with
+      | Read_key (registry, bytes) ->
+        if registry then begin
+          match Pvac_registry.validate_shape bytes with
+          | Ok _ -> ()
+          | Error reason -> failwith reason
+        end;
+        Ok (Key (image (key ~reference:false bytes)))
+      | request -> eval ~key:(key ~reference:true) request
+    with
+    | Out_of_memory -> Error Memory
+    | Stack_overflow -> Error Stack
+    | Invalid_argument _ | Failure _ -> Error Invalid
+
+let serve_session () =
+  let execute = session_eval () in
   let rec loop () =
     let raw = read_frame () in
     match request_of_bytes raw with
     | Error reason -> failwith reason
     | Ok request ->
-      let result = try eval ~key request with
-        | Out_of_memory -> Error Memory
-        | Stack_overflow -> Error Stack
-        | Invalid_argument _ | Failure _ -> Error Invalid in
+      let result = execute request in
       write_frame (response_bytes (hash raw) result);
       loop () in
   try loop () with End_of_file -> ()

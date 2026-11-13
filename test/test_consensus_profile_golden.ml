@@ -122,6 +122,14 @@ let components ~epoch getenv =
   @ (match Octra_core.Rule_graph.program_source_at ~chain_id ~epoch with
      | Octra_core.Rule_graph.Prior -> []
      | Octra_core.Rule_graph.Active -> ["program_source", "aml_source:oct_gen_count:source_abi:checked_address:option_values:scalar_equality:shape_limits:overlap_64"])
+  @ (match Octra_core.Rule_graph.source_create_at ~chain_id ~epoch with
+     | Octra_core.Rule_graph.Prior -> []
+     | Octra_core.Rule_graph.Active -> ["source_create",
+       "signed_package:preview:non_key_parent:one_child:shared_work:source_record:nested_undo"])
+  @ (match Octra_core.Rule_graph.program_result_at ~chain_id ~epoch with
+     | Octra_core.Rule_graph.Prior -> []
+     | Octra_core.Rule_graph.Active -> ["program_result",
+       "program_exec_failed:circle_call_failed:signed_fee:nonce:undo:replay"])
   @ (match Octra_core.Rule_graph.fhe_work_at ~chain_id ~epoch with
      | Octra_core.Rule_graph.Prior -> []
      | Octra_core.Rule_graph.Active -> ["fhe_work",
@@ -156,7 +164,16 @@ let components ~epoch getenv =
      | Octra_core.Rule_graph.Active -> ["program_records",
        (if Octra_consensus.C_quorum_policy.round_wait
           (Octra_consensus.C_quorum_policy.for_chain chain_id) (Int64.of_int epoch)
-        then Octra_vm.Program_record.consensus_id else Octra_vm.Program_record.released_id)])
+        then (if Octra_core.Rule_graph.scalar_work_at ~chain_id ~epoch = Octra_core.Rule_graph.Active
+          then Octra_vm.Program_record.consensus_id else Octra_vm.Program_record.prior_id)
+        else Octra_vm.Program_record.released_id)])
+  @ (match Octra_core.Rule_graph.seatless_at ~chain_id ~epoch with
+     | Octra_core.Rule_graph.Prior -> []
+     | Octra_core.Rule_graph.Active -> ["execution_profile", "octra:execution_profile:1";
+         "slash_reward", "burn_source_share"; "slash_set", "exact_source_next"])
+  @ (match Octra_core.Rule_graph.scalar_work_at ~chain_id ~epoch with
+     | Octra_core.Rule_graph.Prior -> []
+     | Octra_core.Rule_graph.Active -> ["scalar_work", Octra_vm.Scalar_work.consensus_id])
   @ (match Octra_core.Rule_graph.proof_key_at ~chain_id ~epoch with
      | Octra_core.Rule_graph.Prior -> []
      | Octra_core.Rule_graph.Active -> ["proof_key", "pvac.proof.public_key.fields";
@@ -189,7 +206,126 @@ let derived ~epoch getenv =
         Octra_net.Oce1.put_string buf value)
       (components ~epoch getenv))
 
+let test_execution_parent () =
+  let module S = Octra_core.Store_irmin in
+  let module E = Octra_core.Epoch_exec in
+  let module H = Octra_core.Head_manifest in
+  let module Preflight = Octra_node_runtime.Consensus_epoch_apply_preflight in
+  let activation = Option.get (Octra_core.Rule_graph.seatless_activation_for_chain chain_id) in
+  let epoch = activation.activation_epoch in
+  let env name = List.assoc_opt name devnet in
+  expect "execution profile starts at future seatless"
+    (epoch > (Option.get (Octra_core.Rule_graph.program_records_activation_for_chain chain_id)).activation_epoch);
+  expect "prior execution profile absent"
+    (P.execution_profile ~chain_id ~epoch:(epoch - 1) env = None);
+  expect "prior profile bytes preserved"
+    (raw_hex (P.hash ~chain_id ~epoch:(epoch - 1) env)
+      = "023ced80e6e33bfdec1f5deb70c944d6faef9caf57b828e5312fe4c07d1cf5e1");
+  let profile = Option.get (P.execution_profile ~chain_id ~epoch env) in
+  expect "execution profile is raw32" (String.length profile = 32);
+  expect "execution profile matches consensus" (profile = P.hash ~chain_id ~epoch env);
+  let marker epoch profile = match E.execution_marker_to_string E.{ epoch; profile } with
+    | Ok raw -> Some raw | Error reason -> fail reason in
+  let wrong = String.mapi (fun index value ->
+    if index = 0 then Char.chr (Char.code value lxor 1) else value) profile in
+  let rec files path = match (Unix.lstat path).Unix.st_kind with
+    | Unix.S_REG -> [path, Digest.file path]
+    | Unix.S_DIR -> Sys.readdir path |> Array.to_list |> List.sort String.compare
+      |> List.concat_map (fun name -> files (Filename.concat path name))
+    | _ -> fail "unexpected startup store file" in
+  Test_workspace.with_dir "execution_parent" (fun root ->
+    let check name target head_epoch last current marker expected =
+      let data = Filename.concat root name in
+      Unix.mkdir data 0o700;
+      let path = Filename.concat data "irmin_store" in
+      let store = Lwt_main.run (S.open_store path) in
+      let ledger_root, commit = Fun.protect ~finally:(fun () -> Lwt_main.run (S.close store)) (fun () ->
+        Lwt_main.run (S.begin_epoch_batch store);
+        List.iter (fun (key, value) -> match value with
+          | None -> () | Some value -> Lwt_main.run (S.set_meta store key value))
+          ["last_epoch", last; "current_epoch", current; E.execution_meta_key, marker];
+        Lwt_main.run (S.commit_epoch_batch store "execution parent sample");
+        Option.get (Lwt_main.run (S.get_head_hash store)), Lwt_main.run (S.get_commit_hash store)) in
+      Option.iter (fun generation ->
+        let index = Octra_core.Epoch_index_commitment.genesis_root in
+        let state_root = Octra_core.Epoch_index_commitment.folded_state_root
+          ~ledger_state_root:ledger_root ~epoch_index_root:index in
+        H.atomic_write data (Octra_node_runtime.Consensus_epoch_commit.head_manifest
+          ~generation ~state_root ~ledger_root ~irmin_commit:commit ~txid_hi:(-1L)
+          ~txlog_seg:0 ~txlog_off:0 ~epochlog_off:0 ~commit_id:"execution-parent" ~ts:1.
+          ~epoch_index_hash:index ~epoch_index_root:index)) head_epoch;
+      let before = files data in
+      let store = Lwt_main.run (S.open_store ~readonly:true path) in
+      Fun.protect ~finally:(fun () -> Lwt_main.run (S.close store)) (fun () ->
+        let head = H.load data in
+        let actual = Lwt_main.run (P.check_execution_parent ~chain_id ~epoch:target ~store ~head env) in
+        expect (name ^ " startup result differs") (actual = expected);
+        let store_batches = ref 0 and chaindata_batches = ref 0 in
+        let fatals = ref [] and exits = ref 0 and syncs = ref 0 in
+        let before_batches () =
+          expect (name ^ " execution checked after batch start")
+            (!store_batches = 0 && !chaindata_batches = 0) in
+        let effects = Preflight.{
+          begin_store_batch = (fun () -> incr store_batches; Lwt.return_unit);
+          begin_chaindata_batch = (fun () -> incr chaindata_batches);
+          ledger_hash = (fun () -> Lwt.map Option.get (S.get_head_hash store));
+          cached_head = (fun () -> head);
+          expected_prev_root = (fun _ -> Option.map (fun value -> value.H.state_root) head);
+          check_execution = (fun epoch selected ->
+            before_batches ();
+            expect (name ^ " preflight execution arguments differ") (epoch = target && selected = head);
+            P.check_execution_parent ~chain_id ~epoch ~store ~head:selected env);
+          fatal = (fun message -> before_batches (); fatals := message :: !fatals);
+          require_sync = (fun _ -> incr syncs);
+          exit = (fun () -> before_batches (); incr exits);
+        } in
+        let result = try Ok (Lwt_main.run (Preflight.run effects Preflight.{ epoch_id = target }))
+          with Failure reason -> Error reason in
+        expect (name ^ " preflight requested unrelated sync") (!syncs = 0);
+        match expected, result with
+        | Ok (), Ok result ->
+          expect (name ^ " preflight batch counts differ")
+            (!store_batches = 1 && !chaindata_batches = 1);
+          expect (name ^ " accepted preflight reached fatal exit") (!fatals = [] && !exits = 0);
+          expect (name ^ " preflight ledger root differs") (result.pre_state.ledger_root = ledger_root);
+          let consensus_root = match head with None -> ledger_root | Some head -> head.H.state_root in
+          expect (name ^ " preflight consensus root differs")
+            (result.pre_state.consensus_root = consensus_root)
+        | Error reason, Error actual ->
+          expect (name ^ " preflight refusal differs") (actual = "execution profile refused: " ^ reason);
+          expect (name ^ " refused preflight began batches")
+            (!store_batches = 0 && !chaindata_batches = 0);
+          expect (name ^ " preflight fatal exit differs")
+            (!exits = 1 && !fatals = ["event = epoch_preflight action = refuse reason = " ^ reason])
+        | _ -> fail (name ^ " preflight result differs"));
+      expect (name ^ " startup changed store files") (files data = before) in
+    let number value = Some (string_of_int value) in
+    let parent = number (epoch - 1) and current = number epoch in
+    let absent = Error "execution profile requires the exact predecessor HEAD" in
+    check "prior" (epoch - 1) None None None None (Ok ());
+    check "activation" epoch (Some (epoch - 1)) parent current None (Ok ());
+    check "missing_head" epoch None parent current None absent;
+    check "older_head" epoch (Some (epoch - 2)) parent current None absent;
+    check "advanced_head" epoch (Some epoch) parent current None absent;
+    check "activation_last" epoch (Some (epoch - 1)) (number (epoch - 2)) current None
+      (Error "execution profile last epoch differs");
+    check "activation_current" epoch (Some (epoch - 1)) parent (number (epoch + 1)) None
+      (Error "execution profile current epoch differs");
+    check "activation_marker" epoch (Some (epoch - 1)) parent current (marker (epoch - 1) profile)
+      (Error "execution profile marker is unexpected");
+    let last = number epoch and current = number (epoch + 1) in
+    check "active" (epoch + 1) (Some epoch) last current (marker epoch profile) (Ok ());
+    check "active_missing" (epoch + 1) (Some epoch) last current None
+      (Error "execution profile marker is missing");
+    check "active_profile" (epoch + 1) (Some epoch) last current (marker epoch wrong)
+      (Error "execution profile hash differs");
+    check "active_epoch" (epoch + 1) (Some epoch) last current (marker (epoch - 1) profile)
+      (Error "execution profile epoch differs");
+    check "active_advance" (epoch + 1) (Some epoch) (number (epoch + 1)) (number (epoch + 2))
+      (marker epoch profile) (Error "execution profile last epoch differs"))
+
 let () =
+  test_execution_parent ();
   expect "profile validates" (P.validate getenv = Ok ());
   let standard = P.standard_hash ~chain_id ~epoch:1_500_000 getenv in
   let compat = P.compat_hash getenv in
@@ -322,7 +458,31 @@ let () =
   expect ("round profile golden = " ^ raw_hex rounds)
     (raw_hex rounds = "023ced80e6e33bfdec1f5deb70c944d6faef9caf57b828e5312fe4c07d1cf5e1");
   expect "round profile components" (rounds = derived ~epoch:second devnet_env);
-  expect "round profile persists" (rounds = P.hash ~chain_id ~epoch:max_int devnet_env);
+  if Option.is_some (Octra_core.Rule_graph.scalar_work_activation_for_chain chain_id) then begin
+    let scalar = Option.get (Octra_core.Rule_graph.scalar_work_activation_for_chain chain_id) in
+    expect "round profile persists"
+      (rounds = P.hash ~chain_id ~epoch:(scalar.activation_epoch - 1) devnet_env);
+    List.iter (fun epoch ->
+      expect "preactivation profile differs"
+        (rounds = P.hash ~chain_id ~epoch devnet_env))
+      [second + 1; scalar.anchor_epoch; scalar.activation_epoch - 2];
+    let scalar_profile = P.hash ~chain_id ~epoch:scalar.activation_epoch devnet_env in
+    expect "scalar profile components" (scalar_profile = derived ~epoch:scalar.activation_epoch devnet_env);
+    expect ("work profile golden = " ^ raw_hex scalar_profile)
+      (raw_hex scalar_profile = "155bb1154ffec48410b272c849b213067cc8e26ea84c0db4e38d6f46c56f8e3f");
+    expect "scalar profile differs" (scalar_profile <> rounds);
+    expect "scalar profile persists" (scalar_profile = P.hash ~chain_id ~epoch:max_int devnet_env);
+    expect "scalar profile switching"
+      (P.switch_after ~chain_id ~applied_epoch:(scalar.activation_epoch - 1));
+    Printf.printf "event = scalar_profile epoch = %d hash = %s\n%!"
+      scalar.activation_epoch (raw_hex scalar_profile)
+  end else begin
+    expect "scalar schedule enabled" (Octra_core.Rule_graph.scalar_work_activation_for_chain chain_id = None);
+    List.iter (fun epoch ->
+      expect "inactive scalar changed released profile" (rounds = P.hash ~chain_id ~epoch devnet_env);
+      expect "inactive scalar profile switching" (not (P.switch_after ~chain_id ~applied_epoch:epoch)))
+      [1_759_492; 1_769_491; 1_769_492; 1_769_493; 2_000_000; max_int - 1]
+  end;
   expect "round profile switching" (P.switch_after ~chain_id ~applied_epoch:(second - 1));
   Printf.printf "event = next_profile epoch = 1688734 hash = %s\n%!" (raw_hex next);
   Printf.printf "event = proof_profile epoch = 1663000 hash = %s\n%!" (raw_hex proof);

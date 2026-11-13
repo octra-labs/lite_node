@@ -108,6 +108,16 @@ type deps = {
 val repair_set : ?policy:Octra_consensus.C_quorum_policy.t -> deps -> int64 ->
   (Octra_consensus.C_types.validator_set, string) result
 
+val pending_runtime :
+  deps ->
+  (Octra_consensus.C_driver.t -> target_epoch:int64 -> reason:string -> unit Lwt.t) ->
+  epoch:int64 ->
+  (Consensus_pending_commit_recovery.node_driver_runtime, string) result
+
+val health_root_set : deps -> int64 -> Octra_consensus.C_types.validator_set option
+
+val health_head_time : deps -> int -> float option
+
 val committed_reads :
   readable:(unit -> bool) ->
   Consensus_driver_read.deps ->
@@ -116,6 +126,11 @@ val committed_reads :
 val validator_state_height :
   committed_head_epoch:(unit -> int) ->
   int64
+
+val validator_set_epoch :
+  height:int64 ->
+  Validator_config.t ->
+  int64 option
 
 val enabled :
   int ->

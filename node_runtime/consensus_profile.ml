@@ -320,6 +320,18 @@ let standard_hash ?policy ~chain_id ~epoch getenv =
       put_standard_component buf "program_source"
         Octra_vm.Program_package.source_id
     end;
+    begin match Octra_core.Rule_graph.source_create_at ~chain_id ~epoch with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      put_standard_component buf "source_create"
+        "signed_package:preview:non_key_parent:one_child:shared_work:source_record:nested_undo"
+    end;
+    begin match Octra_core.Rule_graph.program_result_at ~chain_id ~epoch with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      put_standard_component buf "program_result"
+        "program_exec_failed:circle_call_failed:signed_fee:nonce:undo:replay"
+    end;
     begin match Octra_core.Rule_graph.fhe_work_at ~chain_id ~epoch with
     | Octra_core.Rule_graph.Prior -> ()
     | Octra_core.Rule_graph.Active ->
@@ -376,7 +388,21 @@ let standard_hash ?policy ~chain_id ~epoch getenv =
         (if Octra_consensus.C_quorum_policy.round_wait
             (Option.value policy ~default:(Octra_consensus.C_quorum_policy.for_chain chain_id))
             (Int64.of_int epoch)
-         then Octra_vm.Program_record.consensus_id else Octra_vm.Program_record.released_id)
+         then (if Octra_core.Rule_graph.scalar_work_at ~chain_id ~epoch = Octra_core.Rule_graph.Active
+           then Octra_vm.Program_record.consensus_id else Octra_vm.Program_record.prior_id)
+         else Octra_vm.Program_record.released_id)
+    end;
+    begin match Octra_core.Rule_graph.seatless_at ~chain_id ~epoch with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      put_standard_component buf "execution_profile" "octra:execution_profile:1";
+      put_standard_component buf "slash_reward" "burn_source_share";
+      put_standard_component buf "slash_set" "exact_source_next"
+    end;
+    begin match Octra_core.Rule_graph.scalar_work_at ~chain_id ~epoch with
+    | Octra_core.Rule_graph.Prior -> ()
+    | Octra_core.Rule_graph.Active ->
+      put_standard_component buf "scalar_work" Octra_vm.Scalar_work.consensus_id
     end;
     begin match Octra_core.Rule_graph.proof_key_at ~chain_id ~epoch with
     | Octra_core.Rule_graph.Prior -> ()
@@ -418,6 +444,32 @@ let hash ?policy ~chain_id ~epoch getenv =
   match Octra_core.Rule_graph.standard_at ~chain_id ~epoch with
   | Octra_core.Rule_graph.Prior -> compat_hash getenv
   | Octra_core.Rule_graph.Active -> standard_hash ?policy ~chain_id ~epoch getenv
+
+let execution_profile ?policy ~chain_id ~epoch getenv =
+  match Octra_core.Rule_graph.seatless_at ~chain_id ~epoch with
+  | Octra_core.Rule_graph.Prior -> None
+  | Octra_core.Rule_graph.Active -> Some (hash ?policy ~chain_id ~epoch getenv)
+
+let check_execution_parent ~chain_id ~epoch ~store ~head getenv =
+  let profile = execution_profile ~chain_id in
+  match profile ~epoch getenv with
+  | None -> Lwt.return_ok ()
+  | Some _ ->
+    match head with
+    | Some (head : Octra_core.Head_manifest.t) when epoch > 0 && head.epoch_id = epoch - 1 ->
+      let open Lwt.Syntax in
+      let* checked = Octra_core.Epoch_exec.check_execution_state
+          ~profile:(fun ~chain_id ~epoch -> execution_profile ~chain_id ~epoch getenv)
+          ~chain_id ~epoch:head.epoch_id store in
+      begin match checked with
+      | Error _ as error -> Lwt.return error
+      | Ok () ->
+        let* last = Octra_core.Store_irmin.get_meta store "last_epoch" in
+        let* current = Octra_core.Store_irmin.get_meta store "current_epoch" in
+        Lwt.return (Octra_core.Epoch_exec.check_execution_epochs
+          ~epoch:head.epoch_id ~last ~current)
+      end
+    | _ -> Lwt.return_error "execution profile requires the exact predecessor HEAD"
 
 let epochs ?policy chain_id =
   let policy = Option.value policy ~default:(Octra_consensus.C_quorum_policy.for_chain chain_id) in

@@ -19,7 +19,7 @@ if [ "${1:-}" = "--float" ]; then
 fi
 if [ "${1:-}" = "--relay" ]; then
   BUILD_DIR=${OCTRA_BUILD_DIR:-_build}
-  opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j2 \
+  opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j2 \
     test/test_compute_history.exe test/test_resource_compute_service.exe
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_compute_history.exe" --expiry
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_resource_compute_service.exe" --relay
@@ -38,7 +38,7 @@ if [ "${1:-}" = "--replay" ]; then
   cargo test --locked --offline \
     --manifest-path "$ROOT/lib/core/circle_wasm_native/Cargo.toml" \
     --target-dir "$ROOT/runtime_data/circle_bytes_cargo" top1_executor -- --test-threads=1
-  opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j2 \
+  opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j2 \
     test/test_compute_engine.exe test/test_sync_chain.exe
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_compute_engine.exe" --payment
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_sync_chain.exe" --origin
@@ -48,7 +48,7 @@ if [ "${1:-}" = "--replay" ]; then
 fi
 if [ "${1:-}" = "--transfers" ]; then
   BUILD_DIR=${OCTRA_BUILD_DIR:-_build}
-  opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j2 \
+  opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j2 \
     test/test_rest_admit.exe test/test_tx_rule.exe \
     test/test_compute_history.exe test/test_compute_deposit.exe \
     test/test_resource_compute_service.exe test/test_consensus_profile_golden.exe
@@ -66,7 +66,7 @@ if [ "${1:-}" = "--transfers" ]; then
 fi
 if [ "${1:-}" = "--payment" ] || [ "${1:-}" = "--settle" ]; then
   BUILD_DIR=${OCTRA_BUILD_DIR:-_build}
-  opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+  opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
     test/test_compute_deposit.exe test/test_compute_engine.exe \
     test/test_resource_compute_service.exe test/test_compute_history.exe test/test_consensus_profile_golden.exe \
     test/test_rest_admit.exe test/test_tx_rule.exe test/test_proposal.exe test/test_sync_chain.exe
@@ -91,7 +91,7 @@ if [ "${1:-}" = "--payment" ] || [ "${1:-}" = "--settle" ]; then
 fi
 if [ "${1:-}" = "--funding" ]; then
   BUILD_DIR=${OCTRA_BUILD_DIR:-_build}
-  opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+  opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
     test/test_compute_funding.exe test/test_compute_deposit.exe test/test_compute_history.exe \
     test/test_fee_market.exe test/test_consensus_profile_golden.exe test/test_resource_compute_service.exe \
     test/test_sync_chain.exe
@@ -111,7 +111,7 @@ if [ "${1:-}" = "--funding" ]; then
 fi
 if [ "${1:-}" = "--cancel-send" ]; then
   BUILD_DIR=${OCTRA_BUILD_DIR:-_build}
-  opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+  opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
     test/test_compute_history.exe test/test_resource_compute_service.exe test/test_consensus_profile_golden.exe
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_compute_history.exe"
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_resource_compute_service.exe" --cancel-send
@@ -122,7 +122,7 @@ if [ "${1:-}" = "--cancel-send" ]; then
 fi
 if [ "${1:-}" = "--read-set" ]; then
   BUILD_DIR=${OCTRA_BUILD_DIR:-_build}
-  opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+  opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
     test/test_compute_history.exe test/test_resource_compute_service.exe test/test_consensus_profile_golden.exe
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_compute_history.exe"
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_resource_compute_service.exe" --read-set
@@ -133,7 +133,7 @@ if [ "${1:-}" = "--read-set" ]; then
 fi
 if [ "${1:-}" = "--set" ]; then
   BUILD_DIR=${OCTRA_BUILD_DIR:-_build}
-  opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+  opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
     test/test_compute_history.exe test/test_resource_compute_service.exe test/test_consensus_profile_golden.exe
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_compute_history.exe"
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_resource_compute_service.exe" --set
@@ -144,7 +144,7 @@ if [ "${1:-}" = "--set" ]; then
 fi
 if [ "${1:-}" = "--fetch" ]; then
   BUILD_DIR=${OCTRA_BUILD_DIR:-_build}
-  opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+  opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
     test/test_compute_history.exe test/test_resource_compute_service.exe test/test_consensus_profile_golden.exe
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_compute_history.exe"
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_resource_compute_service.exe" --fetch
@@ -155,7 +155,7 @@ if [ "${1:-}" = "--fetch" ]; then
 fi
 if [ "${1:-}" = "--terms" ] || [ "${1:-}" = "--fees" ]; then
   BUILD_DIR=${OCTRA_BUILD_DIR:-_build}
-  opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+  opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
     @compute_work test/test_consensus_profile_golden.exe test/test_fee_market.exe
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_consensus_profile_golden.exe"
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_fee_market.exe"
@@ -166,11 +166,11 @@ if [ "${1:-}" = "--terms" ] || [ "${1:-}" = "--fees" ]; then
 fi
 if [ "${1:-}" = "--consensus" ]; then
   BUILD_DIR=${OCTRA_BUILD_DIR:-_build}
-  opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+  opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
     test/test_byte_work.exe test/test_vm_effects.exe test/test_vm_transition.exe \
     test/test_rule_graph.exe test/test_consensus_profile_golden.exe \
     test/test_contract_rpc_guard.exe
-  opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+  opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
     test/test_circle_program.exe
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_byte_work.exe"
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_vm_effects.exe"
@@ -198,7 +198,7 @@ if [ "${1:-}" = "--input" ]; then
       --manifest-path "$ROOT/lib/core/circle_wasm_native/Cargo.toml" \
       --target-dir "$ROOT/runtime_data/circle_bytes_cargo" "tests::$name" -- --exact --test-threads=1
   done
-  opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+  opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
     test/test_build_input.exe test/test_circle_program.exe \
     test/test_consensus_profile_golden.exe
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_build_input.exe"
@@ -210,7 +210,7 @@ if [ "${1:-}" = "--input" ]; then
 fi
 if [ "${1:-}" = "--json" ]; then
   BUILD_DIR=${OCTRA_BUILD_DIR:-_build}
-  opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+  opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
     test/test_json_tree.exe test/test_rpc_size.exe test/test_circle_program.exe \
     test/test_consensus_profile_golden.exe
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_json_tree.exe"
@@ -223,7 +223,7 @@ if [ "${1:-}" = "--json" ]; then
 fi
 if [ "${1:-}" = "--model" ]; then
   BUILD_DIR=${OCTRA_BUILD_DIR:-_build}
-  opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+  opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
     test/test_compute_engine.exe test/test_build_input.exe
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_build_input.exe"
   opam exec -- "$ROOT/$BUILD_DIR/default/test/test_compute_engine.exe" --cache
@@ -411,25 +411,25 @@ if [ "${1:-}" = "--write" ] || [ "${1:-}" = "--memory" ] \
   done
   if [ "$scope" = top1 ]; then
     BUILD_DIR=${OCTRA_BUILD_DIR:-_build}
-    opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+    opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
       test/test_compute_engine.exe
     opam exec -- "$ROOT/$BUILD_DIR/default/test/test_compute_engine.exe"
   fi
   if [ "$scope" = reply ] || [ "$scope" = parse ]; then
     BUILD_DIR=${OCTRA_BUILD_DIR:-_build}
-    opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+    opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
       test/test_build_input.exe
     opam exec -- "$ROOT/$BUILD_DIR/default/test/test_build_input.exe"
   fi
   if [ "$scope" = parse ]; then
-    opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+    opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
       test/test_compute_engine.exe test/test_consensus_profile_golden.exe
     opam exec -- "$ROOT/$BUILD_DIR/default/test/test_compute_engine.exe" --cache
     opam exec -- "$ROOT/$BUILD_DIR/default/test/test_consensus_profile_golden.exe"
   fi
   if [ "$scope" = session ] || [ "$scope" = job ]; then
     BUILD_DIR=${OCTRA_BUILD_DIR:-_build}
-    opam exec -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
+    opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --cache=disabled --root "$ROOT" --build-dir "$BUILD_DIR" -j1 \
       test/test_compute_engine.exe test/test_consensus_profile_golden.exe
     opam exec -- "$ROOT/$BUILD_DIR/default/test/test_compute_engine.exe" --cache
     opam exec -- "$ROOT/$BUILD_DIR/default/test/test_consensus_profile_golden.exe"

@@ -37,9 +37,13 @@ let plan ?cfg ~has payload =
   with _ -> Legacy
 
 let check_tx ~hash ~tx_json =
-  match Octra_core.Tx_payload.decode_admit (Octra_core.Json_tree.read tx_json) with
-  | Error e -> Decode_error e
-  | Ok tx ->
-    let actual = Octra_core.Transaction.hash tx in
-    if actual <> hash then Hash_mismatch { advertised = hash; actual }
-    else Decoded tx
+  try
+    match Tx_view.decode_network_tx (Octra_core.Json_tree.read tx_json) with
+    | Error e -> Decode_error e
+    | Ok tx ->
+      let actual = Octra_core.Transaction.hash tx in
+      if actual <> hash then Hash_mismatch { advertised = hash; actual }
+      else Decoded tx
+  with
+  | (Out_of_memory | Stack_overflow | Lwt.Canceled) as error -> raise error
+  | error -> Decode_error (Printexc.to_string error)

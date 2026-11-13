@@ -314,13 +314,26 @@ let test_check_cancel () =
     pending
   in
   let first = run_preverify cache ~state_root:"state-a" [item] verify in
-  Lwt.cancel first;
   let second = run_preverify cache ~state_root:"state-a" [item] verify in
+  Lwt.cancel first;
   Lwt.wakeup_later resolve (ready_batch [item]);
   let batch = Lwt_main.run second in
   expect "cancelled waiter preserved job" (!calls = 1);
   expect "second waiter completed"
     (Octra_core.Preverify_worker.txs batch = [item])
+
+let test_check_owner () =
+  let cache = C.create ~cap:4 in
+  let item = tx 23 in
+  let pending, _ = Lwt.task () in
+  let first = run_preverify cache ~state_root:"state-a" [item] (fun _ -> pending) in
+  Lwt.cancel first;
+  expect "unowned check survived cancellation" (Lwt.state pending = Lwt.Fail Lwt.Canceled);
+  let calls = ref 0 in
+  let second = run_preverify cache ~state_root:"state-a" [item] (fun _ ->
+    incr calls; Lwt.return (ready_batch [item])) |> Lwt_main.run in
+  expect "cancelled check retained in cache" (!calls = 1);
+  expect "replacement check differs" (Octra_core.Preverify_worker.txs second = [item])
 
 let test_check_retry () =
   let cache = C.create ~cap:4 in
@@ -578,9 +591,9 @@ let test_check_pending () =
   let first = run_preverify cache ~state_root:"root" [item] verify in
   run_preverify cache ~state_root:"root" [tx ~message:(String.make 2048 'e') 106]
     (fun items -> Lwt.return (ready_batch items)) |> Lwt_main.run |> ignore;
+  let second = run_preverify cache ~state_root:"root" [item] verify in
   Lwt.cancel first;
   expect "shared task not cancelled" (Lwt.is_sleeping job);
-  let second = run_preverify cache ~state_root:"root" [item] verify in
   expect "pending not duplicated" (!calls = 1);
   Lwt.wakeup_later resolve (ready_batch [item]);
   let result = Lwt_main.run second in
@@ -706,6 +719,7 @@ let test_bundle_cancel () =
     (match Lwt.state ready with Lwt.Fail Lwt.Canceled -> true | _ -> false)
 
 let () =
+  test_check_owner ();
   test_bundle_wait ();
   test_bundle_join ();
   test_finalized_wake ();

@@ -183,7 +183,8 @@ let state_root epoch =
 
 let no_funding _ _ = Lwt.return_ok None
 
-let engine ?(output = "{\"tokens\":[198]}") ?(check = fun _ -> ()) execution_count executed =
+let engine ?(output = "{\"tokens\":[198]}") ?(check = fun _ -> ())
+    ?(storage = fun () -> Lwt.return_unit) execution_count executed =
   let deps = Engine.{
     program = (fun ~epoch_id:_ ~state_root:_ ~circle_id ->
       Lwt.return
@@ -194,7 +195,7 @@ let engine ?(output = "{\"tokens\":[198]}") ?(check = fun _ -> ()) execution_cou
            runtime = "wasm_v1";
          }));
     storage = (fun ~epoch_id:_ ~state_root:_ ~circle_id:_ ->
-      Lwt.return (Ok []));
+      Lwt.map (fun () -> Ok []) (storage ()));
     load_model = (fun ~cancel:_ request ->
       Lwt.return
         (Ok Engine.{
@@ -2256,7 +2257,10 @@ let test_cancel_keys ?(retain = false) ?(many = false) data_dir origin caller pe
 let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = false)
     ?(output = "{\"tokens\":[198]}")
     ?(restart = false) ?(cancel_restart = false) ?(fetch_restart = false)
-    ?(rotate = false) ?(cut = Keep) ?(funding_wait = false) data_dir validator_count =
+    ?(rotate = false) ?(cut = Keep) ?(call_saved = false) ?(outage = false)
+    ?(funding_wait = false) data_dir validator_count =
+  if outage && (cut <> At_call || call_saved || validator_count <> 5) then
+    invalid_arg "call outage requires five members and unsaved coordinator";
   Mirage_crypto_rng_unix.use_default ();
   Printf.eprintf "event = service_case cut = %s restart = %b fetch = %b rotate = %b\n%!"
     (match cut with Keep -> "keep" | At_plan -> "plan" | At_call -> "call"
@@ -2378,7 +2382,13 @@ let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = fals
       (fun () -> decr live_reads; Lwt.return_unit) in
   let nodes = ref [] in
   let execution_count = ref 0 in
+  let executions = Hashtbl.create 8 in
   let executed = Lwt_condition.create () in
+  let storage_seen, storage_entered = Lwt.wait () in
+  let storage_wait, storage_release = Lwt.wait () in
+  let votes_ready, votes_release = Lwt.wait () in
+  let expiry_ready, expiry_release = Lwt.wait () in
+  let results_seen = Lwt_condition.create () in
   let held_commitments = Hashtbl.create 8 in
   let released_commitments = Hashtbl.create 8 in
   let observed_offers = Hashtbl.create 8 in
@@ -2389,6 +2399,29 @@ let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = fals
   let stop_request = ref None in
   let stopped, stop_reply = Lwt.wait () in
   let cut_at = cut in
+  let offline = ref None in
+  let check_call (call : Protocol.call) =
+    let id = Octra_node_runtime.Text.raw_to_hex (Certificate.request_id call.request) in
+    List.iteri (fun index identity ->
+      let count = Option.value ~default:0
+        (Hashtbl.find_opt executions (identity.address, id)) in
+      if count <> (if index = 0 && not call_saved || outage && index = 4 then 0 else 1) then
+        fail "call cut provider execution differs") identities in
+  let call_decision (call : Protocol.call) results =
+    let floor = validator_count - ((validator_count - 1) / 3) in
+    Certificate.decide ~chain_id:call.request.chain_id
+      ~current_epoch:call.request.epoch_id ~max_ttl:64L
+      ~selected:(List.map (fun identity -> identity.address) identities)
+      ~signer_floor:floor ~weight_floor:(Z.of_int floor)
+      ~weight_of:(fun address ->
+        if List.exists (fun identity -> identity.address = address) identities then Some Z.one
+        else None)
+      ~verify_signature:(fun vote ->
+        match List.find_opt (fun identity -> identity.address = vote.Certificate.node_id) identities with
+        | None -> false
+        | Some identity -> Octra_ed25519.verify ~pub:identity.public_key
+            ~msg:(Certificate.vote_sign_bytes vote) vote.signature)
+      call.request (List.map (fun result -> result.Protocol.vote) results) in
   let cut = ref cut in
   let reached, reach = Lwt.wait () in
   let held_results = ref [] in
@@ -2401,7 +2434,9 @@ let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = fals
     !nodes
     |> List.filter (fun node ->
       node.identity.address <> sender
-      && node.identity.address <> excluded)
+      && node.identity.address <> excluded
+      && Some node.identity.address <> !offline
+      && Some sender <> !offline)
     |> Lwt_list.iter_s (fun node ->
       Service.on_message node.service ~source:sender payload) in
   let deliver sender excluded payload =
@@ -2412,6 +2447,7 @@ let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = fals
       fst (Lwt.wait ())
     | Protocol.Result _ when !cut = At_call || !cut = At_vote || !cut = Lost || !cut = Cold ->
       held_results := payload :: !held_results;
+      Lwt_condition.broadcast results_seen ();
       if (!cut = Lost || !cut = Cold)
           && List.length (List.sort_uniq String.compare !held_results) >= validator_count then
         mark ();
@@ -2489,16 +2525,17 @@ let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = fals
       end
     | Protocol.Call call ->
       calls := call :: !calls;
+      if outage then offline := Some (List.nth identities 4).address;
       let* () = deliver_now sender excluded payload in
       if !cut = At_call then mark ();
       Lwt.return_unit
     | _ -> deliver_now sender excluded payload in
   let make_node ?(root = data_dir) ?(detached = false) ?(counter = execution_count)
-      ?(funding = observe)
+      ?(funding = observe) ?(pause = false) ?(resume_pause = false)
       ?(traffic = ref 0) identity =
     let disk = history root identity in
     let check (request : Provider_rpc.execute) =
-      match Octra_core.Compute_history.scope disk ~caller:request.caller
+      begin match Octra_core.Compute_history.scope disk ~caller:request.caller
           ~session:(Octra_node_runtime.Text.hex_to_string request.session_id) with
       | Ok (Some scope) when Octra_node_runtime.Text.raw_to_hex scope.request = request.request_id ->
         let call, saved = Record.decode_scope scope.body in
@@ -2514,8 +2551,20 @@ let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = fals
           + String.length (Record.encode_read call saved) in
         if Record.reply_space call saved identity.address <> size then
           fail "executor reply allocation differs"
-      | _ -> fail "executor started before key scope commit" in
-    let provider = Service.{ limits; engine = engine ~output ~check counter executed } in
+      | _ -> fail "executor started before key scope commit"
+      end;
+      if counter == execution_count then begin
+        let key = identity.address, request.request_id in
+        let count = Option.value ~default:0 (Hashtbl.find_opt executions key) + 1 in
+        Hashtbl.replace executions key count;
+        if count <> 1 then fail "provider repeated request execution"
+      end in
+    let storage () =
+      if not pause then Lwt.return_unit else begin
+        if Lwt.is_sleeping storage_seen then Lwt.wakeup_later storage_entered ();
+        Lwt.protected storage_wait
+      end in
+    let provider = Service.{ limits; engine = engine ~output ~check ~storage counter executed } in
     let service =
       Service.create
         ~history:(Ok disk)
@@ -2544,7 +2593,8 @@ let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = fals
           now; cancel_rounds = (fun () -> true);
           send = (fun ~peer payload ->
             incr traffic;
-            if detached then (relayed := payload :: !relayed; Lwt.return_unit)
+            if Some peer = !offline || Some identity.address = !offline then Lwt.return_unit
+            else if detached then (relayed := payload :: !relayed; Lwt.return_unit)
             else match List.find_opt (fun node -> node.identity.address = peer) !nodes with
               | Some node -> Service.on_message node.service ~source:identity.address payload
               | None -> Lwt.return_unit);
@@ -2556,11 +2606,15 @@ let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = fals
             incr traffic;
             if detached then (relayed := payload :: !relayed; Lwt.return_unit)
             else deliver identity.address source payload);
-          sleep = Lwt_unix.sleep;
+          sleep = (fun seconds ->
+            if resume_pause && Lwt.is_sleeping votes_ready then Lwt.protected votes_ready
+            else if resume_pause && outage && Lwt.is_sleeping expiry_ready then Lwt.protected expiry_ready
+            else Lwt_unix.sleep seconds);
         }
         ~provider:(Some provider) in
     { identity; service; disk } in
-  nodes := List.map (fun identity -> make_node identity) identities;
+  nodes := List.mapi (fun index identity ->
+    make_node ~pause:(cut_at = At_call && index = 0) identity) identities;
   let coordinator = List.hd !nodes in
   let session_id = raw_hash "session" in
   let params =
@@ -2670,11 +2724,49 @@ let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = fals
     Lwt.return restored
   end in
   let* coordinator = if cut_at = Keep then Lwt.return coordinator else begin
-    let* () = Lwt.pick [reached;
+    let wait_cut =
+      let* () = reached in
+      if cut_at <> At_call then Lwt.return_unit else begin
+        let* () = Lwt.protected storage_seen in
+        if call_saved then Lwt.wakeup_later storage_release ();
+        let expected = validator_count - (if call_saved then 0 else 1) - (if outage then 1 else 0) in
+        let rec ready () =
+          let providers = List.filter_map (fun payload -> match Protocol.decode payload with
+            | Protocol.Result result -> Some result.vote.node_id | _ -> None) !held_results
+            |> List.sort_uniq String.compare in
+          if List.length providers >= expected then Lwt.return providers
+          else let* () = Lwt_condition.wait results_seen in ready () in
+        let* providers = ready () in
+        let call = List.hd !calls in
+        check_call call;
+        List.iteri (fun index node ->
+          match Octra_core.Compute_history.saved node.disk ~caller:caller.address
+              ~session:session_id ~sequence:call.request.sequence
+              ~request:(Certificate.request_id call.request) with
+          | Ok None when index = 0 && not call_saved || outage && index = 4 -> ()
+          | Ok (Some saved) when (index <> 0 || call_saved) && not (outage && index = 4) ->
+            if saved.context <> Some (Record.encode_read call validator_set) then
+              fail "call cut saved context differs";
+            begin match Protocol.decode saved.reply with
+            | Protocol.Result result when result.vote.node_id = node.identity.address
+                && result.vote.request_id = Certificate.request_id call.request
+                && result.output_json = output
+                && result.vote.output_hash = Protocol.output_hash output
+                && Octra_ed25519.verify ~pub:node.identity.public_key
+                  ~msg:(Certificate.vote_sign_bytes result.vote) result.vote.signature -> ()
+            | _ -> fail "call cut saved result differs"
+            end
+          | _ -> fail "call cut saved execution differs") !nodes;
+        Printf.eprintf "event = call_cut saved = %b providers = %d local = %d\n%!"
+          call_saved (List.length providers) (if call_saved then 1 else 0);
+        Lwt.return_unit
+      end in
+    let* () = Lwt.pick [wait_cut;
       (let* () = Lwt_unix.sleep 120. in Lwt.fail_with "compute restart point timeout")] in
     let before = !execution_count in
     Printf.eprintf "event = service_check phase = restart_cut\n%!";
     let* () = Lwt_unix.with_timeout 120. (fun () -> Service.shutdown coordinator.service) in
+    if cut_at = At_call && not call_saved then Lwt.wakeup_later storage_release ();
     Printf.eprintf "event = service_check phase = restart_closed\n%!";
     let* () = if cut_at = Cold then
       Lwt_list.iter_s (fun node -> Service.shutdown node.service) (List.tl !nodes)
@@ -2813,7 +2905,7 @@ let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = fals
       active_set := Octra_consensus.C_types.make_validator_set [
         {address = other.address; pubkey = other.public_key}]
     end;
-    let restored = make_node coordinator.identity in
+    let restored = make_node ~resume_pause:(cut_at = At_call) coordinator.identity in
     nodes := restored :: (if cut_at = Cold then List.map make_node (List.tl identities)
       else List.tl !nodes);
     cut := Keep;
@@ -2824,6 +2916,7 @@ let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = fals
     | Ok value when status_name value = "waiting" || status_name value = "finished" -> ()
     | _ -> fail "compute pending status not restored"
     end;
+    let* _ = Service.active_jobs restored.service in
     let* restored = if not fetch_restart then Lwt.return restored else begin
       let targets () = List.map (fun (fetch, _) -> fetch.Protocol.target) !answers
         |> List.sort_uniq String.compare in
@@ -2863,12 +2956,136 @@ let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = fals
     end in
     let* () = if cut_at = Lost || cut_at = Cold then Lwt.return_unit
       else Lwt_list.iter_s (deliver_now "" "") (List.rev !held_results) in
+    if cut_at = At_call && not outage then Lwt.wakeup_later votes_release ();
     if cut_at <> At_plan && !execution_count > max before validator_count then
       fail "compute restart repeated execution";
     Lwt.return restored
   end in
+  if outage then begin
+    let call = List.hd !calls in
+    let id = Octra_node_runtime.Text.hex_to_string job_id in
+    let* _ = Service.active_jobs coordinator.service in
+    let record = match Octra_core.Compute_history.work coordinator.disk ~caller:caller.address ~id with
+      | Ok (Some (Octra_core.Compute_history.Issued body)) -> Record.decode body
+      | _ -> fail "call outage issued record missing" in
+    let providers = List.filteri (fun index _ -> index > 0 && index < 4) identities
+      |> List.map (fun identity -> identity.address) |> List.sort String.compare in
+    if record.call <> call || record.validators <> Some validator_set
+       || List.sort String.compare (List.map (fun result -> result.Protocol.vote.node_id) record.results)
+          <> providers then fail "call outage result identities differ";
+    if List.length record.results <> 3 || call_decision call record.results <> Certificate.Insufficient then
+      fail "call outage quorum accepted";
+    check_call call;
+    if !execution_count <> 3 then fail "call outage execution count differs";
+    let* waiting = Rpc.status coordinator.service
+      (read_params coordinator.identity caller !head_epoch job_id) in
+    begin match waiting with
+    | Ok value when status_name value = "waiting" -> ()
+    | _ -> fail "call outage did not remain pending"
+    end;
+    Printf.eprintf "event = call_outage votes = 3 floor = 4 decision = insufficient\n%!";
+    let sent = List.length !calls in
+    let value = call.request in
+    let pending = Service.compute coordinator.service Service.{
+      unit_price = value.unit_price; fee_cap = value.fee_cap;
+      memory_bytes = value.memory_bytes; guest_bytes = value.guest_bytes;
+      fuel_limit = value.fuel_limit; valid_until = call.valid_until;
+      model_epoch = value.model_epoch; model_state_root = value.model_state_root;
+      circle_id = value.circle_id; graph_root = value.graph_root; model_root = value.model_root;
+      program_root = value.program_root; executor_root = value.executor_root;
+      caller = value.caller; caller_public_key = call.caller_public_key;
+      caller_signature = call.caller_signature; session_id = value.session_id;
+      sequence = value.sequence; method_name = call.method_name; params_json = call.params_json;
+      max_output_bytes = value.max_output_bytes} in
+    let* _ = Service.active_jobs coordinator.service in
+    if not (Lwt.is_sleeping pending) then fail "call outage completed before expiry";
+    let* () = head_progress in
+    head_epoch := call.request.expires_epoch;
+    Lwt.wakeup_later votes_release ();
+    let* () = Lwt.pause () in
+    let* _ = Service.active_jobs coordinator.service in
+    let* waiting = Rpc.status coordinator.service
+      (read_params coordinator.identity caller !head_epoch job_id) in
+    begin match waiting with
+    | Ok value when status_name value = "waiting" -> ()
+    | _ -> fail "call outage accepted insufficient votes"
+    end;
+    head_epoch := Int64.succ call.request.expires_epoch;
+    Lwt.wakeup_later expiry_release ();
+    let* expired = Lwt_unix.with_timeout 10. (fun () -> pending) in
+    if expired <> Error "resource compute certificate expired" then
+      fail "call outage expiry reason differs";
+    let* status = Rpc.status coordinator.service
+      (read_params coordinator.identity caller !head_epoch job_id) in
+    begin match status with
+    | Ok value when status_name value = "refused"
+        && field "reason" value = Some (`String "resource compute certificate expired") -> ()
+    | _ -> fail "call outage expiry status differs"
+    end;
+    check_call call;
+    if !execution_count <> 3 then fail "call outage repeated execution";
+    if List.length !calls <> sent then fail "call outage rebroadcast work";
+    if Octra_core.Compute_history.load_job coordinator.disk ~caller:caller.address ~id <> Ok None then
+      fail "call outage produced completed work";
+    Printf.eprintf "event = call_outage status = refused reason = certificate_expired\n%!";
+    let* () = Lwt_list.iter_s (fun node -> Service.shutdown node.service) !nodes in
+    Store.close fund_store
+  end else
   let* response =
     await_finished coordinator caller head_epoch job_id 1000 in
+  let* coordinator = if cut_at <> At_call then Lwt.return coordinator else begin
+    let call = List.hd !calls in
+    check_call call;
+    let body = match Octra_core.Compute_history.load_job coordinator.disk ~caller:caller.address
+        ~id:(Octra_node_runtime.Text.hex_to_string job_id) with
+      | Ok (Some body) -> body | _ -> fail "call cut completed record missing" in
+    let record = Record.decode body in
+    if record.call <> call || record.validators <> Some validator_set then
+      fail "call cut completed context differs";
+    let providers = (if call_saved then identities else List.tl identities)
+      |> List.map (fun identity -> identity.address) |> List.sort String.compare in
+    let certificate = call_decision call record.results in
+    begin match certificate, field "certificate" response with
+    | Certificate.Agreed certificate, Some value
+        when certificate.output_hash = Protocol.output_hash output
+          && certificate.request_id = Certificate.request_id call.request
+          && field "root" value = Some (`String (Octra_node_runtime.Text.raw_to_hex certificate.root))
+          && List.for_all (fun result -> result.Protocol.output_json = output) record.results
+          && List.sort String.compare
+            (List.map (fun signer -> signer.Certificate.node_id) certificate.signers) = providers
+          && field "signer_count" value = Some (`Int (List.length providers))
+          && (match field "signers" value with
+            | Some (`List signers) -> List.length signers = List.length providers
+              && (List.filter_map (fun signer ->
+                match field "node_id" signer with Some (`String address) -> Some address
+                | _ -> None) signers |> List.sort String.compare) = providers
+            | _ -> false) -> ()
+    | _ -> fail "call cut certificate differs"
+    end;
+    Printf.eprintf "event = call_certificate saved = %b signers = %d\n%!"
+      call_saved (List.length providers);
+    let sent = List.length !calls in
+    let rec reboot count current =
+      if count = 0 then Lwt.return current else begin
+        let* () = Service.shutdown current.service in
+        let next = make_node current.identity in
+        nodes := next :: List.tl !nodes;
+        let* status = Rpc.status next.service (read_params next.identity caller !head_epoch job_id) in
+        if status <> Ok response then fail "call cut restart result differs";
+        let* () = Lwt_list.iter_s (deliver_now "" "") (List.rev !held_results) in
+        let* status = Rpc.status next.service (read_params next.identity caller !head_epoch job_id) in
+        if status <> Ok response then fail "call cut repeated status differs";
+        let* submitted = Rpc.submit next.service params in
+        begin match submitted with
+        | Ok value when field "job_id" value = Some (`String job_id) -> ()
+        | _ -> fail "call cut repeated submit differs"
+        end;
+        check_call call;
+        if List.length !calls <> sent then fail "call cut rebroadcast work";
+        reboot (count - 1) next
+      end in
+    reboot 2 coordinator
+  end in
   let chosen = match field "selection" response with
     | Some value -> (match field "offer_id" value with
       | Some (`String id) -> Octra_node_runtime.Text.hex_to_string id
@@ -2887,12 +3104,14 @@ let run ?(span = 64L) ?(inject_duplicate_offer = false) ?(cancel_on_offer = fals
   if funding_wait && (not !late_seen || !late_check) then fail "funding head race not checked";
   if funding_wait && (not !slow_read || !peak_reads <> 1) then
     fail "funding read duplicated after timeout";
+  let expected = if cut_at = At_call && not call_saved then validator_count - 1
+    else validator_count in
   let rec finished attempts =
-    if !execution_count >= validator_count then Lwt.return_unit
+    if !execution_count >= expected then Lwt.return_unit
     else if attempts = 0 then fail "compute restored execution count"
     else let* () = Lwt_unix.sleep 0.01 in finished (attempts - 1) in
   let* () = if cut_at = Keep then Lwt.return_unit else finished 300 in
-  if cut_at <> Keep && !execution_count <> validator_count then fail "compute repeated work";
+  if cut_at <> Keep && !execution_count <> expected then fail "compute repeated work";
   if (cut_at = Lost || cut_at = Cold)
       && (!reads = [] || !answers = [] || Hashtbl.length dropped < 3) then
     fail "saved reply recovery not exercised";
@@ -3766,6 +3985,8 @@ let () =
       Lwt_main.run (run ~span:12L data_dir 1);
       Lwt_main.run (run ~cut:At_plan data_dir 1);
       Lwt_main.run (run ~cut:At_call data_dir 5);
+      Lwt_main.run (run ~cut:At_call ~call_saved:true data_dir 5);
+      Lwt_main.run (run ~cut:At_call ~outage:true data_dir 5);
       Lwt_main.run (run ~cut:At_vote data_dir 5);
       Lwt_main.run (run ~cut:Lost data_dir 5);
       Lwt_main.run (run ~cut:Cold data_dir 5);
@@ -3823,7 +4044,14 @@ let () =
     | [_; "--work-restart"] ->
       Lwt_main.run (run ~cut:At_plan data_dir 1);
       Lwt_main.run (run ~cut:At_call data_dir 5);
+      Lwt_main.run (run ~cut:At_call ~call_saved:true data_dir 5);
+      Lwt_main.run (run ~cut:At_call ~outage:true data_dir 5);
       Lwt_main.run (run ~cut:At_vote data_dir 5)
+    | [_; "--call-cut"] -> Lwt_main.run (run ~cut:At_call data_dir 5)
+    | [_; "--call-outage"] -> Lwt_main.run (run ~cut:At_call ~outage:true data_dir 5)
+    | [_; "--call-pair"] ->
+      Lwt_main.run (run ~cut:At_call data_dir 5);
+      Lwt_main.run (run ~cut:At_call ~call_saved:true data_dir 5)
     | [_; "--fetch"] ->
       Lwt_main.run (run ~cut:Lost data_dir 5);
       Lwt_main.run (run ~cut:Cold data_dir 5);

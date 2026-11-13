@@ -3,11 +3,6 @@
 
 let range_epochs = 16
 
-type peer_head = {
-  responder_addr : string;
-  responder_head_epoch : int64;
-}
-
 type lag_decision =
   | In_sync
   | Do_catchup of int
@@ -48,13 +43,6 @@ type record_apply_decision =
   | Apply_record
   | Skip_applied_record
   | Retry_moved_head
-
-let pick_target_epoch ~(responses : peer_head list) ~(f : int) ~(fallback : int64) : int64 =
-  let heads = List.map (fun r -> r.responder_head_epoch) responses in
-  let sorted = List.sort (fun a b -> Int64.compare b a) heads in
-  match List.nth_opt sorted f with
-  | Some e -> e
-  | None -> fallback
 
 let bounded_distance high low =
   let distance = Z.sub (Z.of_int64 high) (Z.of_int64 low) in

@@ -352,6 +352,146 @@ let test_reward_finality_binding () =
           finalize
           { supplied with proposer_addr = "octB" }))
 
+let test_set_reward () =
+  let module Policy = Octra_consensus.C_quorum_policy in
+  let chain_id = "octra-devnet-9871-cluster" in
+  let epoch_id = 1_900_000L in
+  let policy = Policy.with_seatless_epoch (Policy.for_chain chain_id) (Some epoch_id) in
+  let entries = List.mapi (fun index weight ->
+    C.{address = "oct" ^ String.make 1 (Char.chr (65 + index));
+      pubkey = String.make 32 (Char.chr (index + 1))}, Z.of_int weight) [4; 3; 2; 1] in
+  let validator_set = C.make_weighted_validator_set entries |> expect_ok "reward weighted set" in
+  let make_parent at signers =
+    let header = C.{proto_version = proto_version_current; chain_id; epoch_id = Int64.pred at;
+      prev_state_root = String.make 32 '\001'; tx_list_hash = H.tx_list_hash [];
+      receipt_root = H.receipt_root []; proposed_state_root = String.make 32 '\002';
+      parent_commit_hash = Octra_net.Hash_domain.nil_hash; creator_addr = "octA";
+      txid_hi = 0L; ts = 80.} in
+    let proposal_id = H.proposal_id header in
+    C.{validator_set; certificate = {
+      chain_id; epoch_id = header.epoch_id; commit_round = 1; header; proposal_id;
+      precommits = List.map (fun validator -> C.{chain_id; epoch_id = header.epoch_id;
+        round = 1; vote_type = Precommit; proposal_id; validator;
+        signature = String.make 64 '\003'}) signers;
+    }} in
+  let resolve at parent = R.resolve_for_epoch ~policy ~chain_id ~epoch_id:at
+    ~proposer_addr:"ignored" ~validator_pubkeys:[] (Some parent) in
+  let short = make_parent epoch_id ["octA"; "octB"] in
+  let long = make_parent epoch_id ["octA"; "octB"; "octC"] in
+  let reward = resolve epoch_id short |> expect_ok "set reward" in
+  expect "set reward depended on certificate signers" (resolve epoch_id long = Ok reward);
+  let author = C.{address = "octZ"; pubkey = String.make 32 '\009'} in
+  let authors = [author, Z.one] in
+  let with_authors authors = {short with validator_set =
+    {validator_set with authors = Some (Int64.pred epoch_id, authors)}} in
+  let relief = with_authors authors in
+  expect "set reward dropped relief metadata" (resolve epoch_id relief = Ok reward);
+  let relief = {relief with certificate = {relief.certificate with
+    header = {relief.certificate.header with creator_addr = author.address}}} in
+  let outside = resolve epoch_id relief |> expect_ok "set reward prior author" in
+  expect "set reward added prior author to voters"
+    (outside.validators = reward.validators && outside.proposer_addr = author.address
+      && outside.proposer_public_key = Some (Base64.encode_exn author.pubkey));
+  List.iter (fun altered ->
+    expect "set reward accepted malformed relief authors" (Result.is_error (resolve epoch_id altered))) [
+    with_authors [];
+    with_authors [author, Z.zero];
+    with_authors (List.hd entries :: authors);
+    with_authors [{author with pubkey = (fst (List.hd entries)).pubkey}, Z.one];
+    {short with validator_set = {validator_set with authors = Some (epoch_id, authors)}};
+  ];
+  expect "set reward omitted member weight"
+    (List.map (fun (member : X.reward_validator) -> member.address, member.weight) reward.validators
+      = List.map (fun (member, weight) -> member.C.address, weight) entries);
+  let previous = Int64.pred epoch_id in
+  let before = make_parent previous ["octA"; "octB"] in
+  expect "set reward changed historical source" (resolve previous before = R.of_parent_commit before);
+  expect "set reward accepted another parent epoch" (Result.is_error (resolve epoch_id before));
+  expect "set reward accepted undeclared weights"
+    (Result.is_error (resolve epoch_id {short with validator_set = C.make_validator_set validator_set.validators}));
+  List.iter (fun altered ->
+    expect "set reward accepted malformed parent set"
+      (Result.is_error (resolve epoch_id {short with validator_set = altered}))) [
+    {validator_set with n = validator_set.n + 1};
+    {validator_set with quorum = validator_set.quorum + 1};
+    {validator_set with total_weight = Z.succ validator_set.total_weight};
+    {validator_set with weights = ("octA", Z.zero) :: List.remove_assoc "octA" validator_set.weights};
+    {validator_set with weights = ("octZ", Z.one) :: validator_set.weights};
+    {validator_set with validators = List.hd validator_set.validators :: validator_set.validators};
+  ];
+  let finalize = C.{chain_id; epoch_id; commit_round = 1;
+    header = {short.certificate.header with epoch_id}; proposal_id = short.certificate.proposal_id;
+    precommits = []; parent_commit = Some short} in
+  expect "set reward finality did not bind full set"
+    (R.bind_finality ~policy ~validator_set finalize reward = Ok reward);
+  expect "set reward accepted certificate-only attribution"
+    (Result.is_error (R.bind_finality ~policy ~validator_set finalize
+      (R.of_parent_commit short |> expect_ok "old reward")));
+  expect "set reward accepted missing parent before standard"
+    (Result.is_error (R.bind_finality ~policy ~validator_set
+      {finalize with chain_id = "reward-unconfigured"; parent_commit = None} reward));
+  expect "set reward resolved missing parent before standard"
+    (Result.is_error (R.resolve_for_epoch ~policy ~chain_id:"reward-unconfigured"
+      ~epoch_id ~proposer_addr:"octA" ~validator_pubkeys:[] None));
+  expect "set reward accepted old finality version"
+    (Result.is_error (R.bind_finality ~policy ~validator_set
+      {finalize with header = {finalize.header with proto_version = C.proto_version_parent_legacy}} reward));
+  List.iter (fun base -> List.iter (fun fees ->
+    let base = Z.of_string base and fees = Z.of_int fees in
+    let plan = X.build_reward_plan_with_base ~fee_burn_active:true ~supply_retired:Z.zero
+      ~base_reward:base ~validator_count:4 ~emission_remaining:base
+      ~confirmed_fees:fees ~prev_supply:(Z.sub Octra_core.Denomination.max_supply base)
+      |> expect_ok "set reward plan" in
+    let credits = X.reward_credits reward plan |> expect_ok "set reward credits" in
+    let total = List.fold_left (fun sum (credit : X.reward_credit) -> Z.add sum credit.amount) Z.zero credits in
+    expect "set reward did not conserve issued units"
+      (Z.equal total (Z.sub (Z.add base fees) plan.fees_burned));
+    let pool = Z.add (Z.mul (Z.of_int 4) plan.each_validator) plan.remainder in
+    let shares = List.map (fun (_, weight) -> Z.div (Z.mul pool weight) (Z.of_int 10)) entries in
+    let dust = Z.sub pool (List.fold_left Z.add Z.zero shares) in
+    expect "set reward rounding exceeds member count" (Z.geq dust Z.zero && Z.lt dust (Z.of_int 4));
+    List.iter (fun (member, weight) ->
+      let amount = List.find_opt (fun (credit : X.reward_credit) -> credit.address = member.C.address) credits
+        |> Option.fold ~none:Z.zero ~some:(fun (credit : X.reward_credit) -> credit.amount) in
+      let share = Z.div (Z.mul pool weight) (Z.of_int 10) in
+      expect "set reward weight division differs"
+        (Z.equal amount
+          (if member.address = reward.proposer_addr then
+            Z.add share (Z.add (Z.sub plan.proposer_total plan.remainder) dust)
+           else share))) entries;
+    expect "set reward changed with member order"
+      (X.reward_credits {reward with validators = List.rev reward.validators} plan = Ok credits);
+    let scaled = List.map (fun (member : X.reward_validator) ->
+      {member with weight = Z.mul member.weight (Z.shift_left Z.one 70)}) reward.validators in
+    expect "set reward lost large weight precision"
+      (X.reward_credits {reward with validators = scaled} plan = Ok credits))
+    [0; 1; 4; 5; 37]) ["0"; "1"; "3"; "100"; "999999999999000"];
+  let apply reward = with_store (fun store ->
+    let ledger = L.create store in
+    expect "set reward payer setup" (L.add_account ledger "octA" (Z.of_int 1000) = Ok ());
+    expect "set reward fee debit" (L.debit ledger "octA" (Z.of_int 37) 1 = Ok ());
+    let plan = X.build_reward_plan_with_base ~fee_burn_active:true
+      ~supply_retired:(Z.sub Octra_core.Denomination.max_supply (Z.of_int 1100))
+      ~base_reward:(Z.of_int 100) ~validator_count:4 ~emission_remaining:(Z.of_int 100)
+      ~confirmed_fees:(Z.of_int 37) ~prev_supply:(Z.of_int 1000) |> expect_ok "set reward apply plan" in
+    let backend = X.make_live_backend ~emission_policy:E.Allow store ledger in
+    Lwt_main.run (X.apply_epoch_footer_with_reward ~reward ~backend ~env ~plan);
+    List.iter (fun (address, balance) ->
+      expect "set reward applied balance differs"
+        (Z.equal (L.find ledger address).L.balance (Z.of_int balance)))
+      ["octA", 1072; "octB", 11; "octC", 7; "octD", 3];
+    expect "set reward applied supply differs" (Z.equal (L.get_total_supply ledger) (Z.of_int 1093));
+    expect "set reward retired supply differs"
+      (Lwt_main.run (S.get_meta store ES.retired_key)
+        = Some (Z.to_string (Z.sub Octra_core.Denomination.max_supply (Z.of_int 1093))));
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    List.iter (fun (member : X.reward_validator) ->
+      let account = Lwt_main.run (S.get_account store member.X.address) |> Option.get in
+      expect "set reward saved key differs" (account.public_key = member.public_key)) reward.validators;
+    Lwt_main.run (S.state_hash store)) in
+  expect "set reward applied root depends on certificate"
+    (apply reward = apply (resolve epoch_id long |> expect_ok "set reward long source"))
+
 let test_validator_unbond () =
   let address = "oct4ZKCyAUbLCrHEZzNkqysPokEtqQeC1y5x4YK7Jm4vXSC" in
   let registry =
@@ -1078,6 +1218,243 @@ let atomic_backend ?sender_key_activation_epoch store ledger =
     store
     ledger
 
+let profile_at ~chain_id ~epoch =
+  if chain_id <> env.X.chain_id || epoch < 4 then None
+  else Some (String.make 32 (if epoch = 4 then '\001' else '\002'))
+
+let execution_marker epoch byte =
+  X.execution_marker_to_string X.{ epoch; profile = String.make 32 byte }
+  |> expect_ok "execution marker"
+
+let execution_base store epoch =
+  Lwt_main.run (Lwt_list.iter_s (fun (key, value) -> S.set_meta store key value) [
+    "last_epoch", string_of_int (epoch - 1);
+    "current_epoch", string_of_int epoch;
+    "total_supply", "0";
+    "emission_remaining", "0";
+  ])
+
+let execution_backend store ledger =
+  X.make_live_backend ~emission_policy:E.Guard ~emission_schedule:ES.Inactive
+    ~execution_profile:profile_at store ledger
+
+let test_execution_codec () =
+  let profile = String.init 32 Char.chr in
+  let hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" in
+  let raw = "{\"epoch\":4,\"profile\":\"" ^ hex ^ "\"}" in
+  expect "execution encoding differs"
+    (X.execution_marker_to_string X.{ epoch = 4; profile } = Ok raw);
+  expect "execution decoding differs"
+    (X.execution_marker_of_string raw = Ok X.{ epoch = 4; profile });
+  let fields = ["epoch", `Int 4; "profile", `String hex] in
+  List.iter (fun fields ->
+    expect "execution invalid fields accepted"
+      (Result.is_error (X.execution_marker_of_string (Yojson.Safe.to_string (`Assoc fields))))) [
+    List.remove_assoc "epoch" fields;
+    List.remove_assoc "profile" fields;
+    ("epoch", `Int 4) :: fields;
+    ("profile", `String hex) :: fields;
+    ("extra", `Null) :: fields;
+    ["epoch", `Int (-1); "profile", `String hex];
+    ["epoch", `Int max_int; "profile", `String hex];
+    ["epoch", `String "4"; "profile", `String hex];
+    ["epoch", `Float 4.; "profile", `String hex];
+    ["epoch", `Int 4; "profile", `String (String.uppercase_ascii hex)];
+    ["epoch", `Int 4; "profile", `String profile];
+    ["epoch", `Int 4; "profile", `String (String.make 64 'g')];
+  ];
+  List.iter (fun raw ->
+    expect "execution malformed marker accepted"
+      (Result.is_error (X.execution_marker_of_string raw)))
+    ["null"; "[]"; "{"; raw ^ "{}"; String.make 257 ' '];
+  List.iter (fun marker ->
+    expect "execution invalid marker encoded"
+      (Result.is_error (X.execution_marker_to_string marker)))
+    [X.{epoch = -1; profile}; X.{epoch = 4; profile = hex}];
+  let check epoch marker =
+    X.check_execution ~profile:profile_at ~chain_id:env.X.chain_id ~epoch marker in
+  expect "execution preactivation rejected" (check 3 None = Ok ());
+  expect "execution premature marker accepted"
+    (check 3 (Some (execution_marker 3 '\001'))
+      = Error "execution profile marker is unexpected");
+  expect "execution missing marker accepted"
+    (check 4 None = Error "execution profile marker is missing");
+  expect "execution valid marker rejected" (check 4 (Some (execution_marker 4 '\001')) = Ok ());
+  expect "execution wrong epoch accepted"
+    (check 5 (Some (execution_marker 4 '\002')) = Error "execution profile epoch differs");
+  expect "execution wrong hash accepted"
+    (check 5 (Some (execution_marker 5 '\001')) = Error "execution profile hash differs");
+  expect "execution text callback accepted"
+    (X.check_execution ~profile:(fun ~chain_id:_ ~epoch:_ -> Some hex)
+      ~chain_id:env.X.chain_id ~epoch:4 (Some raw)
+     = Error "execution profile hash is invalid")
+
+let test_execution_state () =
+  with_store (fun store ->
+    execution_base store 4;
+    let check epoch = Lwt_main.run (X.check_execution_state ~profile:profile_at
+      ~chain_id:env.X.chain_id ~epoch store) in
+    expect "execution legacy state rejected" (check 3 = Ok ());
+    expect "execution unmarked state accepted"
+      (check 4 = Error "execution profile marker is missing");
+    execution_base store 5;
+    Lwt_main.run (S.set_meta store X.execution_meta_key (execution_marker 4 '\001'));
+    expect "execution applied state rejected" (check 4 = Ok ());
+    List.iter (fun (key, value, error) ->
+      execution_base store 5;
+      Lwt_main.run (match value with
+        | Some value -> S.set_meta store key value
+        | None -> S.remove_path store ["meta"; key]);
+      expect "execution inconsistent epoch accepted" (check 4 = Error error)) [
+      "last_epoch", None, "execution profile last epoch differs";
+      "last_epoch", Some "3", "execution profile last epoch differs";
+      "last_epoch", Some "04", "execution profile last epoch differs";
+      "current_epoch", None, "execution profile current epoch differs";
+      "current_epoch", Some "6", "execution profile current epoch differs";
+      "current_epoch", Some "+5", "execution profile current epoch differs";
+    ])
+
+let test_execution_refusal () =
+  List.iter (fun (epoch, last, current, marker, error) -> with_store (fun store ->
+    execution_base store epoch;
+    let ledger = L.create store in
+    expect "execution refusal account" (L.add_account ledger env.X.proposer_addr (Z.of_int 100) = Ok ());
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    Lwt_main.run (S.set_meta store "total_supply" "100");
+    Lwt_main.run (S.set_meta store "last_epoch" last);
+    Lwt_main.run (S.set_meta store "current_epoch" current);
+    Option.iter (fun raw -> Lwt_main.run (S.set_meta store X.execution_meta_key raw)) marker;
+    let backend = execution_backend store ledger in
+    let env = { env with X.epoch_id = epoch } in
+    let before = Lwt_main.run (S.state_hash store) in
+    let account = L.find ledger env.X.proposer_addr in
+    expect "execution parent refusal differs"
+      (Lwt_main.run (X.check_execution_parent ~backend ~env) = Error error);
+    let calls = ref 0 in
+    let result = Lwt_main.run (X.run_core ~reward:None ~preverify:None ~backend ~env
+      ~txs:[atomic_tx 1] ~process_tx:(fun ~backend:_ ~env:_ _ ->
+        incr calls; Lwt.return_ok (X.Confirmed Z.zero))) in
+    expect "execution refused after transaction" (result = Error error && !calls = 0);
+    let plan = X.build_reward_plan ~fee_burn_active:false ~supply_retired:Z.zero
+      ~validator_count:1 ~emission_remaining:Z.zero ~confirmed_fees:(Z.of_int 10)
+      ~prev_supply:(Z.of_int 100) |> expect_ok "execution refusal reward" in
+    let refused = Lwt_main.run (Lwt.catch (fun () ->
+      Lwt.map (fun () -> None) (X.apply_epoch_footer ~backend ~env ~plan))
+      (function Failure reason -> Lwt.return_some reason | error -> Lwt.fail error)) in
+    expect "execution footer refusal differs" (refused = Some error);
+    expect "execution refusal changed reward" (L.find ledger env.X.proposer_addr = account);
+    expect "execution refusal changed state" (Lwt_main.run (S.state_hash store) = before);
+    expect "execution refusal opened batch" (store.S.batch_tree = None && not (L.journal_active ledger)))) [
+    4, "2", "4", None, "execution profile last epoch differs";
+    4, "3", "04", None, "execution profile current epoch differs";
+    4, "3", "4", Some (execution_marker 3 '\001'), "execution profile marker is unexpected";
+    5, "4", "5", None, "execution profile marker is missing";
+    5, "4", "5", Some (execution_marker 3 '\001'), "execution profile epoch differs";
+    5, "4", "5", Some (execution_marker 4 '\002'), "execution profile hash differs";
+    5, "4", "5", Some "{}", "execution profile marker is invalid";
+  ]
+
+let test_execution_chain () =
+  with_store (fun store ->
+    execution_base store 4;
+    let ledger = L.create store in
+    let backend = execution_backend store ledger in
+    let run backend epoch = X.run ~backend ~env:{env with X.epoch_id = epoch}
+      ~txs:[] ~process_tx:(fun ~backend:_ ~env:_ _ -> Lwt.return_ok Z.zero)
+      |> Lwt_main.run in
+    let check epoch = Lwt_main.run (X.check_execution_state ~profile:profile_at
+      ~chain_id:env.X.chain_id ~epoch store) in
+    let first = run backend 4 |> expect_ok "execution activation" in
+    expect "execution activation marker differs"
+      (Lwt_main.run (S.get_meta store X.execution_meta_key) = Some (execution_marker 4 '\001'));
+    expect "execution activation state rejected" (check 4 = Ok ());
+    expect "execution root omitted marker" (Lwt_main.run (S.state_hash store) = first.X.post_state_root);
+    let head = Lwt_main.run (S.Store.Head.find store.S.store) |> Option.get in
+    let zero = X.build_reward_plan ~fee_burn_active:false ~supply_retired:Z.zero
+      ~validator_count:1 ~emission_remaining:Z.zero ~confirmed_fees:Z.zero
+      ~prev_supply:Z.zero |> expect_ok "execution zero reward" in
+    Lwt_main.run (S.begin_epoch_batch store);
+    Lwt_main.run (X.apply_epoch_footer ~backend ~env:{env with X.epoch_id = 5} ~plan:zero);
+    expect "execution footer omitted batch marker"
+      (Lwt_main.run (S.get_meta store X.execution_meta_key) = Some (execution_marker 5 '\002'));
+    expect "execution footer omitted batch root"
+      (Lwt_main.run (S.get_batch_tree_hash store) <> Some first.post_state_root);
+    expect "execution uncommitted footer changed root"
+      (Lwt_main.run (S.state_hash store) = first.post_state_root);
+    S.abort_epoch_batch store;
+    expect "execution abort kept marker" (check 4 = Ok ());
+    let old = X.make_live_backend ~emission_policy:E.Guard ~emission_schedule:ES.Inactive store ledger in
+    ignore (run old 5 |> expect_ok "execution old binary advance");
+    expect "execution old binary stamped marker"
+      (Lwt_main.run (S.get_meta store X.execution_meta_key) = Some (execution_marker 4 '\001'));
+    expect "execution old binary state accepted" (check 5 = Error "execution profile epoch differs");
+    let before = Lwt_main.run (S.state_hash store) in
+    expect "execution old suffix restamped"
+      (run backend 6 = Error "execution profile epoch differs");
+    expect "execution old suffix changed root" (Lwt_main.run (S.state_hash store) = before);
+    Lwt_main.run (S.Store.Head.set store.S.store head);
+    expect "execution recovered state rejected" (check 4 = Ok ());
+    ignore (run backend 5 |> expect_ok "execution successor");
+    expect "execution successor profile differs"
+      (Lwt_main.run (S.get_meta store X.execution_meta_key) = Some (execution_marker 5 '\002'));
+    expect "execution successor state rejected" (check 5 = Ok ()))
+
+let test_execution_parity () =
+  let run profile = with_store (fun store ->
+    execution_base store 4;
+    let ledger = L.create store in
+    let base = Lwt_main.run (S.state_hash store) in
+    let result = Octra_core.State_preview.with_preview ~base_store:store ~base_ledger:ledger
+      ~proof_mode:Octra_core.Rule_graph.Prior ~fold:X.prior_fold
+      ~epoch_id:4 ~proposal_id:"execution-preview"
+      (fun backend -> X.run ~backend:{backend with X.execution_profile = profile;
+        emission_policy = E.Guard; emission_schedule = ES.Inactive}
+        ~env ~txs:[] ~process_tx:(fun ~backend:_ ~env:_ _ -> Lwt.return_ok Z.zero))
+      |> Lwt_main.run |> expect_ok "execution preview" in
+    expect "execution preview changed live root" (Lwt_main.run (S.state_hash store) = base);
+    expect "execution preview leaked marker" (Lwt_main.run (S.get_meta store X.execution_meta_key) = None);
+    let backend = X.make_live_backend ~emission_policy:E.Guard ~emission_schedule:ES.Inactive
+      ~execution_profile:profile store ledger in
+    let applied = run_empty_epoch backend |> expect_ok "execution live" in
+    expect "execution preview root differs" (result.X.post_state_root = applied.X.post_state_root);
+    applied.post_state_root) in
+  expect "execution marker absent from root"
+    (run profile_at <> run (fun ~chain_id:_ ~epoch:_ -> None));
+  let legacy profile = with_store (fun store ->
+    execution_base store 3;
+    let backend = X.make_live_backend ~execution_profile:profile store (L.create store) in
+    let result = X.run ~backend ~env:{env with X.epoch_id = 3} ~txs:[]
+      ~process_tx:(fun ~backend:_ ~env:_ _ -> Lwt.return_ok Z.zero)
+      |> Lwt_main.run |> expect_ok "execution legacy" in
+    expect "execution legacy stamped marker" (Lwt_main.run (S.get_meta store X.execution_meta_key) = None);
+    result.X.post_state_root) in
+  expect "execution legacy root changed"
+    (legacy profile_at = legacy (fun ~chain_id:_ ~epoch:_ -> None))
+
+let test_execution_capture () =
+  with_store (fun store ->
+    execution_base store 5;
+    Lwt_main.run (S.set_meta store X.execution_meta_key (execution_marker 4 '\001'));
+    let ledger = L.create store in
+    expect "execution capture account" (L.add_account ledger env.X.proposer_addr (Z.of_int 100) = Ok ());
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    Lwt_main.run (S.set_meta store "total_supply" "100");
+    let hash = ref (String.make 32 '\002') in
+    let profile ~chain_id ~epoch =
+      if epoch = 5 then Some !hash else profile_at ~chain_id ~epoch in
+    let backend = X.make_live_backend ~emission_policy:E.Guard ~emission_schedule:ES.Inactive
+      ~sender_key_activation_epoch:max_int ~execution_profile:profile store ledger in
+    let result = X.run_core ~reward:None ~preverify:None ~backend
+      ~env:{env with X.epoch_id = 5} ~txs:[atomic_tx 1]
+      ~process_tx:(fun ~backend:_ ~env:_ _ ->
+        hash := String.make 32 '\003'; Lwt.return_ok (X.Confirmed Z.zero))
+      |> Lwt_main.run |> expect_ok "execution capture" in
+    expect "execution profile captured after transaction"
+      (Lwt_main.run (S.get_meta store X.execution_meta_key) = Some (execution_marker 5 '\002'));
+    expect "execution captured root differs" (Lwt_main.run (S.state_hash store) = result.X.post_state_root);
+    expect "execution captured state rejected"
+      (Lwt_main.run (X.check_execution_state ~profile:profile_at ~chain_id:env.X.chain_id ~epoch:5 store) = Ok ()))
+
 let test_sender_key_activation () =
   let run epoch activation =
     with_store (fun store ->
@@ -1274,6 +1651,86 @@ let test_sender_key_after_fee () =
     expect "fee rejection sender key absent"
       ((L.find ledger env.X.proposer_addr).L.public_key = None))
 
+let test_preview_prefix () =
+  let module Work = Octra_core.Exec_resource in
+  let execute partial = with_store (fun store ->
+    let ledger = L.create store in
+    expect "prefix account added" (L.add_account ledger env.X.proposer_addr (Z.of_int 100) = Ok ());
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    let backend = atomic_backend ~sender_key_activation_epoch:env.X.epoch_id store ledger in
+    let first = atomic_tx 1 in
+    let second = atomic_tx 2 in
+    let deferred = ref [] in
+    let run () = X.run_core ~reward:None ~preverify:None ~backend ~env
+      ~txs:(if partial then [first; second] else [first])
+      ~process_tx:(fun ~backend:_ ~env:_ tx -> Work.run ~hash:(T.hash tx) (fun () ->
+        let open Lwt.Syntax in
+        expect "prefix debit" (L.debit ledger tx.from (Z.of_int 10) tx.nonce = Ok ());
+        let* () = S.set_meta store "prefix_last" (string_of_int tx.nonce) in
+        if tx.nonce = 2 then Lwt.fail (Work.Unavailable Time)
+        else Lwt.return_ok (X.Confirmed Z.zero))) in
+    let result, stopped = Lwt_main.run (if partial then
+      Work.preview ~accept:(fun () -> true) ~defer:(fun hash resource ->
+        deferred := (hash, resource) :: !deferred) run
+      else Lwt.map (fun result -> result, false) (run ())) in
+    let result = expect_ok "prefix execution" result in
+    expect "prefix selection state" (stopped = partial);
+    expect "prefix resource identity" (!deferred = if partial then [T.hash second, Work.Time] else []);
+    expect "prefix transaction count" (result.X.artifacts.tx_count = 1);
+    expect "prefix has no rejected record" (result.X.artifacts.rejected = []);
+    expect "prefix storage rollback" (Lwt_main.run (S.get_meta store "prefix_last") = Some "1");
+    expect "prefix ledger rollback" ((L.find ledger first.from).L.nonce = 1);
+    result.post_state_root) in
+  let complete = execute false in
+  expect "prefix root differs from full replay" (execute true = complete)
+
+let test_preview_senders () =
+  let module Work = Octra_core.Exec_resource in
+  List.iter (fun resource -> List.iter (fun failed ->
+    let execute partial = with_store (fun store ->
+      let ledger = L.create store in
+      let healthy = {(atomic_tx 1) with T.from = "octZHealthy"} in
+      List.iter (fun address ->
+        expect "sender account added" (L.add_account ledger address (Z.of_int 50) = Ok ()))
+        [env.X.proposer_addr; healthy.from];
+      Lwt_main.run (L.flush_dirty_lwt ledger);
+      let backend = atomic_backend ~sender_key_activation_epoch:env.X.epoch_id store ledger in
+      let chain = List.init 3 (fun i -> atomic_tx (i + 1)) in
+      let kept = List.filter (fun tx -> tx.T.nonce < failed) chain @ [healthy] in
+      let deferred = ref [] in
+      let visited = ref [] in
+      let run () = X.run_core ~reward:None ~preverify:None ~backend ~env
+        ~txs:(if partial then healthy :: chain else kept)
+        ~process_tx:(fun ~backend:_ ~env:_ tx -> Work.run ~hash:(T.hash tx) (fun () ->
+          let open Lwt.Syntax in
+          visited := tx :: !visited;
+          expect "sender successor executed" (tx.from <> env.X.proposer_addr || tx.nonce <= failed);
+          expect "sender debit" (L.debit ledger tx.from (Z.of_int 10) tx.nonce = Ok ());
+          let* () = S.set_meta store tx.from (string_of_int tx.nonce) in
+          if tx.from = env.X.proposer_addr && tx.nonce = failed then
+            Lwt.fail (Work.Unavailable resource)
+          else Lwt.return_ok (X.Confirmed Z.zero))) in
+      let result, partial_result = Lwt_main.run (Work.preview ~accept:(fun () -> true)
+        ~defer:(fun hash resource -> deferred := (hash, resource) :: !deferred) run) in
+      let result = expect_ok "sender execution" result in
+      expect "sender partial result" (partial_result = partial);
+      expect "sender resource identity" (!deferred =
+        if partial then [T.hash (atomic_tx failed), resource] else []);
+      expect "other sender omitted" (List.map fst result.X.artifacts.confirmed = T.consensus_order kept);
+      expect "sender failure charged" (result.X.artifacts.rejected = [] && Z.equal result.X.artifacts.confirmed_fees Z.zero);
+      expect "sender successor executed" (not (List.exists (fun tx ->
+        tx.T.from = env.X.proposer_addr && tx.nonce > failed) !visited));
+      expect "sender nonce rollback" ((L.find ledger env.X.proposer_addr).L.nonce = failed - 1);
+      expect "sender balance rollback" (Z.equal (L.find ledger env.X.proposer_addr).L.balance
+        (Z.of_int (50 - 10 * (failed - 1))));
+      expect "sender storage rollback" (Lwt_main.run (S.get_meta store env.X.proposer_addr) =
+        if failed = 1 then None else Some "1");
+      expect "other sender storage" (Lwt_main.run (S.get_meta store healthy.from) = Some "1");
+      result.post_state_root) in
+    let complete = execute false in
+    expect "sender replay root differs" (execute true = complete)) [1; 2])
+    Work.[Time; Memory; Stack; Host]
+
 let test_tx_exception_rollback () =
   with_store (fun store ->
     let ledger = L.create store in
@@ -1386,7 +1843,20 @@ let test_worker_retry_loop () =
     expect "worker resource bypassed retry" (stopped && !calls = attempts);
     let delays = if attempts = 4 then [0.25; 0.5; 1.] else [] in
     expect "worker resource delay changed" (List.rev !waits = delays))
-    Octra_core.Exec_resource.[Host, 4; Memory, 1; Stack, 1];
+    Octra_core.Exec_resource.[Host, 4; Memory, 4; Stack, 1];
+  calls := 0;
+  waits := [];
+  let value = A.worker_retry ~wait (fun () ->
+    incr calls;
+    if !calls < 3 then Lwt.fail (Octra_core.Exec_resource.Unavailable Memory)
+    else Lwt.return 9) |> Lwt_main.run in
+  expect "memory pressure stopped apply" (value = 9 && !calls = 3);
+  expect "memory pressure busy loop" (List.rev !waits = [0.25; 0.5]);
+  let sleeping, _ = Lwt.task () in
+  let retry = A.worker_retry ~wait:(fun _ -> sleeping) (fun () ->
+    Lwt.fail (Octra_core.Exec_resource.Unavailable Memory)) in
+  Lwt.cancel retry;
+  expect "memory wait ignored cancellation" (Lwt.state retry = Lwt.Fail Lwt.Canceled);
   let failed =
     try
       A.worker_retry ~wait (fun () -> Lwt.fail (Failure "fatal"))
@@ -1437,7 +1907,181 @@ let test_worker_stop_rollback () =
       expect "worker stop changed nonce" ((L.find ledger tx.from).L.nonce = 0);
       expect "worker stop retained journal" (not (L.journal_active ledger));
       S.abort_epoch_batch store))
-    Octra_core.Exec_resource.[Host, 4; Memory, 1; Stack, 1]
+    Octra_core.Exec_resource.[Host, 4; Memory, 4; Stack, 1]
+
+let test_checkpoint_outcomes () =
+  List.iter (fun outcome -> with_store (fun store ->
+    let ledger = L.create store in
+    let tx = atomic_tx 1 in
+    expect "checkpoint account" (L.add_account ledger tx.from (Z.of_int 100) = Ok ());
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    Lwt_main.run (S.begin_epoch_batch store);
+    let used = ref 4 and restored = ref 0 in
+    let checkpoint () =
+      let prior = !used in
+      fun () -> incr restored; used := prior in
+    let result = Lwt_main.run (Lwt.catch (fun () ->
+      Lwt.map (fun result -> Ok result) (Octra_core.Tx_savepoint.run ~checkpoint
+        ~ledger ~store (fun () ->
+          expect "checkpoint debit" (L.debit ledger tx.from (Z.of_int 40) tx.nonce = Ok ());
+          used := 9;
+          match outcome with
+          | 0 -> Lwt.return_error "refused"
+          | 1 -> Lwt.fail (Failure "checkpoint fault")
+          | 2 -> Lwt.return_ok (X.Confirmed (Z.of_int 40))
+          | _ -> Lwt.return_ok (X.Rejected_after_fee
+              {fee = Z.of_int 40; error_type = "charged"; reason = "refused"}))))
+      (fun error -> Lwt.return_error (Printexc.to_string error))) in
+    expect "checkpoint result class" (match outcome, result with
+      | 0, Ok (Error "refused") -> true
+      | 1, Error reason -> reason = "Failure(\"checkpoint fault\")"
+      | (2 | 3), Ok (Ok _) -> true
+      | _ -> false);
+    let committed = outcome >= 2 in
+    expect "checkpoint outcome restored incorrectly"
+      (!used = (if committed then 9 else 4) && !restored = (if committed then 0 else 1));
+    let account = L.find ledger tx.from in
+    expect "checkpoint account outcome"
+      (Z.equal account.balance (Z.of_int (if committed then 60 else 100))
+       && account.nonce = (if committed then 1 else 0));
+    expect "checkpoint journal remains" (not (L.journal_active ledger));
+    S.abort_epoch_batch store)) [0; 1; 2; 3];
+  with_store (fun store ->
+    let ledger = L.create store in
+    Lwt_main.run (S.begin_epoch_batch store);
+    ignore (L.begin_journal ledger |> expect_ok "checkpoint outer journal");
+    let used = ref 4 and restored = ref 0 in
+    let checkpoint () = let prior = !used in fun () -> incr restored; used := prior in
+    let failed = try ignore (Lwt_main.run (Octra_core.Tx_savepoint.run ~checkpoint
+      ~ledger ~store (fun () -> used := 9; S.abort_epoch_batch store;
+        Lwt.return_error "refused"))); false
+      with Failure reason -> reason = "store batch is not active" in
+    expect "checkpoint lost restoration failure" failed;
+    expect "checkpoint skipped participant restoration" (!used = 4 && !restored = 1);
+    expect "checkpoint aborted outer journal twice" (L.journal_active ledger);
+    ignore (L.abort_journal ledger |> expect_ok "checkpoint outer restore"))
+
+let test_checkpoint_journal () =
+  with_store (fun store ->
+    let ledger = L.create store in
+    Lwt_main.run (S.begin_epoch_batch store);
+    let before = Lwt_main.run (S.get_batch_tree_hash store) in
+    let used = ref 4 and restored = ref 0 in
+    let checkpoint () = let prior = !used in fun () -> incr restored; used := prior in
+    let failed = try ignore (Lwt_main.run (Octra_core.Tx_savepoint.run ~checkpoint
+      ~ledger ~store (fun () ->
+        used := 9;
+        Lwt.bind (S.set_meta store "journal_probe" "1") (fun () ->
+          ignore (L.commit_journal ledger |> expect_ok "journal inner commit");
+          Lwt.return_ok (X.Confirmed Z.zero))))); false
+      with Failure _ -> true in
+    expect "journal commit failure was accepted" failed;
+    expect "journal commit failure kept participant state" (!used = 4 && !restored = 1);
+    expect "journal commit failure kept store write"
+      (before <> None && Lwt_main.run (S.get_batch_tree_hash store) = before);
+    S.abort_epoch_batch store)
+
+let test_checkpoint_cancel () =
+  with_store (fun store ->
+    let module Work = Octra_core.Exec_resource in
+    let ledger = L.create store in
+    let tx = atomic_tx 1 in
+    expect "cancel account" (L.add_account ledger tx.from (Z.of_int 100) = Ok ());
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    Lwt_main.run (S.begin_epoch_batch store);
+    let used = ref 4 and events = ref [] in
+    let pending, _ = Lwt.task () in
+    let cleanup, release = Lwt.wait () in
+    let checkpoint () = let prior = !used in fun () ->
+      events := "restore" :: !events; used := prior in
+    let task = Octra_core.Tx_savepoint.run ~checkpoint ~ledger ~store (fun () ->
+      Work.interrupt (fun () ->
+        expect "cancel debit" (L.debit ledger tx.from (Z.of_int 40) tx.nonce = Ok ());
+        used := 9;
+        Lwt.finalize (fun () -> pending) (fun () ->
+          let open Lwt.Syntax in
+          let* () = Lwt.no_cancel cleanup in
+          events := "cleanup" :: !events;
+          Lwt.return_unit))) in
+    Lwt.cancel task;
+    expect "checkpoint restored before cleanup" (!events = [] && !used = 9 && Lwt.is_sleeping task);
+    Lwt.wakeup release ();
+    let canceled = Lwt_main.run (Lwt.catch (fun () -> Lwt.map (fun _ -> false) task)
+      (function Lwt.Canceled -> Lwt.return_true | error -> Lwt.fail error)) in
+    expect "checkpoint cancellation differs" canceled;
+    expect "checkpoint cleanup order" (List.rev !events = ["cleanup"; "restore"] && !used = 4);
+    expect "checkpoint cancellation changed account"
+      ((L.find ledger tx.from).nonce = 0 && Z.equal (L.find ledger tx.from).balance (Z.of_int 100));
+    expect "checkpoint cancellation retained journal" (not (L.journal_active ledger));
+    S.abort_epoch_batch store)
+
+let test_checkpoint_commit () =
+  List.iter (fun (expires, yields) -> with_store (fun store ->
+    let module Work = Octra_core.Exec_resource in
+    let module Save = Octra_core.Tx_savepoint in
+    let ledger = L.create store in
+    let tx = atomic_tx 1 in
+    expect "commit account" (L.add_account ledger tx.from (Z.of_int 100) = Ok ());
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    Lwt_main.run (S.begin_epoch_batch store);
+    ignore (L.begin_journal ledger |> expect_ok "commit epoch journal");
+    expect "commit prior credit" (L.credit ledger tx.from (Z.of_int 7) = Ok ());
+    let entered = ref false and used = ref 4 in
+    let checkpoint () = let prior = !used in fun () -> used := prior in
+    let clock () =
+      if expires && !entered && List.length ledger.L.epoch_journals < 3 then 2. else 0. in
+    let result = Lwt_main.run (Lwt.catch (fun () -> Lwt.map (fun value -> Ok value)
+      (Save.run ~checkpoint ~ledger ~store (fun () ->
+        Work.select ~limit:1. ~clock ~running:(fun () -> true) (fun () ->
+          Work.run ~hash:"commit" (fun () ->
+            Save.run ~ledger ~store (fun () ->
+              let open Lwt.Syntax in
+              let* () = if yields then Lwt.pause () else Lwt.return_unit in
+              entered := true;
+              expect "commit debit" (L.debit ledger tx.from (Z.of_int 40) tx.nonce = Ok ());
+              used := 9;
+              let* () = S.set_meta store "commit-write" "accepted" in
+              Lwt.return_ok ())))))) (fun error -> Lwt.return_error error)) in
+    let committed = match result with
+      | Ok (Ok ()) -> true
+      | Error (Work.Exhausted ("commit", Work.Time)) when expires -> false
+      | _ -> failwith "commit result differs" in
+    expect "commit cut erased prior operation"
+      (Z.equal (L.find ledger tx.from).balance (Z.of_int (if committed then 67 else 107)));
+    expect "commit nonce differs" ((L.find ledger tx.from).nonce = (if committed then 1 else 0));
+    expect "commit participant differs" (!used = (if committed then 9 else 4));
+    expect "commit store differs"
+      (Lwt_main.run (S.get_meta store "commit-write") = (if committed then Some "accepted" else None));
+    expect "commit cut closed epoch journal" (List.length ledger.L.epoch_journals = 1);
+    ignore (L.abort_journal ledger |> expect_ok "commit epoch restore");
+    expect "commit epoch restore differs" (Z.equal (L.find ledger tx.from).balance (Z.of_int 100));
+    S.abort_epoch_batch store)) [false, false; false, true; true, false; true, true]
+
+let test_memory_rollback () =
+  let execute retries = with_store (fun store ->
+    let ledger = L.create store in
+    let tx = atomic_tx 1 in
+    expect "memory account added" (L.add_account ledger tx.from (Z.of_int 100) = Ok ());
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    Lwt_main.run (S.begin_epoch_batch store);
+    let calls = ref 0 in
+    let result = Lwt_main.run (A.worker_retry ~wait:(fun _ -> Lwt.pause ()) (fun () ->
+      Octra_core.Tx_savepoint.run ~ledger ~store (fun () ->
+        incr calls;
+        expect "memory retry debit" (L.debit ledger tx.from (Z.of_int 40) tx.nonce = Ok ());
+        let open Lwt.Syntax in
+        let* () = S.set_meta store "memory-write" "accepted" in
+        if !calls <= retries then Lwt.fail (Octra_core.Exec_resource.Unavailable Memory)
+        else Lwt.return_ok ()))) in
+    expect "memory retry result" (result = Ok ());
+    expect "memory retry attempts" (!calls = retries + 1);
+    expect "memory retry balance" (Z.equal (L.find ledger tx.from).L.balance (Z.of_int 60));
+    expect "memory retry nonce" ((L.find ledger tx.from).L.nonce = 1);
+    expect "memory retry journal" (not (L.journal_active ledger));
+    let state = Lwt_main.run (L.hash ledger) in
+    S.abort_epoch_batch store;
+    state) in
+  expect "memory retry state differs" (execute 2 = execute 0)
 
 let test_key_retry () =
   let module Shell = Octra_node_runtime.Consensus_epoch_key_switch_shell in
@@ -1468,13 +2112,320 @@ let test_key_retry () =
   expect "key switch retry ignored cancellation" (Lwt.state retry = Lwt.Fail Lwt.Canceled);
   expect "key switch cancellation wrote receipt" (!confirmed = 1 && !refused = 0)
 
+let burn_inputs () =
+  let chain_id = "octra-devnet-9871-cluster" in
+  let epoch_id = (Option.get
+    (Octra_core.Rule_graph.seatless_activation_for_chain chain_id)).activation_epoch in
+  let validators = List.mapi (fun index weight ->
+    let public_key = Base64.encode_exn (String.make 32 (Char.chr (80 + index))) in
+    X.{address = Octra_core.Crypto.Address.address_from_pubkey public_key;
+      public_key = Some public_key; weight = Z.of_int weight}) [4; 3; 2; 1] in
+  let first = List.hd validators in
+  chain_id, epoch_id, X.{proposer_addr = first.address;
+    proposer_public_key = first.public_key; validators}
+
+let burn_registry epoch addresses =
+  let slashes = List.mapi (fun index offender -> `Assoc [
+    "id", `String (Base64.encode_exn (String.make 32 (Char.chr (index + 1))));
+    "offender", `String offender;
+    "evidence_epoch", `String (string_of_int (epoch - 1));
+    "applied_epoch", `String (string_of_int epoch);
+    "amount", `String "999999";
+  ]) addresses in
+  `Assoc ["standard", `String Octra_core.Validator_policy.standard_name;
+    "candidates", `List []; "slashes", `List slashes]
+  |> Yojson.Safe.to_string |> Octra_core.Validator_registry.of_string
+  |> expect_ok "burn registry" |> Octra_core.Validator_registry.to_string |> Option.some
+
+let burn_plan ~base ~fees =
+  X.build_reward_plan_with_base ~fee_burn_active:true
+    ~supply_retired:(Z.sub Octra_core.Denomination.max_supply (Z.of_int (1000 + base)))
+    ~base_reward:(Z.of_int base) ~validator_count:4 ~emission_remaining:(Z.of_int base)
+    ~confirmed_fees:(Z.of_int fees) ~prev_supply:(Z.of_int 1000)
+  |> expect_ok "burn plan"
+
+let check_burn_values reward plan expected =
+  let credits = X.reward_credits reward plan |> expect_ok "burn credits" in
+  List.iter2 (fun (member : X.reward_validator) amount ->
+    let actual = List.find_opt (fun (credit : X.reward_credit) ->
+      credit.address = member.address) credits
+      |> Option.fold ~none:Z.zero ~some:(fun (credit : X.reward_credit) -> credit.amount) in
+    expect "burn changed individual share" (Z.equal actual (Z.of_int amount)))
+    reward.X.validators expected;
+  expect "burn net conservation" (X.sum_reward_credits credits = plan.X.total_reward);
+  expect "burn envelope differs"
+    (Z.add plan.new_total_supply (Z.add plan.new_emission_remaining plan.new_supply_retired)
+      = Octra_core.Denomination.max_supply)
+
+let test_burn_shares () =
+  let chain_id, epoch_id, reward = burn_inputs () in
+  let raw = burn_plan ~base:100 ~fees:37 in
+  List.iter (fun (indices, burned, expected) ->
+    let addresses = List.map (fun index ->
+      (List.nth reward.X.validators index).X.address) indices in
+    let registry = burn_registry epoch_id addresses in
+    let plan = X.prepare_reward_plan ~chain_id ~epoch_id ~registry ~reward raw
+      |> expect_ok "burn prepare" in
+    expect "burn amount differs" (plan.reward_burned = Z.of_int burned);
+    expect "burn gross splits changed"
+      (plan.each_validator = raw.each_validator && plan.remainder = raw.remainder
+       && plan.proposer_total = raw.proposer_total);
+    expect "burn reserve changed" (plan.new_emission_remaining = raw.new_emission_remaining);
+    expect "burn supply differs" (plan.new_total_supply = Z.of_int (1093 - burned));
+    check_burn_values reward plan expected;
+    expect "burn checked credits differ"
+      (X.reward_credits_at ~chain_id ~epoch_id ~registry ~reward plan = X.reward_credits reward plan))
+    [[], 0, [109; 11; 7; 3]; [1], 11, [109; 0; 7; 3];
+     [0], 109, [0; 11; 7; 3]; [0; 1; 2; 3], 130, [0; 0; 0; 0]]
+
+let test_burn_guards () =
+  let chain_id, epoch_id, reward = burn_inputs () in
+  let raw = burn_plan ~base:100 ~fees:37 in
+  let registry = burn_registry epoch_id [reward.X.proposer_addr] in
+  let prepare epoch_id registry plan = X.prepare_reward_plan ~chain_id ~epoch_id ~registry ~reward plan in
+  let plan = prepare epoch_id registry raw |> expect_ok "burn guard prepare" in
+  expect "burn prepared twice" (Result.is_error (prepare epoch_id registry plan));
+  expect "burn raw footer plan accepted"
+    (Result.is_error (X.reward_credits_at ~chain_id ~epoch_id ~registry ~reward raw));
+  expect "burn forged amount accepted"
+    (Result.is_error (X.reward_credits reward {plan with reward_burned = Z.succ plan.reward_burned}));
+  expect "burn future slash applied"
+    (prepare epoch_id (burn_registry (epoch_id + 1) [reward.proposer_addr]) raw = Ok raw);
+  expect "burn past slash ignored"
+    (prepare (epoch_id + 1) registry raw = Ok plan);
+  expect "burn unresolved offender recovered later rewards"
+    (prepare (epoch_id + 2) registry raw = Ok plan);
+  expect "burn historical reward rewritten" (prepare (epoch_id - 1) registry raw = Ok raw);
+  expect "burn historical malformed registry changed behavior"
+    (prepare (epoch_id - 1) (Some "bad") raw = Ok raw);
+  expect "burn malformed registry ignored" (Result.is_error (prepare epoch_id (Some "bad") raw));
+  expect "burn duplicate exclusions accepted"
+    (Result.is_error (X.reward_credits reward {plan with excluded = plan.excluded @ plan.excluded}))
+
+let test_burn_dust () =
+  let chain_id, epoch_id, reward = burn_inputs () in
+  let registry = burn_registry epoch_id [reward.X.proposer_addr] in
+  let plan = X.prepare_reward_plan ~chain_id ~epoch_id ~registry ~reward
+    (burn_plan ~base:1 ~fees:0) |> expect_ok "burn dust prepare" in
+  expect "burn proposer dust paid" (plan.reward_burned = Z.one && plan.total_reward = Z.zero);
+  check_burn_values reward plan [0; 0; 0; 0];
+  let addresses = List.map (fun (member : X.reward_validator) -> member.address) reward.validators in
+  let plan = X.prepare_reward_plan ~chain_id ~epoch_id ~registry:(burn_registry epoch_id addresses)
+    ~reward (burn_plan ~base:0 ~fees:37) |> expect_ok "burn fee only" in
+  expect "burn fee only amount differs" (plan.reward_burned = Z.of_int 30);
+  expect "burn fee only supply differs" (plan.new_total_supply = Z.of_int 963);
+  check_burn_values reward plan [0; 0; 0; 0]
+
+let burn_signer () =
+  let raw = String.make 32 '\090' in
+  let secret = Mirage_crypto_ec.Ed25519.priv_of_octets raw |> function
+    | Ok secret -> secret | Error _ -> fail "burn signing key refused" in
+  let public = Mirage_crypto_ec.Ed25519.pub_of_priv secret
+    |> Mirage_crypto_ec.Ed25519.pub_to_octets |> Base64.encode_exn in
+  Base64.encode_exn raw, public, Octra_core.Crypto.Address.address_from_pubkey public
+
+let seed_burn ?(durable = false) store ledger registry =
+  let set key value = Lwt_main.run (S.set_meta store key value) in
+  let _, public, payer = burn_signer () in
+  expect "burn payer added" (L.add_account_with_pubkey ledger payer (Z.of_int 1000) public = Ok ());
+  Lwt_main.run (L.flush_dirty_lwt ledger);
+  set "total_supply" "1000";
+  set "emission_remaining" (string_of_int ES.duration_epochs);
+  Option.iter (set Octra_core.Validator_registry.meta_key) registry;
+  if durable then begin
+    let _, _, reward = burn_inputs () in
+    set (X.validator_penalty_key reward.proposer_addr) (Base64.encode_exn (String.make 32 'p'))
+  end
+
+let burn_backend store ledger epoch_id =
+  X.make_live_backend ~emission_policy:E.Allow
+    ~emission_schedule:(ES.Security_curve {activation_epoch = epoch_id})
+    ~validator_policy:Octra_core.Validator_policy.Inactive store ledger
+
+let apply_burn_node backend (reward : X.reward_attribution) epoch_id =
+  let module Footer = Octra_node_runtime.Consensus_epoch_apply_footer in
+  let open Lwt.Syntax in
+  let values = Hashtbl.create 12 in
+  let* () = Lwt_list.iter_s (fun key ->
+    let* value = S.get_meta backend.X.store key in
+    Option.iter (Hashtbl.replace values key) value; Lwt.return_unit)
+    (["total_supply"; "emission_remaining"; Octra_core.Validator_registry.meta_key]
+      @ List.map X.validator_penalty_key (X.reward_addresses reward)) in
+  let set_meta key value =
+    let* () = backend.set_meta key value in
+    Hashtbl.replace values key value; Lwt.return_unit in
+  let backend = {backend with X.set_meta} in
+  let deps = Footer.{get_meta = Hashtbl.find_opt values; set_meta; policy = E.Allow;
+    schedule = backend.emission_schedule; legacy_total = None;
+    public_supply = backend.ops.total_supply;
+    apply_footer = (fun env reward plan -> X.apply_epoch_footer_with_reward ~backend ~env ~reward ~plan);
+    log = (fun _ -> ())} in
+  let request = Footer.{chain_id = "octra-devnet-9871-cluster"; epoch_id; epoch_ts = 40.;
+    proposer_addr = reward.X.proposer_addr; validator_pubkeys = []; reward;
+    ready_state_root_at = (fun _ -> Lwt.return_none); ready_max_lag = -1;
+    confirmed_fees = Z.of_int 37; short = Fun.id} in
+  let* result = Footer.run_node deps request in
+  expect "burn node net plan differs"
+    (result.plan.reward_burned = Z.of_int 25 && result.plan.total_reward = Z.of_int 6);
+  expect "burn node exposed excluded recipient"
+    (List.for_all (fun (recipient : Octra_core.Epochlog.reward_recipient) ->
+      recipient.reward_addr <> reward.proposer_addr) result.reward_recipients);
+  Lwt.return_unit
+
+let run_burn_path node store ledger (reward : X.reward_attribution) epoch_id =
+  let module C = Octra_consensus.C_types in
+  let voting = List.map2 (fun (member : X.reward_validator) weight ->
+    C.{address = member.address; pubkey = Base64.decode_exn (Option.get member.public_key)}, Z.of_int weight)
+    reward.validators [3; 3; 2; 2]
+    |> C.make_weighted_validator_set |> expect_ok "burn voting set" in
+  let backend = { (burn_backend store ledger epoch_id) with X.voting_set = Some (epoch_id, voting) } in
+  let env = {env with X.chain_id = "octra-devnet-9871-cluster"; epoch_id;
+    proposer_addr = reward.X.proposer_addr;
+    validator_addrs = List.map (fun member -> member.C.address) voting.validators;
+    validator_pubkeys = List.map (fun member ->
+      member.C.address, Base64.encode_exn member.pubkey) voting.validators} in
+  let secret, public, payer = burn_signer () in
+  let tx = {(atomic_tx 1) with T.from = payer; to_ = reward.proposer_addr;
+    public_key = Some public; amount = Z.zero; ou = Z.of_int 37} in
+  let tx = Octra_core.Tx_signature.sign
+    (Octra_core.Tx_signature.at ~chain_id:env.chain_id ~epoch:(Int64.of_int epoch_id)) tx secret in
+  let charge () = L.debit ledger payer tx.ou tx.nonce |> expect_ok "burn fee debit" in
+  let open Lwt.Syntax in
+  let* () = if node then begin
+    let* () = S.begin_epoch_batch store in
+    let* () = X.prepare_validator_penalties ~backend ~env in
+    charge ();
+    let* () = X.advance_validator_set ~backend ~env in
+    let* () = apply_burn_node backend reward epoch_id in
+    let* () = L.flush_dirty_lwt ledger in
+    S.commit_epoch_batch store "burn-node"
+  end else
+    let* result = X.run_core ~reward:(Some reward) ~preverify:None ~backend ~env
+      ~txs:[tx] ~process_tx:(fun ~backend:_ ~env:_ _ ->
+        charge (); Lwt.return_ok (X.Confirmed (Z.of_int 37))) in
+    ignore (expect_ok "burn core apply" result); Lwt.return_unit in
+  List.iter2 (fun (member : X.reward_validator) expected ->
+    let balance = L.find_opt ledger member.address
+      |> Option.fold ~none:Z.zero ~some:(fun account -> account.L.balance) in
+    expect "burn applied share differs" (balance = Z.of_int expected)) reward.validators [0; 3; 2; 1];
+  expect "burn public total differs" (L.get_total_supply ledger = Z.of_int 969);
+  let* total = S.get_meta store "total_supply" in
+  let* remaining = S.get_meta store "emission_remaining" in
+  let* retired = S.get_meta store ES.retired_key in
+  expect "burn metadata total differs" (total = Some "969");
+  expect "burn reserve metadata differs" (remaining = Some (string_of_int (ES.duration_epochs - 1)));
+  expect "burn schedule overwrote retired"
+    (retired = Some (Z.to_string (Z.sub Octra_core.Denomination.max_supply
+      (Z.of_int (ES.duration_epochs + 968)))));
+  S.state_hash store
+
+let test_burn_zero_footer () =
+  let chain_id, epoch_id, reward = burn_inputs () in
+  let addresses = List.map (fun (member : X.reward_validator) -> member.address) reward.X.validators in
+  let registry = burn_registry epoch_id addresses in
+  let plan = X.prepare_reward_plan ~chain_id ~epoch_id ~registry ~reward
+    (burn_plan ~base:100 ~fees:37) |> expect_ok "burn zero prepare" in
+  with_store (fun store ->
+    let ledger = L.create store in
+    expect "burn zero payer" (L.add_account ledger env.X.proposer_addr (Z.of_int 1000) = Ok ());
+    expect "burn zero fee" (L.debit ledger env.X.proposer_addr (Z.of_int 37) 1 = Ok ());
+    Option.iter (fun raw -> Lwt_main.run (S.set_meta store
+      Octra_core.Validator_registry.meta_key raw)) registry;
+    let backend = burn_backend store ledger epoch_id in
+    Lwt_main.run (X.apply_epoch_footer_with_reward ~backend ~reward ~plan
+      ~env:{env with X.chain_id; epoch_id; proposer_addr = reward.proposer_addr});
+    expect "burn zero created recipients" (List.for_all (fun address ->
+      L.find_opt ledger address = None) addresses);
+    expect "burn zero public supply" (L.get_total_supply ledger = Z.of_int 963);
+    expect "burn zero supply metadata" (Lwt_main.run (S.get_meta store "total_supply") = Some "963");
+    expect "burn zero emission metadata" (Lwt_main.run (S.get_meta store "emission_remaining") = Some "0");
+    expect "burn zero retired metadata" (Lwt_main.run (S.get_meta store ES.retired_key)
+      = Some (Z.to_string (Z.sub Octra_core.Denomination.max_supply (Z.of_int 963)))))
+
+let test_burn_paths () =
+  let _, epoch_id, reward = burn_inputs () in
+  let registry = burn_registry epoch_id [reward.X.proposer_addr] in
+  let run node = with_store (fun store ->
+    let ledger = L.create store in seed_burn store ledger registry;
+    Lwt_main.run (run_burn_path node store ledger reward epoch_id)) in
+  let core = run false in
+  expect "burn node and core roots differ" (run true = core);
+  with_store (fun store ->
+    let ledger = L.create store in seed_burn store ledger registry;
+    let before = Lwt_main.run (S.state_hash store) in
+    let result = Octra_core.State_preview.with_state ~base_store:store ~base_ledger:ledger
+      ~epoch_id ~proposal_id:"reward-burn" (fun store ledger ->
+        Lwt.map Result.ok (run_burn_path false store ledger reward epoch_id))
+      |> Lwt_main.run |> expect_ok "burn preview" in
+    expect "burn preview and apply differ" (result = core);
+    expect "burn preview changed live root" (Lwt_main.run (S.state_hash store) = before);
+    expect "burn preview changed live balance"
+      ((L.find ledger (let _, _, payer = burn_signer () in payer)).L.balance = Z.of_int 1000))
+
+let test_burn_pruned_node () =
+  let _, epoch_id, reward = burn_inputs () in
+  let run node = with_store (fun store ->
+    let ledger = L.create store in
+    seed_burn ~durable:true store ledger None;
+    Lwt_main.run (run_burn_path node store ledger reward epoch_id)) in
+  expect "durable penalty node and core roots differ" (run true = run false)
+
+let test_voting_source () =
+  let module C = Octra_consensus.C_types in
+  let chain_id, epoch_id, reward = burn_inputs () in
+  let source = List.map2 (fun (member : X.reward_validator) weight ->
+    let pubkey = Base64.decode_exn (Option.get member.public_key) in
+    C.{address = member.address; pubkey}, Z.of_int weight)
+    reward.validators [3; 3; 2; 2]
+    |> C.make_weighted_validator_set |> expect_ok "voting source" in
+  let offender = (List.nth source.validators 3).C.address in
+  let next, _ = C.evict_validator_set ~offenders:[offender] source
+    |> expect_ok "voting removal" in
+  expect "voting entry cap missing"
+    (Result.is_error (C.checked_validator_set_for_epoch ~chain_id
+      ~epoch_id:(Int64.of_int epoch_id) next));
+  with_store (fun store ->
+    let env = {env with X.chain_id; epoch_id;
+      validator_addrs = List.map (fun member -> member.C.address) next.validators;
+      validator_pubkeys = List.map (fun member ->
+        member.C.address, Base64.encode_exn member.pubkey) next.validators} in
+    let backend = X.make_live_backend ~voting_set:(epoch_id, next) store (L.create store) in
+    expect "voting source rejected" (X.current_voting_set ~backend ~env = Ok next);
+    List.iter (fun (name, backend, env) ->
+      expect name (Result.is_error (X.current_voting_set ~backend ~env))) [
+      "voting missing accepted", {backend with voting_set = None}, env;
+      "voting epoch accepted", {backend with voting_set = Some (epoch_id - 1, next)}, env;
+      "voting members accepted", backend, {env with validator_addrs = []};
+      "voting keys accepted", backend, {env with validator_pubkeys = []};
+    ])
+
 let () =
+  test_voting_source ();
+  test_burn_shares ();
+  test_burn_guards ();
+  test_burn_dust ();
+  test_burn_zero_footer ();
+  test_burn_paths ();
+  test_burn_pruned_node ();
+  test_execution_codec ();
+  test_execution_state ();
+  test_execution_refusal ();
+  test_execution_chain ();
+  test_execution_parity ();
+  test_execution_capture ();
+  test_checkpoint_outcomes ();
+  test_checkpoint_journal ();
+  test_checkpoint_cancel ();
+  test_checkpoint_commit ();
+  test_preview_prefix ();
+  test_preview_senders ();
   test_standard_gate ();
   test_policy ();
   test_reward_plan ();
   test_reward_env ();
   test_weighted_reward_credits ();
   test_reward_finality_binding ();
+  test_set_reward ();
   test_validator_unbond ();
   test_consensus_standard ();
   test_consensus_cutover ();
@@ -1502,5 +2453,6 @@ let () =
   test_worker_retry_rollback ();
   test_worker_retry_loop ();
   test_worker_stop_rollback ();
+  test_memory_rollback ();
   test_key_retry ();
   print_endline "status = pass test = epoch_exec_reward_atomic"

@@ -1,6 +1,13 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
+type parse_kind = Octra_net.P2p_tx_gossip.parse_kind = Direct | Encrypted | Program
+
+let parse_kind op =
+  match Octra_net.P2p_tx_gossip.parse_kind (Transaction.op_type_to_string op) with
+  | Some kind -> kind
+  | None -> invalid_arg "unsupported transaction parse kind"
+
 type limits = {
   encrypted_data_len : int;
   message_len : int;

@@ -9,6 +9,7 @@ type deps = {
   quarantine_active : unit -> bool;
   replay_stashed : source:string -> unit Lwt.t;
   probe_health : unit -> unit Lwt.t;
+  reset_ahead_streak : unit -> unit;
   reset_liveness : source:string -> unit Lwt.t;
 }
 
@@ -53,6 +54,7 @@ type 'driver driver_deps = {
   replay_stashed : source:string -> unit Lwt.t;
   start_driver : 'driver -> unit Lwt.t;
   probe_health : 'driver -> unit Lwt.t;
+  reset_ahead_streak : unit -> unit;
   reset_liveness : 'driver -> source:string -> unit Lwt.t;
   pending_recovery : 'driver -> bool Lwt.t;
   poll_interval : float;
@@ -72,6 +74,10 @@ type fork_repair_runtime = {
 }
 
 type driver_probe_deps = {
+  root_set : int64 -> Octra_consensus.C_types.validator_set option;
+  head_time : int -> float option;
+  now : unit -> float;
+  reset_ahead_streak : unit -> unit;
   probe_range : Octra_consensus.C_driver.t -> unit Lwt.t;
   env_int : string -> int -> int;
   getenv : string -> string option;
@@ -116,6 +122,9 @@ type node_fork_repair_runtime = {
 }
 
 type node_driver_probe_runtime = {
+  root_set : int64 -> Octra_consensus.C_types.validator_set option;
+  head_time : int -> float option;
+  now : unit -> float;
   probe_range : Octra_consensus.C_driver.t -> unit Lwt.t;
   env_int : string -> int -> int;
   getenv : string -> string option;
@@ -178,6 +187,8 @@ type node_liveness_deps = {
 }
 
 type node_driver_health_runtime = {
+  root_set : int64 -> Octra_consensus.C_types.validator_set option;
+  head_time : int -> float option;
   probe_range : Octra_consensus.C_driver.t -> unit Lwt.t;
   env_int : string -> int -> int;
   getenv : string -> string option;
@@ -474,6 +485,11 @@ let repair_empty_fork (runtime : fork_repair_runtime)
 
 let node_driver_probe_deps (runtime : node_driver_probe_runtime) =
   {
+    root_set = runtime.root_set;
+    head_time = runtime.head_time;
+    now = runtime.now;
+    reset_ahead_streak = (fun () ->
+      Consensus_runtime_state.reset_ahead_streak runtime.runtime_state);
     probe_range = runtime.probe_range;
     env_int = runtime.env_int;
     getenv = runtime.getenv;
@@ -519,6 +535,9 @@ let node_driver_health_deps (runtime : node_driver_health_runtime) =
     probe =
       node_driver_probe_deps
         ({
+          root_set = runtime.root_set;
+          head_time = runtime.head_time;
+          now = runtime.now;
           probe_range = runtime.probe_range;
           env_int = runtime.env_int;
           getenv = runtime.getenv;
@@ -561,14 +580,8 @@ let node_driver_health_deps (runtime : node_driver_health_runtime) =
         } : node_liveness_deps);
   }
 
-let driver_probe_config (deps : driver_probe_deps) driver =
-  let vs =
-    driver.Octra_consensus.C_driver.engine
-      .Octra_consensus.C_engine.vs
-  in
+let driver_probe_config (deps : driver_probe_deps) =
   Consensus_health_shell.{
-    active_f = vs.Octra_consensus.C_types.f;
-    validator_count = vs.Octra_consensus.C_types.n;
     state_attest_configured =
       deps.env_int "OCTRA_STATE_ATTEST_MIN_PEERS" 0;
     snapshot_policy_threshold =
@@ -583,6 +596,15 @@ let driver_probe_config (deps : driver_probe_deps) driver =
 
 let driver_probe_deps (deps : driver_probe_deps) driver =
   Consensus_health_shell.{
+    head_time = deps.head_time;
+    now = deps.now;
+    root_weights = (fun ~epoch_id ->
+      let module D = Octra_consensus.C_driver in
+      match deps.root_set epoch_id with
+      | Some validator_set -> D.epoch_root_weights ~validator_set driver ~epoch_id
+      | None when epoch_id = -1L -> D.epoch_root_weights driver ~epoch_id
+      | None -> None);
+    reset_ahead_streak = deps.reset_ahead_streak;
     normalize_next_epoch_for_head = deps.normalize_next_epoch_for_head;
     committed_head_epoch = deps.committed_head_epoch;
     current_epoch = deps.current_epoch;
@@ -595,16 +617,16 @@ let driver_probe_deps (deps : driver_probe_deps) driver =
     mark_quarantine = deps.mark_quarantine;
     query_epoch_root = (fun ~epoch_id ~timeout_seconds ->
       Octra_consensus.C_driver.query_epoch_root
-        ~wait_for:Octra_consensus.C_driver.Consensus_quorum
+        ~fresh:true
+        ~wait_for:Octra_consensus.C_driver.Collection_window
         driver
         ~epoch_id
         ~timeout_seconds);
     root_consensus_quorum = (fun ~epoch_id ~root responses ->
-      Octra_consensus.C_driver.epoch_root_consensus_quorum
-        driver
-        ~epoch_id
-        ~root
-        responses);
+      match deps.root_set epoch_id with
+      | Some validator_set -> Octra_consensus.C_driver.epoch_root_consensus_quorum
+          ~validator_set driver ~epoch_id ~root responses
+      | None -> false);
     read_local_root_raw = deps.read_local_root_raw;
     committed_epoch_root_raw = deps.committed_epoch_root_raw;
     peer_snapshot = (fun () ->
@@ -637,7 +659,7 @@ let run_driver_probe (deps : driver_probe_deps) driver =
       in
       Consensus_join_rpc.http_head deps.getenv ~chain_id ~validator_hash
         ~after:(Int64.of_int (deps.committed_head_epoch ())))
-    (driver_probe_config deps driver)
+    (driver_probe_config deps)
     (driver_probe_deps deps driver) in
   if deps.catchup_active () then Lwt.return_unit else deps.probe_range driver
 
@@ -673,8 +695,10 @@ let await_pending_recovery (deps : deps) ~delay recover =
 
 let poll_once (deps : deps) =
   let open Lwt.Syntax in
-  if deps.catchup_active () then
+  if deps.catchup_active () then begin
+    deps.reset_ahead_streak ();
     Lwt.return_unit
+  end
   else
     let* () =
       if deps.quarantine_active () then
@@ -682,20 +706,30 @@ let poll_once (deps : deps) =
       else
         Lwt.return_unit
     in
-    if deps.catchup_active () then Lwt.return_unit else
+    if deps.catchup_active () then begin
+      deps.reset_ahead_streak ();
+      Lwt.return_unit
+    end else
     let* () = deps.probe_health () in
     deps.reset_liveness ~source:"health_poll"
 
-let poll_step deps =
+let probe_failed event = function
+  | (Lwt.Canceled
+    | Consensus_pending_commit_recovery.Store_fault _
+    | Octra_core.Private_ledger.Worker_stopped _
+    | Out_of_memory
+    | Stack_overflow) as error -> Lwt.fail error
+  | error ->
+    Log.error "consensus"
+      "event = %s error = %s" event (Printexc.to_string error);
+    Lwt.return_unit
+
+let poll_step (deps : deps) =
   Lwt.catch
     (fun () -> poll_once deps)
-    (function
-      | Lwt.Canceled -> Lwt.fail Lwt.Canceled
-      | exn ->
-        Log.error "consensus"
-          "event = health_poll_failed error = %s"
-          (Printexc.to_string exn);
-        Lwt.return_unit)
+    (fun error ->
+      deps.reset_ahead_streak ();
+      probe_failed "health_poll_failed" error)
 
 let rec poll_loop (deps : deps) ~interval =
   let open Lwt.Syntax in
@@ -711,7 +745,7 @@ let launch (deps : launch_deps) =
     if not ready then Lwt.return_unit
     else
       let* () = deps.start_driver () in
-      let* () = deps.startup_probe () in
+      let* () = Lwt.catch deps.startup_probe (probe_failed "health_startup_failed") in
       Lwt.async deps.poll_loop;
       deps.log_started ();
       Lwt.return_unit)
@@ -735,6 +769,7 @@ let health_deps_of_driver (deps : 'driver driver_deps) driver =
     quarantine_active = (fun () -> !(deps.state.quarantine));
     replay_stashed = deps.replay_stashed;
     probe_health = (fun () -> deps.probe_health driver);
+    reset_ahead_streak = deps.reset_ahead_streak;
     reset_liveness = (fun ~source ->
       deps.reset_liveness driver ~source);
   }
@@ -758,6 +793,7 @@ let consensus_driver_deps (deps : consensus_driver_runtime) =
     start_driver = Octra_consensus.C_driver.start;
     probe_health = (fun driver ->
       run_driver_probe deps.probe driver);
+    reset_ahead_streak = deps.probe.reset_ahead_streak;
     reset_liveness = (fun driver ~source ->
       maybe_reset_liveness deps.liveness driver ~source);
     pending_recovery = deps.pending_recovery;

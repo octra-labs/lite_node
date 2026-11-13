@@ -9,6 +9,7 @@ type io = {
   has_tx : string -> bool;
   find_tx : string -> Octra_core.Transaction.t option;
   sender_pk : Octra_core.Transaction.t -> string option;
+  find_account : string -> Octra_core.Ledger.account option;
   add_tx : Octra_core.Transaction.t -> (string, string) result;
   send_payload : string -> unit;
   send_batch : (unit -> string option) list -> unit;
@@ -21,16 +22,16 @@ type io = {
 
 val handle_tx :
   ?duty:(int64 * Octra_core.Rule_graph.mode) option ->
-  ?bft_mode:bool -> io -> Octra_core.Transaction.t -> unit
+  ?bft_mode:bool -> io -> Octra_core.Transaction.t -> unit Lwt.t
 
 val handle_legacy :
   ?duty:(int64 * Octra_core.Rule_graph.mode) option ->
-  ?bft_mode:bool -> io -> unit
+  ?bft_mode:bool -> io -> unit Lwt.t
 
 val handle_plan :
   ?duty:(int64 * Octra_core.Rule_graph.mode) option ->
-  ?bft_mode:bool -> io -> unit
+  ?bft_mode:bool -> io -> unit Lwt.t
 
 val handle :
   ?duty:(int64 * Octra_core.Rule_graph.mode) option ->
-  ?bft_mode:bool -> io -> unit
+  ?bft_mode:bool -> io -> unit Lwt.t

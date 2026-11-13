@@ -6,6 +6,7 @@ module C_driver = Octra_consensus.C_driver
 type majority = {
   root : string;
   count : int;
+  weight : Z.t;
 }
 
 type root_quorum =
@@ -51,28 +52,13 @@ type lag_plan =
   | Lagging_soft of int
   | Lagging_quarantine of int
 
-val required_attesters :
-  active_f:int ->
-  validator_count:int ->
-  configured:int ->
-  int
-
 val peer_root_majority :
+  weights:C_driver.root_weights ->
   C_driver.epoch_root_response_record list ->
   majority option
 
-val root_with_quorum :
-  required:int ->
-  majority option ->
-  majority option
-
-val compare_root :
-  required:int ->
-  local_root:string ->
-  majority option ->
-  root_quorum
-
 val peer_root_quorum :
+  weights:C_driver.root_weights ->
   required:int ->
   local_root:string ->
   C_driver.epoch_root_response_record list ->
@@ -86,10 +72,16 @@ val root_quorum_has_quorum :
   root_quorum ->
   bool
 
-val peer_root_with_quorum :
-  required:int ->
-  C_driver.epoch_root_response_record list ->
-  majority option
+val peer_roots : weights:C_driver.root_weights ->
+  C_driver.epoch_root_response_record list -> majority list
+val own_root_proved : weights:C_driver.root_weights -> local_root:string ->
+  C_driver.epoch_root_response_record list -> bool
+val target_ceiling : head:int64 -> head_time:float option -> now:float ->
+  allowance:int -> int64 option
+val peer_target : weights:C_driver.root_weights -> ceiling:int64 ->
+  C_driver.epoch_root_response_record list -> int64 option
+val peer_ahead : weights:C_driver.root_weights -> head:int64 -> ceiling:int64 ->
+  C_driver.epoch_root_response_record list -> int64 option
 
 val in_sync_plan :
   required:int ->
@@ -106,6 +98,9 @@ val stale_sample_plan :
   live_head_attested:bool ->
   stale_retries:int ->
   retry_plan
+
+val within_ahead_grace : head:int -> ahead_by:int -> grace_epochs:int ->
+  drift_tolerance:int -> bool
 
 val ahead_no_quorum_plan :
   head:int ->

@@ -9,19 +9,30 @@ type activation = {
 
 type rule = Prior | Capped | Stake
 
-type t = { count_epoch : int64; stake_epoch : int64 option; round_epoch : int64 option }
+type stake = { epoch : int64; seatless : int64 option }
+
+type t = { count_epoch : int64; stake : stake option; round_epoch : int64 option }
 
 let with_round_epoch policy epoch =
   if Option.fold ~none:false ~some:(fun round ->
-    match policy.stake_epoch with None -> true | Some stake -> round < stake) epoch then
+    match policy.stake with None -> true | Some stake -> round < stake.epoch) epoch then
     invalid_arg "round activation order";
   {policy with round_epoch = epoch}
+
+let with_seatless_epoch policy epoch =
+  match policy.stake, epoch with
+  | None, None -> policy
+  | None, Some _ -> invalid_arg "seatless activation requires stake"
+  | Some stake, Some epoch when epoch < stake.epoch ->
+    invalid_arg "seatless activation order"
+  | Some stake, seatless -> {policy with stake = Some {stake with seatless}}
 
 let make ~count_epoch ~stake_epoch ~round_epoch =
   if count_epoch < 0L || Option.fold ~none:false
     ~some:(fun epoch -> epoch <= count_epoch) stake_epoch then
     invalid_arg "quorum activation order";
-  with_round_epoch {count_epoch; stake_epoch; round_epoch = None} round_epoch
+  let stake = Option.map (fun epoch -> {epoch; seatless = None}) stake_epoch in
+  with_round_epoch {count_epoch; stake; round_epoch = None} round_epoch
 
 let rule_at ~count_epoch ~stake_epoch ~epoch_id =
   if Int64.compare count_epoch 0L < 0
@@ -72,12 +83,27 @@ let count_epoch chain_id =
   | None -> 0L
   | Some activation -> Int64.of_int activation.activation_epoch
 
+let seatless_activation_for_chain chain_id : activation option =
+  if String.equal chain_id devnet_chain_id then Some {
+    anchor_epoch = 1_829_338;
+    anchor_state_root = "621bc1164a85fc654cc8aeb34e8b23e8146edbc8448c4fbba5e8f9debcdd70af";
+    activation_epoch = 1_842_000;
+  } else None
+
 let for_chain chain_id =
   make ~count_epoch:(count_epoch chain_id) ~stake_epoch:(linear_epoch ~chain_id)
     ~round_epoch:(round_epoch ~chain_id)
+  |> fun policy -> with_seatless_epoch policy
+    (Option.map (fun value -> Int64.of_int value.activation_epoch)
+      (seatless_activation_for_chain chain_id))
 
 let select policy epoch_id =
-  rule_at ~count_epoch:policy.count_epoch ~stake_epoch:policy.stake_epoch ~epoch_id
+  rule_at ~count_epoch:policy.count_epoch
+    ~stake_epoch:(Option.map (fun stake -> stake.epoch) policy.stake) ~epoch_id
+
+let seatless policy epoch_id =
+  Option.fold ~none:false ~some:(fun stake ->
+    Option.fold ~none:false ~some:(fun epoch -> epoch_id >= epoch) stake.seatless) policy.stake
 
 let round_wait policy epoch_id =
   Option.fold ~none:false ~some:(fun epoch -> epoch_id >= epoch) policy.round_epoch
@@ -102,27 +128,28 @@ let consensus_id ~chain_id =
 
 let id_at policy ~chain_id ~epoch_id =
   let prior = consensus_id ~chain_id in
-  match policy.stake_epoch with
-  | Some epoch when select policy epoch_id = Stake ->
-    prior ^ ":stake:" ^ Int64.to_string epoch
+  match policy.stake with
+  | Some stake when select policy epoch_id = Stake ->
+    let prior = prior ^ ":stake:" ^ Int64.to_string stake.epoch in
+    begin match stake.seatless with
+    | Some epoch when epoch_id >= epoch ->
+      prior ^ ":seatless:" ^ Int64.to_string epoch ^ ":single_seat_survival"
+    | _ -> prior
+    end
   | _ -> prior
 
 let consensus_id_at ~chain_id ~epoch_id = id_at (for_chain chain_id) ~chain_id ~epoch_id
 
 let epochs policy = List.sort_uniq Int64.compare
-  (Option.to_list policy.stake_epoch @ Option.to_list policy.round_epoch)
+  ((match policy.stake with None -> [] | Some stake -> stake.epoch :: Option.to_list stake.seatless)
+    @ Option.to_list policy.round_epoch)
 
 let linear_weight ~chain_id ~epoch_id =
   rule ~chain_id ~epoch_id = Stake
 
-let count_floor_required ~chain_id ~epoch_id =
-  active ~chain_id ~epoch_id
-
-let count_cap_required ~chain_id ~epoch_id =
-  rule ~chain_id ~epoch_id = Capped
+let rewind policy ~from_epoch ~to_epoch =
+  not (List.exists (fun epoch -> from_epoch >= epoch && to_epoch < epoch)
+    (policy.count_epoch :: epochs policy))
 
 let rewind_allowed ~chain_id ~from_epoch ~to_epoch =
-  rewind_at ~count_epoch:(count_epoch chain_id)
-    ~stake_epoch:(linear_epoch ~chain_id) ~from_epoch ~to_epoch
-  && not (Option.fold ~none:false
-    ~some:(fun epoch -> from_epoch >= epoch && to_epoch < epoch) (round_epoch ~chain_id))
+  rewind (for_chain chain_id) ~from_epoch ~to_epoch

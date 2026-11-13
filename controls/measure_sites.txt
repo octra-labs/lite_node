@@ -1,0 +1,239 @@
+printed_set_field bin/octra_state_sync_manifest.ml validators.Octra_consensus.C_types.quorum
+seat_cap_rule lib/bootstrap/state_sync_checkpoint.ml if not (Octra_consensus.C_quorum_policy.seatless policy body.epoch) then Ok ()
+same_name_alias lib/bootstrap/sync_anchor.ml module C_quorum_policy = Octra_consensus.C_quorum_policy
+author_weight_rule lib/bootstrap/sync_anchor.ml && C_quorum_policy.linear_weight ~chain_id ~epoch_id:mark.height
+stake_set_rule lib/bootstrap/sync_anchor.ml if C_quorum_policy.select policy value.finalize.epoch_id = C_quorum_policy.Stake then
+set_hash_field lib/consensus/c_config.ml Octra_net.Oce1.put_u32_int buf vs.f;
+set_hash_field lib/consensus/c_config.ml Octra_net.Oce1.put_u32_int buf vs.quorum;
+set_hash_field lib/consensus/c_config.ml Octra_net.Oce1.put_string buf (Z.to_string vs.quorum_weight)
+author_weight_rule lib/consensus/c_driver.ml if not (C_quorum_policy.linear_weight ~chain_id:t.config.chain_id
+stake_set_rule lib/consensus/c_driver.ml if C_quorum_policy.select t.policy t.engine.state.height <> C_quorum_policy.Stake
+stake_set_rule lib/consensus/c_driver.ml && C_quorum_policy.select t.policy state.height = C_quorum_policy.Stake
+printed_set_field lib/consensus/c_driver.ml quorum = t.engine.vs.quorum;
+printed_set_field lib/consensus/c_driver.ml quorum_weight = t.engine.vs.quorum_weight;
+author_weight_rule lib/consensus/c_driver.ml if not (C_quorum_policy.linear_weight ~chain_id:t.config.chain_id
+printed_set_field lib/consensus/c_driver.ml target.quorum
+stake_set_rule lib/consensus/c_driver.ml if C_quorum_policy.select t.policy height <> C_quorum_policy.Stake
+stake_set_rule lib/consensus/c_driver.ml let changed = C_quorum_policy.select t.policy target_epoch = C_quorum_policy.Stake
+printed_set_field lib/consensus/c_driver.ml target_epoch validator_set.n validator_set.quorum cfg.fingerprint;
+printed_set_field lib/consensus/c_driver.ml effective.quorum
+printed_set_field lib/consensus/c_driver.ml (Z.to_string effective.quorum_weight)
+printed_set_field lib/consensus/c_driver.ml validator_set.n validator_set.quorum (Z.to_string snapshot.total_weight)
+stake_set_rule lib/consensus/c_driver.ml let selected = match C_quorum_policy.select t.policy t.engine.state.height, t.finality_set with
+stake_set_rule lib/consensus/c_driver.ml | C_quorum_policy.Stake, Some resolve -> resolve finalize.C_types.epoch_id
+stake_set_rule lib/consensus/c_driver.ml | C_quorum_policy.Stake, None -> Error "historical validator resolver is missing"
+root_weights_set lib/consensus/c_driver.ml let rule = C_quorum_policy.select t.policy epoch_id in
+root_stamp lib/consensus/c_driver.ml let stamp = C_measure.label space ^ ":" ^ raw_to_hex (C_config.validator_set_hash validator_set)
+stake_set_rule lib/consensus/c_driver.ml || (C_quorum_policy.select t.policy t.engine.state.height = C_quorum_policy.Stake
+printed_set_field lib/consensus/c_driver.ml t.config.my_addr t.engine.state.height t.engine.vs.n t.engine.vs.quorum;
+printed_level lib/consensus/c_driver.ml let need = if alone then "0" else C_measure.start_text space in
+stake_set_rule lib/consensus/c_engine.ml || (C_quorum_policy.select t.policy t.state.height = C_quorum_policy.Stake
+value_reuse_needs_a_seat lib/consensus/c_engine.ml t.vs.quorum >= 1
+stake_set_rule lib/consensus/c_engine.ml if C_quorum_policy.select t.policy t.state.height = C_quorum_policy.Stake then
+seat_cap_rule lib/consensus/c_engine.ml if C_quorum_policy.seatless policy epoch_id then
+light_set_field lib/consensus/c_light_multi.ml && a.f = b.f
+light_set_field lib/consensus/c_light_multi.ml && a.quorum = b.quorum
+light_set_field lib/consensus/c_light_multi.ml && Z.equal a.quorum_weight b.quorum_weight
+light_set_field lib/consensus/c_light_validator_set.ml f = vs.f;
+light_set_field lib/consensus/c_light_validator_set.ml quorum = vs.quorum;
+light_set_field lib/consensus/c_light_validator_set.ml quorum_weight = vs.quorum_weight;
+light_set_field lib/consensus/c_light_validator_set.ml && t.f = vs.f
+light_set_field lib/consensus/c_light_validator_set.ml && t.quorum = vs.quorum
+light_set_field lib/consensus/c_light_validator_set.ml && Z.equal t.quorum_weight vs.quorum_weight
+author_weight_rule lib/consensus/c_light_validator_set.ml C_quorum_policy.linear_weight ~chain_id:t.chain_id ~epoch_id:height) t.authors
+set_change_overlap lib/consensus/c_relief.ml C_measure.overlap
+set_change_overlap lib/consensus/c_relief.ml | Error C_measure.Few_seats ->
+set_change_overlap lib/consensus/c_relief.ml | Error C_measure.Low_weight ->
+set_change_overlap lib/consensus/c_relief.ml | Error C_measure.No_proof ->
+author_weight_rule lib/consensus/c_relief.ml && C_quorum_policy.linear_weight ~chain_id ~epoch_id:height then
+set_from_shape lib/consensus/c_types.ml let C_measure.{ n; f; quorum; total_weight; quorum_weight } =
+set_shape_check lib/consensus/c_types.ml if vs.n <> checked.n || vs.f <> checked.f
+set_shape_check lib/consensus/c_types.ml || vs.quorum <> checked.quorum
+set_shape_check lib/consensus/c_types.ml || not (Z.equal vs.quorum_weight checked.quorum_weight) then
+seat_cap_rule lib/consensus/c_types.ml if not (C_quorum_policy.seatless policy epoch_id) then Ok effective
+seat_cap_rule lib/consensus/c_types.ml if not (C_quorum_policy.seatless policy epoch_id) then Ok checked
+seat_cap_rule lib/consensus/c_types.ml if not (C_quorum_policy.seatless policy epoch_id) then Ok None
+cap_search_faults lib/consensus/c_types.ml if vs.f <= 0 || count_live_at_cap ~faults:vs.f maximum entries then
+cap_search_faults lib/consensus/c_types.ml if count_live_at_cap ~faults:vs.f middle entries then
+set_by_rule lib/consensus/c_types.ml | C_quorum_policy.Capped -> count_capped_set vs
+set_by_rule lib/consensus/c_types.ml | C_quorum_policy.Prior | C_quorum_policy.Stake -> vs
+set_by_rule lib/consensus/c_types.ml let rule = C_quorum_policy.select policy epoch_id in
+set_by_rule lib/consensus/c_types.ml | Some (height, _) when height <> epoch_id || rule <> C_quorum_policy.Stake ->
+author_weight_rule lib/consensus/c_types.ml && C_quorum_policy.linear_weight ~chain_id ~epoch_id ->
+author_weight_rule lib/consensus/c_types.ml && C_quorum_policy.linear_weight ~chain_id ~epoch_id ->
+set_by_rule lib/consensus/c_types.ml let rule = C_quorum_policy.select policy epoch_id in
+compute_committee_threshold lib/consensus/resource_attestation_flow.ml else Resource_attestations.quorum_weight total_weight
+compute_committee_threshold lib/consensus/resource_attestations.ml ((total_weight * of_int 2) / of_int 3) + one
+compute_committee_threshold lib/core/compute_bill.ml ~max_ttl:Protocol.call_ttl ~selected ~signer_floor:(List.length selected * 2 / 3 + 1)
+printed_set_field lib/core/epoch_exec.ml (Z.to_string snapshot.quorum_weight)
+encoded_size lib/core/pvac_verify_protocol.ml if String.length encoded > ((max_pubkey_bytes * 4) / 3) + 8 then
+rule_graph_view lib/core/rule_graph.ml Octra_consensus.C_quorum_policy.active
+snapshot_quota_copy lib/core/validator_entry.ml Ok Z.(add (div (mul total_weight (of_int 2)) (of_int 3)) one)
+seat_cap_rule_alias lib/core/validator_set_update.ml let module Q = Octra_consensus.C_quorum_policy in
+object_quorum_type lib/vm/runtime/contract_vm.ml object_quorum : Octra_core.Circle_object_apply.quorum;
+decimal_digits_estimate lib/vm/runtime/contract_vm.ml let size = Z.numbits number / 3 + 2 in
+decimal_digits_estimate lib/vm/runtime/contract_vm.ml let bytes = Z.numbits number / 3 + 2 in
+decimal_digits_estimate lib/vm/runtime/local_vm.ml let bytes = Z.numbits value / 3 + 2 in
+stake_set_rule node_runtime/consensus_driver_boot_shell.ml if Octra_consensus.C_quorum_policy.select policy current = Octra_consensus.C_quorum_policy.Stake
+author_weight_rule node_runtime/consensus_driver_boot_shell.ml if Octra_consensus.C_quorum_policy.linear_weight
+author_weight_rule node_runtime/consensus_driver_boot_shell.ml if Octra_consensus.C_quorum_policy.linear_weight
+printed_level node_runtime/consensus_driver_boot_shell.ml level = Octra_consensus.C_measure.promise_text
+printed_set_field node_runtime/consensus_driver_launch_shell.ml quorum = validator_set.quorum;
+printed_set_field node_runtime/consensus_health_wiring.ml runtime.quorum);
+reward_rule_alias node_runtime/consensus_reward_attribution.ml let module Policy = Octra_consensus.C_quorum_policy in
+reward_parent_rule node_runtime/consensus_reward_attribution.ml if Octra_consensus.C_quorum_policy.seatless policy finalize.epoch_id
+reward_parent_rule node_runtime/consensus_reward_attribution.ml if Octra_consensus.C_quorum_policy.seatless policy epoch_id
+author_weight_rule node_runtime/consensus_profile.ml if Octra_consensus.C_quorum_policy.linear_weight ~chain_id
+printed_set_field node_runtime/p2p_config.ml active_vs.quorum);
+reward_view_alias node_runtime/rest_read_rpc.ml let module Policy = Octra_consensus.C_quorum_policy in
+compute_committee_threshold node_runtime/resource_compute_service.ml count - ((count - 1) / 3)
+compute_committee_threshold node_runtime/resource_compute_service.ml Z.(add (div (mul total (of_int 2)) (of_int 3)) one)
+printed_set_field node_runtime/rpc_view.ml "quorum_weight", `String (Z.to_string proof.quorum_weight);
+printed_set_field node_runtime/rpc_view.ml "f", `Int proof.f;
+printed_set_field node_runtime/rpc_view.ml "quorum", `Int proof.quorum;
+printed_set_field node_runtime/rpc_view.ml "quorum", `Int rows.quorum;
+printed_set_field node_runtime/rpc_view.ml "quorum_weight", `String (Z.to_string rows.quorum_weight);
+author_weight_rule node_runtime/startup_p2p_shell.ml ((Octra_consensus.C_quorum_policy.linear_weight
+author_weight_rule node_runtime/startup_p2p_shell.ml if Octra_consensus.C_quorum_policy.linear_weight
+stake_set_rule node_runtime/sync_chain.ml Octra_consensus.C_quorum_policy.select policy epoch = Octra_consensus.C_quorum_policy.Stake
+author_weight_rule node_runtime/sync_chain.ml if not (Octra_consensus.C_quorum_policy.linear_weight
+printed_set_field node_runtime/validator_config.ml quorum = scheduled.validator_set.quorum;
+set_by_rule node_runtime/validator_config.ml (Octra_consensus.C_quorum_policy.select policy current_height) cfg.stake_vs then Ok cfg
+printed_set_field node_runtime/validator_config.ml | Scheduled { activate_epoch; n; quorum; fingerprint } ->
+printed_set_field node_runtime/validator_config.ml vs.n vs.f vs.quorum;
+printed_set_field node_runtime/validator_config.ml quorum = next_vs.quorum;
+eviction_epoch_rule lib/bootstrap/sync_anchor.ml | Some witness when C_quorum_policy.seatless (C_quorum_policy.for_chain finalize.chain_id)
+eviction_epoch_rule lib/bootstrap/sync_anchor.ml || not (C_quorum_policy.seatless policy epoch) then
+eviction_epoch_rule lib/consensus/c_driver.ml else if not (C_quorum_policy.seatless policy eviction.epoch)
+eviction_epoch_rule lib/consensus/c_driver.ml || not (C_quorum_policy.seatless policy activate_epoch) then
+relief_restore_rule lib/consensus/c_relief.ml if height > mark.height && C_quorum_policy.seatless policy height
+startup_set_rule node_runtime/consensus_driver_launch_shell.ml | _ when not (Octra_consensus.C_quorum_policy.seatless policy runtime.start_height) ->
+relief_restore_rule node_runtime/consensus_validator_anchor.ml | Some mark when Octra_consensus.C_quorum_policy.seatless
+startup_set_rule node_runtime/startup_p2p_shell.ml | None, Some resolve when Octra_consensus.C_quorum_policy.seatless
+startup_set_rule node_runtime/validator_config.ml let trusted_height = Octra_consensus.C_quorum_policy.seatless policy current_height
+startup_set_rule node_runtime/validator_config.ml && Octra_consensus.C_quorum_policy.seatless policy (Int64.succ current_height)) in
+seat_cap_rule node_runtime/validator_config.ml when Octra_consensus.C_quorum_policy.seatless policy current_height ->
+set_count_shape lib/bootstrap/state_sync_manifest.ml if validator_set.Octra_consensus.C_types.n < 1 then Error "empty signer set"
+set_count_codec lib/consensus/c_config.ml Octra_net.Oce1.put_u32_int buf vs.n;
+driver_set_size lib/consensus/c_driver.ml { n_validators = validator_set.C_types.n; policy; config; engine; stake_vs; swarm;
+driver_set_size lib/consensus/c_driver.ml let search, request = C_proof_search.step ~validators:t.engine.vs.n
+driver_set_size lib/consensus/c_driver.ml let table = Hashtbl.create validator_set.C_types.n in
+driver_set_size lib/consensus/c_driver.ml t.n_validators <- target.C_types.n;
+driver_set_size lib/consensus/c_driver.ml target.n
+driver_set_size lib/consensus/c_driver.ml t.n_validators <- validator_set.C_types.n;
+driver_set_size lib/consensus/c_driver.ml t.n_validators <- effective.n;
+driver_set_size lib/consensus/c_driver.ml effective.n
+driver_set_size lib/consensus/c_driver.ml t.n_validators <- validator_set.C_types.n;
+driver_set_size lib/consensus/c_driver.ml let active_ids = Hashtbl.create t.engine.vs.C_types.n in
+driver_set_size lib/consensus/c_driver.ml match C_root_query.join ~fresh ~capacity:t.engine.vs.n
+set_count_codec lib/consensus/c_light_multi.ml && a.n = b.n
+set_count_codec lib/consensus/c_light_validator_set.ml n = vs.n;
+set_count_codec lib/consensus/c_light_validator_set.ml && t.n = vs.n
+relief_set_size lib/consensus/c_relief.ml else if current.n < 4 || target.n < 4 then
+relief_set_size lib/consensus/c_relief.ml else if target.n >= current.n then
+set_count_shape lib/consensus/c_types.ml if not vs.weighted || vs.n < 4 then vs
+set_count_shape lib/consensus/c_types.ml let shape = C_measure.shape ~seats:checked.n ~total:checked.total_weight in
+set_count_shape lib/consensus/c_types.ml C_measure.minority (C_measure.shape ~seats:vs.n ~total:vs.total_weight)
+set_count_shape lib/consensus/c_types.ml if vs.n <= 0 then
+set_count_shape lib/consensus/c_types.ml let idx = Int64.to_int (Int64.rem epoch_id (Int64.of_int vs.n)) in
+set_count_shape lib/consensus/c_types.ml let idx = (idx + round) mod vs.n in
+set_count_shape lib/consensus/c_types.ml validator_set.n > 0
+compute_count lib/core/compute_input.ml if chain_id = "" || epoch < 0L || validators.n = 0 || hash <> tree_hash tree then
+compute_count lib/core/compute_input.ml if chain_id = "" || saved < 0L || validators.n = 0 then
+reward_count lib/core/epoch_exec.ml ~base_reward ~validator_count ~emission_remaining ~confirmed_fees
+reward_count lib/core/epoch_exec.ml if validator_count <= 0 then
+reward_count lib/core/epoch_exec.ml let n = Z.of_int validator_count in
+reward_count lib/core/epoch_exec.ml let build_reward_plan ~fee_burn_active ~supply_retired ~validator_count
+reward_count lib/core/epoch_exec.ml ~validator_count
+reward_count lib/core/epoch_exec.ml let validator_count = Z.of_int (List.length validators) in
+reward_count lib/core/epoch_exec.ml (Z.mul plan.each_validator validator_count)
+reward_count lib/core/epoch_exec.ml ~validator_count:(List.length reward.validators)
+reward_count lib/core/epoch_exec.ml ~validator_count:(List.length reward.validators)
+peer_capacity net/p2p_swarm.ml let peer_capacity ~max_peers ~validator_count ~observer_count = function
+peer_capacity net/p2p_swarm.ml | Validator -> validator_count < max_peers
+peer_capacity net/p2p_swarm.ml let validator_count t = role_count t Validator
+peer_capacity net/p2p_swarm.ml ~validator_count:(validator_count t)
+peer_capacity net/p2p_swarm.ml if validator_count t >= t.config.max_peers then
+peer_capacity net/p2p_swarm.ml || validator_count t >= t.config.max_peers then
+peer_capacity net/p2p_swarm.ml if not t.running || validator_count t >= target then begin
+peer_capacity net/p2p_swarm.ml if validator_count t < List.length (bootstrap_endpoints t) then
+compute_count node_runtime/compute_record.ml let committee_size = min Protocol.max_members validators.n in
+recovery_count node_runtime/consensus_driver_boot_shell.ml validator_count = validator_set.Octra_consensus.C_types.n;
+recovery_count node_runtime/consensus_driver_launch_shell.ml validator_count = validator_set.n;
+reward_count node_runtime/consensus_epoch_apply_footer.ml let reward_plan ~validator_count ~confirmed_fees meta =
+reward_count node_runtime/consensus_epoch_apply_footer.ml ~validator_count
+reward_count node_runtime/consensus_epoch_apply_footer.ml let scheduled_reward_plan deps request ~validator_count meta =
+reward_count node_runtime/consensus_epoch_apply_footer.ml ~validator_count
+reward_count node_runtime/consensus_epoch_apply_footer.ml ~validator_count
+reward_count node_runtime/consensus_epoch_apply_footer.ml let reward_line ~fees ~proposer ~short ~validator_count plan =
+reward_count node_runtime/consensus_epoch_apply_footer.ml validator_count
+reward_count node_runtime/consensus_epoch_apply_footer.ml let validator_count = List.length request.reward.validators in
+reward_count node_runtime/consensus_epoch_apply_footer.ml ~validator_count
+reward_count node_runtime/consensus_epoch_apply_footer.ml ~validator_count
+reward_count node_runtime/consensus_epoch_apply_footer.mli validator_count:int ->
+reward_count node_runtime/consensus_epoch_apply_footer.mli validator_count:int ->
+recovery_count node_runtime/consensus_health_wiring.ml validator_count : int;
+recovery_count node_runtime/consensus_health_wiring.ml runtime.validator_count
+recovery_count node_runtime/consensus_health_wiring.mli validator_count : int;
+recovery_count node_runtime/consensus_pending_commit_recovery.ml let decide ~validator_count ~reached ~level ~promised_root_raw responses =
+recovery_count node_runtime/consensus_pending_commit_recovery.ml let peers = validator_count - 1 in
+recovery_count node_runtime/consensus_pending_commit_recovery.ml validator_count : int;
+recovery_count node_runtime/consensus_pending_commit_recovery.ml validator_count : int;
+recovery_count node_runtime/consensus_pending_commit_recovery.ml ~validator_count
+recovery_count node_runtime/consensus_pending_commit_recovery.ml validator_count;
+recovery_count node_runtime/consensus_pending_commit_recovery.ml ~validator_count:runtime.validator_count
+recovery_count node_runtime/consensus_pending_commit_recovery.ml let run_pending (deps : deps) ~validator_count ~reached ~level p =
+recovery_count node_runtime/consensus_pending_commit_recovery.ml match decide ~validator_count ~reached ~level ~promised_root_raw responses with
+recovery_count node_runtime/consensus_pending_commit_recovery.ml let run_once (deps : deps) ~validator_count ~reached ~level =
+recovery_count node_runtime/consensus_pending_commit_recovery.ml (run_pending deps ~validator_count ~reached ~level)
+recovery_count node_runtime/consensus_pending_commit_recovery.ml ~validator_count:runtime.validator_count
+recovery_count node_runtime/consensus_pending_commit_recovery.mli validator_count:int ->
+recovery_count node_runtime/consensus_pending_commit_recovery.mli validator_count : int;
+recovery_count node_runtime/consensus_pending_commit_recovery.mli validator_count : int;
+recovery_count node_runtime/consensus_pending_commit_recovery.mli validator_count:int ->
+recovery_count node_runtime/consensus_pending_commit_recovery.mli validator_count:int ->
+set_count_shape node_runtime/consensus_validator_anchor.ml if config.active_vs.Octra_consensus.C_types.n = 0 then
+peer_set_size node_runtime/p2p_config.ml active_vs.n
+compute_count node_runtime/resource_compute_service.ml min max_committee_members validator_set.Octra_consensus.C_types.n
+set_count_codec node_runtime/rpc_view.ml "n", `Int proof.n;
+genesis_count node_runtime/startup_account_shell.ml let genesis_amounts ~validator_count =
+genesis_count node_runtime/startup_account_shell.ml per_validator = Z.div circulating (Z.of_int validator_count);
+genesis_count node_runtime/startup_account_shell.ml let amounts = genesis_amounts ~validator_count:(List.length validators) in
+genesis_count node_runtime/startup_account_shell.mli validator_count:int ->
+set_count_shape node_runtime/validator_config.ml n = scheduled.validator_set.n;
+set_count_shape node_runtime/validator_config.ml if vs.n >= 4 || (vs.n > 0 && evicted) then Quorum_ok
+set_count_shape node_runtime/validator_config.ml vs.n)
+set_count_shape node_runtime/validator_config.ml "event = startup_refused reason = validator_count n = %d f = %d quorum = %d minimum = 4"
+set_count_shape node_runtime/validator_config.ml n = next_vs.n;
+plan_activation_rule lib/consensus/c_driver.ml | Error C_types.Seat_cap when not (C_quorum_policy.seatless policy current_epoch) -> Ok ()
+preverify_cache_cap node_runtime/preverify_submit.ml if List.length entries >= cap_threshold then
+program_spawn_cap circle_runtime/circle_exec.ml if List.length t.spawns > spawn_cap then
+program_asset_cap circle_runtime/circle_exec.ml if List.length t.assets + List.length t.encrypted_assets > asset_effect_cap then
+compute_committee_size node_runtime/resource_compute_service.ml && List.length nodes >= committee_size
+compute_member_cap node_runtime/compute_record.ml || members = [] || List.length members > Protocol.max_members
+compute_selection_size node_runtime/compute_record.ml if List.length selection.members <> committee_size
+checkpoint_exporter_count lib/bootstrap/state_sync_manifest.ml else if List.length signatures < required then
+proof_start_window lib/core/proof_warm.ml else if List.length starts >= 3 then
+proof_start_window lib/core/proof_warm.ml && List.length starts < 3 then
+program_relay_quorum lib/core/circle_transport/circle_transport_topology.ml List.length active_claims >= quorum_threshold policy
+compute_waiter_cap lib/core/compute_pool.ml | Some _ -> waiter.priority = Required && List.length waiters < t.required_limit
+compute_waiter_count lib/core/compute_pool.ml required_waiting = List.length t.required_waiters;
+vm_edge_count lib/vm/aml/analysis/c_ent.ml (Z.add (Z.mul (Z.of_int 2) n2) (Z.mul (Z.of_int 3) n3));
+reward_source_size lib/consensus/c_reward_source.ml else if List.length source.reward_members > max_members then
+stored_vote_count lib/consensus/c_value_log.ml | `List [`String proposal; `List votes] when List.length votes <= C_codec.max_validators ->
+compute_signer_floor lib/consensus/resource_compute_certificate.ml || signer_floor > List.length selected
+compute_vote_cap lib/consensus/resource_compute_certificate.ml else if List.length votes > max_votes then
+compute_signer_floor lib/consensus/resource_compute_certificate.ml List.length values >= signer_floor
+stored_proof_count lib/consensus/c_vote_log.ml | `List proofs when List.length proofs <= 3 ->
+stored_vote_count lib/consensus/c_vote_log.ml | `List votes when votes <> [] && List.length votes <= C_codec.max_validators ->
+stored_proof_count lib/consensus/c_vote_log.ml let* () = if List.length proofs <= 3 then Ok () else Error "vote proof retention is full" in
+eviction_wire_size lib/core/validator_set_update.ml else if items = [] || List.length items > Octra_consensus.C_codec.max_validators then
+eviction_wire_size lib/core/validator_set_update.ml else if List.length eviction.offenders > Octra_consensus.C_codec.max_validators then
+duty_member_cap lib/core/set_fold.ml if List.length active > cfg.max_members then
+seat_change_minimum lib/core/validator_entry.ml if List.length after < 4 then Ok ()
+seat_weight_change lib/core/validator_entry.ml let excess = Z.sub (Z.mul (Z.of_int 3) member.weight) after_total in
+seat_change_minimum lib/core/validator_entry.ml (List.length before < 4 ||
+seat_weight_change lib/core/validator_entry.ml | Some old -> Z.gt excess (Z.sub (Z.mul (Z.of_int 3) old.weight) before_total))
+snapshot_minimum lib/core/validator_entry.ml if List.length validators < 4 then
+hfhe_commit_count lib/vm/aml/crypto/c_hfhe.ml let commits = Z.mul rounds (Z.of_int 3) in
+base64_decode_size lib/vm/runtime/byte_work.ml let capacity = Z.mul (Z.cdiv (Z.of_int length) (Z.of_int 4)) (Z.of_int 3) in

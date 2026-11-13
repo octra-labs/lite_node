@@ -98,10 +98,11 @@ let prepare txs rejections =
     reward = { X.proposer_addr = "octProposer"; proposer_public_key = None; validators = [] };
   }
 
-let result ~txs ~root ~rejections ~fees = X.{
+let result ~inputs ~txs ~root ~rejections ~fees = X.{
   post_state_root = root;
   artifacts = {
-    confirmed = List.mapi (fun position tx -> tx, position) txs;
+    confirmed = List.map (fun tx -> tx, List.assoc (T.hash tx)
+      (List.mapi (fun position item -> T.hash item, position) inputs)) txs;
     rejected = rejections;
     confirmed_fees = fees;
     tx_count = List.length txs + List.length rejections;
@@ -111,6 +112,11 @@ let result ~txs ~root ~rejections ~fees = X.{
 let execute ?(txs = [confirmed]) ?(rejections = [rejection]) fault =
   let prepared = prepare txs rejections in
   let inputs = R.get (O.merge ~confirmed:txs ~rejections) in
+  let executed = O.executed ~confirmed:txs rejections in
+  let paid = List.filter (fun (item : O.rejection) -> item.charged) rejections in
+  let rejected scope = List.map (fun (item : O.rejection) -> X.{
+    tx = item.tx; error_type = item.error_type; reason = item.reason; charged = item.charged
+  }) scope in
   let head = ref first in
   let previews = ref 0 in
   let writes = ref 0 in
@@ -134,7 +140,7 @@ let execute ?(txs = [confirmed]) ?(rejections = [rejection]) fault =
       incr previews;
       let input_scope = !previews = 1 in
       expect "preview transaction scope"
-        (R.hashes scope = R.hashes (if input_scope then inputs else txs));
+        (R.hashes scope = R.hashes (if input_scope then inputs else executed));
       expect "preview receipt scope"
         (List.map (fun receipt -> receipt.Octra_core.Preverify_receipt.tx_hash)
           gate.R.G.receipts = R.hashes scope);
@@ -143,16 +149,18 @@ let execute ?(txs = [confirmed]) ?(rejections = [rejection]) fault =
       let root = if input_scope then input_root else next in
       let root = if not input_scope && fault = "preview_root" then first else root in
       let rejections =
-        if input_scope then List.map (fun (item : O.rejection) -> X.{
+        List.map (fun (item : O.rejection) -> X.{
           tx = item.tx;
           error_type = item.error_type;
-          reason = (if fault = "reason" then "different" else item.reason);
-          charged = item.charged;
-        }) (if fault = "order" then List.rev rejections else rejections)
-        else []
+          reason = (if fault = "reason" || (not input_scope && fault = "paid_reason")
+            then "different" else item.reason);
+          charged = (if not input_scope && fault = "paid_flag" then not item.charged else item.charged);
+        }) (if input_scope then (if fault = "order" then List.rev rejections else rejections)
+          else if fault = "paid_missing" then []
+          else if fault = "paid_order" then List.rev paid else paid)
       in
       let fees = if fault = "negative" then Z.neg Z.one else Z.one in
-      let value = result ~txs ~root ~rejections ~fees in
+      let value = result ~inputs:scope ~txs ~root ~rejections ~fees in
       let value =
         if fault = "position" then
           { value with artifacts = { value.artifacts with confirmed = [confirmed, 1] } }
@@ -166,12 +174,15 @@ let execute ?(txs = [confirmed]) ?(rejections = [rejection]) fault =
       expect "apply follows both previews" (!previews = 2);
       expect "apply receipt scope"
         (List.map (fun receipt -> receipt.Octra_core.Preverify_receipt.tx_hash)
-          gate.R.G.receipts = R.hashes txs);
+          gate.R.G.receipts = R.hashes executed);
       head := (if fault = "store" then first else next);
       let root = if fault = "apply_root" then first else next in
       let fees = if fault = "fees" then Z.zero else Z.one in
       let index_root = if fault = "index" then index else prepared.expected_eic in
-      Lwt.return { result = result ~txs ~root ~rejections:[] ~fees; index_root });
+      let rejections = rejected paid in
+      let rejections = if fault = "apply_paid_flag" then
+        List.map (fun (item : X.tx_reject) -> {item with charged = false}) rejections else rejections in
+      Lwt.return { result = result ~inputs:executed ~txs ~root ~rejections ~fees; index_root });
   } in
   let prepared =
     if fault = "next_cursor" then
@@ -314,5 +325,31 @@ let () =
   | Error "replay rejected order differs", 0 -> ()
   | _ -> failwith "rejection permutation accepted"
   end;
+  let paid = O.{rejection with position = 0; tx = tx 1; charged = true} in
+  let second_paid = O.{paid with position = 1; tx = tx 2} in
+  let first_unpaid = O.{rejection with position = 0; tx = tx 1} in
+  List.iter (fun (txs, rejections) ->
+    match execute ~txs ~rejections "" with
+    | Ok actual, 1 ->
+      expect "paid receipt changed in trace"
+        (actual.rejections = List.map O.encode_rejection rejections);
+      expect "paid receipt changed index count" (actual.confirmed = R.hashes txs)
+    | Error reason, _ -> failwith ("paid replay refused: " ^ reason)
+    | _ -> failwith "paid replay write count differs")
+    [[], [paid]; [tx 2], [paid]; [tx 2], [paid; later];
+     [tx 3], [first_unpaid; second_paid]; [tx 3], [paid; second_paid];
+     [tx 4], [first_unpaid; second_paid; {paid with position = 2; tx = tx 3}]];
+  begin match execute ~txs:[tx 3] ~rejections:[paid; second_paid] "paid_order" with
+  | Error "replay executed rejection order differs", 0 -> ()
+  | _ -> failwith "paid replay accepted reordered execution"
+  end;
+  List.iter (fun (fault, reason, writes) ->
+    match execute ~txs:[tx 2] ~rejections:[paid; later] fault with
+    | Error actual, count -> expect fault (actual = reason && count = writes)
+    | Ok _, _ -> failwith ("paid replay accepted " ^ fault))
+    ["paid_flag", "preview_rejection_mismatch", 0;
+     "paid_reason", "preview_rejection_mismatch", 0;
+     "paid_missing", "replay execution count differs", 0;
+     "apply_paid_flag", "preview_rejection_mismatch", 1];
   Printf.printf "event = replay_checks status = pass cases = %d execution = sample preverify = sample\n"
-    (List.length faults + 11 + inputs)
+    (List.length faults + 22 + inputs)

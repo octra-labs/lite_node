@@ -137,12 +137,134 @@ type backend = {
   proof_mode : Rule_graph.mode;
   math : bool;
   fold : int -> (fold_ctx, string) result;
+  execution_profile : chain_id:string -> epoch:int -> string option;
+  voting_set : (int * Octra_consensus.C_types.validator_set) option;
+  fold_parent : (Set_fold.parent_view, string) result option;
   begin_batch : Rule_graph.mode -> unit Lwt.t;
   commit_batch : unit -> unit Lwt.t;
   flush_dirty : unit -> unit Lwt.t;
   get_head_hash : unit -> string option Lwt.t;
   set_meta : string -> string -> unit Lwt.t;
 }
+
+type execution_marker = {
+  epoch : int;
+  profile : string;
+}
+
+let execution_meta_key = "execution_profile"
+
+let execution_marker_to_string (marker : execution_marker) =
+  if marker.epoch < 0 || marker.epoch = max_int then
+    Error "execution profile epoch is invalid"
+  else if String.length marker.profile <> 32 then
+    Error "execution profile hash is invalid"
+  else
+    let hex = "0123456789abcdef" in
+    let bytes = Bytes.create 64 in
+    String.iteri (fun index value ->
+      let byte = Char.code value in
+      Bytes.set bytes (index * 2) hex.[byte lsr 4];
+      Bytes.set bytes (index * 2 + 1) hex.[byte land 15]) marker.profile;
+    Ok (Yojson.Safe.to_string (`Assoc [
+      "epoch", `Int marker.epoch;
+      "profile", `String (Bytes.unsafe_to_string bytes);
+    ]))
+
+let execution_marker_of_string raw =
+  let invalid () = Error "execution profile marker is invalid" in
+  if String.length raw > 256 then invalid ()
+  else
+    try
+      match Yojson.Safe.from_string raw with
+      | `Assoc fields ->
+        begin match List.sort (fun (left, _) (right, _) -> String.compare left right) fields with
+        | ["epoch", `Int epoch; "profile", `String hex]
+          when epoch >= 0 && epoch < max_int && String.length hex = 64
+            && String.for_all (function '0' .. '9' | 'a' .. 'f' -> true | _ -> false) hex ->
+          let digit = function
+            | '0' .. '9' as value -> Char.code value - Char.code '0'
+            | value -> Char.code value - Char.code 'a' + 10 in
+          let profile = String.init 32 (fun index ->
+            Char.chr ((digit hex.[index * 2] lsl 4) lor digit hex.[index * 2 + 1])) in
+          Ok { epoch; profile }
+        | _ -> invalid ()
+        end
+      | _ -> invalid ()
+    with Yojson.Json_error _ -> invalid ()
+
+let check_execution ~profile ~chain_id ~epoch marker =
+  match profile ~chain_id ~epoch, marker with
+  | None, None -> Ok ()
+  | None, Some _ -> Error "execution profile marker is unexpected"
+  | Some expected, _ when String.length expected <> 32 ->
+    Error "execution profile hash is invalid"
+  | Some _, None -> Error "execution profile marker is missing"
+  | Some expected, Some raw ->
+    Result.bind (execution_marker_of_string raw) (fun marker ->
+      if marker.epoch <> epoch then Error "execution profile epoch differs"
+      else if marker.profile <> expected then Error "execution profile hash differs"
+      else Ok ())
+
+let check_execution_epochs ~epoch ~last ~current =
+  if epoch < 0 || epoch = max_int then Error "execution profile epoch is invalid"
+  else if last <> Some (string_of_int epoch) then
+    Error "execution profile last epoch differs"
+  else if current <> Some (string_of_int (epoch + 1)) then
+    Error "execution profile current epoch differs"
+  else Ok ()
+
+let check_execution_state ~profile ~chain_id ~epoch store =
+  let open Lwt.Syntax in
+  let expected = profile ~chain_id ~epoch in
+  let* marker = Store_irmin.get_meta store execution_meta_key in
+  match check_execution ~profile:(fun ~chain_id:_ ~epoch:_ -> expected)
+    ~chain_id ~epoch marker with
+  | Error error -> Lwt.return_error error
+  | Ok () ->
+    match expected with
+    | None -> Lwt.return_ok ()
+    | Some _ ->
+      let* last = Store_irmin.get_meta store "last_epoch" in
+      let* current = Store_irmin.get_meta store "current_epoch" in
+      Lwt.return (check_execution_epochs ~epoch ~last ~current)
+
+let capture_execution ~backend ~(env : env) =
+  let expected = backend.execution_profile ~chain_id:env.chain_id ~epoch:env.epoch_id in
+  let previous = match expected with
+    | Some _ when env.epoch_id > 0 ->
+      backend.execution_profile ~chain_id:env.chain_id ~epoch:(env.epoch_id - 1)
+    | _ -> None in
+  let fold_parent =
+    if Rule_graph.seatless_at ~chain_id:env.chain_id ~epoch:env.epoch_id <> Rule_graph.Active then None
+    else match backend.fold env.epoch_id with
+      | Ok {mode = Rule_graph.Active; parent = Some parent; duty_marks; _} ->
+        Some (Set_fold.prepare_parent ~marks:(duty_marks = Rule_graph.Active) ~chain_id:env.chain_id parent)
+      | Error _ | Ok _ -> None in
+  { backend with fold_parent; execution_profile = (fun ~chain_id ~epoch ->
+      if chain_id = env.chain_id && epoch = env.epoch_id then expected
+      else if env.epoch_id > 0 && chain_id = env.chain_id && epoch = env.epoch_id - 1 then previous
+      else backend.execution_profile ~chain_id ~epoch) }
+
+let check_execution_parent ~backend ~(env : env) =
+  let open Lwt.Syntax in
+  match backend.execution_profile ~chain_id:env.chain_id ~epoch:env.epoch_id with
+  | None -> Lwt.return_ok ()
+  | Some expected ->
+    if env.epoch_id <= 0 || env.epoch_id = max_int then
+      Lwt.return_error "execution profile epoch is invalid"
+    else if String.length expected <> 32 then
+      Lwt.return_error "execution profile hash is invalid"
+    else
+      let previous = env.epoch_id - 1 in
+      let* last = Store_irmin.get_meta backend.store "last_epoch" in
+      let* current = Store_irmin.get_meta backend.store "current_epoch" in
+      match check_execution_epochs ~epoch:previous ~last ~current with
+      | Error error -> Lwt.return_error error
+      | Ok () ->
+        let* marker = Store_irmin.get_meta backend.store execution_meta_key in
+        Lwt.return (check_execution ~profile:backend.execution_profile
+          ~chain_id:env.chain_id ~epoch:previous marker)
 
 let resolve_legacy_total = function
   | Some _ as value -> value
@@ -185,6 +307,8 @@ let prior_fold _ =
 
 let make_live_backend ?compute ?emission_policy ?emission_schedule ?legacy_total_supply
     ?sender_key_activation_epoch ?validator_policy
+    ?voting_set
+    ?(execution_profile = fun ~chain_id:_ ~epoch:_ -> None)
     ?(proof_mode=Rule_graph.Active) ?(math=false) ?(fold=prior_fold)
     store ledger = {
   store;
@@ -206,6 +330,9 @@ let make_live_backend ?compute ?emission_policy ?emission_schedule ?legacy_total
   proof_mode;
   math;
   fold;
+  execution_profile;
+  voting_set;
+  fold_parent = None;
   begin_batch = (fun mode -> Store_irmin.begin_epoch_batch ~mode store);
   commit_batch = (fun () -> Store_irmin.commit_epoch_batch store "epoch");
   flush_dirty = (fun () -> Ledger.flush_dirty_lwt ledger);
@@ -215,6 +342,8 @@ let make_live_backend ?compute ?emission_policy ?emission_schedule ?legacy_total
 
 let make_overlay_backend ?compute ?emission_policy ?emission_schedule
     ?legacy_total_supply ?sender_key_activation_epoch ?validator_policy
+    ?voting_set
+    ?(execution_profile = fun ~chain_id:_ ~epoch:_ -> None)
     ?(proof_mode=Rule_graph.Active) ?(math=false) ?(fold=prior_fold) store ledger overlay = {
   store;
   ledger;
@@ -235,6 +364,9 @@ let make_overlay_backend ?compute ?emission_policy ?emission_schedule
   proof_mode;
   math;
   fold;
+  execution_profile;
+  voting_set;
+  fold_parent = None;
   begin_batch = (fun mode -> Store_irmin.begin_epoch_batch ~mode store);
   commit_batch = (fun () -> Store_irmin.commit_epoch_batch store "epoch_overlay");
   flush_dirty = (fun () -> Lwt.return_unit);
@@ -253,6 +385,8 @@ type reward_plan = {
   fees_burned : Z.t;
   fees_rewarded : Z.t;
   total_reward : Z.t;
+  reward_burned : Z.t;
+  excluded : string list;
   proposer_total : Z.t;
   each_validator : Z.t;
   remainder : Z.t;
@@ -317,6 +451,8 @@ let build_reward_plan_with_base ~fee_burn_active ~supply_retired
                 fees_burned = fee_split.burned;
                 fees_rewarded = fee_split.rewarded;
                 total_reward;
+                reward_burned = Z.zero;
+                excluded = [];
                 proposer_total;
                 each_validator;
                 remainder;
@@ -410,6 +546,25 @@ type reward_credit = {
   validator : bool;
   amount : Z.t;
 }
+
+let sum_reward_credits credits =
+  List.fold_left (fun total (credit : reward_credit) -> Z.add total credit.amount) Z.zero credits
+
+let net_reward_credits plan credits =
+  if Z.sign plan.total_reward < 0 || Z.sign plan.reward_burned < 0 then
+    Error "reward amounts are negative"
+  else if plan.excluded <> List.sort_uniq String.compare plan.excluded then
+    Error "reward exclusions are not ordered and unique"
+  else if not (Z.equal (sum_reward_credits credits)
+      (Z.add plan.total_reward plan.reward_burned)) then
+    Error "reward distribution total mismatch"
+  else
+    let burned, credits = List.partition (fun (credit : reward_credit) ->
+      List.mem credit.address plan.excluded) credits in
+    if not (Z.equal (sum_reward_credits burned) plan.reward_burned)
+       || not (Z.equal (sum_reward_credits credits) plan.total_reward) then
+      Error "reward burn distribution mismatch"
+    else Ok credits
 
 let canonical_reward_validators (validators : reward_validator list) =
   List.sort
@@ -511,16 +666,61 @@ let reward_credits (reward : reward_attribution) plan =
           |> List.filter (fun credit -> Z.sign credit.amount > 0)
           |> List.sort (fun left right -> String.compare left.address right.address)
         in
-        let credited =
-          List.fold_left
-            (fun total credit -> Z.add total credit.amount)
-            Z.zero
-            credits
-        in
-        if not (Z.equal credited plan.total_reward) then
-          Error "reward distribution total mismatch"
-        else
-          Ok credits
+        net_reward_credits plan credits
+
+let validator_penalty_key address = "validator_penalty:" ^ address
+
+let validator_penalties ~read ~chain_id ~epoch_id addresses =
+  if Rule_graph.seatless_at ~chain_id ~epoch:epoch_id <> Rule_graph.Active then Lwt.return []
+  else Lwt_list.filter_s (fun address ->
+    Lwt.map Option.is_some (read (validator_penalty_key address)))
+    (List.sort_uniq String.compare addresses)
+
+let reward_addresses (reward : reward_attribution) =
+  reward.proposer_addr :: List.map (fun (member : reward_validator) -> member.address) reward.validators
+
+let reward_exclusions ?(penalized = []) ~chain_id ~epoch_id ~registry ~(reward : reward_attribution) () =
+  match Rule_graph.seatless_at ~chain_id ~epoch:epoch_id with
+  | Rule_graph.Prior -> Ok []
+  | Rule_graph.Active ->
+    let ( let* ) = Result.bind in
+    let* registry = match registry with
+      | None -> Ok Validator_registry.empty
+      | Some raw -> Validator_registry.of_string raw in
+    let addresses = reward_addresses reward in
+    let records = Validator_registry.slashes registry |> List.filter_map
+      (fun (record : Validator_registry.slash_record) ->
+        let epoch = Int64.of_int epoch_id in
+        if record.applied_epoch <= epoch
+           && List.mem record.offender addresses
+        then Some record.offender else None) in
+    Ok (List.sort_uniq String.compare (records @ List.filter (fun address -> List.mem address addresses) penalized))
+
+let prepare_reward_plan ?penalized ~chain_id ~epoch_id ~registry ~reward plan =
+  let ( let* ) = Result.bind in
+  if not (Z.equal plan.reward_burned Z.zero) || plan.excluded <> [] then
+    Error "reward plan is already prepared"
+  else
+    let* excluded = reward_exclusions ?penalized ~chain_id ~epoch_id ~registry ~reward () in
+    if excluded = [] then Ok plan
+    else
+      let* credits = reward_credits reward plan in
+      let burned = List.filter (fun (credit : reward_credit) ->
+        List.mem credit.address excluded) credits |> sum_reward_credits in
+      let next = {plan with excluded; reward_burned = burned;
+        total_reward = Z.sub plan.total_reward burned;
+        new_total_supply = Z.sub plan.new_total_supply burned;
+        new_supply_retired = Z.add plan.new_supply_retired burned} in
+      if Z.sign next.new_total_supply < 0 then Error "reward burn exceeds total supply"
+      else
+        let* _ = reward_credits reward next in
+        Ok next
+
+let reward_credits_at ?penalized ~chain_id ~epoch_id ~registry ~reward plan =
+  let ( let* ) = Result.bind in
+  let* excluded = reward_exclusions ?penalized ~chain_id ~epoch_id ~registry ~reward () in
+  if excluded <> plan.excluded then Error "reward exclusions differ from applied slashes"
+  else reward_credits reward plan
 
 let default_reward (env : env) : reward_attribution =
   let validators =
@@ -544,6 +744,13 @@ let default_reward (env : env) : reward_attribution =
 
 let apply_epoch_footer_with_reward ~reward ~backend ~env ~plan =
   let open Lwt.Syntax in
+  let backend = capture_execution ~backend ~env in
+  let execution = backend.execution_profile ~chain_id:env.chain_id ~epoch:env.epoch_id in
+  let* () =
+    let* checked = check_execution_parent ~backend ~env in
+    match checked with
+    | Ok () -> Lwt.return_unit
+    | Error error -> Lwt.fail_with error in
   let* () =
     match Emission_policy.check_reward backend.emission_policy plan.base_reward with
     | Ok () -> Lwt.return_unit
@@ -551,14 +758,22 @@ let apply_epoch_footer_with_reward ~reward ~backend ~env ~plan =
   in
   let* () = check_reward_supply backend plan in
   let supply_before_rewards = backend.ops.total_supply () in
+  let* registry = match Rule_graph.seatless_at ~chain_id:env.chain_id ~epoch:env.epoch_id with
+    | Rule_graph.Prior -> Lwt.return_none
+    | Rule_graph.Active -> Store_irmin.get_meta backend.store Validator_registry.meta_key in
+  let* penalized = validator_penalties ~read:(Store_irmin.get_meta backend.store) ~chain_id:env.chain_id ~epoch_id:env.epoch_id
+    (reward_addresses reward) in
+  let credits =
+    if Z.leq plan.total_reward Z.zero && Z.equal plan.reward_burned Z.zero && plan.excluded = []
+       && Rule_graph.seatless_at ~chain_id:env.chain_id ~epoch:env.epoch_id = Rule_graph.Prior
+    then []
+    else match reward_credits_at ~penalized ~chain_id:env.chain_id ~epoch_id:env.epoch_id
+      ~registry ~reward plan with
+      | Ok credits -> credits
+      | Error error -> failwith error in
   let* () =
     if Z.leq plan.total_reward Z.zero then Lwt.return_unit
     else begin
-      let credits =
-        match reward_credits reward plan with
-        | Ok credits -> credits
-        | Error error -> failwith error
-      in
       let reward_addrs =
         List.map (fun credit -> credit.address) credits
       in
@@ -572,18 +787,26 @@ let apply_epoch_footer_with_reward ~reward ~backend ~env ~plan =
           (fun credit -> credit_reward backend credit.address credit.amount)
           credits
       in
-      let* () = check_reward_credits backend ~before:supply_before_rewards plan in
-      if Z.gt plan.base_reward Z.zero || Z.gt plan.fees_burned Z.zero then begin
-        let* () = backend.set_meta "emission_remaining" (Z.to_string plan.new_emission_remaining) in
-        let* () = backend.set_meta "total_supply" (Z.to_string plan.new_total_supply) in
-        if plan.supply_tracking_active then
-          backend.set_meta "supply_retired" (Z.to_string plan.new_supply_retired)
-        else
-          Lwt.return_unit
-      end else
-        Lwt.return_unit
+      check_reward_credits backend ~before:supply_before_rewards plan
     end
   in
+  let* () =
+    if (Z.gt plan.total_reward Z.zero || Z.gt plan.reward_burned Z.zero)
+       && (Z.gt plan.base_reward Z.zero || Z.gt plan.fees_burned Z.zero
+           || Z.gt plan.reward_burned Z.zero) then begin
+      let* () = backend.set_meta "emission_remaining" (Z.to_string plan.new_emission_remaining) in
+      let* () = backend.set_meta "total_supply" (Z.to_string plan.new_total_supply) in
+      if plan.supply_tracking_active || Z.gt plan.reward_burned Z.zero then
+        backend.set_meta "supply_retired" (Z.to_string plan.new_supply_retired)
+      else Lwt.return_unit
+    end else Lwt.return_unit in
+  let* () = match execution with
+    | None -> Lwt.return_unit
+    | Some profile ->
+      begin match execution_marker_to_string { epoch = env.epoch_id; profile } with
+      | Error error -> Lwt.fail_with error
+      | Ok raw -> backend.set_meta execution_meta_key raw
+      end in
   let* () = backend.set_meta "last_epoch" (string_of_int env.epoch_id) in
   let* () = backend.set_meta "current_epoch" (string_of_int (env.epoch_id + 1)) in
   Lwt.return_unit
@@ -2411,13 +2634,27 @@ let set_fold_cfg ctx =
 let set_fold_start ctx =
   std_value ctx ctx.start ctx.profile_start
 
+let next_set_fold ~backend ~env ctx state =
+  let ( let* ) = Result.bind in
+  let cfg = set_fold_cfg ctx in
+  let* prepared = match backend.fold_parent with
+    | None -> Ok None | Some value -> Result.map Option.some value in
+  let* next, reason, changed = Set_fold.advance ?prepared
+    ~cap_mode:ctx.cap_mode ~marks:(ctx.duty_marks = Rule_graph.Active)
+    cfg ~chain_id:env.chain_id ~start:(set_fold_start ctx)
+    ~at:(Int64.of_int env.epoch_id) ~parent:ctx.parent state in
+  let* next, locked = match ctx.seat_mode with
+    | Rule_graph.Prior -> Ok (next, false)
+    | Rule_graph.Active ->
+      Set_fold.lock cfg ~active:(std_value ctx env.validator_addrs ctx.members) next in
+  Ok (next, reason, changed || locked)
+
 let apply_set_fold ~backend ~env =
   let open Lwt.Syntax in
   let ctx = fold_at backend env.epoch_id in
   match ctx.mode with
   | Rule_graph.Prior -> Lwt.return_unit
   | Rule_graph.Active ->
-    let cfg = set_fold_cfg ctx in
     let at = Int64.of_int env.epoch_id in
     let* stored = load_set_fold backend in
     let state =
@@ -2427,30 +2664,10 @@ let apply_set_fold ~backend ~env =
     in
     begin
       match
-        Set_fold.advance
-          ~cap_mode:ctx.cap_mode
-          ~marks:(ctx.duty_marks = Rule_graph.Active)
-          cfg
-          ~chain_id:env.chain_id
-          ~start:(set_fold_start ctx)
-          ~at
-          ~parent:ctx.parent
-          state
+        next_set_fold ~backend ~env ctx state
       with
       | Error error -> failwith ("validator set fold update rejected: " ^ error)
       | Ok (next, reason, changed) ->
-        let next, locked =
-          match ctx.seat_mode with
-          | Rule_graph.Prior -> next, false
-          | Rule_graph.Active ->
-            let active = std_value ctx env.validator_addrs ctx.members in
-            begin
-              match Set_fold.lock cfg ~active next with
-              | Ok result -> result
-              | Error error ->
-                failwith ("validator seat lock rejected: " ^ error)
-            end
-        in
         Option.iter
           (fun reason ->
             Octra_log.warn
@@ -2459,9 +2676,161 @@ let apply_set_fold ~backend ~env =
               at
               reason)
           reason;
-        if changed || locked then save_set_fold backend next
+        if changed then save_set_fold backend next
         else Lwt.return_unit
     end
+
+let current_voting_set ~backend ~(env : env) =
+  let module C = Octra_consensus.C_types in
+  let ( let* ) = Result.bind in
+  match backend.voting_set with
+  | None -> Error "epoch voting set is missing"
+  | Some (epoch, _) when epoch <> env.epoch_id -> Error "epoch voting set height differs"
+  | Some (_, set) ->
+    let* set = C.structural_validator_set_for_epoch
+      ~chain_id:env.chain_id ~epoch_id:(Int64.of_int env.epoch_id) set
+      |> Result.map_error C.set_error_message in
+    let members = List.map (fun member ->
+      member.C.address, Base64.encode_exn member.pubkey) set.C.validators
+      |> List.sort compare in
+    if members <> List.sort compare env.validator_pubkeys
+       || List.map fst members <> List.sort String.compare env.validator_addrs then
+      Error "epoch voting set members differ"
+    else Ok set
+
+let validator_promotion ~chain_id ~epoch_id ~active update =
+  let module C = Octra_consensus.C_types in
+  let ( let* ) = Result.bind in
+  let* pending = Validator_set_update.validator_set update in
+  match update.Validator_set_update.eviction with
+  | Some _ ->
+    let* () = Validator_set_update.check_set_at ~chain_id ~epoch_id update in
+    Ok (C.Pending_set pending)
+  | None -> C.pending_set_for_epoch ~chain_id ~epoch_id ~active pending
+    |> Result.map_error C.set_error_message
+
+let fold_set ~cfg ~mode ~source ~active state =
+  match mode with
+  | Rule_graph.Prior -> Ok (state, false)
+  | Rule_graph.Active ->
+    Set_fold.note_set cfg ~epoch:source ~active state
+    |> Result.map (fun next -> next, next <> state)
+
+let snapshot_parameters ctx (policy : Validator_policy.active) ~active state =
+  let cfg = set_fold_cfg ctx in
+  let max_validators, incumbents = match ctx.seat_mode with
+    | Rule_graph.Prior -> cfg.max_members, []
+    | Rule_graph.Active ->
+      match Set_fold.seats state with
+      | Some seats -> (match ctx.open_mode with
+        | Rule_graph.Prior -> seats, active
+        | Rule_graph.Active -> cfg.max_members, [])
+      | None -> failwith "validator seat limit is missing" in
+  let activation_delay = std_value ctx policy.Validator_policy.parameters.activation_delay cfg.delay in
+  {policy.parameters with Validator_entry.max_validators; activation_delay}, incumbents
+
+let check_registry_change ?fold ~backend ~(env : env) (policy : Validator_policy.active) ~before ~after () =
+  let open Lwt.Syntax in
+  if Rule_graph.seatless_at ~chain_id:env.chain_id ~epoch:env.epoch_id <> Rule_graph.Active then
+    Lwt.return_ok ()
+  else
+    let ctx = fold_at backend env.epoch_id in
+    let cfg = set_fold_cfg ctx in
+    let at = Int64.of_int env.epoch_id in
+    let* stored = load_set_fold backend in
+    let* raw = Store_irmin.get_meta backend.store Validator_set_update.pending_meta_key in
+    let pending = match raw with None -> Ok None
+      | Some raw -> Validator_set_update.of_string raw |> Result.map Option.some in
+    let entries = Validator_registry.entries before @ Validator_registry.entries after in
+    let pending_addresses = match pending with
+      | Ok (Some update) -> List.map (fun (member : Validator_set_update.validator_entry) -> member.address) update.validators
+      | Ok None | Error _ -> [] in
+    let* penalized = validator_penalties ~read:(Store_irmin.get_meta backend.store) ~chain_id:env.chain_id ~epoch_id:env.epoch_id
+      (pending_addresses @ List.map (fun (entry : Validator_entry.entry) -> entry.address) entries) in
+    Lwt.return (let ( let* ) = Result.bind in
+      let* base = stored in
+      let* state, _, _ = next_set_fold ~backend ~env ctx base in
+      let* next = match fold with
+        | None -> Ok state
+        | Some changed -> next_set_fold ~backend ~env ctx changed
+          |> Result.map (fun (state, _, _) -> state) in
+      let* pending = pending in
+      let* active = current_voting_set ~backend ~env in
+      let cadence = match ctx.standard_mode with
+        | Rule_graph.Prior -> policy.snapshot_interval
+        | Rule_graph.Active -> cfg.cadence in
+      let delay = std_value ctx policy.parameters.activation_delay cfg.delay in
+      let first_source = Int64.sub (Int64.of_int policy.activation_epoch) delay in
+      let align epoch =
+        let epoch = Int64.max first_source (Int64.max at epoch) in
+        let rest = Int64.rem (Int64.sub epoch first_source) cadence in
+        if rest = 0L then epoch else Int64.add epoch (Int64.sub cadence rest) in
+      let* promotion = match pending with
+        | Some update when update.weighted && not (List.exists
+            (fun (member : Validator_set_update.validator_entry) -> List.mem member.address penalized) update.validators) ->
+          let source = Int64.max at update.activate_epoch in
+          validator_promotion ~chain_id:env.chain_id ~epoch_id:source ~active:(Some active) update
+          |> Result.map (function
+            | Octra_consensus.C_types.Active_set set
+            | Octra_consensus.C_types.Pending_set set ->
+              Some (source, List.map (fun member -> member.Octra_consensus.C_types.address) set.validators))
+        | _ -> Ok None in
+      let source = align (match promotion with Some (epoch, _) -> epoch | None -> at) in
+      let advance folded =
+        let* folded, _ = fold_set ~cfg ~mode:ctx.live_mode ~source:at ~active:env.validator_addrs folded in
+        match promotion with
+        | Some (epoch, members) when epoch <= source ->
+          fold_set ~cfg ~mode:ctx.live_mode ~source:epoch ~active:members folded
+          |> Result.map (fun (state, _) -> state, members)
+        | _ -> Ok (folded, env.validator_addrs) in
+      let select registry (folded, members) =
+        let parameters, incumbents = snapshot_parameters ctx policy ~active:members folded in
+        let entries, _ = Set_fold.filter cfg ~start:(set_fold_start ctx) ~source
+          (Validator_registry.entries registry) folded in
+        let entries = List.filter (fun (entry : Validator_entry.entry) ->
+          not (List.mem entry.address penalized)) entries in
+        Validator_entry.select_members ~incumbents parameters ~source_epoch:source entries in
+      let* state = advance state in
+      let* next = advance next in
+      Validator_entry.check_weight_change ~before:(select before state) ~after:(select after next))
+
+let remember_validator_penalty ~backend ~address ~id =
+  let open Lwt.Syntax in
+  let key = validator_penalty_key address in
+  let* recorded = Store_irmin.get_meta backend.store key in
+  match recorded with
+  | Some _ -> Lwt.return_unit
+  | None -> backend.set_meta key id
+
+let remember_validator_penalties ~backend ~(env : env) registry =
+  let open Lwt.Syntax in
+  if Rule_graph.seatless_at ~chain_id:env.chain_id ~epoch:env.epoch_id <> Rule_graph.Active then
+    Lwt.return_unit
+  else
+    let key = "validator_penalty_epoch" in
+    let epoch = Int64.of_int env.epoch_id in
+    let* saved = Store_irmin.get_meta backend.store key in
+    match saved with
+    | Some raw ->
+      let applied = try Int64.of_string raw with _ -> failwith "validator penalty epoch is invalid" in
+      if applied < 0L || applied > epoch then Lwt.fail_with "validator penalty epoch differs"
+      else Lwt.return_unit
+    | None ->
+      let* () = Lwt_list.iter_s (fun (record : Validator_registry.slash_record) ->
+        if record.applied_epoch > epoch then Lwt.return_unit
+        else remember_validator_penalty ~backend ~address:record.offender ~id:record.id)
+        (Validator_registry.slashes registry) in
+      backend.set_meta key (Int64.to_string epoch)
+
+let prepare_validator_penalties ~backend ~(env : env) =
+  let open Lwt.Syntax in
+  if Rule_graph.seatless_at ~chain_id:env.chain_id ~epoch:env.epoch_id <> Rule_graph.Active then
+    Lwt.return_unit
+  else
+    let* registry = load_validator_registry backend in
+    match registry with
+    | Ok registry -> remember_validator_penalties ~backend ~env registry
+    | Error reason -> Lwt.fail_with ("validator penalty registry corrupt: " ^ reason)
 
 let ensure_validator_escrow backend =
   if backend.ops.mem Validator_registry.escrow_address then
@@ -2486,6 +2855,11 @@ let process_validator_bond_tx ~backend ~env tx =
       | Error error ->
         Lwt.return (Stdlib.Error ("malformed_transaction", error))
       | Ok payload ->
+        let* penalized = validator_penalties ~read:(Store_irmin.get_meta backend.store) ~chain_id:env.chain_id
+          ~epoch_id:env.epoch_id [tx.from] in
+        if penalized <> [] then
+          Lwt.return (Stdlib.Error ("validator_bond_rejected", "validator was disqualified by evidence"))
+        else
         let* registry_result = load_validator_registry backend in
         begin
           match registry_result with
@@ -2511,6 +2885,11 @@ let process_validator_bond_tx ~backend ~env tx =
                 Lwt.return
                   (Stdlib.Error ("validator_bond_rejected", error))
               | Ok next ->
+                let* checked = check_registry_change ~backend ~env policy
+                  ~before:registry ~after:next () in
+                match checked with
+                | Error error -> Lwt.return (Stdlib.Error ("validator_bond_rejected", error))
+                | Ok () ->
                 let debit = Z.add tx.amount tx.ou in
                 begin
                   match backend.ops.debit tx.from debit tx.nonce with
@@ -2550,7 +2929,7 @@ let process_validator_exit_tx ~backend ~env tx =
     Lwt.return
       (Stdlib.Error
          ("validator_exit_rejected", "validator admission is inactive"))
-  | Validator_policy.Bonded _ ->
+  | Validator_policy.Bonded policy ->
     if Z.sign tx.Transaction.amount <> 0 then
       Lwt.return
         (Stdlib.Error
@@ -2577,6 +2956,11 @@ let process_validator_exit_tx ~backend ~env tx =
               Lwt.return
                 (Stdlib.Error ("validator_exit_rejected", error))
             | Ok next ->
+              let* checked = check_registry_change ~backend ~env policy
+                ~before:registry ~after:next () in
+              match checked with
+              | Error error -> Lwt.return (Stdlib.Error ("validator_exit_rejected", error))
+              | Ok () ->
               begin
                 match backend.ops.debit tx.from tx.ou tx.nonce with
                 | Error error ->
@@ -2702,6 +3086,16 @@ let load_slash_supply backend =
   | _, Error error, _
   | _, _, Error error -> Lwt.return (Error error)
 
+let check_evidence_set ~backend ~(env : env) registry =
+  if Rule_graph.seatless_at ~chain_id:env.chain_id ~epoch:env.epoch_id <> Rule_graph.Active then Ok ()
+  else
+    let ( let* ) = Result.bind in
+    let* current = current_voting_set ~backend ~env in
+    let* offenders = Validator_set_update.eviction_offenders
+      ~chain_id:env.chain_id ~epoch:env.epoch_id ~registry ~current in
+    if offenders = [] then Ok ()
+    else Octra_consensus.C_types.plan_eviction ~offenders current |> Result.map (fun _ -> ())
+
 let process_validator_evidence_tx ~backend ~env tx =
   let open Lwt.Syntax in
   match backend.validator_policy with
@@ -2759,14 +3153,24 @@ let process_validator_evidence_tx ~backend ~env tx =
                       (Stdlib.Error
                          ("validator_evidence_rejected", error))
                   | Ok evidence ->
+                    let* () = remember_validator_penalties ~backend ~env registry in
                     begin
-                      match
-                        Validator_registry.apply_slash
+                      let checked =
+                        let ( let* ) = Result.bind in
+                        let active = Rule_graph.seatless_at
+                          ~chain_id:env.chain_id ~epoch:env.epoch_id = Rule_graph.Active in
+                        let* retain_offenders = if not active then Ok []
+                          else current_voting_set ~backend ~env |> Result.map (fun (set : Octra_consensus.C_types.validator_set) ->
+                            List.map (fun member -> member.Octra_consensus.C_types.address) set.validators) in
+                        let* next, amount = Validator_registry.apply_slash
+                          ~retain_rewards:active ~retain_offenders
                           ~current_epoch
                           ~evidence_epochs
                           evidence
-                          registry
-                      with
+                          registry in
+                        let* () = check_evidence_set ~backend ~env next in
+                        Ok (next, amount) in
+                      match checked with
                       | Error error ->
                         Lwt.return
                           (Stdlib.Error
@@ -2821,6 +3225,9 @@ let process_validator_evidence_tx ~backend ~env tx =
                                           backend
                                           next
                                       in
+                                      let* () = if Rule_graph.seatless_at ~chain_id:env.chain_id
+                                          ~epoch:env.epoch_id <> Rule_graph.Active then Lwt.return_unit
+                                        else remember_validator_penalty ~backend ~address:evidence.offender ~id:evidence.id in
                                       let* () =
                                         backend.set_meta
                                           "total_supply"
@@ -3019,9 +3426,13 @@ let ready_mark ~cfg ~mode ~start ~source ~address ~prior ~marked fold =
     marked
   | Rule_graph.Active, Some _ -> prior
 
-let process_bonded_validator_ready_tx ~backend ~env ~ctx tx
+let process_bonded_validator_ready_tx ~backend ~env ~ctx ~policy tx
     (ready : Validator_registry.ready_payload) =
   let open Lwt.Syntax in
+  let* penalized = validator_penalties ~read:(Store_irmin.get_meta backend.store) ~chain_id:env.chain_id ~epoch_id:env.epoch_id [tx.Transaction.from] in
+  if penalized <> [] then
+    Lwt.return (Stdlib.Error ("validator_ready_rejected", "validator was disqualified by evidence"))
+  else
   if not (String.equal tx.Transaction.from tx.to_) then
     Lwt.return
       (Stdlib.Error
@@ -3106,7 +3517,11 @@ let process_bonded_validator_ready_tx ~backend ~env ~ctx tx
                             ~marked:next
                             fold
                         in
-                        begin
+                        let* checked = check_registry_change ?fold ~backend ~env policy
+                          ~before:registry ~after:next () in
+                        begin match checked with
+                        | Error error -> Lwt.return (Stdlib.Error ("validator_ready_rejected", error))
+                        | Ok () ->
                           match backend.ops.debit tx.from tx.ou tx.nonce with
                           | Error error ->
                             Lwt.return
@@ -3209,14 +3624,14 @@ let process_validator_ready_tx ~backend ~env tx =
     match backend.validator_policy with
     | Validator_policy.Inactive ->
       process_legacy_validator_ready_tx ~backend ~env tx
-    | Validator_policy.Bonded _ ->
+    | Validator_policy.Bonded policy ->
       let ctx = fold_at backend env.epoch_id in
       begin
         match
           Validator_registry.ready_payload_of_message tx.Transaction.message
         with
         | Ok ready ->
-          process_bonded_validator_ready_tx ~backend ~env ~ctx tx ready
+          process_bonded_validator_ready_tx ~backend ~env ~ctx ~policy tx ready
         | Error error ->
           begin
             match ctx.ready_mode with
@@ -3556,18 +3971,16 @@ let process_standard_tx ~(backend : backend) ~(env : env) tx =
     ~env
     tx
 
-let fold_set ~cfg ~mode ~source ~active state =
-  match mode with
-  | Rule_graph.Prior -> Ok (state, false)
-  | Rule_graph.Active ->
-    Set_fold.note_set cfg ~epoch:source ~active state
-    |> Result.map (fun next -> next, next <> state)
-
 let validator_snapshot_input ?active ~backend ~env policy registry =
   let open Lwt.Syntax in
   let source = Int64.of_int env.epoch_id in
   let promoted = Option.value active ~default:env.validator_addrs in
   let ctx = fold_at backend env.epoch_id in
+  let entries = Validator_registry.entries registry in
+  let* penalized = validator_penalties ~read:(Store_irmin.get_meta backend.store) ~chain_id:env.chain_id ~epoch_id:env.epoch_id
+    (List.map (fun (entry : Validator_entry.entry) -> entry.address) entries) in
+  let entries = List.filter (fun (entry : Validator_entry.entry) ->
+    not (List.mem entry.address penalized)) entries in
   let active =
     match ctx.live_mode with
     | Rule_graph.Prior -> env.validator_addrs
@@ -3577,8 +3990,8 @@ let validator_snapshot_input ?active ~backend ~env policy registry =
   | Rule_graph.Prior ->
     Lwt.return
       (policy.Validator_policy.parameters,
-       Validator_registry.entries registry,
-       [])
+        entries,
+        [])
   | Rule_graph.Active ->
     let cfg = set_fold_cfg ctx in
     let* stored = load_set_fold backend in
@@ -3601,7 +4014,7 @@ let validator_snapshot_input ?active ~backend ~env policy registry =
         cfg
         ~start:(set_fold_start ctx)
         ~source
-        (Validator_registry.entries registry)
+        entries
         state
     in
     Octra_log.info
@@ -3612,29 +4025,7 @@ let validator_snapshot_input ?active ~backend ~env policy registry =
       counts.shadow
       counts.allowed;
     Set_report.excluded cfg ~start:(set_fold_start ctx) ~source ~active state;
-    let max_validators, incumbents =
-      match ctx.seat_mode with
-      | Rule_graph.Prior -> cfg.max_members, []
-      | Rule_graph.Active ->
-        begin
-          match Set_fold.seats state with
-          | Some seats ->
-            begin
-              match ctx.open_mode with
-              | Rule_graph.Prior -> seats, active
-              | Rule_graph.Active -> cfg.max_members, []
-            end
-          | None -> failwith "validator seat limit is missing"
-        end
-    in
-    let activation_delay =
-      std_value ctx policy.parameters.activation_delay cfg.delay
-    in
-    let parameters = {
-      policy.parameters with
-      Validator_entry.max_validators;
-      activation_delay;
-    } in
+    let parameters, incumbents = snapshot_parameters ctx policy ~active state in
     Lwt.return (parameters, entries, incumbents)
 
 let schedule_validator_snapshot ?active ~backend ~env () =
@@ -3717,6 +4108,14 @@ let schedule_validator_snapshot ?active ~backend ~env () =
                 | Error error ->
                   failwith ("validator snapshot rejected: " ^ error)
                 | Ok update ->
+                  match Validator_set_update.check_set_at ~chain_id:env.chain_id
+                    ~epoch_id:source_epoch update with
+                  | Error reason ->
+                    Octra_log.info "validator"
+                      "event = snapshot_skipped source_epoch = %Ld activate_epoch = %Ld reason = %s"
+                      source_epoch activate_epoch reason;
+                    Lwt.return_unit
+                  | Ok () ->
                   let* () =
                     backend.set_meta
                       Validator_set_update.pending_meta_key
@@ -3736,36 +4135,119 @@ let schedule_validator_snapshot ?active ~backend ~env () =
         end
     end
 
-let promote_active_validator_set ~backend ~env =
+let promote_active_validator_set ~backend ~(env : env) =
   let open Lwt.Syntax in
-  let* pending =
-    Store_irmin.get_meta
-      backend.store
-      Validator_set_update.pending_meta_key
-  in
+  let module C = Octra_consensus.C_types in
+  let* pending = Store_irmin.get_meta backend.store Validator_set_update.pending_meta_key in
   match pending with
   | None -> Lwt.return_none
   | Some raw ->
-    begin
-      match Validator_set_update.of_string raw with
-      | Error error ->
-        failwith ("pending validator set corrupt: " ^ error)
-      | Ok update ->
-        if update.Validator_set_update.weighted
-           && Int64.compare
-                update.activate_epoch
-                (Int64.of_int env.epoch_id) <= 0 then
-          let* () =
-            backend.set_meta
-              Validator_set_update.active_meta_key
-              raw
-          in
-          update.validators
-          |> List.map (fun item -> item.Validator_set_update.address)
-          |> Lwt.return_some
+    let update = match Validator_set_update.of_string raw with
+      | Ok update -> update
+      | Error reason -> failwith ("pending validator set corrupt: " ^ reason) in
+    if not update.weighted || update.activate_epoch > Int64.of_int env.epoch_id then Lwt.return_none
+    else
+      let epoch_id = Int64.of_int env.epoch_id in
+      let decision =
+        if Rule_graph.seatless_at ~chain_id:env.chain_id ~epoch:env.epoch_id <> Rule_graph.Active then
+          Validator_set_update.validator_set update |> Result.map (fun set -> C.Pending_set set)
         else
-          Lwt.return_none
-    end
+          let active = match backend.voting_set with
+            | None -> None
+            | Some _ ->
+              (match current_voting_set ~backend ~env with
+               | Ok active -> Some active
+               | Error reason -> failwith reason) in
+          validator_promotion ~chain_id:env.chain_id ~epoch_id ~active update in
+      match decision with
+      | Error reason -> failwith ("pending validator set rejected: " ^ reason)
+      | Ok (C.Active_set active) ->
+        let* () = Store_irmin.remove_path backend.store ["meta"; Validator_set_update.pending_meta_key] in
+        Lwt.return_some (List.map (fun member -> member.C.address) active.validators)
+      | Ok (C.Pending_set _) ->
+        let* () = backend.set_meta Validator_set_update.active_meta_key raw in
+        let* () = match update.eviction with
+          | None -> Lwt.return_unit
+          | Some _ -> Store_irmin.remove_path backend.store ["meta"; Validator_set_update.pending_meta_key] in
+        Lwt.return_some (List.map (fun item -> item.Validator_set_update.address) update.validators)
+
+let eviction_wait_key = "validator_eviction_wait"
+
+let write_eviction_wait ~backend ~current ~offenders ~weight =
+  let open Lwt.Syntax in
+  let value = `Assoc [
+    "source", `String (Octra_consensus.C_codec.encode_validator_set current |> Base64.encode_exn);
+    "offenders", `List (List.map (fun address -> `String address) offenders);
+    "weight", `String (Z.to_string weight)] |> Yojson.Safe.to_string in
+  let* stored = Store_irmin.get_meta backend.store eviction_wait_key in
+  let* () = if stored = Some value then Lwt.return_unit
+    else backend.set_meta eviction_wait_key value in
+  Store_irmin.remove_path backend.store ["meta"; Validator_set_update.pending_meta_key]
+
+let cancel_penalized_pending ~backend ~(env : env) =
+  let open Lwt.Syntax in
+  let* pending = Store_irmin.get_meta backend.store Validator_set_update.pending_meta_key in
+  match pending with
+  | None -> Lwt.return_false
+  | Some raw ->
+    let update = match Validator_set_update.of_string raw with
+      | Ok update -> update
+      | Error reason -> failwith ("pending validator set corrupt: " ^ reason) in
+    if update.activate_epoch <= Int64.of_int env.epoch_id then Lwt.return_false
+    else
+      let* offenders = validator_penalties ~read:(Store_irmin.get_meta backend.store) ~chain_id:env.chain_id ~epoch_id:env.epoch_id
+        (List.map (fun (member : Validator_set_update.validator_entry) -> member.address) update.validators) in
+      if offenders = [] then Lwt.return_false
+      else
+        let* () = Store_irmin.remove_path backend.store ["meta"; Validator_set_update.pending_meta_key] in
+        Lwt.return_true
+
+let schedule_validator_eviction ~backend ~(env : env) =
+  let open Lwt.Syntax in
+  if Rule_graph.seatless_at ~chain_id:env.chain_id ~epoch:env.epoch_id
+      <> Rule_graph.Active then Lwt.return_false
+  else
+    let* loaded = load_validator_registry backend in
+    let registry = match loaded with
+      | Ok registry -> registry
+      | Error reason -> failwith ("validator eviction registry corrupt: " ^ reason) in
+    let events = Validator_registry.slashes registry in
+    if events = [] then cancel_penalized_pending ~backend ~env
+    else
+      let* () = remember_validator_penalties ~backend ~env registry in
+      let current = match current_voting_set ~backend ~env with
+        | Ok set -> set
+        | Error reason -> failwith reason in
+      let offenders = match Validator_set_update.eviction_offenders
+        ~chain_id:env.chain_id ~epoch:env.epoch_id ~registry ~current with
+        | Ok offenders -> offenders
+        | Error reason -> failwith ("validator eviction source rejected: " ^ reason) in
+      if offenders <> [] then
+        match Octra_consensus.C_types.plan_eviction ~offenders current with
+        | Error reason -> failwith ("validator eviction source rejected: " ^ reason)
+        | Ok (Octra_consensus.C_types.Retain_set weight) ->
+          let* () = write_eviction_wait ~backend ~current ~offenders ~weight in
+          Octra_log.warn "validator"
+            "event = eviction_wait epoch = %d weight = %s total = %s"
+            env.epoch_id (Z.to_string weight) (Z.to_string current.total_weight);
+          Lwt.return_true
+        | Ok (Octra_consensus.C_types.Remove_set _) ->
+        let source_epoch = Int64.of_int env.epoch_id in
+        let update = match Validator_set_update.make_eviction ~source_epoch
+          ~activate_epoch:(Int64.succ source_epoch) ~offenders current with
+          | Ok (update, _) -> update
+          | Error reason -> failwith ("validator eviction rejected: " ^ reason) in
+        let () = match Validator_set_update.check_eviction_state
+          ~chain_id:env.chain_id ~epoch:env.epoch_id ~registry ~current update with
+          | Ok _ -> ()
+          | Error reason -> failwith ("validator eviction state rejected: " ^ reason) in
+        let* () = backend.set_meta Validator_set_update.pending_meta_key
+          (Validator_set_update.to_string update) in
+        let* () = Store_irmin.remove_path backend.store ["meta"; eviction_wait_key] in
+        Lwt.return_true
+      else
+        let* () = Store_irmin.remove_path backend.store ["meta"; eviction_wait_key] in
+        cancel_penalized_pending ~backend ~env
 
 let advance_validator_set ~backend ~env =
   let open Lwt.Syntax in
@@ -3776,7 +4258,9 @@ let advance_validator_set ~backend ~env =
     | _ -> Lwt.return_unit in
   let* () = apply_set_fold ~backend ~env in
   let* active = promote_active_validator_set ~backend ~env in
-  schedule_validator_snapshot ?active ~backend ~env ()
+  let* evicted = schedule_validator_eviction ~backend ~env in
+  if evicted then Lwt.return_unit
+  else schedule_validator_snapshot ?active ~backend ~env ()
 
 let register_confirmed_sender_key ~backend ~env (tx : Transaction.t) =
   let stored =
@@ -3795,10 +4279,20 @@ let register_confirmed_sender_key ~backend ~env (tx : Transaction.t) =
   | Sender_key_policy.Register key ->
     backend.ops.register_public_key tx.from key
 
-let run_core ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
+let run_core_with ~checkpoint ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
     ~(process_tx : backend:backend -> env:env -> Transaction.t ->
         (tx_effect, string * string) Stdlib.result Lwt.t) =
   let open Lwt.Syntax in
+  let backend = capture_execution ~backend ~env in
+  let* checked = check_execution_parent ~backend ~env in
+  let checked = Result.bind checked (fun () ->
+    match backend.voting_set with
+    | Some _ when Rule_graph.seatless_at ~chain_id:env.chain_id ~epoch:env.epoch_id
+        = Rule_graph.Active -> current_voting_set ~backend ~env |> Result.map (fun _ -> ())
+    | _ -> Ok ()) in
+  match checked with
+  | Error error -> Lwt.return_error error
+  | Ok () ->
   match Tx_envelope.check_epoch ~chain_id:env.chain_id
     ~epoch:(Int64.of_int env.epoch_id) txs with
   | Error error -> Lwt.return (Error ("transaction envelope: " ^ error))
@@ -3819,13 +4313,21 @@ let run_core ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
       (fun () ->
       let ctx = fold_at backend env.epoch_id in
       let* () = backend.begin_batch ctx.account_mode in
+      let* () = prepare_validator_penalties ~backend ~env in
       let confirmed = ref [] in
       let rejected = ref [] in
       let confirmed_fees = ref Z.zero in
       let pos = ref 0 in
-      let* () = Lwt_list.iter_s (fun tx ->
-        let* result =
+      let module Senders = Set.Make (String) in
+      let rec execute skipped = function
+      | [] -> Lwt.return_unit
+      | tx :: rest when Senders.mem tx.Transaction.from skipped -> execute skipped rest
+      | tx :: rest when not (Exec_resource.next ~hash:(Transaction.hash tx) ()) ->
+        execute (Senders.add tx.Transaction.from skipped) rest
+      | tx :: rest ->
+        let* result = Lwt.catch (fun () -> Lwt.map Option.some (
           Tx_savepoint.run
+            ?checkpoint
             ~ledger:backend.ledger
             ~store:backend.store
             (fun () ->
@@ -3837,24 +4339,34 @@ let run_core ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
                 | Ok (Rejected_after_fee _)
                 | Error _ -> ()
               end;
-              Lwt.return result)
+              Lwt.return result))) (function
+          | Exec_resource.Exhausted (hash, resource) as error ->
+            if hash = Transaction.hash tx && Exec_resource.defer hash resource
+            then Lwt.return_none else Lwt.fail error
+          | Exec_resource.Window_expired hash as error ->
+            if hash = Transaction.hash tx && Exec_resource.omit hash
+            then Lwt.return_none else Lwt.fail error
+          | error -> Lwt.fail error)
         in
+        begin match result with
+        | None -> execute (Senders.add tx.Transaction.from skipped) rest
+        | Some result ->
         (match result with
          | Ok (Confirmed fee) ->
            confirmed := (tx, !pos) :: !confirmed;
            confirmed_fees := Z.add !confirmed_fees fee
          | Ok (Rejected_after_fee { fee; error_type; reason }) ->
-           let charged = ctx.vm_bytes = Rule_graph.Active
-             && (match tx.op_type with
-               | Transaction.ComputeFund | ComputeReturn | ComputeSettle -> true
-               | _ -> false) in
+           let charged = Tx_envelope.charged_operation ~compute:ctx.vm_bytes
+             ~program:(Rule_graph.program_result_at ~chain_id:env.chain_id ~epoch:env.epoch_id)
+             ~error_type tx.op_type in
            rejected := { tx; error_type; reason; charged } :: !rejected;
            confirmed_fees := Z.add !confirmed_fees fee
          | Error (etype, reason) ->
            rejected := { tx; error_type = etype; reason; charged = false } :: !rejected);
         incr pos;
-        Lwt.return_unit
-      ) ordered_txs in
+        execute skipped rest
+        end in
+      let* () = execute Senders.empty ordered_txs in
       let* () = advance_validator_set ~backend ~env in
       let* emission_remaining_opt = Store_irmin.get_meta backend.store "emission_remaining" in
       let emission_remaining =
@@ -3929,6 +4441,15 @@ let run_core ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
         with
         | Ok plan -> plan
         | Error error -> failwith error in
+      let* registry = match Rule_graph.seatless_at ~chain_id:env.chain_id ~epoch:env.epoch_id with
+        | Rule_graph.Prior -> Lwt.return_none
+        | Rule_graph.Active -> Store_irmin.get_meta backend.store Validator_registry.meta_key in
+      let* penalized = validator_penalties ~read:(Store_irmin.get_meta backend.store) ~chain_id:env.chain_id ~epoch_id:env.epoch_id
+        (reward_addresses reward) in
+      let plan = match prepare_reward_plan ~penalized ~chain_id:env.chain_id ~epoch_id:env.epoch_id
+        ~registry ~reward plan with
+        | Ok plan -> plan
+        | Error error -> failwith error in
       let* () =
         apply_epoch_footer_with_reward
           ~reward
@@ -3951,14 +4472,14 @@ let run_core ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
           Lwt.return_unit
       in
       let* () =
-        if Option.is_none prev_supply_opt then
+        if Option.is_none prev_supply_opt || Z.gt plan.reward_burned Z.zero then
           backend.set_meta "total_supply" (Z.to_string plan.new_total_supply)
         else
           Lwt.return_unit
       in
       let* () =
-        if schedule_binding.Emission_schedule.active
-           && Option.is_none supply_retired then
+        if (schedule_binding.Emission_schedule.active && Option.is_none supply_retired)
+           || Z.gt plan.reward_burned Z.zero then
           backend.set_meta
             Emission_schedule.retired_key
             (Z.to_string plan.new_supply_retired)
@@ -3966,10 +4487,10 @@ let run_core ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
           Lwt.return_unit
       in
       let* () = backend.flush_dirty () in
-      if List.length txs > 0 then
+      if !pos > 0 then
         Octra_log.info "epoch"
           "event = apply_summary epoch = %d txs = %d confirmed = %d rejected = %d fees = %s fee_burn = %s base_reward = %s"
-          env.epoch_id (List.length txs) (List.length !confirmed) (List.length !rejected)
+          env.epoch_id !pos (List.length !confirmed) (List.length !rejected)
           (Z.to_string !confirmed_fees) (Z.to_string plan.fees_burned)
           (Z.to_string plan.base_reward);
       let* batch_h = Store_irmin.get_batch_tree_hash backend.store in
@@ -3989,7 +4510,7 @@ let run_core ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
           confirmed = List.rev !confirmed;
           rejected = List.rev !rejected;
           confirmed_fees = !confirmed_fees;
-          tx_count = List.length txs;
+          tx_count = !pos;
         }
       }))
       (fun exn ->
@@ -3997,8 +4518,11 @@ let run_core ~reward ~preverify ~backend ~env ~(txs : Transaction.t list)
         Store_irmin.abort_epoch_batch backend.store;
         ignore (Ledger.abort_journal backend.ledger);
         match exn with
-        | Exec_resource.Exhausted _ -> Lwt.fail exn
+        | Exec_resource.Exhausted _ | Exec_resource.Window_expired _ -> Lwt.fail exn
         | _ -> Lwt.return (Error (Printexc.to_string exn)))
+
+let run_core ~reward ~preverify ~backend ~env ~txs ~process_tx =
+  run_core_with ~checkpoint:None ~reward ~preverify ~backend ~env ~txs ~process_tx
 
 let confirmed_process process_tx ~backend ~env tx =
   let open Lwt.Syntax in

@@ -308,7 +308,7 @@ def recover_state(config, values, replace_state, plan, min_epoch):
         raise ValidatorError("state sync client hash mismatch")
     stage = Path(values["OCTRA_OPERATOR_SYNC_STAGE"])
     sources = state_sync_sources(values["OCTRA_STATE_SYNC_SOURCES"])
-    issue = sync_issue(tip, floor)
+    issue = sync_issue(tip, floor) if tip is not None and tip["head"] is not None else None
     if issue is not None:
         raise ValidatorError(issue)
     preserved = free_state_path(data_path, "prior", head["epoch"]) if ready else None

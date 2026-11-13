@@ -159,6 +159,12 @@ let pull_code : Contract_vm.instr array =
     MLOAD (10, 1001);
     MLOAD (11, 1002);
     MLOAD (12, 1003);
+    LDI (31, VInt Z.zero);
+    ADD (32, 31, 12);
+    LT (32, 32, 31);
+    LDI (33, VBool true);
+    NEQ (32, 32, 33);
+    ASSERT 32;
     LDI (13, VString "grants:");
     CONCAT (14, 13, 10);
     LDI (15, VString ":");
@@ -200,12 +206,18 @@ let mint_code : Contract_vm.instr array =
   let open Contract_vm in
   [|
     JDEST 600;
+    MLOAD (13, 1001);
+    MLOAD (14, 1002);
     CALLER 10;
     SLOAD (11, "owner");
     EQ (12, 10, 11);
     ASSERT 12;
-    MLOAD (13, 1001);
-    MLOAD (14, 1002);
+    LDI (31, VInt Z.zero);
+    ADD (32, 31, 14);
+    LT (32, 32, 31);
+    LDI (33, VBool true);
+    NEQ (32, 32, 33);
+    ASSERT 32;
     SLOAD (15, "total_supply");
     LDI (16, VInt Z.zero);
     ADD (16, 16, 15);
@@ -228,6 +240,12 @@ let burn_code : Contract_vm.instr array =
   [|
     JDEST 700;
     MLOAD (10, 1001);
+    LDI (31, VInt Z.zero);
+    ADD (32, 31, 10);
+    LT (32, 32, 31);
+    LDI (33, VBool true);
+    NEQ (32, 32, 33);
+    ASSERT 32;
     LDI (11, VString "balances:");
     CALLER 12;
     CONCAT (13, 11, 12);

@@ -1201,11 +1201,15 @@ let test_directory () =
   Test_workspace.with_dir "compute_directory" (fun path ->
     let store = Filename.concat path "compute_history" in
     Unix.symlink path store;
-    let refused = try let db = open_db path in History.close db; false with _ -> true in
+    let refused = try let db = open_db path in History.close db; false with
+      | Invalid_argument reason -> reason = "compute history directory permissions" in
     expect "symlink refused" refused;
     Unix.unlink store;
     Unix.mkdir store 0o755;
-    let refused = try let db = open_db path in History.close db; false with _ -> true in
+    Unix.chmod store 0o755;
+    expect "directory permissions differ" ((Unix.lstat store).Unix.st_perm land 0o777 = 0o755);
+    let refused = try let db = open_db path in History.close db; false with
+      | Invalid_argument reason -> reason = "compute history directory permissions" in
     expect "shared directory refused" refused)
 
 let test_cancel_expiry () =

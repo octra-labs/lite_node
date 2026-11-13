@@ -912,7 +912,7 @@ let payload_limits = Tx_view.{
 
 let test_payload_check () =
   expect_payload_ok "standard payload"
-    (Tx_view.payload_check ~limits:payload_limits (sample_tx Transaction.Standard));
+    (Lwt_main.run (Tx_view.payload_check ~limits:payload_limits (sample_tx Transaction.Standard)));
   let message_too_large =
     { (sample_tx Transaction.Standard) with
       Transaction.message = Some "12345";
@@ -920,15 +920,15 @@ let test_payload_check () =
   in
   expect_payload_error "message too large"
     ("malformed_transaction", "encrypted_data or message exceeds size limit")
-    (Tx_view.payload_check ~limits:payload_limits message_too_large);
+    (Lwt_main.run (Tx_view.payload_check ~limits:payload_limits message_too_large));
   expect_payload_error "encrypted data too large"
     ("malformed_transaction", "encrypted_data or message exceeds size limit")
-    (Tx_view.payload_check
+    (Lwt_main.run (Tx_view.payload_check
        ~limits:payload_limits
-       (sample_tx ~encrypted_data:"123456" Transaction.Standard));
+       (sample_tx ~encrypted_data:"123456" Transaction.Standard)));
   expect_payload_error "encrypt missing payload"
     ("malformed_transaction", "malformed or oversized encrypted_data")
-    (Tx_view.payload_check ~limits:payload_limits (sample_tx Transaction.EncryptOp));
+    (Lwt_main.run (Tx_view.payload_check ~limits:payload_limits (sample_tx Transaction.EncryptOp)));
   let malicious =
     { (sample_tx Transaction.ProgramExec) with
       Transaction.message = Some "[\"<script>alert(1)</script>\"]";
@@ -936,7 +936,172 @@ let test_payload_check () =
   in
   expect_payload_error "program params html"
     ("malformed_transaction", "contract call params contain invalid characters")
-    (Tx_view.payload_check ~limits:payload_limits malicious)
+    (Lwt_main.run (Tx_view.payload_check ~limits:payload_limits malicious))
+
+let test_payload_queue () =
+  let module Memory = Octra_core.Compute_memory in
+  let module Pool = Octra_core.Proof_pool in
+  let limits = Tx_view.payload_limits in
+  let malformed = Error ("malformed_transaction", "malformed or oversized encrypted_data") in
+  let busy = Error ("pre_verify_busy", "payload parse queue is full") in
+  let values = List.map (sample_tx ~encrypted_data:"{}")
+    Transaction.[EncryptOp; DecryptOp; StealthOp; ClaimOp; KeySwitch] in
+  let check tx = Tx_view.payload_check ~limits tx in
+  let initial = Memory.stats Memory.shared in
+  let quota = Memory.limit_of_getenv Sys.getenv_opt / 4 in
+  let ticket = Memory.reserve Memory.shared ~speculative:true quota |> Option.get in
+  Fun.protect ~finally:(fun () -> Memory.release ticket) (fun () ->
+    List.iter (fun tx ->
+      if Lwt_main.run (check tx) <> busy then fail "payload bypassed memory reservation") values;
+    if Lwt_main.run (check (sample_tx Transaction.EncryptOp)) <> malformed then
+      fail "missing payload classification changed";
+    expect_payload_error "wire limit before queue"
+      ("malformed_transaction", "encrypted_data or message exceeds size limit")
+      (Lwt_main.run (Tx_view.payload_check ~limits:payload_limits
+        (sample_tx ~encrypted_data:"123456" Transaction.KeySwitch))));
+  let large = sample_tx ~encrypted_data:(String.make 1_000_000 'x') Transaction.KeySwitch in
+  if Option.get (Tx_view.payload_parse_bytes large) < 3 * 32 * 1024 * 1024 then
+    fail "parse reservation omitted decompression space";
+  let mutex = Mutex.create () and condition = Condition.create () in
+  let released = ref false in
+  let block () =
+    Mutex.lock mutex;
+    while not !released do Condition.wait condition mutex done;
+    Mutex.unlock mutex in
+  let blockers = List.init Pool.capacity (fun _ ->
+    Pool.try_run ~priority:Pool.Required ~bytes:0 block) in
+  Lwt_main.run (Lwt.finalize (fun () ->
+    let open Lwt.Syntax in
+    let pending = List.init Octra_core.Resource_lanes.preverify_speculative_queue_limit
+      (fun _ -> Pool.try_run ~priority:Pool.Speculative ~bytes:0 (fun () -> ())) in
+    let* () = Lwt_list.iter_s (fun tx ->
+      let* result = check tx in
+      if result <> busy then fail "payload bypassed speculative capacity";
+      Lwt.return_unit) values in
+    List.iter Lwt.cancel pending;
+    let before = Memory.stats Memory.shared in
+    let tx = List.hd values in
+    let completed = ref false in
+    let job = Lwt.map (fun _ -> completed := true) (check tx) in
+    if not (Lwt.is_sleeping job) then fail "payload did not wait for worker";
+    let reserved = (Memory.stats Memory.shared).bytes - before.bytes in
+    if reserved <> Option.get (Tx_view.payload_parse_bytes tx) then
+      fail "queued payload reservation differs";
+    Lwt.cancel job;
+    if Lwt.state job <> Lwt.Fail Lwt.Canceled then fail "payload cancellation swallowed";
+    if !completed || Memory.stats Memory.shared <> before then
+      fail "cancelled payload retained work or bytes";
+    Lwt.return_unit)
+    (fun () ->
+      Mutex.lock mutex;
+      released := true;
+      Condition.broadcast condition;
+      Mutex.unlock mutex;
+      Lwt_list.iter_s (fun job -> Lwt.map (fun _ -> ()) job) blockers));
+  List.iter (fun tx ->
+    if Lwt_main.run (check tx) <> malformed then fail "malformed payload outcome changed") values;
+  if Memory.stats Memory.shared <> initial then fail "payload queue leaked reservation"
+
+let test_payload_progress () =
+  let module Memory = Octra_core.Compute_memory in
+  let module Registry = Octra_core.Pvac_registry in
+  let raw, image_bytes =
+    let key, _ = Pvac_ffi.keygen_from_seed (Pvac_ffi.default_params ()) (Bytes.make 32 '\047') in
+    let raw = Pvac_ffi.serialize_pubkey key |> Bytes.to_string in
+    raw, Pvac_ffi.pubkey_image_size key in
+  if String.length raw < 1_000_000 || image_bytes < 8 * 1024 * 1024 then
+    fail "seeded key wire or vector size is too small";
+  let durations = List.init 3 (fun _ ->
+    Gc.full_major ();
+    let started = Unix.gettimeofday () in
+    let key = match Registry.load_pubkey raw with
+      | Ok key -> key
+      | Error reason -> fail ("seeded key parse refused: " ^ reason) in
+    let elapsed = Unix.gettimeofday () -. started in
+    if Pvac_ffi.pubkey_image_size key <> image_bytes then fail "seeded key image changed";
+    elapsed) in
+  let native_seconds = List.fold_left min infinity durations in
+  if not (Float.is_finite native_seconds) || native_seconds < 0.008 then
+    fail (Printf.sprintf "native parse window too short for heartbeat demonstration: %.3fms"
+      (native_seconds *. 1000.));
+  let body = Yojson.Safe.to_string (`Assoc [
+    "new_pubkey", `String (Base64.encode_exn raw);
+    "aes_kat", `String (Registry.expected_kat ());
+  ]) in
+  let tx = sample_tx ~amount:Z.zero ~encrypted_data:body Transaction.KeySwitch in
+  expect_payload_ok "seeded key wire size"
+    (Tx_view.payload_size_check ~limits:Tx_view.payload_limits tx);
+  let bytes = Option.get (Tx_view.payload_parse_bytes tx) in
+  let idle = Memory.stats Memory.shared in
+  if idle.jobs <> 0 then fail "native parse test requires an idle compute pool";
+  let charged () =
+    let usage = Memory.stats Memory.shared in
+    usage.jobs = idle.jobs + 1 && usage.bytes = idle.bytes + bytes
+    && usage.speculative = idle.speculative + bytes in
+  let rec settle deadline =
+    let open Lwt.Syntax in
+    if Memory.stats Memory.shared = idle then Lwt.return_unit
+    else if Unix.gettimeofday () >= deadline then
+      Lwt.fail_with "native parse completion did not release reservation"
+    else let* () = Lwt_unix.sleep 0.001 in settle deadline in
+  Printf.printf "event = payload_parse_key wire = %d image = %d reserved = %d native_ms = %.3f\n%!"
+    (String.length body) image_bytes bytes (native_seconds *. 1000.);
+  List.iter (fun cancel ->
+    Gc.full_major ();
+    Lwt_main.run (let open Lwt.Syntax in
+      let pulses = ref 0 and completed = ref false in
+      let started = Unix.gettimeofday () in
+      let previous = ref started and max_gap = ref 0. in
+      let tick () =
+        let now = Unix.gettimeofday () in
+        max_gap := max !max_gap (now -. !previous);
+        previous := now in
+      let rec heartbeat () =
+        let* () = Lwt_unix.sleep 0.001 in
+        tick ();
+        if charged () then incr pulses;
+        heartbeat () in
+      let timer = heartbeat () in
+      let active = ref None in
+      Lwt.finalize (fun () -> Lwt_unix.with_timeout 20. (fun () ->
+        let work = Tx_view.payload_check ~limits:Tx_view.payload_limits tx in
+        active := Some work;
+        let launch_seconds = Unix.gettimeofday () -. started in
+        tick ();
+        Lwt.on_success work (fun _ -> completed := true);
+        if launch_seconds >= native_seconds *. 0.75 then
+          fail (Printf.sprintf "native payload parse blocked before returning its promise: %.3fms native = %.3fms"
+            (launch_seconds *. 1000.) (native_seconds *. 1000.));
+        let* () = if cancel then begin
+          let* () = Lwt_unix.sleep (native_seconds /. 4.) in
+          if not (Lwt.is_sleeping work && charged ()) || !pulses < 2 then
+            fail "running native cancellation had no charged heartbeat window";
+          let held = Memory.stats Memory.shared in
+          Lwt.cancel work;
+          if Lwt.state work <> Lwt.Fail Lwt.Canceled then fail "running native parse swallowed cancellation";
+          if Memory.stats Memory.shared <> held then fail "running native cancellation released bytes early";
+          let* () = settle (Unix.gettimeofday () +. 20.) in
+          let* () = Lwt.pause () in
+          if !completed then fail "cancelled native parse resumed its consumer";
+          Lwt.return_unit
+        end else begin
+          let* result = work in
+          expect_payload_ok "valid native queued parse" result;
+          Lwt.return_unit
+        end in
+        tick ();
+        let elapsed = Unix.gettimeofday () -. started in
+        Printf.printf "event = payload_parse_progress cancel = %b pulses = %d launch_ms = %.3f max_gap_ms = %.3f elapsed_ms = %.3f\n%!"
+          cancel !pulses (launch_seconds *. 1000.) (!max_gap *. 1000.) (elapsed *. 1000.);
+        if !pulses < 2 then fail "valid native parse did not interleave charged heartbeats";
+        if !max_gap >= native_seconds *. 0.75 then fail "native payload parse blocked the heartbeat";
+        if Memory.stats Memory.shared <> idle then fail "completed native parse retained bytes";
+        Lwt.return_unit))
+        (fun () ->
+          Lwt.cancel timer;
+          Option.iter Lwt.cancel !active;
+          settle (Unix.gettimeofday () +. 20.))))
+    [false; false; false; true; true]
 
 let test_deep_message () =
   let deep = String.make 250_000 '[' ^ "0" ^ String.make 250_000 ']' in
@@ -945,8 +1110,8 @@ let test_deep_message () =
     if not (Tx_view.call_params_ok tx) then fail "deep message refused";
     if op <> Transaction.ProgramDeploy then
       expect_payload_ok "deep message"
-        (Tx_view.payload_check ~limits:{ payload_limits with
-          message_program_len = 10_000_000 } tx))
+        (Lwt_main.run (Tx_view.payload_check ~limits:{ payload_limits with
+          message_program_len = 10_000_000 } tx)))
     [Transaction.ContractCall; Transaction.ProgramExec; Transaction.MultiExec;
      Transaction.ContractDeploy; Transaction.ProgramDeploy; Transaction.CircleCall]
 
@@ -1000,6 +1165,26 @@ let test_bft_op_check () =
     (Tx_view.bft_op_check
        ~bft_mode:false
        (sample_tx Transaction.StealthOp))
+
+let test_devnet_profile () =
+  if Sys.getenv_opt "OCTRA_BFT_RELEASE_PROFILE" <> Some "devnet_full_v1" then
+    fail "devnet profile not selected";
+  List.iter (fun (op_type, accepted) ->
+    let tx = sample_tx op_type in
+    let name = "devnet " ^ Transaction.op_type_to_string op_type in
+    let expected = if accepted then Ok () else
+      Error ("unsupported_operation", Transaction.bft_reject_reason op_type) in
+    if Tx_view.bft_op_check ~bft_mode:true tx <> expected then
+      fail (name ^ " operation check differs");
+    if Tx_view.pre_route_check ~now:12.5 ~max_timestamp_drift:1.0
+        ~observer_rpc_mode:false ~bft_mode:true tx <> expected then
+      fail (name ^ " pre route check differs")) [
+    Transaction.Standard, true;
+    Transaction.EncryptOp, true;
+    Transaction.StealthOp, true;
+    Transaction.ComputeFund, true;
+    Transaction.PrivateOp, false;
+  ]
 
 let test_signature_check () =
   let signed_tx, pub_b64 = signed_sample_tx () in
@@ -1157,13 +1342,13 @@ let test_stealth_delta_layer_limit () =
   end;
   expect_payload_error "layered stealth admission"
     ("malformed_transaction", "malformed or oversized encrypted_data")
-    (Tx_view.payload_check ~limits:Tx_view.payload_limits layered_tx);
+    (Lwt_main.run (Tx_view.payload_check ~limits:Tx_view.payload_limits layered_tx));
   expect_payload_ok "wrapped scalar stealth admission"
-    (Tx_view.payload_check
+    (Lwt_main.run (Tx_view.payload_check
        ~limits:Tx_view.payload_limits
        (sample_tx
           ~encrypted_data:(stealth_payload_with_cipher scalar)
-          Transaction.StealthOp))
+          Transaction.StealthOp)))
 
 let test_preverify_stealth_payload () =
   begin
@@ -1234,12 +1419,13 @@ let test_preverify_saturation () =
     List.init occupied (fun _ ->
       Octra_core.Proof_pool.try_run
         ~priority:Octra_core.Compute_pool.Speculative
+        ~bytes:0
         block)
   in
   let completed, resolve_completed = Lwt.task () in
   let compute () =
     let open Lwt.Syntax in
-    let* value = Tx_view.run_preverify_compute (fun () -> 42) in
+    let* value = Tx_view.run_preverify_compute ~bytes:0 (fun () -> 42) in
     match value with
     | Error reason -> Lwt.return (Preverify_submit.Unavailable reason)
     | Ok value ->
@@ -1500,15 +1686,9 @@ let test_post_signature_check () =
        (sample_tx ~nonce:10 Transaction.Standard))
 
 let submit_signature_ok ?account_public_key tx =
-  Tx_view.submit_signature_check ~signing:Octra_core.Tx_signature.Historical
+  Lwt_main.run (Tx_view.submit_signature_check ~signing:Octra_core.Tx_signature.Historical
     ~account_public_key
-    ~preverify_has_capacity:true
-    ~preverify_pending:0
-    ~preverify_pending_max:2
-    ~bft_mode:false
-    ~confirmed_nonce:7
-    ~bft_window:32
-    tx
+    tx)
 
 let test_submit_signature_check () =
   let signed_tx, pub_b64 = signed_sample_tx () in
@@ -1546,7 +1726,7 @@ let test_runtime_profiles () =
     if selected <> Some (Octra_node_runtime.Text.raw_to_hex hash) then fail "runtime schedule differs")
     [1_614_499; 1_614_500; 1_654_002; 1_662_999; 1_663_000; 1_688_733; 1_688_734]
 
-let () =
+let test_default () =
   test_runtime_profiles ();
   test_circle_tx_code ();
   test_public_calls ();
@@ -1568,6 +1748,8 @@ let () =
   test_encrypted_payload_check ();
   test_call_params_check ();
   test_payload_check ();
+  test_payload_queue ();
+  test_payload_progress ();
   test_deep_message ();
   test_pre_route_check ();
   test_bft_op_check ();
@@ -1583,3 +1765,11 @@ let () =
   test_post_signature_check ();
   test_submit_signature_check ();
   print_endline "status = pass test = tx_view"
+
+let () =
+  match Array.to_list Sys.argv with
+  | [_] -> test_default ()
+  | [_; "--devnet-profile"] ->
+    test_devnet_profile ();
+    print_endline "status = pass test = tx_view_devnet"
+  | _ -> fail "unknown test mode"

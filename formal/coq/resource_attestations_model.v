@@ -1604,6 +1604,50 @@ Print Assumptions reservation_kept.
 Print Assumptions flood_preserves_slot.
 End Slots.
 
+Theorem storage_index_range (prefix count : Z) :
+  (0 < count)%Z -> (0 <= Z.abs (Z.rem prefix count) < count)%Z.
+Proof.
+  intros positive. split; [apply Z.abs_nonneg|].
+  pose proof (Z.rem_bound_abs prefix count ltac:(lia)) as limited.
+  rewrite (Z.abs_eq count) in limited by lia. exact limited.
+Qed.
+
+Theorem storage_remainder_safe (prefix count : Z) :
+  (0 < count <= 9223372036854775807)%Z ->
+  (-9223372036854775808 < Z.rem prefix count < 9223372036854775807)%Z /\
+  (0 <= Z.abs (Z.rem prefix count) < count)%Z.
+Proof.
+  intros [positive limit].
+  pose proof (storage_index_range prefix count positive) as range.
+  split; [|exact range].
+  destruct (Z_le_gt_dec 0 (Z.rem prefix count)) as [nonnegative|negative].
+  - rewrite (Z.abs_eq (Z.rem prefix count)) in range by lia. lia.
+  - rewrite (Z.abs_neq (Z.rem prefix count)) in range by lia. lia.
+Qed.
+
+Theorem storage_index_compat (prefix count : Z) :
+  (-9223372036854775808 <= prefix <= 9223372036854775807)%Z ->
+  prefix <> (-9223372036854775808)%Z -> (0 < count)%Z ->
+  (0 <= Z.abs prefix <= 9223372036854775807)%Z /\
+  Z.abs (Z.rem prefix count) = Z.rem (Z.abs prefix) count.
+Proof.
+  intros span ordinary positive. split.
+  - destruct (Z_le_gt_dec 0 prefix) as [nonnegative|negative].
+    + rewrite Z.abs_eq by lia. lia.
+    + rewrite Z.abs_neq by lia. lia.
+  - symmetry. apply Z.rem_abs_l. lia.
+Qed.
+
+Example storage_index_minimum :
+  Z.rem (-9223372036854775808)%Z 3 = (-2)%Z /\
+  Z.abs (Z.rem (-9223372036854775808)%Z 3) = 2%Z.
+Proof. vm_compute. split; reflexivity. Qed.
+
+Print Assumptions storage_index_range.
+Print Assumptions storage_remainder_safe.
+Print Assumptions storage_index_compat.
+Print Assumptions storage_index_minimum.
+
 Fixpoint path_ok (index : nat) (sides : list bool) : bool :=
   match sides with
   | [] => Nat.eqb index 0

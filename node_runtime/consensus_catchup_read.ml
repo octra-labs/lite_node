@@ -133,6 +133,7 @@ let build_record deps ~epoch_id ~target_int ~finality elog tx_hashes txs_json pa
           None
         | Ok partition ->
           match Octra_core.Preverify_receipt_policy.check
+            ~rejections:partition.rejections
             ~epoch_id:target_int
             ~receipts:partition.preverify
             parsed_txs with

@@ -3,6 +3,7 @@
 
 module P = Private_ledger
 module T = Transaction
+module Senders = Set.Make (String)
 
 let consensus_id = "private_receipt:verify_apply:retry_tx:amount_link_v1"
 
@@ -14,6 +15,12 @@ type limits = {
 type verification =
   | Verify_proof of string option
   | Apply_receipt of string
+
+type usage = {
+  fhe : int;
+  stealth : int;
+  debits : Senders.t;
+}
 
 type t = {
   ledger : Ledger.t;
@@ -33,9 +40,7 @@ type t = {
     address:string ->
     cipher:string ->
     Pvac_legacy_public_replay.decision;
-  mutable fhe : int;
-  mutable stealth : int;
-  debits : (string, unit) Hashtbl.t;
+  mutable used : usage;
 }
 
 let create
@@ -66,10 +71,12 @@ let create
     limits;
     preverify;
     legacy_replay;
-    fhe = 0;
-    stealth = 0;
-    debits = Hashtbl.create 32;
+    used = {fhe = 0; stealth = 0; debits = Senders.empty};
   }
+
+let checkpoint t =
+  let used = t.used in
+  fun () -> t.used <- used
 
 let failure t e =
   match t.proof_mode with
@@ -101,18 +108,19 @@ let key_ready t addr =
       ("pvac_key_unbound", "pvac public key is not bound to consensus state")
 
 let debit_open t addr =
-  if Hashtbl.mem t.debits addr then
+  if Senders.mem addr t.used.debits then
     Error
       ("encrypted_op_limit",
        "only one encrypted debit operation per sender per epoch")
   else
     Ok ()
 
-let mark_fhe t =
-  t.fhe <- t.fhe + 1
-
-let mark_debit t addr =
-  Hashtbl.replace t.debits addr ()
+let mark ?debit ?(stealth = false) t =
+  let used = t.used in
+  let debits = Option.fold ~none:used.debits
+    ~some:(fun address -> Senders.add address used.debits) debit in
+  t.used <- {fhe = used.fhe + 1;
+    stealth = used.stealth + (if stealth then 1 else 0); debits}
 
 let verification t tx =
   match t.preverify with
@@ -225,7 +233,7 @@ let verified_private t tx ~project ~pack verify =
 
 let encrypt t tx =
   let open Lwt.Syntax in
-  match self tx, cap "fhe_epoch_cap" t.fhe t.limits.max_fhe with
+  match self tx, cap "fhe_epoch_cap" t.used.fhe t.limits.max_fhe with
   | Error e, _
   | _, Error e -> Lwt.return_error e
   | Ok (), Ok () ->
@@ -272,7 +280,7 @@ let encrypt t tx =
           match applied with
           | Error e -> Lwt.return_error e
           | Ok _ ->
-            mark_fhe t;
+            mark t;
             Lwt.return_ok tx.T.ou
         end
     end
@@ -280,7 +288,7 @@ let encrypt t tx =
 let decrypt t tx =
   let open Lwt.Syntax in
   match self tx,
-        cap "fhe_epoch_cap" t.fhe t.limits.max_fhe,
+        cap "fhe_epoch_cap" t.used.fhe t.limits.max_fhe,
         debit_open t tx.T.from with
   | Error e, _, _
   | _, Error e, _
@@ -329,8 +337,7 @@ let decrypt t tx =
           match applied with
           | Error e -> Lwt.return_error e
           | Ok _ ->
-            mark_fhe t;
-            mark_debit t tx.T.from;
+            mark ~debit:tx.T.from t;
             Lwt.return_ok tx.T.ou
         end
     end
@@ -377,7 +384,7 @@ let key_switch t tx =
       ~field_policy:t.field_policy
       tx,
     self tx,
-    cap "fhe_epoch_cap" t.fhe t.limits.max_fhe
+    cap "fhe_epoch_cap" t.used.fhe t.limits.max_fhe
   with
   | Rule_graph.Prior, true, _, _ ->
     Lwt.return_error
@@ -439,7 +446,7 @@ let key_switch t tx =
       | P.Key_switch_rejected rejected ->
         Lwt.return (failure t rejected.failure)
       | P.Key_switch_applied _ ->
-        mark_fhe t;
+        mark t;
         Lwt.return_ok tx.T.ou
     end
 
@@ -522,8 +529,8 @@ let verified_stealth_plan t tx =
 
 let stealth t tx =
   let open Lwt.Syntax in
-  match cap "fhe_epoch_cap" t.fhe t.limits.max_fhe,
-        cap "stealth_epoch_cap" t.stealth t.limits.max_stealth,
+  match cap "fhe_epoch_cap" t.used.fhe t.limits.max_fhe,
+        cap "stealth_epoch_cap" t.used.stealth t.limits.max_stealth,
         debit_open t tx.T.from with
   | Error e, _, _
   | _, Error e, _
@@ -579,9 +586,7 @@ let stealth t tx =
                         Lwt.fail_with
                           ("stealth output commit failed: " ^ e)
                       | Ok _ ->
-                        mark_fhe t;
-                        t.stealth <- t.stealth + 1;
-                        mark_debit t tx.from;
+                        mark ~debit:tx.from ~stealth:true t;
                         Lwt.return_ok tx.ou
                     end
                 end
@@ -653,7 +658,7 @@ let verified_claim_plan t tx =
 
 let claim t tx =
   let open Lwt.Syntax in
-  match self tx, cap "fhe_epoch_cap" t.fhe t.limits.max_fhe with
+  match self tx, cap "fhe_epoch_cap" t.used.fhe t.limits.max_fhe with
   | Error e, _
   | _, Error e -> Lwt.return_error e
   | Ok (), Ok () ->
@@ -693,7 +698,7 @@ let claim t tx =
                         Lwt.fail_with
                           ("claim output commit failed: " ^ e)
                       | Ok () ->
-                        mark_fhe t;
+                        mark t;
                         Lwt.return_ok tx.ou
                     end
                 end

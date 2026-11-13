@@ -35,8 +35,38 @@ type deps = {
   warn : string -> unit;
 }
 
+let host_reason = function
+  | "hfhe verifier busy" -> "hfhe_verifier_busy"
+  | "proof worker queue is full" -> "proof_queue_full"
+  | "proof worker timed out" -> "proof_timeout"
+  | "proof worker memory limit exceeded" -> "proof_memory"
+  | "hfhe backend exception" -> "hfhe_exception"
+  | "compute memory busy" -> "compute_memory"
+  | "native input busy" -> "native_input"
+  | "circle session busy" -> "circle_session_busy"
+  | "circle session closed" -> "circle_session_closed"
+  | reason when String.starts_with ~prefix:"proof worker unavailable: " reason -> "proof_unavailable"
+  | reason when String.starts_with ~prefix:"proof worker failed: " reason -> "proof_failed"
+  | _ -> "native_other"
+
+let circle_work ~epoch ~tx action =
+  Lwt.catch action (function
+    | Octra_circle_runtime.Circle_exec.Execution_unavailable reason ->
+      Octra_log.warn "consensus"
+        "event = circle_host_unavailable epoch = %d hash = %s reason = %s reason_hash = %s"
+        epoch (Tx.hash tx) (host_reason reason)
+        Digestif.SHA256.(digest_string reason |> to_hex);
+      Lwt.fail (Core.Exec_resource.Unavailable Host)
+    | Core.Exec_resource.Unavailable resource as error ->
+      Octra_log.warn "consensus"
+        "event = circle_resource_unavailable epoch = %d hash = %s resource = %s"
+        epoch (Tx.hash tx) (Core.Exec_resource.name resource);
+      Lwt.fail error
+    | error -> Lwt.fail error)
+
 let node_backend
     ?compute
+    ?(voting_set = fun ~epoch:_ -> Ok None)
     ?(private_artifacts = fun _ -> [])
     ?(key_artifacts = fun _ -> [])
     ~program_trust
@@ -113,6 +143,13 @@ let node_backend
                         ~proposal_id
                         ?expected_prev_root
                         (fun backend ->
+                let voting_set = match voting_set ~epoch:epoch_id with
+                  | Ok set -> Option.map (fun set -> epoch_id, set) set
+                  | Error reason -> failwith reason in
+                let backend = { backend with Core.Epoch_exec.voting_set;
+                  execution_profile =
+                  (fun ~chain_id ~epoch ->
+                    Consensus_profile.execution_profile ~chain_id ~epoch Sys.getenv_opt) } in
                 let open Lwt.Syntax in
                 let* checked =
                   if not capture then Lwt.return_ok ()
@@ -161,6 +198,7 @@ let node_backend
                 let process_tx ~backend ~env
                     (tx : Octra_core.Transaction.t) =
                   Octra_core.Exec_resource.run ~hash:(Octra_core.Transaction.hash tx) (fun () ->
+                  Octra_core.Exec_resource.interrupt (fun () ->
                   if Octra_core.Transaction.bft_crypto_active ()
                     && Octra_core.Transaction.bft_crypto_op tx.op_type
                   then
@@ -177,14 +215,10 @@ let node_backend
                          result)
                   else
                     if capture && tx.op_type = Tx.CircleCall then
-                      let* result, binding = Lwt.catch
+                      let* result, binding = circle_work ~epoch:epoch_id ~tx
                         (fun () -> Consensus_vm_transition.capture_circle
                           ~circle_mode ~wasm_compute_mode ~program_trust ~object_cost
-                          ~backend ~env tx)
-                        (function
-                          | Octra_circle_runtime.Circle_exec.Execution_unavailable _ ->
-                            Lwt.fail (Core.Exec_resource.Unavailable Host)
-                          | error -> Lwt.fail error) in
+                          ~backend ~env tx) in
                       let receipt = match binding with
                         | None -> Error "circle receipt capture missing"
                         | Some binding ->
@@ -206,9 +240,11 @@ let node_backend
                       ~object_cost
                       ~backend
                       ~env
-                      tx)
+                      tx))
                 in
-                let* result = Octra_core.Epoch_exec.run_core
+                let* result = Octra_core.Epoch_exec.run_core_with
+                  ~checkpoint:(Some (fun () ->
+                    Core.Private_transition.checkpoint private_transition))
                   ~reward:(Some reward)
                   ~preverify:(if capture then None else Some preverify)
                   ~backend
@@ -220,6 +256,11 @@ let node_backend
                 | Ok execution ->
                   if not capture then Lwt.return_ok { execution; preverify }
                   else
+                    let artifacts = execution.Core.Epoch_exec.artifacts in
+                    let processed = List.map fst artifacts.confirmed
+                      @ List.map (fun row -> row.Core.Epoch_exec.tx) artifacts.rejected in
+                    let txs = List.filter (fun tx -> List.exists (fun item ->
+                      Tx.hash item = Tx.hash tx) processed) txs in
                     let receipts = preverify.Gate.receipts @ List.rev !captured in
                     let selected = List.filter_map (fun tx ->
                       List.find_opt (fun receipt ->

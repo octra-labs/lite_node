@@ -37,18 +37,50 @@ let legacy () =
     on_consensus = (fun () -> failwith "legacy reached consensus");
     on_resource_compute = (fun () -> failwith "legacy reached compute");
     tx = {guard = N.P2p_tx_gossip_guard.create (); has_tx = (fun _ -> false);
-      find_tx = (fun _ -> None); sender_pk = (fun _ -> None); add_tx = (fun _ -> Error "unused");
+      find_tx = (fun _ -> None); sender_pk = (fun _ -> None); find_account = (fun _ -> None);
+      add_tx = (fun _ -> Error "unused");
       send_payload = ignore; send_batch = ignore; broadcast_payload = ignore;
       report_bad_peer = (fun _ -> incr reports); close_peer = (fun () -> ());
       now = (fun () -> 0.); signing = (fun () -> Octra_core.Tx_signature.Historical); max_drift = 1.}} in
-  R.P2p_swarm_dispatch.handle_frame deps N.P2p_frame.{msg_type = msg_epoch_broadcast; payload = ""};
+  Lwt_main.run (R.P2p_swarm_dispatch.handle_frame deps N.P2p_frame.{msg_type = msg_epoch_broadcast; payload = ""});
   check (!reports = 1) "bad epoch header not reported"
+
+let read_names = [|"octra_programAbi"; "octra_contractAbi";
+    "circle_program_info"; "octra_circleProgramInfo";
+    "circle_program_info_auth"; "octra_circleProgramInfoAuth";
+    "contract_call"; "octra_programCall"; "circle_view"; "octra_circleView";
+    "circle_view_auth"; "octra_circleViewAuth"|]
+
+let batch_alias () =
+  let module Rpc = Octra_core.Rpc in
+  let meta = R.Rpc_http.{rpc_peer = "test"; rpc_user_agent = "test"; rpc_body_bytes = 0} in
+  Array.iter (fun name ->
+    let calls = ref 0 in
+    let handle params () = incr calls; Lwt.return_ok params in
+    let routes = [name, handle; "other", handle] in
+    let query method_ id = `Assoc ["jsonrpc", `String "2.0";
+      "method", `String method_; "params", `List [`Int id]; "id", `Int id] in
+    let body = `List (List.init 5 (query name) @ [`Null; query "other" 6])
+      |> Yojson.Safe.to_string in
+    let responses = run (R.Rpc_dispatch.process_body meta body () routes) in
+    check (!calls = 5) ("batch alias bypassed work limit: " ^ name);
+    let expected = List.init 4 (fun id -> Rpc.response_json (Rpc.Result (`List [`Int id], `Int id)))
+      @ [Rpc.response_json (Rpc.Error_ (Rpc.err 107 "program read batch limit is 4" None, `Int 4))] in
+    (match responses with
+    | `List values ->
+      check (List.filteri (fun index _ -> index < 5) values = expected)
+        ("batch alias changed responses: " ^ name);
+      check (List.length values = 7 && List.nth values 6 =
+        Rpc.response_json (Rpc.Result (`List [`Int 6], `Int 6))) "batch lost light request"
+    | _ -> failwith "batch response shape differs");
+    calls := 0;
+    let response = run (R.Rpc_dispatch.process_body meta (Yojson.Safe.to_string (query name 0)) () routes) in
+    check (!calls = 1 && response = Rpc.response_json (Rpc.Result (`List [`Int 0], `Int 0)))
+      "single read changed") read_names
 
 let batch () =
   let calls = ref 0 in
-  let names = [|"octra_programAbi"; "octra_contractAbi";
-    "circle_program_info"; "octra_circleProgramInfo";
-    "circle_program_info_auth"; "octra_circleProgramInfoAuth"|] in
+  let names = read_names in
   let routes = List.map (fun name -> name, (fun _ () -> incr calls; Lwt.return_ok `Null))
     ("other" :: Array.to_list names) in
   let body = `List (List.init 100 (fun i -> `Assoc ["jsonrpc", `String "2.0";
@@ -149,8 +181,12 @@ let circle () =
     Fun.protect ~finally:(fun () -> run (S.close store)) (fun () ->
       let circle_id = "read_circle" in
       let regs = List.init 255 (fun _ -> 0) in
-      let raw = V.Bytecode.encode
+      let large = V.Bytecode.encode
         (Array.init 5801 (fun n -> if n = 0 then V.Contract_vm.STOP else V.Contract_vm.EMIT ("e", regs))) in
+      check (Result.is_error (V.Contract.methods_checked ~source:false ~trusted:[] ~point_ops:true large))
+        "oversized descriptor accepted";
+      let raw = V.Bytecode.encode
+        (Array.init 1001 (fun n -> if n = 0 then V.Contract_vm.STOP else V.Contract_vm.EMIT ("e", regs))) in
       let info = C.{circle_id; runtime = Octb; version = 1L; owner = "owner";
         code_hash = sha256_hex raw; stable_root = zero_hash_hex; assets_root = zero_hash_hex;
         privacy_class = Public; browser_mode = Native_sealed; resource_mode = Public_resources;
@@ -188,4 +224,13 @@ let circle () =
         [Unix.Unix_error (Unix.EAGAIN, "Thread.create", ""), E.Host;
          Failure "Thread.create", E.Host; Out_of_memory, E.Memory; Stack_overflow, E.Stack]))
 
-let () = legacy (); broadcast (); batch (); abi (); circle (); print_endline "status = pass test = read_work"
+let () =
+  batch_alias ();
+  batch ();
+  if not (Array.exists (String.equal "--batch") Sys.argv) then begin
+    legacy ();
+    broadcast ();
+    abi ();
+    circle ()
+  end;
+  print_endline "status = pass test = read_work"

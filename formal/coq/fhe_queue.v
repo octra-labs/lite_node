@@ -355,3 +355,90 @@ Print Assumptions retry_count.
 Print Assumptions retry_source.
 Print Assumptions retry_faults.
 Print Assumptions retry_finite.
+
+Module Reserve.
+
+Inductive state := Available | Borrowed | Closing | Released.
+Inductive message := Borrow | Settle | Close.
+Inductive effect := Grant | Deny | Free.
+
+Definition step current input : state * list effect :=
+  match current, input with
+  | Available, Borrow => (Borrowed, [Grant])
+  | _, Borrow => (current, [Deny])
+  | Borrowed, Settle => (Available, [])
+  | Closing, Settle | Available, Close => (Released, [Free])
+  | Borrowed, Close => (Closing, [])
+  | _, _ => (current, [])
+  end.
+
+Fixpoint effects current inputs : list effect :=
+  match inputs with
+  | [] => []
+  | input :: rest =>
+    let '(next, output) := step current input in
+    output ++ effects next rest
+  end.
+
+Definition frees output := length (filter (fun item =>
+  match item with Free => true | _ => false end) output).
+
+Lemma released_free : forall inputs, frees (effects Released inputs) = 0.
+Proof.
+  induction inputs as [|input rest induction]; [reflexivity |].
+  destruct input; simpl; exact induction.
+Qed.
+
+Theorem free_once : forall inputs current, frees (effects current inputs) <= 1.
+Proof.
+  induction inputs as [|input rest induction]; intros current.
+  - change (0 <= 1). lia.
+  - destruct current, input; simpl; try apply induction;
+      unfold frees; simpl; change (S (frees (effects Released rest)) <= 1);
+      rewrite released_free; lia.
+Qed.
+
+Theorem grant_source : forall current input next,
+  step current input = (next, [Grant]) ->
+  current = Available /\ input = Borrow /\ next = Borrowed.
+Proof. intros [] [] next run; simpl in run; inversion run; auto. Qed.
+
+Theorem close_waits : forall inputs,
+  Forall (fun input => input <> Settle) inputs ->
+  frees (effects Borrowed inputs) = 0 /\ frees (effects Closing inputs) = 0.
+Proof.
+  induction inputs as [|input rest induction]; intros intact; [split; reflexivity |].
+  inversion intact as [|first suffix different remaining]; subst.
+  specialize (induction remaining). destruct induction as [borrowed closing].
+  destruct input; simpl; try (split; assumption); contradiction.
+Qed.
+
+Lemma released_closed : forall inputs, ~ In Grant (effects Released inputs).
+Proof.
+  induction inputs as [|input rest induction]; simpl; [tauto |].
+  destruct input; simpl in *; intuition discriminate.
+Qed.
+
+Lemma closing_closed : forall inputs, ~ In Grant (effects Closing inputs).
+Proof.
+  induction inputs as [|input rest induction]; simpl; [tauto |].
+  destruct input; simpl in *; try (intuition discriminate).
+  pose proof (released_closed rest). intuition discriminate.
+Qed.
+
+Theorem close_no_grant : forall current inputs,
+  ~ In Grant (effects (fst (step current Close)) inputs).
+Proof. intros [] inputs; simpl; apply closing_closed || apply released_closed. Qed.
+
+Theorem queue_room : forall total reserved ordinary borrowed,
+  reserved <= total -> ordinary <= total - reserved -> borrowed <= reserved ->
+  ordinary + borrowed <= total.
+Proof. intros. lia. Qed.
+
+Print Assumptions free_once.
+Print Assumptions grant_source.
+Print Assumptions close_waits.
+Print Assumptions close_no_grant.
+Print Assumptions queue_room.
+
+End Reserve.

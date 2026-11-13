@@ -99,6 +99,23 @@ let max_pubkey_bytes = 8 * 1024 * 1024
 
 let max_value_bytes = 16 * 1024 * 1024
 
+let rec input_bytes = function
+  | Math request | Proof_key request -> input_bytes request
+  | Ping -> 0
+  | Groth16 r -> Compute_memory.strings [r.key; r.proof; r.inputs]
+  | Encrypt r -> Compute_memory.add
+      (Compute_memory.strings [r.pubkey; r.cipher; r.proof; r.commitment; r.blinding])
+      (Z.size r.amount * (Sys.word_size / 8))
+  | Claim r -> Compute_memory.strings [r.pubkey; r.cipher; r.proof; r.commitment]
+  | Key_switch_claim r -> Compute_memory.strings [r.pubkey; r.cipher; r.proof; r.commitment]
+  | Stored_key_claim r -> Compute_memory.strings [r.pubkey; r.cipher; r.proof; r.commitment]
+  | Historical_migration_claim r -> Compute_memory.strings [r.pubkey; r.cipher; r.proof; r.commitment]
+  | Range r -> Compute_memory.strings [r.pubkey; r.cipher; r.proof]
+  | Zero r -> Compute_memory.strings [r.pubkey; r.cipher; r.proof]
+  | Range_bound r -> Compute_memory.strings [r.pubkey; r.cipher; r.proof; r.commitment]
+  | Circle_cell r -> Compute_memory.strings
+      [r.pubkey; r.cipher; r.ciphertext_commitment; r.proof; r.amount_commitment]
+
 let bind result f =
   match result with
   | Ok value -> f value
@@ -258,9 +275,15 @@ let request_json request =
 let request_bytes request =
   Yojson.Safe.to_string (request_json request)
 
+let hash_bytes raw =
+  let state = Digestif.SHA256.init () in
+  let state = Digestif.SHA256.feed_string state schema in
+  let state = Digestif.SHA256.feed_string state "\000" in
+  let state = Digestif.SHA256.feed_string state raw in
+  Digestif.SHA256.(to_hex (get state))
+
 let request_hash request =
-  Digestif.SHA256.digest_string (schema ^ "\000" ^ request_bytes request)
-  |> Digestif.SHA256.to_hex
+  hash_bytes (request_bytes request)
 
 let parse_amount fields =
   bind (string_field "amount" fields) (fun raw ->

@@ -717,7 +717,9 @@ let verify_roots certificate data_dir =
             end
       end
 
-let run_sync ?stage ?(verify_state = Verify.verify) certificate sources root =
+let run_sync ?stage ?execution_profile ?verify_state certificate sources root =
+  let verify_state = Option.value verify_state
+    ~default:(Verify.verify ?execution_profile) in
   let donor = match stage with
     | None -> None
     | Some stage ->
@@ -1067,7 +1069,7 @@ let sync_manifests ~max_bytes ~stage ~check ~sync manifests =
   in
   loop manifests
 
-let run () =
+let run ?execution_profile () =
   Arg.parse options (fun value -> fail ("unexpected argument: " ^ value)) usage;
   let stage = require "stage" !stage_dir in
   let _ = require "chain-id" !chain_id in
@@ -1126,12 +1128,12 @@ let run () =
       ~max_bytes:!max_bytes
       ~stage
       ~check:check_manifest_chunk
-      ~sync:(run_sync ~stage)
+      ~sync:(run_sync ~stage ?execution_profile)
       manifests)
     (fun () -> Unix.close lock; Lwt.return_unit)
 
-let main () =
-  try Lwt_main.run (run ()) with
+let main ?execution_profile () =
+  try Lwt_main.run (run ?execution_profile ()) with
   | Snapshot_expired message ->
       Printf.eprintf
         "error = state sync snapshot expired reason = %s action = restart_with_current_manifest\n%!"

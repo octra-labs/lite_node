@@ -118,7 +118,9 @@ let transaction ~find_drop ?(account_nonce = fun _ -> None) chaindata ~params =
       | Some tx ->
         Option.bind
           (account_nonce tx.Transaction.from)
-          (fun confirmed -> Staging.queue_state ~confirmed txh)
+          (fun confirmed -> Staging.queue_state ~confirmed
+            ?head:(Option.map (fun head -> Int64.of_int head.Octra_core.Head_manifest.epoch_id)
+              (Octra_core.Head_manifest.get_cached ())) txh)
     in
     let confirmed =
       if Option.is_some pending then None

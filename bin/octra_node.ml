@@ -95,6 +95,13 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
   let () =
     Startup_process_shell.configure_process ~exit_fatal:exit_error;
 
+    begin match Staging.check_config () with
+    | Ok () -> ()
+    | Error reason ->
+      Log.fatal "init" "event = staging_config status = rejected reason = %S" reason;
+      exit_error ()
+    end;
+
     let startup_network =
       Startup_process_shell.network_config ~env:env_opt
     in
@@ -128,6 +135,12 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
     end;
 
     let init_mode = cli_has_flag "--init" in
+    begin match Lwt_main.run (Octra_core.Circle_wasm_worker.check ()) with
+    | Ok () -> Log.info "init" "event = circle_worker status = ready"
+    | Error reason ->
+      Log.fatal "init" "event = circle_worker status = rejected reason = %s" reason;
+      exit_error ()
+    end;
     let publisher_mode = cli_has_flag "--state-sync-publisher" in
     let base_role =
       Octra_node_runtime.Consensus_mode.of_inputs
@@ -512,6 +525,16 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         }))
     in
     let current_epoch = ref epoch in
+    let execution_check = Lwt_main.run
+      (Octra_node_runtime.Consensus_profile.check_execution_parent
+        ~chain_id:startup_network.chain_id ~epoch ~store
+        ~head:(Octra_core.Head_manifest.get_cached ()) env_opt) in
+    begin match execution_check with
+    | Ok () -> ()
+    | Error reason ->
+      Log.fatal "init" "event = execution_profile action = refuse reason = %s" reason;
+      exit_error ()
+    end;
     let drop_db = Tx_drop.open_db data_dir in
     let drop_clock = Mtime_clock.counter () in
     let drop_sink = Octra_node_runtime.Drop_sink.create
@@ -573,114 +596,44 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         ~result_policy:(fun () -> private_result_policy !current_epoch)
         ledger
     in
-    let bind_rule
-        name
-        (activation : Rule_graph.activation option)
-        evaluate =
-      match activation with
-      | None ->
-        (match evaluate 0 with
-         | Ok Rule_graph.Active ->
+    let bind_rule (check : Rule_graph.check) =
+      let name = check.name in
+      match Rule_graph.check_start check ~epoch:!current_epoch with
+      | Ok (Rule_graph.Awaiting activation) ->
+        Log.info "init"
+          "event = rule_graph rule = %s status = awaiting_anchor anchor_epoch = %d activation_epoch = %d"
+          name
+          activation.anchor_epoch
+          activation.activation_epoch
+      | Error fault ->
+        Log.fatal "init"
+          "event = rule_graph rule = %s status = rejected reason = %s"
+          name
+          (Rule_graph.fault_message fault);
+        exit_error ()
+      | Ok (Rule_graph.Checked mode) ->
+        match mode, check.activation with
+         | Rule_graph.Active, None ->
            Log.info "init"
              "event = rule_graph rule = %s status = bound activation_epoch = 0"
              name
-         | Ok Rule_graph.Prior ->
+         | Rule_graph.Prior, None ->
            Log.info "init"
              "event = rule_graph rule = %s status = prior"
              name
-         | Error fault ->
+         | Rule_graph.Prior, Some _ ->
            Log.fatal "init"
-             "event = rule_graph rule = %s status = rejected reason = %s"
-             name
-             (Rule_graph.fault_message fault);
-           exit_error ())
-      | Some activation ->
-        if !current_epoch <= activation.anchor_epoch then
-          Log.info "init"
-            "event = rule_graph rule = %s status = awaiting_anchor anchor_epoch = %d activation_epoch = %d"
-            name
-            activation.anchor_epoch
-            activation.activation_epoch
-        else
-          match evaluate activation.activation_epoch with
-          | Ok Rule_graph.Active ->
-            Log.info "init"
-              "event = rule_graph rule = %s status = bound anchor_epoch = %d activation_epoch = %d"
-              name
-              activation.anchor_epoch
-              activation.activation_epoch
-          | Ok Rule_graph.Prior ->
-            Log.fatal "init"
               "event = rule_graph rule = %s status = rejected reason = activation_unreachable"
               name;
-            exit_error ()
-          | Error fault ->
-            Log.fatal "init"
-              "event = rule_graph rule = %s status = rejected reason = %s"
-              name
-              (Rule_graph.fault_message fault);
-            exit_error ()
+           exit_error ()
+         | Rule_graph.Active, Some activation ->
+           Log.info "init"
+             "event = rule_graph rule = %s status = bound anchor_epoch = %d activation_epoch = %d"
+             name
+             activation.anchor_epoch
+             activation.activation_epoch
     in
-    bind_rule
-      "circle"
-      (Rule_graph.circle_activation rules)
-      (fun epoch -> Rule_graph.circle rules ~epoch);
-    bind_rule
-      "validator_quorum"
-      (Rule_graph.validator_quorum_activation rules)
-      (fun epoch -> Rule_graph.validator_quorum rules ~epoch);
-    bind_rule
-      "epoch_time"
-      (Rule_graph.epoch_time_activation rules)
-      (fun epoch -> Rule_graph.epoch_time rules ~epoch);
-    bind_rule
-      "owner_migration"
-      (Rule_graph.owner_migration_activation rules)
-      (fun epoch -> Rule_graph.owner_migration rules ~epoch);
-    bind_rule
-      "wasm_compute"
-      (Rule_graph.wasm_compute_activation rules)
-      (fun epoch -> Rule_graph.wasm_compute rules ~epoch);
-    bind_rule
-      "private_payload"
-      (Rule_graph.private_payload_activation rules)
-      (fun epoch -> Rule_graph.private_payload rules ~epoch);
-    bind_rule
-      "set_fold"
-      (Rule_graph.set_fold_activation rules)
-      (fun epoch -> Rule_graph.set_fold rules ~epoch);
-    bind_rule
-      "validator_ready"
-      (Rule_graph.validator_ready_activation rules)
-      (fun epoch -> Rule_graph.validator_ready rules ~epoch);
-    bind_rule
-      "ready_ref"
-      (Rule_graph.ready_ref_activation rules)
-      (fun epoch -> Rule_graph.ready_ref rules ~epoch);
-    bind_rule
-      "set_fold_cap"
-      (Rule_graph.set_fold_cap_activation rules)
-      (fun epoch -> Rule_graph.set_fold_cap rules ~epoch);
-    bind_rule
-      "object_cost"
-      (Rule_graph.object_cost_activation rules)
-      (fun epoch -> Rule_graph.object_cost rules ~epoch);
-    bind_rule
-      "stake"
-      (Rule_graph.stake_activation_for_chain startup_network.chain_id)
-      (fun epoch -> Rule_graph.stake rules ~epoch);
-    bind_rule
-      "proof_key"
-      (Rule_graph.proof_key_activation_for_chain startup_network.chain_id)
-      (fun epoch -> Rule_graph.proof_key rules ~epoch);
-    bind_rule
-      "program_records"
-      (Rule_graph.program_records_activation_for_chain startup_network.chain_id)
-      (fun epoch -> Rule_graph.program_records rules ~epoch);
-    bind_rule
-      "duty_marks"
-      (Rule_graph.duty_marks_activation_for_chain startup_network.chain_id)
-      (fun epoch -> Rule_graph.duty_marks rules ~epoch);
+    List.iter bind_rule (Rule_graph.startup_checks rules);
 
     let validator_ready_max_lag =
       max 0 (env_int "OCTRA_VALIDATOR_READY_MAX_LAG_EPOCHS" 64)
@@ -799,8 +752,6 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         Consensus_epoch_apply_start_shell.{
           source = Consensus_epoch_apply_source.{
             rules;
-            check_override_receipts = (fun ~epoch_id ~receipts txs ->
-              Octra_core.Preverify_receipt_policy.check ~epoch_id ~receipts txs);
             find_finalized = (fun epoch ->
               Consensus_finality_state.find_finalized finality_state epoch);
             cached_bundle = proposal_bundle_runtime.cached_bundle;
@@ -834,6 +785,9 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
               |> Option.map (fun finalize ->
                 let header = finalize.Octra_consensus.C_types.header in
                 header.Octra_consensus.C_types.prev_state_root));
+            check_execution = (fun epoch head ->
+              Octra_node_runtime.Consensus_profile.check_execution_parent
+                ~chain_id:startup_network.chain_id ~epoch ~store ~head env_opt);
             fatal = Log.fatal "epoch" "%s";
             require_sync;
             exit = exit_error;
@@ -917,8 +871,16 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         failwith ("finalized preverify receipt parse failed: " ^ reason)
     in
     let* shared_result =
+      let voting_set =
+        match override_validator_set with
+        | Some set -> Some (!current_epoch, set)
+        | None ->
+          Consensus_finality_state.find_finalized_with_set finality_state !current_epoch
+          |> Option.map (fun (_, set) -> !current_epoch, set)
+      in
       Consensus_epoch_apply_shared.run_node
         ~compute:compute_verify
+        ?voting_set
         ?preverify
         ?parent_commit
         {
@@ -939,7 +901,7 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
                       validator.Octra_consensus.C_types.address,
                       Base64.encode_exn validator.pubkey)
                     set.Octra_consensus.C_types.validators)
-                override_validator_set
+                (Option.map snd voting_set)
             in
             Consensus_epoch_apply_env.standard_for_proposer
               ?validator_pubkeys
@@ -1230,6 +1192,15 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
         backend =
           Consensus_proposal_preview_shell.node_backend
             ~compute:compute_verify
+            ~voting_set:(fun ~epoch ->
+              match !driver_ref with
+              | Some driver when driver.Octra_consensus.C_driver.engine.state.height
+                  = Int64.of_int epoch -> Ok (Some driver.engine.vs)
+              | _ ->
+                if Octra_core.Rule_graph.seatless_at ~chain_id ~epoch
+                    = Octra_core.Rule_graph.Active then
+                  Error "preview voting set is unavailable"
+                else Ok None)
             ~private_artifacts:
               (Consensus_private_preverify.artifacts private_preverify)
             ~key_artifacts:
@@ -2201,7 +2172,11 @@ let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
       Startup_node_launch_shell.{
         p2p_port;
         rpc = rpc_task;
-        services = if recovery_mode then [] else [sync_task];
+        services = if recovery_mode then [] else [sync_task;
+          Octra_node_runtime.Staging_expiry.run
+            ~confirmed_nonce:(fun address -> Option.map (fun (account : Ledger.account) -> account.nonce)
+              (Ledger.find_opt ledger address))
+            ~save:save_drops ~notify:Rest.notify_staging_update];
         observer = observer_mode;
         follow = consensus_mode;
         tick_loop;

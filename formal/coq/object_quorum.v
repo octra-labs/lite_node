@@ -147,3 +147,302 @@ Proof.
   intros state quorum count before after excess. unfold apply_if.
   rewrite (excess_refused quorum count excess). reflexivity.
 Qed.
+
+Module Health.
+
+Import ListNotations.
+
+Definition count_floor (prior : bool) (f : Z) : Z :=
+  if prior then 0 else f + 1.
+
+Definition source_threshold (total : Z) : Z := total - Stake.quota total + 1.
+
+Definition agrees weight prior f threshold yes ids :=
+  (count_floor prior f <=? Stake.score (fun _ => 1) yes ids)
+  && (threshold <=? Stake.score weight yes ids).
+
+Definition head_mask (replied : nat -> bool) (head : nat -> Z) (target : Z) id :=
+  replied id && (target <=? head id).
+
+Definition low_mask (replied : nat -> bool) (head : nat -> Z) (local : Z) id :=
+  replied id && (head id <? local).
+
+Definition ahead weight threshold replied head local ids :=
+  (threshold <=? Stake.score weight (low_mask replied head local) ids)
+  && (Stake.score weight (head_mask replied head local) ids <? threshold).
+
+Definition root_mask (replied : nat -> bool) (roots : nat -> option Z) (root : Z) id :=
+  replied id && match roots id with
+  | Some value => value =? root
+  | None => false
+  end.
+
+Definition eligible_foreign weight prior f threshold replied roots local foreign ids :=
+  negb (local =? foreign)
+  && agrees weight prior f threshold (root_mask replied roots foreign) ids.
+
+Lemma source_threshold_range total :
+  0 < total ->
+  total <= 3 * source_threshold total /\ 3 * source_threshold total < total + 3.
+Proof.
+  intros positive. unfold source_threshold, Stake.quota.
+  pose proof (Z.div_mod (2 * total) 3 ltac:(lia)).
+  pose proof (Z.mod_pos_bound (2 * total) 3 ltac:(lia)).
+  nia.
+Qed.
+
+Lemma source_fault_budget total faulty :
+  0 < total -> 3 * faulty < total -> faulty < source_threshold total.
+Proof.
+  intros positive minority.
+  pose proof (source_threshold_range total positive) as [lower upper]. lia.
+Qed.
+
+Lemma score_nonnegative weight yes ids :
+  (forall id, In id ids -> 0 <= weight id) ->
+  0 <= Stake.score weight yes ids.
+Proof.
+  induction ids as [|id rest ih]; intros positive; simpl; [lia|].
+  assert (0 <= weight id) by (apply positive; simpl; auto).
+  assert (0 <= Stake.score weight yes rest).
+  { apply ih. intros other present. apply positive. simpl. auto. }
+  destruct (yes id); lia.
+Qed.
+
+Lemma score_mask weight left right ids :
+  (forall id, In id ids -> 0 <= weight id) ->
+  (forall id, In id ids -> left id = true -> right id = true) ->
+  Stake.score weight left ids <= Stake.score weight right ids.
+Proof.
+  induction ids as [|id rest ih]; intros positive included; simpl; [lia|].
+  assert (0 <= weight id) by (apply positive; simpl; auto).
+  assert (Stake.score weight left rest <= Stake.score weight right rest).
+  { apply ih.
+    - intros other present. apply positive. simpl. auto.
+    - intros other present accepted. apply included; simpl; auto. }
+  assert (left id = true -> right id = true) as step.
+  { apply included. simpl. auto. }
+  destruct (left id), (right id); simpl in *.
+  - lia.
+  - specialize (step eq_refl). discriminate.
+  - lia.
+  - lia.
+Qed.
+
+Theorem prior_weight_only weight f threshold yes ids :
+  agrees weight true f threshold yes ids = (threshold <=? Stake.score weight yes ids).
+Proof.
+  unfold agrees, count_floor.
+  assert (0 <= Stake.score (fun _ => 1) yes ids) as nonnegative.
+  { apply score_nonnegative. intros id present. lia. }
+  assert (0 <=? Stake.score (fun _ => 1) yes ids = true) as counted
+    by (apply Z.leb_le; exact nonnegative).
+  rewrite counted. reflexivity.
+Qed.
+
+Theorem stake_count_floor weight f threshold yes ids :
+  agrees weight false f threshold yes ids = true <->
+  f + 1 <= Stake.score (fun _ => 1) yes ids /\ threshold <= Stake.score weight yes ids.
+Proof.
+  unfold agrees, count_floor. rewrite andb_true_iff.
+  repeat rewrite Z.leb_le. reflexivity.
+Qed.
+
+Lemma insufficient weight prior f threshold yes ids :
+  Stake.score weight yes ids < threshold ->
+  agrees weight prior f threshold yes ids = false.
+Proof.
+  intros low. unfold agrees.
+  assert (threshold <=? Stake.score weight yes ids = false) as refused
+    by (apply Z.leb_gt; exact low).
+  rewrite refused, andb_false_r. reflexivity.
+Qed.
+
+Lemma low_score weight faulty replied head local ids :
+  (forall id, In id ids -> 0 <= weight id) ->
+  (forall id, In id ids -> replied id = true -> faulty id = false -> local <= head id) ->
+  Stake.score weight (low_mask replied head local) ids <= Stake.score weight faulty ids.
+Proof.
+  intros positive current. apply score_mask; [exact positive|].
+  intros id present supported. unfold low_mask in supported.
+  apply andb_true_iff in supported as [responded low].
+  apply Z.ltb_lt in low.
+  destruct (faulty id) eqn:bad; [reflexivity|].
+  pose proof (current id present responded bad). lia.
+Qed.
+
+Theorem false_ahead_refused weight faulty replied head local ids threshold :
+  (forall id, In id ids -> 0 <= weight id) ->
+  Stake.score weight faulty ids < threshold ->
+  (forall id, In id ids -> replied id = true -> faulty id = false -> local <= head id) ->
+  ahead weight threshold replied head local ids = false.
+Proof.
+  intros positive minority current. unfold ahead.
+  pose proof (low_score weight faulty replied head local ids positive current).
+  assert (threshold <=? Stake.score weight (low_mask replied head local) ids = false)
+    as refused by (apply Z.leb_gt; lia).
+  rewrite refused. reflexivity.
+Qed.
+
+Corollary source_ahead_limit weight faulty replied head local ids :
+  (forall id, In id ids -> 0 <= weight id) ->
+  0 < Stake.score weight (fun _ => true) ids ->
+  3 * Stake.score weight faulty ids < Stake.score weight (fun _ => true) ids ->
+  (forall id, In id ids -> replied id = true -> faulty id = false -> local <= head id) ->
+  ahead weight (source_threshold (Stake.score weight (fun _ => true) ids))
+    replied head local ids = false.
+Proof.
+  intros positive total minority current.
+  apply (false_ahead_refused weight faulty replied head local ids).
+  - exact positive.
+  - apply source_fault_budget; assumption.
+  - exact current.
+Qed.
+
+Theorem current_weight_protects weight replied head local ids threshold :
+  threshold <= Stake.score weight (head_mask replied head local) ids ->
+  ahead weight threshold replied head local ids = false.
+Proof.
+  intros enough. unfold ahead.
+  assert (Stake.score weight (head_mask replied head local) ids <? threshold = false)
+    as refused by (apply Z.ltb_ge; exact enough).
+  rewrite refused, andb_false_r. reflexivity.
+Qed.
+
+Lemma head_score weight faulty replied head target ids :
+  (forall id, In id ids -> 0 <= weight id) ->
+  (forall id, In id ids -> replied id = true -> faulty id = false -> head id < target) ->
+  Stake.score weight (head_mask replied head target) ids <= Stake.score weight faulty ids.
+Proof.
+  intros positive above. apply score_mask; [exact positive|].
+  intros id present supported. unfold head_mask in supported.
+  apply andb_true_iff in supported as [responded high].
+  apply Z.leb_le in high.
+  destruct (faulty id) eqn:bad; [reflexivity|].
+  pose proof (above id present responded bad). lia.
+Qed.
+
+Theorem head_source_refused weight faulty replied head target ids prior f threshold :
+  (forall id, In id ids -> 0 <= weight id) ->
+  Stake.score weight faulty ids < threshold ->
+  (forall id, In id ids -> replied id = true -> faulty id = false -> head id < target) ->
+  agrees weight prior f threshold (head_mask replied head target) ids = false.
+Proof.
+  intros positive minority above. apply insufficient.
+  pose proof (head_score weight faulty replied head target ids positive above). lia.
+Qed.
+
+Corollary source_head_limit weight faulty replied head target ids prior f :
+  (forall id, In id ids -> 0 <= weight id) ->
+  0 < Stake.score weight (fun _ => true) ids ->
+  3 * Stake.score weight faulty ids < Stake.score weight (fun _ => true) ids ->
+  (forall id, In id ids -> replied id = true -> faulty id = false -> head id < target) ->
+  agrees weight prior f (source_threshold (Stake.score weight (fun _ => true) ids))
+    (head_mask replied head target) ids = false.
+Proof.
+  intros positive total minority above.
+  apply (head_source_refused weight faulty replied head target ids prior f).
+  - exact positive.
+  - apply source_fault_budget; assumption.
+  - exact above.
+Qed.
+
+Lemma root_score weight faulty replied roots foreign ids :
+  (forall id, In id ids -> 0 <= weight id) ->
+  (forall id, In id ids -> replied id = true -> faulty id = false -> roots id <> Some foreign) ->
+  Stake.score weight (root_mask replied roots foreign) ids <= Stake.score weight faulty ids.
+Proof.
+  intros positive separate. apply score_mask; [exact positive|].
+  intros id present supported. unfold root_mask in supported.
+  apply andb_true_iff in supported as [responded matches].
+  destruct (roots id) as [value|] eqn:reported; simpl in matches; [|discriminate].
+  apply Z.eqb_eq in matches.
+  destruct (faulty id) eqn:bad; [reflexivity|].
+  exfalso. apply (separate id present responded bad).
+  rewrite reported, matches. reflexivity.
+Qed.
+
+Theorem faulty_root_ineligible weight faulty replied roots local foreign ids prior f threshold :
+  (forall id, In id ids -> 0 <= weight id) ->
+  Stake.score weight faulty ids < threshold ->
+  (forall id, In id ids -> replied id = true -> faulty id = false -> roots id <> Some foreign) ->
+  eligible_foreign weight prior f threshold replied roots local foreign ids = false.
+Proof.
+  intros positive minority separate. unfold eligible_foreign.
+  assert (agrees weight prior f threshold (root_mask replied roots foreign) ids = false)
+    as refused.
+  { apply insufficient.
+    pose proof (root_score weight faulty replied roots foreign ids positive separate). lia. }
+  rewrite refused, andb_false_r. reflexivity.
+Qed.
+
+Corollary source_root_limit weight faulty replied roots local foreign ids prior f :
+  (forall id, In id ids -> 0 <= weight id) ->
+  0 < Stake.score weight (fun _ => true) ids ->
+  3 * Stake.score weight faulty ids < Stake.score weight (fun _ => true) ids ->
+  (forall id, In id ids -> replied id = true -> faulty id = false -> roots id <> Some foreign) ->
+  eligible_foreign weight prior f (source_threshold (Stake.score weight (fun _ => true) ids))
+    replied roots local foreign ids = false.
+Proof.
+  intros positive total minority separate.
+  apply (faulty_root_ineligible weight faulty replied roots local foreign ids prior f).
+  - exact positive.
+  - apply source_fault_budget; assumption.
+  - exact separate.
+Qed.
+
+Fixpoint insert_head (head : Z) (heads : list Z) : list Z :=
+  match heads with
+  | [] => [head]
+  | value :: rest =>
+    if value <=? head then head :: heads else value :: insert_head head rest
+  end.
+
+Definition count_target (f : nat) (head : nat -> Z) (replied : nat -> bool) (ids : list nat) :=
+  nth_error (fold_right insert_head [] (map head (filter replied ids))) f.
+
+Definition sample_ids : list nat := [0%nat; 1%nat; 2%nat; 3%nat].
+Definition sample_faulty (id : nat) := Nat.ltb id 2%nat.
+Definition sample_weight id : Z := if sample_faulty id then 1 else 100.
+Definition sample_head id : Z := if sample_faulty id then 5000 else 10.
+Definition sample_roots id : option Z := if sample_faulty id then Some 1 else Some 0.
+
+Example count_only_target :
+  count_target 1%nat sample_head (fun _ => true) sample_ids = Some 5000 /\
+  map sample_head (filter (fun id => negb (sample_faulty id)) sample_ids) = [10; 10] /\
+  Stake.score sample_weight sample_faulty sample_ids = 2 /\
+  source_threshold (Stake.score sample_weight (fun _ => true) sample_ids) = 68 /\
+  agrees sample_weight false 1 68 (head_mask (fun _ => true) sample_head 5000) sample_ids = false.
+Proof. vm_compute. repeat split; reflexivity. Qed.
+
+Example faulty_root_case :
+  Stake.score (fun _ => 1) (root_mask (fun _ => true) sample_roots 1) sample_ids = 2 /\
+  eligible_foreign sample_weight false 1 68 (fun _ => true) sample_roots 0 1 sample_ids = false.
+Proof. vm_compute. split; reflexivity. Qed.
+
+Example policy_count_case :
+  agrees sample_weight true 1 68 (fun id => Nat.eqb id 2%nat) sample_ids = true /\
+  agrees sample_weight false 1 68 (fun id => Nat.eqb id 2%nat) sample_ids = false.
+Proof. vm_compute. split; reflexivity. Qed.
+
+Example source_not_finality :
+  source_threshold 3 = 1 /\
+  agrees (fun _ => 1) true 0 (source_threshold 3)
+    (fun id => Nat.eqb id 0%nat) [0%nat; 1%nat; 2%nat] = true /\
+  Stake.accepts (fun _ => 1) 0
+    (fun id => Nat.eqb id 0%nat) [0%nat; 1%nat; 2%nat] = false.
+Proof. vm_compute. repeat split; reflexivity. Qed.
+
+Example low_head_case :
+  let heads := fun id => if sample_faulty id then 7 else 10 in
+  agrees sample_weight false 3 68 (head_mask (fun _ => true) heads 7) sample_ids = true /\
+  agrees sample_weight false 3 68 (head_mask (fun _ => true) heads 10) sample_ids = false /\
+  ahead sample_weight 68 (fun _ => true) heads 10 sample_ids = false.
+Proof. vm_compute. repeat split; reflexivity. Qed.
+
+Example heavy_low_case :
+  let heads := fun id => if sample_faulty id then 10 else 7 in
+  ahead sample_weight 68 (fun _ => true) heads 10 sample_ids = true.
+Proof. vm_compute. reflexivity. Qed.
+
+End Health.

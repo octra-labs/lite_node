@@ -13,7 +13,16 @@ module J = Octra_node_runtime.Consensus_finality_journal
 let get = function Ok value -> value | Error reason -> failwith reason
 let check name yes = if not yes then failwith name
 let chain = "octra-devnet-9871-cluster"
-let height = Int64.add 2L (Option.get (Octra_consensus.C_quorum_policy.linear_epoch ~chain_id:chain))
+let seatless = match Array.to_list Sys.argv with
+  | [_] -> false
+  | [_; "--seatless"] -> true
+  | _ -> invalid_arg "relief path arguments"
+let height =
+  let module Policy = Octra_consensus.C_quorum_policy in
+  let activation = if seatless then Int64.of_int
+    (Option.get (Policy.seatless_activation_for_chain chain)).activation_epoch
+    else Option.get (Policy.linear_epoch ~chain_id:chain) in
+  Int64.add 2L activation
 let raw s = Digestif.SHA256.(digest_string s |> to_raw_string)
 let hex s = Digestif.SHA256.(digest_string s |> to_hex)
 let keys = List.init 7 (fun n ->
@@ -280,7 +289,7 @@ let test_restart_split () =
     header = value; tx_hashes = []; parent_commit = None; proposer = creator; signature = ""} in
   let proposal = {proposal with signature = sign creator (H.propose_sign_bytes proposal)} in
   let cfg = D.{activate_epoch = plan.activate_epoch; validator_set = target;
-    fingerprint = plan.fingerprint} in
+    fingerprint = plan.fingerprint; eviction = None} in
   let finals = ref [] in
   let make path member =
     let head = ref (Int64.pred height) in
@@ -839,11 +848,224 @@ let test_snapshot () =
     let wire = A.make ~steps:[step] ~finalize:later ~validator_set:target |> A.encode in
     ignore (get (A.verify_path ~validator_set:trusted wire)))
 
+let test_relief_activation () = Test_workspace.with_dir "relief-activation" (fun path ->
+  let module P = Octra_consensus.C_quorum_policy in
+  let at = Int64.of_int (Option.get (P.seatless_activation_for_chain chain)).activation_epoch in
+  let before = Int64.sub at 2L in
+  let entries = List.map2 (fun (member, _) weight -> member, Z.of_int (weight * 1_000_000))
+    keys [5; 2; 2; 2; 2; 2; 1] in
+  let current = get (C.make_weighted_validator_set entries) in
+  let target = get (C.make_weighted_validator_set (List.filteri (fun index _ -> index < 6) entries)) in
+  let plan = get (U.make_weighted ~source_epoch:(Int64.pred before) ~activate_epoch:(Int64.succ at)
+    (C.weights_of_set target |> List.map (fun ((member : C.validator_info), weight) ->
+      Octra_core.Validator_entry.{address = member.address; pubkey = member.pubkey; weight}))) in
+  let proof = List.map (fun (member, _) ->
+    let vote = Octra_consensus.C_codec.{chain_id = chain; epoch_id = before; round = 64;
+      step = C.PrecommitStep; request = false; validator = member.C.address; signature = ""} in
+    {vote with signature = sign member.address (H.round_sync_sign_bytes vote)}) keys in
+  let mark = match R.decide ~chain_id:chain ~height:before ~current ~target
+    ~activate_epoch:plan.activate_epoch ~fingerprint:plan.fingerprint ~proof with
+    | R.Apply mark -> mark | R.Refuse reason -> failwith reason | R.Wait -> failwith "prior relief waited" in
+  let selected = get (R.restore ~chain_id:chain ~height:before ~current ~target
+    ~activate_epoch:plan.activate_epoch ~fingerprint:plan.fingerprint mark) |> Option.get in
+  let store = Lwt_main.run (I.open_store ~fresh:true path) in
+  Fun.protect ~finally:(fun () -> Lwt_main.run (I.close store)) (fun () ->
+    let epoch = Int64.pred before in
+    let update = U.to_string plan in
+    Lwt_main.run (I.set_meta store U.pending_meta_key update);
+    Lwt_main.run (I.tag_epoch store (Int64.to_int epoch));
+    let state = get (Lwt_main.run (I.merkle_proof_at_epoch store (Int64.to_int epoch)
+      ["meta"; U.pending_meta_key])) in
+    let index = hex "activation-index" in
+    let folded = Octra_core.Epoch_index_commitment.folded_state_root
+      ~ledger_state_root:state.ledger_state_root ~epoch_index_root:index in
+    let head epoch root = {(header epoch root) with creator_addr = (List.hd target.validators).address} in
+    let parent = finalize current 0 (head epoch Digestif.SHA256.(of_hex folded |> to_raw_string)) in
+    let step = A.{source = Relief mark; finalize = parent; ledger_state_root = state.ledger_state_root;
+      epoch_index_root = index; update; proof = state.proof} in
+    let trusted = get (A.encoded_validator_set current) in
+    let path at =
+      let set = C.validator_set_for_epoch ~chain_id:chain ~epoch_id:at selected in
+      A.make ~steps:[step] ~finalize:(finalize set 65 (head at (raw "activation-final")))
+        ~validator_set:set in
+    let original = path (Int64.pred at) in
+    ignore (A.verify_path ~validator_set:trusted (A.encode original) |> get);
+    ignore (Lwt_main.run (A.derive_lwt ~validator_set:trusted original) |> get);
+    check "new entry accepted blocking seat"
+      (Result.is_error (U.check_set_at ~chain_id:chain ~epoch_id:at plan));
+    check "activated sync lost trusted preactivation set"
+      (Result.is_ok (A.verify_path ~validator_set:trusted (A.encode (path at))))))
+
+let test_weight_refusal () =
+  let entries = List.map2 (fun (member, _) weight -> member, Z.of_int weight)
+    keys [9; 8; 8; 1; 1; 1; 1] in
+  let current = get (C.make_weighted_validator_set entries) in
+  let next = get (C.make_weighted_validator_set (List.filteri (fun index _ -> index < 5) entries)) in
+  check "test lost intersection proof"
+    (Octra_consensus.C_measure.overlap (C.space ~chain_id:chain ~epoch_id:height current)
+      next.C.weights = Ok ());
+  check "relief accepted blocking seat"
+    (R.decide ~chain_id:chain ~height ~current ~target:next ~activate_epoch:(Int64.add height 8L)
+      ~fingerprint:(hex "heavy-plan") ~proof:[]
+      = R.Refuse "validator weight reaches blocking threshold");
+  let epoch = Int64.pred height in
+  let prior = { (header epoch (raw "heavy-state")) with
+    creator_addr = (List.hd next.validators).address } in
+  let cert = finalize next 0 prior in
+  let encoded = A.make ~steps:[] ~finalize:cert ~validator_set:next |> A.encode in
+  let trusted = get (A.encoded_validator_set next) in
+  check "empty sync path lost trusted set"
+    (Result.is_ok (A.verify_path ~validator_set:trusted encoded));
+  check "async empty path lost trusted set"
+    (Result.is_ok (Lwt_main.run (A.derive_lwt ~validator_set:trusted
+      (A.make ~steps:[] ~finalize:cert ~validator_set:next))))
+
+let test_weight_history () =
+  let module X = Octra_core.Epoch_exec in
+  let module L = Octra_core.Ledger in
+  let module Reward = Octra_node_runtime.Consensus_reward_attribution in
+  let entries = List.map2 (fun (member, _) weight -> member, Z.of_int weight)
+    keys [4; 4; 4; 4; 1; 1; 1] in
+  let first = get (C.make_weighted_validator_set entries) in
+  let trusted = get (A.encoded_validator_set first) in
+  let path = Test_workspace.unique_dir "weight-history" in
+  let store = Lwt_main.run (I.open_store ~fresh:true path) in
+  let payer = (fst (List.hd entries)).C.address in
+  let root, balances = Fun.protect ~finally:(fun () -> Lwt_main.run (I.close store)) (fun () ->
+    let ledger = L.create store in
+    get (L.add_account ledger payer (Z.of_int 1000));
+    let rec advance index current steps expected =
+      if index = 6 then expected else
+      let epoch = Int64.add height (Int64.of_int (index * 16)) in
+      let ordered = C.weights_of_set current |> List.sort (fun (a, x) (b, y) ->
+        let order = Z.compare x y in if order = 0 then String.compare a.C.address b.C.address else order) in
+      let removed, _ = List.hd ordered in
+      let remaining = match index with
+        | 3 -> entries
+        | 4 -> List.mapi (fun at (member, weight) -> member, if at = 0 then Z.of_int 5 else weight) entries
+        | 5 -> List.filteri (fun at _ -> at > 0) entries
+        | _ -> List.filter (fun (member, _) -> member.C.address <> removed.address) ordered in
+      let next = get (C.make_weighted_validator_set remaining) in
+      let update = get (U.make_weighted ~source_epoch:(Int64.pred epoch)
+        ~activate_epoch:(if index < 3 then Int64.add epoch 8L else epoch) (List.map (fun (member, weight) ->
+          Octra_core.Validator_entry.{address = member.C.address; pubkey = member.pubkey; weight}) remaining)) in
+      let source, restored = if index >= 3 then A.Pending, next else
+      let proof = List.map (fun member ->
+        let sync = Octra_consensus.C_codec.{chain_id = chain; epoch_id = epoch; round = 64;
+          step = C.PrecommitStep; request = false; validator = member.C.address; signature = ""} in
+        {sync with signature = sign member.address (H.round_sync_sign_bytes sync)}) current.C.validators in
+      let decide proof target = R.decide ~chain_id:chain ~height:epoch ~current
+        ~activate_epoch:update.activate_epoch ~target ~fingerprint:update.fingerprint ~proof in
+      let mark = match decide proof next with R.Apply value -> value
+        | _ -> failwith "weighted history transition refused" in
+      List.iter (fun votes -> check "weighted history false proof accepted"
+        (match decide votes next with R.Refuse _ -> true | _ -> false))
+        [List.hd proof :: proof;
+         List.map (fun (vote : Octra_consensus.C_codec.round_sync) -> {vote with epoch_id = Int64.pred epoch}) proof;
+         [{(List.hd proof) with signature = String.make 64 '\000'}]];
+      let altered = get (C.make_weighted_validator_set (List.mapi (fun at (member, weight) ->
+        member, if at = 0 then Z.succ weight else weight) remaining)) in
+      check "weighted history retained weight changed"
+        (match decide proof altered with R.Refuse _ -> true | _ -> false);
+      let restored = get (R.restore ~chain_id:chain ~height:epoch ~current
+        ~activate_epoch:update.activate_epoch ~target:next ~fingerprint:update.fingerprint mark) |> Option.get in
+      A.Relief mark, restored in
+      check "weighted history voter weights differ" (C.weights_of_set restored = C.weights_of_set next);
+      let encoded = U.to_string update in
+      Lwt_main.run (I.set_meta store U.pending_meta_key encoded);
+      Lwt_main.run (L.flush_dirty_lwt ledger);
+      Lwt_main.run (I.tag_epoch store (Int64.to_int (Int64.pred epoch)));
+      let state = get (Lwt_main.run (I.merkle_proof_at_epoch store
+        (Int64.to_int (Int64.pred epoch)) ["meta"; U.pending_meta_key])) in
+      let index_root = hex ("weight-history-" ^ string_of_int index) in
+      let folded = Octra_core.Epoch_index_commitment.folded_state_root
+        ~ledger_state_root:state.ledger_state_root ~epoch_index_root:index_root
+        |> Digestif.SHA256.of_hex |> Digestif.SHA256.to_raw_string in
+      let author = (List.find (fun (member : C.validator_info) ->
+        C.is_validator current member.address) next.validators).C.address in
+      let parent = finalize current 0 {(header (Int64.pred epoch) folded) with creator_addr = author} in
+      let step = A.{source; finalize = parent;
+        ledger_state_root = state.ledger_state_root; epoch_index_root = index_root;
+        update = encoded; proof = state.proof} in
+      let steps = steps @ [step] in
+      let cert = finalize restored 65 {(header epoch (raw "weight-history-final")) with creator_addr = author} in
+      let threshold = Z.succ (Z.div (Z.mul (Z.of_int 2) next.total_weight) (Z.of_int 3)) in
+      let weight (vote : C.vote) = C.weight_of_addr next vote.validator |> Option.get in
+      let votes = List.sort (fun a b -> Z.compare (weight b) (weight a)) cert.precommits in
+      let signed, precommits = List.fold_left (fun (total, kept) vote ->
+        if Z.geq total threshold then total, kept else Z.add total (weight vote), vote :: kept)
+        (Z.zero, []) votes in
+      check "weighted history subset not selected"
+        (Z.geq signed threshold && List.length precommits < next.n);
+      let cert = {cert with precommits} in
+      let wire = A.make ~steps ~finalize:cert ~validator_set:restored |> A.encode in
+      let accepted = get (A.verify_path ~validator_set:trusted wire) in
+      check "weighted history final set differs" (A.validator_set accepted = restored);
+      let changed = get (C.make_weighted_validator_set (List.mapi (fun at (member, weight) ->
+        member, if at = 0 then Z.succ weight else weight) remaining)) in
+      check "weighted history uncertified weights accepted"
+        (Result.is_error (A.verify_path ~validator_set:trusted
+          (A.make ~steps ~finalize:cert ~validator_set:changed |> A.encode)));
+      if index > 0 then begin
+        let short = A.verify_path ~validator_set:trusted
+          (A.make ~steps:[step] ~finalize:cert ~validator_set:restored |> A.encode) in
+        if index < 3 then check "weighted history missing relief accepted" (Result.is_error short)
+        else begin
+          get (A.verify_finalize ~chain_id:chain ~validator_set:first parent);
+          check "weighted history direct certificate refused" (Result.is_ok short)
+        end
+      end;
+      let reward = get (Reward.resolve_for_epoch ~chain_id:chain ~epoch_id:(Int64.succ epoch)
+        ~proposer_addr:"ignored" ~validator_pubkeys:[]
+        (Some C.{certificate = certificate_of_finalize cert; validator_set = restored})) in
+      check "weighted history reward members differ"
+        (List.sort compare (List.map (fun (member : X.reward_validator) -> member.address, member.weight)
+          reward.validators) = List.sort compare (List.map (fun (member, weight) -> member.C.address, weight) remaining));
+      let supply = L.get_total_supply ledger in
+      let plan = get (X.build_reward_plan_with_base ~fee_burn_active:true
+        ~supply_retired:(Z.sub Octra_core.Denomination.max_supply (Z.add supply (Z.of_int (600 - index * 100))))
+        ~base_reward:(Z.of_int 100) ~validator_count:next.n
+        ~emission_remaining:(Z.of_int (600 - index * 100)) ~confirmed_fees:(Z.of_int 37) ~prev_supply:supply) in
+      let pool = Z.add (Z.mul (Z.of_int next.n) plan.each_validator) plan.remainder in
+      let shares = List.map (fun (member, weight) -> member.C.address,
+        Z.div (Z.mul pool weight) next.total_weight) remaining in
+      let dust = Z.sub pool (List.fold_left (fun sum (_, value) -> Z.add sum value) Z.zero shares) in
+      let add rows (address, amount) =
+        let before = Option.value ~default:Z.zero (List.assoc_opt address rows) in
+        (address, Z.add before amount) :: List.remove_assoc address rows in
+      let expected = List.fold_left add (add expected (payer, Z.of_int (-37)))
+        ((author, Z.add (Z.sub plan.proposer_total plan.remainder) dust) :: shares) in
+      get (L.debit ledger payer (Z.of_int 37) (index + 1));
+      let env = X.{chain_id = chain; epoch_id = Int64.to_int (Int64.succ epoch);
+        proposer_addr = author; validator_addrs = []; validator_pubkeys = [];
+        prev_state_root = ""; epoch_ts = 0.; ready_state_root_at = None; ready_max_lag = -1} in
+      Lwt_main.run (X.apply_epoch_footer_with_reward ~reward ~env ~plan
+        ~backend:(X.make_live_backend ~emission_policy:Octra_core.Emission_policy.Allow store ledger));
+      List.iter (fun (address, expected) -> check "weighted history account differs"
+        (Z.equal (L.find ledger address).L.balance expected)) expected;
+      check "weighted history supply differs" (Z.equal (L.get_total_supply ledger) (Z.add supply (Z.of_int 93)));
+      Lwt_main.run (L.flush_dirty_lwt ledger);
+      Printf.printf "event = weight_history step = %d members = %d total_weight = %s supply = %s\n%!"
+        (index + 1) next.n (Z.to_string next.total_weight) (Z.to_string (L.get_total_supply ledger));
+      advance (index + 1) next steps expected in
+    let balances = advance 0 first [] [payer, Z.of_int 1000] in
+    Lwt_main.run (I.state_hash store), balances) in
+  let reopened = Lwt_main.run (I.open_store path) in
+  Fun.protect ~finally:(fun () -> Lwt_main.run (I.close reopened)) (fun () ->
+    check "weighted history root changed after reopen" (Lwt_main.run (I.state_hash reopened) = root);
+    List.iter (fun (address, expected) ->
+      let account = Lwt_main.run (I.get_account reopened address) |> Option.get in
+      check "weighted history reopened balance differs" (Z.equal account.balance expected)) balances)
+
 let () =
+  check "relief selected rule differs"
+    (Octra_consensus.C_quorum_policy.seatless
+      (Octra_consensus.C_quorum_policy.for_chain chain) height = seatless);
   test_roles ();
   test_engine ();
   List.iter test_source_votes [0; 65];
   test_restart_split ();
   List.iter (fun epoch -> List.iter (test_split_conflict epoch) [false; true]) [1_500_000L; height];
   test_snapshot ();
-  Printf.printf "test = relief_path status = pass\n"
+  if seatless then begin test_relief_activation (); test_weight_refusal (); test_weight_history () end;
+  Printf.printf "test = relief_path epoch = %Ld status = pass\n" height

@@ -10,6 +10,8 @@ type t
 
 val consensus_id : string
 
+val checkpoint : t -> (unit -> unit)
+
 val create :
   registered:bool ->
   preverify:Preverify_commit.t option ->

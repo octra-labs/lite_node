@@ -2,7 +2,7 @@
  (name pvac_ffi)
  (foreign_stubs
   (language cxx)
-  (names pvac_stubs)
+  (names pvac_stubs ready_stubs)
   (include_dirs %{project_root}/pvac/include)
   (extra_deps pvac_serialize.hpp native_call.hpp)
   (flags (:include flags.sexp)))

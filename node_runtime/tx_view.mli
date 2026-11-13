@@ -3,6 +3,15 @@
 
 val display_from : Octra_core.Transaction.t -> string
 
+val payload_account_check :
+  bft_mode:bool ->
+  bft_window:int ->
+  min_ou:Z.t ->
+  min_relay_fee:Z.t ->
+  account:Octra_core.Ledger.account option ->
+  Octra_core.Transaction.t ->
+  (unit, string * string) result
+
 val display_to : Octra_core.Transaction.t -> string
 
 val mask_stealth_row : Yojson.Safe.t -> Yojson.Safe.t
@@ -153,6 +162,10 @@ val decode_submit_batch_tx :
   Yojson.Safe.t ->
   (Octra_core.Transaction.t, string) result
 
+val decode_network_tx :
+  Yojson.Safe.t ->
+  (Octra_core.Transaction.t, string) result
+
 val submit_rpc_error :
   string ->
   string ->
@@ -300,10 +313,12 @@ val payload_size_check :
   Octra_core.Transaction.t ->
   (unit, string * string) result
 
+val payload_parse_bytes : Octra_core.Transaction.t -> int option
+
 val payload_check :
   limits:payload_limits ->
   Octra_core.Transaction.t ->
-  (unit, string * string) result
+  (unit, string * string) result Lwt.t
 
 val bft_op_check :
   bft_mode:bool ->
@@ -370,6 +385,7 @@ val preverify_unavailable_message :
   string
 
 val run_preverify_compute :
+  bytes:int ->
   (unit -> 'a) ->
   ('a, preverify_unavailable) result Lwt.t
 
@@ -395,11 +411,5 @@ val post_signature_check :
 val submit_signature_check :
   signing:Octra_core.Tx_signature.t ->
   account_public_key:string option ->
-  preverify_has_capacity:bool ->
-  preverify_pending:int ->
-  preverify_pending_max:int ->
-  bft_mode:bool ->
-  confirmed_nonce:int ->
-  bft_window:int ->
   Octra_core.Transaction.t ->
-  (unit, string * string) result
+  (unit, string * string) result Lwt.t

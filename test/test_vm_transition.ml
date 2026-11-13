@@ -195,6 +195,24 @@ let process ?(env = env) ?preverify ?save_receipt_raw backend transaction =
        ~object_cost:false
        transaction)
 
+let vault_code () =
+  let path = Filename.concat (Filename.dirname Sys.executable_name) "vault.wasm" in
+  let channel = open_in_bin path in
+  Fun.protect ~finally:(fun () -> close_in channel)
+    (fun () -> really_input_string channel (in_channel_length channel))
+
+let capture_call ~ledger ~store ~backend ~env transaction =
+  let snapshot = Lwt_main.run (Octra_core.Ledger.hash ledger)
+    |> Octra_core.Preverify_worker.state_hash in
+  Octra_core.Ledger.begin_journal ledger |> Result.get_ok;
+  let saved = Store.save_batch store |> Result.get_ok in
+  let result, binding = Fun.protect
+    ~finally:(fun () -> Octra_core.Tx_savepoint.restore ledger store saved)
+    (fun () -> Lwt_main.run (Transition.capture_circle
+      ~circle_mode:Octra_core.Rule_graph.Active ~wasm_compute_mode:Octra_core.Rule_graph.Active
+      ~backend ~env ~program_trust ~object_cost:false transaction)) in
+  snapshot, result, binding
+
 let expect_confirmed label = function
   | Ok (Epoch_exec.Confirmed fee) ->
     expect label (Z.equal fee (Z.of_int 10))
@@ -1480,11 +1498,7 @@ Program CirclePayments {
       | _ -> fail "circle call result differs"
       end in
     let pay amount refuse = [`String receiver; `Int amount; `Bool refuse] in
-    let wasm_raw =
-      let path = Filename.concat (Filename.dirname Sys.executable_name) "vault.wasm" in
-      let channel = open_in_bin path in
-      Fun.protect ~finally:(fun () -> close_in channel)
-        (fun () -> really_input_string channel (in_channel_length channel)) in
+    let wasm_raw = vault_code () in
     let wasm_payload = Circles.{runtime = Wasm_v1; privacy_class = Public;
       browser_mode = Native_sealed; resource_mode = Public_resources;
       code_b64 = Some (Base64.encode_exn wasm_raw); policy_hash = None; members_root = None;
@@ -2035,10 +2049,7 @@ let test_wasm_pairs ?(keyed = false) () =
     let pk, sk = F.keygen_from_seed (F.default_params ()) seed in
     pk, F.enc_values_seeded pk sk [|3L|] seed, F.enc_values_seeded pk sk [|5L; 7L|] seed in
   let reason = if keyed then "hfhe key shape mismatch" else "hfhe slot count mismatch" in
-  let path = Filename.concat (Filename.dirname Sys.executable_name) "vault.wasm" in
-  let channel = open_in_bin path in
-  let code = Fun.protect ~finally:(fun () -> close_in channel)
-    (fun () -> really_input_string channel (in_channel_length channel)) in
+  let code = vault_code () in
   let env = {env with chain_id = "octra-devnet-9871-cluster"} in
   let run replay epoch = with_store ("wasm_pairs_" ^ string_of_int epoch) (fun store ->
     let owner = "oct6wMiXWiH5SKkfpXC9RvGEBTyPPMN9NgQxVWPDwjhmtcZ" in
@@ -2213,6 +2224,158 @@ let test_wasm_pairs ?(keyed = false) () =
     result) in
   ignore (run false 1_662_999);
   expect "pair execution differs across replay" (run false 1_663_000 = run true 1_663_000)
+
+let test_wasm_reply () =
+  let module R = Octra_core.Rule_graph in
+  let module L = Octra_core.Ledger in
+  let module H = Octra_core.Circle_hfhe_policy in
+  let module F = Pvac_ffi in
+  let module P = Octra_core.Preverify_receipt in
+  let module W = Octra_core.Preverify_worker in
+  let module C = Octra_core.Preverify_commit in
+  let module E = Octra_circle_runtime.Circle_exec in
+  let seed = Bytes.make 32 '\012' in
+  let pk, _ = F.keygen_from_seed (F.default_params ()) seed in
+  let code = vault_code () in
+  let env = {env with chain_id = "octra-devnet-9871-cluster"} in
+  let start = match R.program_result_activation_for_chain env.chain_id with
+    | Some plan -> plan.activation_epoch
+    | None -> fail "reply rule plan missing" in
+  let zero = String.make 64 '0' in
+  let run epoch = with_store ("wasm_reply_" ^ string_of_int epoch) (fun store ->
+    let owner = "oct6wMiXWiH5SKkfpXC9RvGEBTyPPMN9NgQxVWPDwjhmtcZ" in
+    let active = R.program_result_at ~chain_id:env.chain_id ~epoch = R.Active in
+    let env = {env with epoch_id = epoch} in
+    let ledger = L.create store in
+    begin match L.add_account ledger owner (Z.of_int 400_000_000) with
+    | Ok () -> ()
+    | Error reason -> fail reason end;
+    Lwt_main.run (L.set_pvac_pubkey ledger owner (F.serialize_pubkey pk |> Bytes.to_string));
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    let fold epoch = Epoch_exec.prior_fold epoch
+      |> Result.map (fun ctx -> {ctx with Epoch_exec.proof_exec = R.Active}) in
+    let backend = Epoch_exec.make_live_backend ~fold store ledger in
+    Lwt_main.run (backend.begin_batch R.Prior);
+    let receipts = ref [] in
+    let apply ?preverify ?(env = env) transaction =
+      Lwt_main.run (Octra_core.Tx_savepoint.run ~ledger ~store (fun () ->
+      Transition.process_tx ?preverify ~backend ~env
+        ~circle_mode:R.Prior ~wasm_compute_mode:R.Active ~program_trust ~object_cost:false
+        ~save_receipt_raw:(fun ~tx_hash ~json -> receipts := (tx_hash, json) :: !receipts)
+        transaction)) in
+    let payload = Circles.{runtime = Wasm_v1; privacy_class = Public;
+      browser_mode = Native_sealed; resource_mode = Public_resources;
+      code_b64 = Some (Base64.encode_exn code); policy_hash = None; members_root = None;
+      export_policy = None; limits = default_limits} in
+    let target = Circles.circle_id_of_deploy ~deployer:owner ~nonce:1 payload in
+    expect_confirmed "reply circle deploy" (apply ~env:{env with epoch_id = start - 1}
+      (tx ~owner ~target ~nonce:1 ~op_type:Transaction.CircleDeploy ~payload:None
+      ~message:(Some (Yojson.Safe.to_string (Circles.yojson_of_deploy_payload payload)))));
+    let storage = Lwt_main.run (Store.load_circle_stable_storage store target) |> Result.get_ok in
+    Hashtbl.replace storage H.require_live_key_policy_key "false";
+    List.iter (fun key -> Hashtbl.replace storage key "any_registered")
+      [H.load_pk_mode_key; H.cipher_arithmetic_mode_key;
+       H.cipher_serde_mode_key; H.pubkey_serde_mode_key];
+    ignore (Lwt_main.run (Store.save_circle_stable_storage store target storage));
+    let account () = Option.get (L.find_opt ledger owner) in
+    let fee = Z.of_int 20_000_000 in
+    let call ?(nested = false) number reason =
+      Lwt_main.run (L.flush_dirty_lwt ledger);
+      let before = account () in
+      let written = List.length !receipts in
+      let transaction = {(tx ~owner ~target ~nonce:(before.nonce + 1)
+        ~op_type:Transaction.CircleCall ~payload:(Some "fhe_number")
+        ~message:(Some (Yojson.Safe.to_string (`List [`String owner; `String number; `Bool nested]))))
+        with ou = fee} in
+      let snapshot, result, binding = capture_call ~ledger ~store ~backend ~env transaction in
+      begin match result with
+      | Ok (Epoch_exec.Rejected_after_fee rejected) ->
+        expect ("reply capture reason differs: " ^ rejected.reason) (rejected.reason = reason)
+      | Ok (Epoch_exec.Confirmed _) -> fail "reply capture confirmed"
+      | Error (kind, reason) -> fail ("reply capture refused: " ^ kind ^ ": " ^ reason)
+      end;
+      let binding = Option.get binding in
+      if not active then
+        expect "reply binding differs before rule"
+          (E.hfhe_binding_equal binding (E.failed_call_result "").hfhe_binding)
+      else begin
+        let circle = Octra_node_runtime.Consensus_circle_preverify.circle_state snapshot binding in
+        let receipt = P.make_circle ~tx_hash:(Transaction.hash transaction)
+          ~input_hash:(W.circle_input_hash transaction circle)
+          ~output_hash:(W.circle_output_hash transaction circle "ok")
+          ~circle ~ok:true ~reason:"" ~cost:(Octra_core.Resource_lanes.cost transaction)
+          |> Result.get_ok in
+        expect "reply receipt invalid" (C.check_receipt transaction receipt = Ok ());
+        expect "reply receipt state differs"
+          (Lwt_main.run (C.check_state ledger transaction receipt) = Ok ());
+        let empty = {circle with context_hash = zero; transcript = []} in
+        let altered = {receipt with P.circle = Some empty;
+          input_hash = W.circle_input_hash transaction empty;
+          output_hash = W.circle_output_hash transaction empty "ok"} in
+        expect "empty reply receipt shape invalid" (C.check_receipt transaction altered = Ok ());
+        let refused = try ignore (apply ~preverify:(C.create [altered]) transaction); false with
+          | Octra_vm.Direct_exec.Receipt_mismatch _ -> true in
+        expect "empty reply receipt was applied" refused;
+        expect "empty reply receipt was published" (List.length !receipts = written);
+        expect "empty reply receipt changed account"
+          ((account ()).L.balance = before.L.balance && (account ()).nonce = before.nonce);
+        let applied = try apply ~preverify:(C.create [receipt]) transaction with
+          | Octra_vm.Direct_exec.Receipt_mismatch _ -> fail "reply receipt refused at apply" in
+        begin match applied with
+        | Ok (Epoch_exec.Rejected_after_fee rejected) ->
+          expect ("reply apply reason differs: " ^ rejected.reason) (rejected.reason = reason);
+          expect "reply apply fee differs" (rejected.fee = fee)
+        | Ok (Epoch_exec.Confirmed _) -> fail "reply apply confirmed"
+        | Error (kind, reason) -> fail ("reply apply refused: " ^ kind ^ ": " ^ reason)
+        end;
+        expect "reply receipt count differs" (List.length !receipts = written + 1);
+        expect "reply fee differs" ((account ()).L.balance = Z.sub before.L.balance fee);
+        expect "reply nonce differs" ((account ()).nonce = before.nonce + 1);
+        expect "reply binding lost circle" (binding.circle_id = target);
+        expect "reply binding lost context" (binding.context_hash <> zero);
+        expect "reply binding lost entry"
+          (List.map (fun entry -> entry.Octra_core.Circle_hfhe_transcript.method_name)
+            binding.transcript = if nested then [] else ["fhe_load_pk"]);
+        expect_confirmed "reply next nonce" (apply (tx ~owner ~target ~nonce:(before.nonce + 2)
+          ~op_type:Transaction.CircleCall ~payload:(Some "visit") ~message:(Some "[]")))
+      end in
+    call "x" "wasm response integer is invalid";
+    if active then begin
+      call ("0x" ^ String.make 16_385 'f') "wasm response integer width exceeds limit";
+      call "short" "wasm response too short";
+      call "trap" "wasm `unreachable` instruction executed";
+      call ~nested:true "x" "wasm response integer is invalid"
+    end;
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    let result = Lwt_main.run (Store.get_batch_tree_hash store), List.rev !receipts in
+    Store.abort_epoch_batch store;
+    result) in
+  ignore (run (start - 1));
+  expect "reply execution differs across runs" (run start = run start)
+
+let test_wasm_refusal () =
+  let module W = Octra_core.Circle_wasm_host in
+  let module T = Octra_core.Circle_hfhe_transcript in
+  let entry = T.{method_name = "fhe_load_pk"; request_hash = String.make 64 'a';
+    response_hash = String.make 64 'b'; result = None} in
+  let decode entries response = Lwt_main.run (W.decode_execution ~storage_tbl:(Hashtbl.create 0)
+    (Ok (`Assoc ["success", `Bool false; "status_code", `Int 0; "effort_used", `Int 7;
+      "response_b64", `String (Base64.encode_exn response); "storage_pairs", `Null;
+      "events", `List []; "hfhe_receipt_entries", entries]))) in
+  let short = "wasm response too short" in
+  begin match decode (T.entries_json [entry]) "abc" with
+  | Error (W.Refused (reason, entries)) ->
+    expect "refusal reason differs" (reason = short);
+    expect "refusal entries differ" (entries = [entry])
+  | _ -> fail "refusal lost entries"
+  end;
+  expect "refusal without entries differs"
+    (decode (`List []) "abc" = Error (W.Refused (short, [])));
+  expect "refusal with invalid entries differs"
+    (decode (`String "") "abc" = Error (W.Rejected "circle_hfhe_entries_invalid"));
+  expect "plain refusal differs"
+    (W.plain (decode (T.entries_json [entry]) "abc") = Error (W.Rejected short));
+  expect "refusal message differs" (W.error_message (W.Refused (short, [entry])) = short)
 
 let test_wasm_text () =
   let module W = Octra_circle_runtime.Wasm_call in
@@ -2557,7 +2720,200 @@ program ByteWork {
        "octra-devnet-9871-cluster") in
      [plan.activation_epoch - 1; plan.activation_epoch; plan.activation_epoch + 1])
 
+let test_scalar_epoch () =
+  let chain_id = "octra-devnet-9871-cluster" in
+  let at = Option.fold ~none:1_769_492
+    ~some:(fun (plan : Octra_core.Rule_graph.activation) -> plan.activation_epoch)
+    (Octra_core.Rule_graph.scalar_work_activation_for_chain chain_id) in
+  let run label epoch fee = with_store label (fun store ->
+    let owner = "oct11111111111111111111111111111111111111111" in
+    let raw, encoded = compile source_v1 in
+    let target = Contract.addr_from_code raw owner 1 in
+    let ledger = Octra_core.Ledger.create store in
+    ignore (Octra_core.Ledger.add_account ledger owner (Z.of_int 10_000_000) |> Result.get_ok);
+    Lwt_main.run (Octra_core.Ledger.flush_dirty_lwt ledger);
+    let backend = Epoch_exec.make_live_backend store ledger in
+    Lwt_main.run (backend.begin_batch Octra_core.Rule_graph.Prior);
+    expect_confirmed "historical deploy" (process backend (tx ~owner ~target ~nonce:1
+      ~op_type:Transaction.ContractDeploy ~payload:(Some encoded) ~message:(Some "[]")));
+    let receipts = ref [] in
+    let transaction = { (tx ~owner ~target ~nonce:2 ~op_type:Transaction.ProgramExec
+      ~payload:(Some "inc") ~message:(Some "[]")) with ou = Z.of_int fee } in
+    let result = process ~env:{env with chain_id; epoch_id = epoch}
+      ~save_receipt_raw:(fun ~tx_hash:_ ~json -> receipts := json :: !receipts) backend transaction in
+    let value = view_int store target owner "count" in
+    let account = Option.get (Octra_core.Ledger.find_opt ledger owner) in
+    Lwt_main.run (Octra_core.Ledger.flush_dirty_lwt ledger);
+    let root = Lwt_main.run (Store.get_batch_tree_hash store) in
+    Store.abort_epoch_batch store;
+    result, value, account.balance, account.nonce, root, !receipts) in
+  let prior = run "scalar_before" (at - 1) 10 in
+  let after = run "scalar_after" at 10 in
+  let accepted, value, _, _, _, _ = prior in
+  expect_confirmed "prior allowance" accepted;
+  expect "prior call result" (Z.equal value Z.one);
+  let accepted, value, balance, nonce, _, receipts = after in
+  expect_confirmed "minimum call allowance" accepted;
+  expect "minimum call result changed" (Z.equal value Z.one);
+  expect "minimum call fee changed" (Z.equal balance (Z.of_int 9_999_980) && nonce = 2);
+  expect "minimum call receipt missing" (receipts <> []);
+  expect "minimum call replay changed"
+    (after = run "scalar_after_repeat" at 10);
+  let next, value, _, _, _, _ = run "scalar_next" (at + 1) 10 in
+  expect_confirmed "next epoch allowance" next;
+  expect "next epoch value changed" (Z.equal value Z.one);
+  let paid = run "scalar_paid" at 200_000 in
+  let repeated = run "scalar_repeat" at 200_000 in
+  expect "scalar replay root or receipt differs" (paid = repeated);
+  let result, value, _, _, _, _ = paid in
+  expect "paid scalar call" (match result with
+    | Ok (Epoch_exec.Confirmed fee) -> Z.equal fee (Z.of_int 200_000) | _ -> false);
+  expect "paid scalar value changed" (Z.equal value Z.one)
+
+let test_scalar_routes () =
+  let broken name = Array.exists (String.equal name) Sys.argv in
+  with_store "scalar_routes" (fun store ->
+    let owner = "oct11111111111111111111111111111111111111111" in
+    let _, encoded = compile source_v1 in
+    let legacy = Octra_vm.Bytecode.encode
+      [|ContractVM.LDI (0, ContractVM.VInt (Z.shift_left Z.one 230_000)); ContractVM.STOP|]
+      |> Base64.encode_exn in
+    let circle code =
+      let payload = Circles.{runtime = Octb; privacy_class = Public;
+        browser_mode = Native_sealed; resource_mode = Public_resources;
+        code_b64 = Some code; policy_hash = None; members_root = None;
+        export_policy = None; limits = default_limits} in
+      { (tx ~owner ~target:owner ~nonce:1 ~op_type:Transaction.CircleDeploy ~payload:None
+        ~message:(Some (Yojson.Safe.to_string (Circles.yojson_of_deploy_payload payload))))
+        with ou = Z.of_int 10_000_000 } in
+    let admit active code = Lwt_main.run (Circle_code.admit ~scalar_work:active
+      ~store ~program_trust ~point_ops:true (circle code)) in
+    expect "historical Circle refused" (Result.is_ok (admit false legacy));
+    expect "Circle scalar gate bypassed" (Result.is_error (admit (not (broken "circle")) legacy));
+    expect "priced Circle refused" (Result.is_ok (admit true encoded));
+    let sources = Octra_vm.Program_record.{main = "main.aml"; compiler = "protocol";
+      loops = false; files = [Program_package.{path = "main.aml";
+        body = source_v1 ^ String.make 60_000 ' '}]} in
+    let _, compiled = Octra_vm.Program_record.compile ~metered:true sources |> Result.get_ok in
+    let compiled = Octra_vm.Oct_compile.emit_program compiled
+      |> Octra_vm.Oct_compile.attest_program ~key_id:release_key.id ~private_key:release_private_key in
+    let raw = Option.get compiled.program_envelope in
+    let encoded = Base64.encode_exn raw in
+    let target = Contract.addr_from_code raw owner 1 in
+    let ledger = Octra_core.Ledger.create store in
+    ignore (Octra_core.Ledger.add_account ledger owner (Z.of_int 10_000_000) |> Result.get_ok);
+    Lwt_main.run (Octra_core.Ledger.flush_dirty_lwt ledger);
+    let fold epoch = Epoch_exec.prior_fold epoch |> Result.map (fun fold ->
+      {fold with Epoch_exec.program_records = Octra_core.Rule_graph.Active}) in
+    let backend = Epoch_exec.make_live_backend ~fold store ledger in
+    Lwt_main.run (backend.begin_batch Octra_core.Rule_graph.Prior);
+    expect_confirmed "source setup" (process backend (tx ~owner ~target ~nonce:1
+      ~op_type:Transaction.ContractDeploy ~payload:(Some encoded) ~message:(Some "[]")));
+    let message = Octra_vm.Program_upgrade.source_message
+      ~expected_code_hash:Digestif.SHA256.(digest_string raw |> to_hex) in
+    let transaction = { (tx ~owner ~target ~nonce:2 ~op_type:Transaction.ContractUpgrade
+      ~payload:(Some (Base64.encode_exn (Octra_vm.Program_record.encode_sources sources)))
+      ~message:(Some message)) with ou = Z.of_int 210_000 } in
+    let chain_id = "octra-devnet-9871-cluster" in
+    let plan = Octra_core.Rule_graph.scalar_work_activation_for_chain chain_id in
+    let at = Option.fold ~none:1_769_492
+      ~some:(fun (plan : Octra_core.Rule_graph.activation) -> plan.activation_epoch) plan in
+    let epoch_id = at - if broken "source" then 1 else 0 in
+    let result = process ~env:{env with chain_id; epoch_id} backend transaction in
+    (match plan with
+    | None -> expect "inactive source work changed" (match result with
+      | Ok (Epoch_exec.Confirmed fee) -> Z.equal fee transaction.ou
+      | _ -> false)
+    | Some _ -> expect "source compilation was not priced" (match result with
+      | Ok (Epoch_exec.Rejected_after_fee rejected) -> rejected.reason = "program source work refused"
+      | _ -> false));
+    let account = Option.get (Octra_core.Ledger.find_opt ledger owner) in
+    expect "source refusal fee differs" (account.nonce = 2
+      && Z.equal account.balance (Z.of_int 9_789_990));
+    Store.abort_epoch_batch store)
+
+let test_early_binding () =
+  let module R = Octra_core.Rule_graph in
+  let module L = Octra_core.Ledger in
+  let module W = Octra_core.Preverify_worker in
+  let module E = Octra_circle_runtime.Circle_exec in
+  let code = vault_code () in
+  let env = {env with chain_id = "octra-devnet-9871-cluster"} in
+  let start = match R.program_result_activation_for_chain env.chain_id with
+    | Some plan -> plan.activation_epoch
+    | None -> fail "early rule plan missing" in
+  let owner = "oct6wMiXWiH5SKkfpXC9RvGEBTyPPMN9NgQxVWPDwjhmtcZ" in
+  let setup store =
+    let ledger = L.create store in
+    begin match L.add_account ledger owner (Z.of_int 400_000_000) with
+    | Ok () -> ()
+    | Error reason -> fail reason end;
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    let backend = Epoch_exec.make_live_backend store ledger in
+    Lwt_main.run (backend.begin_batch R.Prior);
+    let payload = Circles.{runtime = Wasm_v1; privacy_class = Public;
+      browser_mode = Native_sealed; resource_mode = Public_resources;
+      code_b64 = Some (Base64.encode_exn code); policy_hash = None; members_root = None;
+      export_policy = None; limits = default_limits} in
+    let target = Circles.circle_id_of_deploy ~deployer:owner ~nonce:1 payload in
+    expect_confirmed "early circle deploy"
+      (Lwt_main.run (Octra_core.Tx_savepoint.run ~ledger ~store (fun () ->
+        Transition.process_tx ~backend ~env:{env with epoch_id = start - 1}
+          ~circle_mode:R.Prior ~wasm_compute_mode:R.Active ~program_trust ~object_cost:false
+          (tx ~owner ~target ~nonce:1 ~op_type:Transaction.CircleDeploy ~payload:None
+            ~message:(Some (Yojson.Safe.to_string (Circles.yojson_of_deploy_payload payload)))))));
+    Lwt_main.run (Store.save_circle_program_code_b64 store target
+      (Base64.encode_exn (code ^ "\000")));
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    let info = Option.get (Lwt_main.run (Store.get_circle_info store target)) in
+    ledger, backend, target, info, Lwt_main.run (Store.get_batch_tree_hash store) in
+  let run epoch = with_store ("early_binding_" ^ string_of_int epoch) (fun store ->
+    let active = R.program_result_at ~chain_id:env.chain_id ~epoch = R.Active in
+    expect "early rule side differs" (active = (epoch >= start));
+    let ledger, backend, target, info, root = setup store in
+    let transaction = {(tx ~owner ~target ~nonce:2 ~op_type:Transaction.CircleCall
+      ~payload:(Some "visit") ~message:(Some "[]")) with ou = Z.of_int 20_000_000} in
+    let snapshot, result, binding = capture_call ~ledger ~store ~backend
+      ~env:{env with epoch_id = epoch} transaction in
+    begin match result with
+    | Ok (Epoch_exec.Rejected_after_fee rejected) ->
+      expect ("early refusal reason differs: " ^ rejected.reason)
+        (rejected.reason = "circle code hash mismatch")
+    | Ok (Epoch_exec.Confirmed _) -> fail "early capture confirmed"
+    | Error (kind, reason) -> fail ("early capture refused: " ^ kind ^ ": " ^ reason)
+    end;
+    expect "early capture changed state" (root = Lwt_main.run (Store.get_batch_tree_hash store));
+    let binding = match binding with
+      | Some binding -> binding
+      | None -> fail "early capture missing" in
+    let empty = (E.failed_call_result "").hfhe_binding in
+    let ready = match W.circle_receipt transaction
+      (Octra_node_runtime.Consensus_circle_preverify.circle_state snapshot binding) with
+      | W.Ready _ -> true
+      | W.Defer _ | W.Skip _ -> false in
+    if active then begin
+      expect "early binding lost circle" (binding.circle_id = target);
+      expect "early binding lost code" (binding.code_hash = info.code_hash);
+      expect "early binding lost storage root" (binding.stable_root = info.stable_root);
+      expect "early binding lost reads" (binding.public_reads_hash = E.public_reads_hash []);
+      expect "early binding gained context"
+        (binding.context_hash = empty.context_hash && binding.transcript = []);
+      expect "early receipt missing" ready
+    end else begin
+      expect "early binding filled before rule" (E.hfhe_binding_equal binding empty);
+      expect "early receipt built before rule" (not ready)
+    end;
+    Store.abort_epoch_batch store) in
+  run (start - 1);
+  run start
+
 let () =
+  if Array.length Sys.argv = 2 && List.mem Sys.argv.(1) ["--scalar"; "circle"; "source"] then begin
+    test_scalar_epoch ();
+    test_scalar_routes ();
+    print_endline "status = pass test = scalar_epoch";
+    exit 0
+  end;
   if Array.length Sys.argv = 2 && Sys.argv.(1) = "--bytes" then begin
     test_spawn_budget ();
     test_resource_abort ();
@@ -2568,6 +2924,13 @@ let () =
   if Array.length Sys.argv = 2 && Sys.argv.(1) = "--keys" then begin
     test_wasm_pairs ~keyed:true ();
     print_endline "status = pass test = wasm_keys";
+    exit 0
+  end;
+  if Array.length Sys.argv = 2 && Sys.argv.(1) = "--reply" then begin
+    test_wasm_refusal ();
+    test_early_binding ();
+    test_wasm_reply ();
+    print_endline "status = pass test = wasm_reply";
     exit 0
   end;
   if Array.length Sys.argv = 2 && Sys.argv.(1) = "--pairs" then begin
@@ -2588,6 +2951,9 @@ let () =
   test_vm_bytes ();
   test_wasm_pairs ();
   test_wasm_pairs ~keyed:true ();
+  test_wasm_refusal ();
+  test_early_binding ();
+  test_wasm_reply ();
   test_wasm_text ();
   test_wasm_response ();
   test_write_abort ~phase:"vm_commit_after_program" ();

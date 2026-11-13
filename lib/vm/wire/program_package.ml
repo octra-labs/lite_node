@@ -286,7 +286,7 @@ let compile_sources ~metered ~loops ~compiler ~point_ops package =
 let compile_sources_checked ~metered ~loops package =
   compile_sources_with (Oct_compile.compile_program_described ~metered ~loops) package
 
-let build_with ~point_ops compile package =
+let build_with ?(view = false) ~point_ops compile package =
   let result, used = compile package in
   match result.Oct_compile.error, result.program_envelope with
   | Some reason, _ -> Error (Compile_failed reason)
@@ -300,7 +300,7 @@ let build_with ~point_ops compile package =
     | Some source -> Error (Unused_source source.path)
     | None ->
       bind
-        (match Code_check.decode_program_source ~point_ops envelope with
+        (match Code_check.decode_program_source ~view ~point_ops envelope with
          | Ok admitted -> Ok admitted
          | Error error ->
            Error (Check_failed (Code_check.error_message error)))
@@ -319,7 +319,7 @@ let build ?(metered = false) ?(consts = false) ~loops ~compiler ~point_ops packa
   bind checked (fun () ->
     build_with ~point_ops (compile_sources ~metered ~loops ~compiler ~point_ops) package)
 
-let compile_sources_at ~metered ~loops ~compiler ~point_ops ~main ~sources =
+let compile_sources_in ~view ~metered ~loops ~compiler ~point_ops ~main ~sources =
   if compiler <> Protocol && not point_ops then Error Bad_compiler_profile
   else
   bind (normalize ~main sources) (fun sources ->
@@ -330,12 +330,14 @@ let compile_sources_at ~metered ~loops ~compiler ~point_ops ~main ~sources =
       | Protocol when point_ops -> compile_sources_checked ~metered ~loops
       | Protocol -> compile_sources_with Prior_compile.compile_program_multi
     in
-    build_with ~point_ops compile {
+    build_with ~view ~point_ops compile {
       compiler_profile;
       main;
       sources;
       envelope = "";
     })
+
+let compile_sources_at = compile_sources_in ~view:false
 
 let compile_at = compile_sources_at ~metered:false
 
@@ -348,6 +350,22 @@ let compile ~main ~sources =
 
 let validate_base64 encoded =
   bind (decode_base64 encoded) (fun _ -> Ok ())
+
+let source_cost sources =
+  if not (List.for_all (fun source -> Scalar_work.text_ok source.body) sources) then None
+  else Some (List.fold_left (fun total source ->
+    Z.add total (Scalar_work.parse (String.length source.body))) Z.zero sources)
+
+let scalar_cost encoded =
+  match decode_base64 encoded with
+  | Error _ -> None
+  | Ok package -> Option.map (fun cost -> Z.add (Z.mul (Z.of_int 4) cost)
+      (Scalar_work.load (String.length encoded))) (source_cost package.sources)
+
+let scalar_check ~limit encoded =
+  let load = Scalar_work.load (String.length encoded) in
+  if Z.gt load limit then false else
+  Option.fold ~none:false ~some:(fun cost -> Z.leq cost limit) (scalar_cost encoded)
 
 let admit_base64 ?(metered = false) ?(compiler = Protocol) ?(point_ops = false) ?(loops = false)
     ?(consts = false) encoded =

@@ -31,8 +31,14 @@ type deps = {
   warn : string -> unit;
 }
 
+val host_reason : string -> string
+val circle_work : epoch:int -> tx:Octra_core.Transaction.t ->
+  (unit -> 'a Lwt.t) -> 'a Lwt.t
+
 val node_backend :
   ?compute:Octra_core.Compute_bill.verifier ->
+  ?voting_set:
+    (epoch:int -> (Octra_consensus.C_types.validator_set option, string) result) ->
   ?private_artifacts:
     (Octra_core.Transaction.t list ->
      (string * Octra_core.Private_ledger.private_artifact) list) ->

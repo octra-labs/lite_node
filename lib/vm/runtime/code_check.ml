@@ -72,7 +72,7 @@ let admit ~program ~point_ops code =
 let of_code ?(point_ops = false) code = admit ~program:false ~point_ops code
 
 module Decode : sig
-  val code : active:bool -> string -> (Contract_vm.instr array, string) result
+  val code : view:bool -> active:bool -> string -> (Contract_vm.instr array, string) result
 end = struct
   type key = { active : bool; hash : string; raw : string }
   type entry = { key : key; code : Contract_vm.instr array; bytes : int }
@@ -105,24 +105,26 @@ end = struct
       take max_entries max_bytes (entry :: rest), ()
 
   let entries = ref []
+  let view_entries = ref []
   let lock = Mutex.create ()
 
-  let request : type a. a message -> a = fun message ->
+  let request : type a. bool -> a message -> a = fun view message ->
+    let entries = if view then view_entries else entries in
     Mutex.lock lock;
     Fun.protect ~finally:(fun () -> Mutex.unlock lock) (fun () ->
       let next, reply = step !entries message in
       entries := next;
       reply)
 
-  let code ~active raw =
+  let code ~view ~active raw =
     let length = String.length raw in
-    if length > max_bytes - 1024 then Bytecode.decode ~active raw
+    if length > max_bytes - 1024 then Bytecode.decode ~view ~active raw
     else
       let key = { active; raw; hash = Digestif.SHA256.(digest_string raw |> to_raw_string) } in
-      match request (Read key) with
+      match request view (Read key) with
       | Some code -> Ok (Array.copy code)
       | None ->
-        match Bytecode.decode ~active raw with
+        match Bytecode.decode ~view ~active raw with
         | Error error -> Error error
         | Ok code ->
           let word = Sys.word_size / 8 in
@@ -131,13 +133,13 @@ end = struct
           if bytes > max_bytes || words > (max_bytes - bytes) / word then Ok code
           else begin
             let bytes = bytes + word * words in
-            request (Keep { key; code; bytes });
+            request view (Keep { key; code; bytes });
             Ok (Array.copy code)
           end
 end
 
-let decode ?(point_ops = false) raw =
-  match Decode.code ~active:point_ops raw with
+let decode ?(view = false) ?(point_ops = false) raw =
+  match Decode.code ~view ~active:point_ops raw with
   | Error err -> Error (Decode_error err)
   | Ok code -> of_code ~point_ops code
 
@@ -407,11 +409,11 @@ let verify_program_cert ~attested ~trusted raw_code code raw =
   | (Stack_overflow | Out_of_memory) as error -> raise error
   | _ -> Error "invalid program certificate"
 
-let decode_program ?(trusted = []) ?(point_ops = false) raw =
+let decode_program ?(view = false) ?(trusted = []) ?(point_ops = false) raw =
   match Program_envelope.decode raw with
   | Error error -> Error (Decode_error (Program_envelope.error_message error))
   | Ok envelope ->
-    match Decode.code ~active:point_ops envelope.code with
+    match Decode.code ~view ~active:point_ops envelope.code with
     | Error error -> Error (Decode_error error)
     | Ok code ->
       match
@@ -428,11 +430,11 @@ let decode_program ?(trusted = []) ?(point_ops = false) raw =
           (fun program -> { program with compiler_version = Some version })
           (of_program ~point_ops ~facts code)
 
-let decode_program_source ?(point_ops = false) raw =
+let decode_program_source ?(view = false) ?(point_ops = false) raw =
   match Program_envelope.decode raw with
   | Error error -> Error (Decode_error (Program_envelope.error_message error))
   | Ok envelope ->
-    match Decode.code ~active:point_ops envelope.code with
+    match Decode.code ~view ~active:point_ops envelope.code with
     | Error error -> Error (Decode_error error)
     | Ok code ->
       match
@@ -449,13 +451,29 @@ let decode_program_source ?(point_ops = false) raw =
           (fun program -> { program with compiler_version = Some version })
           (of_program ~point_ops ~facts code)
 
+let scalar_cost raw =
+  if Program_envelope.is_program raw then
+    match Program_envelope.decode raw with
+    | Error _ -> None
+    | Ok envelope -> Bytecode.scalar_cost envelope.Program_envelope.code
+  else Bytecode.scalar_cost raw
+
+let view_allowed raw =
+  let load = Scalar_work.load (String.length raw) in
+  Z.leq load (Z.of_int 10_000_000) &&
+  Option.fold ~none:false ~some:(fun scalar ->
+    Z.leq (Z.add scalar load) (Z.of_int 10_000_000)) (scalar_cost raw)
+
 type saved =
   | Image of t
   | Checked of profile * Program_effects.t * string option
 
 let checked : saved Code_cache.t = Code_cache.create ()
+let view_checked : saved Code_cache.t = Code_cache.create ()
 
-let reuse ~mode ~trusted ~point_ops raw compute =
+let reuse ~view ~mode ~trusted ~point_ops raw compute =
+  if view && not (view_allowed raw) then Error (Verify_error "program read effort exceeds limit") else
+  let checked = if view then view_checked else checked in
   let key = Code_cache.key ~mode ~point_ops ~trusted raw in
   let retain = function
     | Image image as value when not (Code_cache.fits key value) ->
@@ -470,26 +488,26 @@ let reuse ~mode ~trusted ~point_ops raw compute =
         |> Result.map (fun envelope -> envelope.Program_envelope.code)
         |> Result.map_error (fun error -> Decode_error (Program_envelope.error_message error)) in
     Result.bind code (fun raw ->
-      Decode.code ~active:point_ops raw
+      Decode.code ~view ~active:point_ops raw
       |> Result.map_error (fun error -> Decode_error error)
       |> Result.map (fun admitted_code ->
         {admitted_code; admitted_effects; profile; compiler_version}))
 
-let decode ?(point_ops = false) raw =
-  reuse ~mode:0 ~point_ops ~trusted:[] raw
-    (fun () -> decode ~point_ops raw)
+let decode ?(view = false) ?(point_ops = false) raw =
+  reuse ~view ~mode:0 ~point_ops ~trusted:[] raw
+    (fun () -> decode ~view ~point_ops raw)
 
-let decode_program ?(trusted = []) ?(point_ops = false) raw =
-  reuse ~mode:1 ~point_ops ~trusted raw
-    (fun () -> decode_program ~trusted ~point_ops raw)
+let decode_program ?(view = false) ?(trusted = []) ?(point_ops = false) raw =
+  reuse ~view ~mode:1 ~point_ops ~trusted raw
+    (fun () -> decode_program ~view ~trusted ~point_ops raw)
 
-let decode_deploy ?(trusted = []) ?(point_ops = false) raw =
-  if Program_envelope.is_program raw then decode_program ~trusted ~point_ops raw
-  else decode ~point_ops raw
+let decode_deploy ?(view = false) ?(trusted = []) ?(point_ops = false) raw =
+  if Program_envelope.is_program raw then decode_program ~view ~trusted ~point_ops raw
+  else decode ~view ~point_ops raw
 
-let decode_program_source ?(point_ops = false) raw =
-  reuse ~mode:2 ~point_ops ~trusted:[] raw
-    (fun () -> decode_program_source ~point_ops raw)
+let decode_program_source ?(view = false) ?(point_ops = false) raw =
+  reuse ~view ~mode:2 ~point_ops ~trusted:[] raw
+    (fun () -> decode_program_source ~view ~point_ops raw)
 
 let compiler_version program = program.compiler_version
 

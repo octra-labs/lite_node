@@ -223,6 +223,7 @@ val plan_deploy_input_with_keys :
   deploy_input_plan
 
 val parse_multi_exec_calls :
+  ?scalar_work:bool ->
   max_calls:int ->
   string ->
   (call list, string) result

@@ -71,7 +71,7 @@ let test_relay_size () =
 
 let test_missing_sender () =
   let runtime = runtime () in
-  match R.validate_and_submit_tx runtime (ledger ()) (standard_tx ()) with
+  match Lwt_main.run (R.validate_and_submit_tx runtime (ledger ()) (standard_tx ())) with
   | Error ("sender_not_found", _) -> ()
   | Error (tag, reason) ->
     fail ("unexpected error " ^ tag ^ ": " ^ reason)
@@ -90,7 +90,7 @@ let test_observer_submission_policy () =
   with_env "OCTRA_CONSENSUS_MODE" "observer" (fun () ->
     with_env "OCTRA_OBSERVER_RELAY_SUBMITS" "" (fun () ->
       let runtime = runtime () in
-      match R.validate_and_submit_tx runtime (ledger ()) (standard_tx ()) with
+      match Lwt_main.run (R.validate_and_submit_tx runtime (ledger ()) (standard_tx ())) with
       | Error ("read_only_observer", _) -> ()
       | Error (tag, reason) ->
         fail ("unexpected observer error " ^ tag ^ ": " ^ reason)
@@ -98,7 +98,7 @@ let test_observer_submission_policy () =
         fail "read-only observer accepted submission");
     with_env "OCTRA_OBSERVER_RELAY_SUBMITS" "1" (fun () ->
       let runtime = runtime () in
-      match R.validate_and_submit_tx runtime (ledger ()) (standard_tx ()) with
+      match Lwt_main.run (R.validate_and_submit_tx runtime (ledger ()) (standard_tx ())) with
       | Error ("sender_not_found", _) -> ()
       | Error (tag, reason) ->
         fail ("unexpected relay observer error " ^ tag ^ ": " ^ reason)
@@ -162,6 +162,21 @@ let test_preverify () =
     | Ok _ -> fail "busy preverify left transaction in staging"
   end;
   expect "busy preverify rolled staging back" (Staging.all () = []);
+  let saved = ref [] in
+  let ready = {runtime with R.preverify_admit = (fun _ -> Ok ());
+    save_drops = (fun drops -> saved := drops @ !saved)} in
+  let original = match R.add_tx_to_staging ~relay:false ready ledger item with
+    | Ok hash -> hash | Error reason -> fail reason in
+  let replacement = {item with Transaction.ou = Z.of_int 20_000} in
+  List.iter (fun preverify_admit ->
+    let refused = {ready with R.preverify_admit} in
+    expect "refused replacement accepted"
+      (Result.is_error (R.add_tx_to_staging ~relay:false refused ledger replacement));
+    expect "refused replacement removed original"
+      (Staging.find_by_hash original = Some item);
+    expect "refused replacement recorded drops" (!saved = []);
+    expect "refused replacement changed size" (Staging.staging_size () = 1))
+    [(fun _ -> Error "pre_verify_busy"); (fun _ -> failwith "preverify stopped")];
   Staging.clear ()
 
 let test_eviction () =
@@ -303,7 +318,7 @@ let test_duty_flood () =
   expect "next confirmed duty accepted" (submit first = Ok hash);
   expect "duty repeat remains idempotent" (submit first = Ok hash);
   let replacement = { first with Transaction.ou = Z.of_int 1_001 } in
-  let validate tx = Result.map_error Octra_node_runtime.Tx_view.staging_error (submit tx) in
+  let validate tx = Lwt.return (Result.map_error Octra_node_runtime.Tx_view.staging_error (submit tx)) in
   let response = Lwt_main.run (Octra_node_runtime.Submit_rpc.submit ~validate
     (`List [Transaction.to_yojson replacement])) in
   (match response with
@@ -522,7 +537,7 @@ let test_compute_paths () =
         let before = Ledger.find ledger tx.from in
         (match route with
         | 0 ->
-          let result = R.validate_and_submit_tx runtime ledger tx in
+          let result = Lwt_main.run (R.validate_and_submit_tx runtime ledger tx) in
           expect "compute RPC activation" (Result.is_ok result = accepted);
           if not accepted then expect "compute RPC exact error"
             (result = Error ("malformed_transaction", reason))
@@ -537,16 +552,17 @@ let test_compute_paths () =
           let payload = if route = 2 then Octra_net.P2p_tx_gossip.encode
               (Octra_net.P2p_tx_gossip.Tx {hash = Transaction.hash tx; tx_json = json})
             else Octra_net.Oce1.encode (fun buffer -> Octra_net.Oce1.put_string buffer json) in
-          P.handle P.{guard = Octra_net.P2p_tx_gossip_guard.create (); payload;
+          Lwt_main.run (P.handle P.{guard = Octra_net.P2p_tx_gossip_guard.create (); payload;
             peer_id = "compute-peer"; has_tx = (fun _ -> false); find_tx = (fun _ -> None);
             sender_pk = (fun _ -> tx.public_key);
+            find_account = Ledger.find_opt ledger;
             add_tx = R.add_tx_to_staging ~relay:false runtime ledger;
             send_payload = (fun _ -> fail "unexpected compute fetch");
             send_batch = (fun _ -> fail "unexpected compute fetch");
             broadcast_payload = (fun _ -> incr gossip);
             report_bad_peer = (fun _ -> fail "compute peer punished");
             close_peer = (fun () -> fail "compute peer closed");
-            now = Unix.gettimeofday; signing = (fun () -> Octra_core.Tx_signature.Historical); max_drift = 300.};
+            now = Unix.gettimeofday; signing = (fun () -> Octra_core.Tx_signature.Historical); max_drift = 300.});
           expect "compute gossip activation" (!gossip = if accepted then 1 else 0));
         expect "compute queue size" (Staging.staging_size () = if accepted then 1 else 0);
         expect "compute preverification activation" (!count = if accepted then 1 else 0);
@@ -555,7 +571,287 @@ let test_compute_paths () =
   Fun.protect ~finally:Staging.clear (fun () ->
     List.iter check [Transaction.ComputeFund; Transaction.ComputeReturn; Transaction.ComputeSettle])
 
-let () =
+let devnet_payloads () =
+  let module F = Octra_core.Crypto.FheBalance in
+  let public, secret =
+    Pvac_ffi.keygen_from_seed (Pvac_ffi.default_params ()) (Bytes.make 32 '\041') in
+  let cipher = Pvac_ffi.enc_value_seeded public secret 1L (Bytes.make 32 '\042') in
+  let blinding = Bytes.make 32 '\043' in
+  let zero_proof = Pvac_ffi.make_zero_proof_bound ~keyed:false
+    public secret cipher 1L blinding |> F.encode_zero_proof in
+  let amount_commitment = Pvac_ffi.pedersen_commit_amount 1L blinding
+    |> Bytes.to_string |> Base64.encode_exn in
+  let commitment = Pvac_ffi.commit_ct public cipher
+    |> Bytes.to_string |> Base64.encode_exn in
+  let cipher = F.encode_cipher cipher in
+  let encrypt = Yojson.Safe.to_string (`Assoc [
+    "cipher", `String cipher;
+    "amount_commitment", `String amount_commitment;
+    "zero_proof", `String zero_proof;
+    "blinding", `String (Base64.encode_exn (Bytes.to_string blinding));
+  ]) in
+  let stealth = Yojson.Safe.to_string (`Assoc [
+    "version", `Int 5;
+    "delta_cipher", `String cipher;
+    "commitment", `String commitment;
+    "range_proof_delta", `String "rp_v1|YQ==";
+    "range_proof_balance", `String "rp_v1|Yg==";
+    "eph_pub", `String "eph";
+    "stealth_tag", `String (String.make 32 '1');
+    "enc_amount", `String "amount";
+    "claim_pub", `String (String.make 64 '2');
+    "amount_commitment", `String amount_commitment;
+    "send_zero_proof", `String "";
+  ]) in
+  encrypt, stealth
+
+let test_devnet_profile () =
+  let module Submit = Octra_node_runtime.Submit_rpc in
+  let module Rpc = Octra_core.Rpc in
+  expect "devnet BFT mode" (Sys.getenv_opt "OCTRA_CONSENSUS_MODE" = Some "bft");
+  expect "devnet profile selected"
+    (Sys.getenv_opt "OCTRA_BFT_RELEASE_PROFILE" = Some "devnet_full_v1");
+  let encrypt, stealth = devnet_payloads () in
+  let base = standard_tx () in
+  let secret = Base64.encode_exn (String.make 32 '\001') in
+  let cases = [
+    Transaction.Standard, base.to_, Z.one, None, None, true;
+    Transaction.EncryptOp, base.from, Z.one, None, Some encrypt, true;
+    Transaction.StealthOp, "stealth", Z.zero, None, Some stealth, true;
+    Transaction.ComputeFund, Octra_core.Compute_funding.escrow, Z.one,
+      Some (String.make 64 'a'), None, true;
+    Transaction.PrivateOp, base.to_, Z.zero, None, None, false;
+  ] in
+  Test_workspace.with_dir "rest_devnet" (fun dir ->
+    let store = Lwt_main.run (Store_irmin.open_store (Filename.concat dir "store")) in
+    Fun.protect
+      ~finally:(fun () -> Staging.clear (); Lwt_main.run (Store_irmin.close store))
+      (fun () ->
+        let ledger = Ledger.create store in
+        Ledger.add_account ledger base.from (Z.of_int 1_000_000) |> Result.get_ok;
+        let checked = ref [] in
+        let drops = ref [] in
+        let runtime = R.{ (runtime ()) with
+          compute_mode = (fun () -> Octra_core.Rule_graph.Active);
+          preverify_admit = (fun tx -> checked := tx :: !checked; Ok ());
+          save_drops = (fun items -> drops := items @ !drops);
+        } in
+        let validate = R.validate_and_submit_tx runtime ledger in
+        List.iter (fun (op_type, to_, amount, message, encrypted_data, accepted) ->
+          let tx = Transaction.sign_with_privkey
+            {base with op_type; to_; amount; message; encrypted_data;
+              ou = Z.of_int 10_000; timestamp = Unix.gettimeofday ()} secret in
+          let hash = Transaction.hash tx in
+          let json = Transaction.to_yojson tx in
+          let reason = Transaction.bft_reject_reason op_type in
+          let name = "devnet " ^ Transaction.op_type_to_string op_type in
+          let routes = [
+            "validate", (fun () ->
+              expect (name ^ " validate result")
+                (Lwt_main.run (validate tx) = if accepted then Ok hash
+                  else Error ("unsupported_operation", reason)));
+            "submit", (fun () ->
+              let expected = if accepted then Ok (`Assoc [
+                "tx_hash", `String hash;
+                "status", `String "accepted";
+                "nonce", `Int tx.nonce;
+                "ou_cost", `String (Z.to_string (Transaction.ou_cost tx));
+              ]) else Error (Rpc.err 116 "unsupported operation" (Some (`String reason))) in
+              expect (name ^ " submit result")
+                (Lwt_main.run (Submit.submit ~validate (`List [json])) = expected));
+            "private_transfer", (fun () ->
+              let expected = if accepted then Ok (`Assoc [
+                "tx_hash", `String hash;
+                "status", `String "pending";
+              ]) else Error (Rpc.err (-32000) ("unsupported_operation: " ^ reason) None) in
+              expect (name ^ " private transfer result")
+                (Lwt_main.run (Submit.private_transfer ~validate (`List [json])) = expected));
+            "submit_batch", (fun () ->
+              let row = if accepted then `Assoc [
+                "status", `String "accepted";
+                "tx_hash", `String hash;
+                "nonce", `Int tx.nonce;
+              ] else `Assoc [
+                "status", `String "rejected";
+                "reason", `String reason;
+                "nonce", `Int tx.nonce;
+              ] in
+              expect (name ^ " batch result")
+                (Lwt_main.run (Submit.submit_batch ~validate (`List [`List [json]]))
+                  = Ok (`Assoc [
+                    "total", `Int 1;
+                    "accepted", `Int (if accepted then 1 else 0);
+                    "rejected", `Int (if accepted then 0 else 1);
+                    "results", `List [row];
+                  ])));
+          ] in
+          List.iter (fun (route, submit) ->
+            Staging.clear ();
+            checked := [];
+            drops := [];
+            let before = Ledger.find ledger tx.from in
+            let name = name ^ " " ^ route in
+            submit ();
+            expect (name ^ " queue contents")
+              (Staging.staging_size () = (if accepted then 1 else 0)
+               && Staging.find_by_hash hash = (if accepted then Some tx else None));
+            expect (name ^ " preverify calls") (!checked = if accepted then [tx] else []);
+            expect (name ^ " no drops") (!drops = []);
+            expect (name ^ " sender unchanged") (Ledger.find ledger tx.from = before)) routes)
+          cases))
+
+let test_parse_wait () =
+  let module Pool = Octra_core.Proof_pool in
+  let module Memory = Octra_core.Compute_memory in
+  let public, _ = Pvac_ffi.keygen_from_seed (Pvac_ffi.default_params ()) (Bytes.make 32 '\045') in
+  let body = Yojson.Safe.to_string (`Assoc [
+    "new_pubkey", `String (Pvac_ffi.serialize_pubkey public |> Bytes.to_string |> Base64.encode_exn);
+    "aes_kat", `String (Octra_core.Pvac_registry.expected_kat ());
+  ]) in
+  List.iter (fun action ->
+    Staging.clear ();
+    let ledger = ledger () in
+    let base = standard_tx () in
+    Ledger.add_account ledger base.from (Z.of_int 20_000_000) |> Result.get_ok;
+    let tx = Transaction.sign_with_privkey {base with
+      to_ = base.from; amount = Z.zero; ou = Z.of_int 10_000;
+      op_type = Transaction.KeySwitch; encrypted_data = Some body}
+      (Base64.encode_exn (String.make 32 '\001')) in
+    let signing = ref Octra_core.Tx_signature.Historical in
+    let checked = ref [] in
+    let runtime = {(runtime ()) with R.signing = (fun () -> !signing);
+      preverify_admit = (fun tx -> checked := tx :: !checked; Ok ())} in
+    let before = Memory.stats Memory.shared in
+    let mutex = Mutex.create () and condition = Condition.create () in
+    let released = ref false in
+    let blockers = List.init Pool.capacity (fun _ -> Pool.try_run ~bytes:0 (fun () ->
+      Mutex.lock mutex;
+      while not !released do Condition.wait condition mutex done;
+      Mutex.unlock mutex)) in
+    let release () =
+      Mutex.lock mutex;
+      released := true;
+      Condition.broadcast condition;
+      Mutex.unlock mutex in
+    Lwt_main.run (Lwt.finalize (fun () ->
+      let open Lwt.Syntax in
+      let work = R.validate_and_submit_tx runtime ledger tx in
+      expect "RPC parser did not await worker" (Lwt.is_sleeping work);
+      expect "RPC staged before parse" (!checked = [] && Staging.staging_size () = 0);
+      begin match action with
+      | "cancel" -> Lwt.cancel work
+      | "signing" -> signing := Octra_core.Tx_signature.Network "changed-network"
+      | "nonce" ->
+        Ledger.transfer ledger ~from:base.from ~to_:base.to_ ~amount:Z.one ~fee:Z.zero 1
+        |> Result.get_ok
+      | _ -> ()
+      end;
+      release ();
+      let* () = Lwt_list.iter_s (fun job -> Lwt.map (fun _ -> ()) job) blockers in
+      let* result = Lwt.catch (fun () -> Lwt.map Option.some work)
+        (function Lwt.Canceled -> Lwt.return_none | error -> Lwt.fail error) in
+      begin match action, result with
+      | "cancel", None -> ()
+      | "signing", Some (Error ("invalid_signature", _)) -> ()
+      | "nonce", Some (Error ("invalid_nonce", "nonce already used")) -> ()
+      | "accept", Some (Ok hash) when hash = Transaction.hash tx -> ()
+      | _ -> fail "RPC changed state or cancelled parse outcome changed"
+      end;
+      expect "RPC late staging after parse" (List.length !checked = if action = "accept" then 1 else 0);
+      expect "RPC queue changed after refusal" (Staging.staging_size () = if action = "accept" then 1 else 0);
+      Lwt.return_unit)
+      (fun () -> release (); Lwt_list.iter_s (fun job -> Lwt.map (fun _ -> ()) job) blockers));
+    expect "RPC parse leaked memory reservation" (Memory.stats Memory.shared = before);
+    Staging.clear ()) ["accept"; "cancel"; "signing"; "nonce"]
+
+let test_network_numbers () =
+  let module View = Octra_node_runtime.Tx_view in
+  let module Submit = Octra_node_runtime.Submit_rpc in
+  let base = standard_tx () in
+  let fields = match Transaction.to_yojson base with `Assoc fields -> fields | _ -> assert false in
+  let numeric field value = `Assoc ((field, value) :: List.remove_assoc field fields) in
+  let limit = Transaction.network_number_chars in
+  expect "network number cap misses supply binary form"
+    (Z.numbits Octra_core.Denomination.max_supply + 3 <= limit);
+  let binary = "+0b" ^ String.concat "_" (List.init 256 (fun _ -> "1")) in
+  expect "network number cap misses separated 256-bit form" (String.length binary <= limit);
+  let allowed = ["1"; "+01"; "0x1"; "0X1"; "0o1"; "0O1"; "0b1"; "0B1";
+    "1_"; "0__1"; binary; Z.to_string Octra_core.Denomination.max_supply;
+    String.make (limit - 1) '0' ^ "1"] in
+  List.iter (fun field ->
+    List.iter (fun raw ->
+      let json = numeric field (`String raw) in
+      expect "network number changed historical decoding"
+        (View.decode_network_tx json = Transaction.of_yojson json)) allowed;
+    let raw = String.make (limit + 1) '1' in
+    let json = numeric field (`String raw) in
+    let reason = field ^ " exceeds network numeric character limit" in
+    expect "historical numeric parser was restricted" (Result.is_ok (Transaction.of_yojson json));
+    expect "network numeric parser accepted excess bytes" (View.decode_network_tx json = Error reason);
+    expect "network numeric parser accepted excess literal"
+      (View.decode_network_tx (numeric field (`Intlit raw)) = Error reason);
+    expect "network numeric parser ignored duplicate field bytes"
+      (View.decode_network_tx (`Assoc (fields @ [field, `String raw])) = Error reason);
+    let validate _ = fail "oversized number reached submission validation" in
+    List.iter (fun submit -> expect "oversized number reached RPC submission"
+      (Result.is_error (Lwt_main.run (submit ())))) [
+      (fun () -> Submit.submit ~validate (`List [json]));
+      (fun () -> Submit.private_transfer ~validate (`List [json]));
+      (fun () -> Submit.private_transfer ~validate (`List [`String (Yojson.Safe.to_string json)]))];
+    let row = `Assoc ["status", `String "error"; "reason", `String reason] in
+    expect "batch did not reject oversized number before validation"
+      (Lwt_main.run (Submit.submit_batch ~validate (`List [`List [json]]))
+        = Ok (`Assoc ["total", `Int 1; "accepted", `Int 0; "rejected", `Int 1;
+          "results", `List [row]]))) ["amount"; "ou"]
+
+let test_program_precheck () =
+  with_env "OCTRA_CONSENSUS_MODE" "single" (fun () ->
+  let module View = Octra_node_runtime.Tx_view in
+  let module Memory = Octra_core.Compute_memory in
+  Staging.clear ();
+  let base = standard_tx () in
+  let item = {base with Transaction.op_type = ProgramDeploy; amount = Z.zero;
+    ou = Z.of_int 1_000_000; nonce = 2; encrypted_data = Some "not-a-package"} in
+  let sign tx = Transaction.sign_with_privkey tx (Base64.encode_exn (String.make 32 '\001')) in
+  expect "Program package is not isolated" (Option.is_some (View.payload_parse_bytes item));
+  let before = Memory.stats Memory.shared in
+  let ticket = Memory.reserve Memory.shared ~speculative:true
+    (Memory.limit_of_getenv Sys.getenv_opt / 4) |> Option.get in
+  Fun.protect ~finally:(fun () -> Memory.release ticket) (fun () ->
+    List.iter (fun (balance, nonce, fee, expected) ->
+      Test_workspace.with_dir "program_precheck" (fun dir ->
+        let store = Lwt_main.run (Store_irmin.open_store (Filename.concat dir "store")) in
+        Fun.protect ~finally:(fun () -> Lwt_main.run (Store_irmin.close store)) (fun () ->
+          let ledger = Ledger.create store in
+          Option.iter (fun balance ->
+            Ledger.add_account ledger base.from balance |> Result.get_ok;
+            List.iter (fun nonce -> Ledger.debit ledger base.from Z.zero nonce |> Result.get_ok)
+              (List.init nonce (fun index -> index + 1))) balance;
+          let tx = sign {item with ou = fee} in
+          let result = Lwt_main.run (R.validate_and_submit_tx (runtime ()) ledger tx) in
+          expect "Program precheck reached package parser"
+            (match result with Error (code, _) -> code = expected | Ok _ -> false);
+          expect "Program precheck staged transaction" (Staging.find_by_hash (Transaction.hash tx) = None))))
+      [None, 0, item.ou, "sender_not_found";
+       Some Z.zero, 0, item.ou, "insufficient_balance";
+       Some (Z.of_int 10_000_000), 2, item.ou, "invalid_nonce";
+       Some (Z.of_int 10_000_000), 0, Z.one, "malformed_transaction";
+       Some (Z.of_int 10_000_000), 0, item.ou, "pre_verify_busy"]);
+  expect "Program precheck leaked reservation" (Memory.stats Memory.shared = before);
+  let module Package = Octra_vm.Program_package in
+  let compiled = Package.compile ~main:"entry.aml"
+    ~sources:[{path = "entry.aml"; body = "program Entry { view fn read(): int { return 7 } }"}]
+    |> Result.map_error Package.error_message |> Result.get_ok in
+  let body = Base64.encode_exn compiled.package in
+  let encoded = {item with Transaction.encrypted_data = Some body} in
+  expect "Program wire shape refused by parse queue"
+    (Lwt_main.run (View.payload_check ~limits:View.payload_limits encoded) = Ok ());
+  expect "Program success leaked reservation" (Memory.stats Memory.shared = before))
+
+let test_default () =
+  test_network_numbers ();
+  test_program_precheck ();
+  test_parse_wait ();
   test_relay_size ();
   test_compute_paths ();
   test_delivery_retry ();
@@ -569,3 +865,11 @@ let () =
   test_duty_flood ();
   test_duty_peer_head ();
   print_endline "status = pass test = rest_accept"
+
+let () =
+  match Array.to_list Sys.argv with
+  | [_] -> test_default ()
+  | [_; "--devnet-profile"] ->
+    with_env "OCTRA_STEALTH_MIN_OU" "5000" test_devnet_profile;
+    print_endline "status = pass test = rest_devnet"
+  | _ -> fail "unknown test mode"

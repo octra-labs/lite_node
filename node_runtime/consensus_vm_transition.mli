@@ -25,6 +25,7 @@ val preverify_circle :
   (Octra_circle_runtime.Circle_exec.hfhe_binding, string) result Lwt.t
 
 val process_tx :
+  ?source_create:Octra_core.Rule_graph.mode ->
   ?preverify:Octra_core.Preverify_commit.t ->
   ?save_receipt_raw:(tx_hash:string -> json:string -> unit) ->
   backend:Octra_core.Epoch_exec.backend ->

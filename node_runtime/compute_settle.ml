@@ -96,7 +96,8 @@ let verify ~lookup ~engine ~epoch ~funded raw =
           max_response_bytes = 1_048_576; timeout_seconds = 300} in
         let* result = Engine.replay_loaded ~limits ~deps ~program_at ~load_model calls in
         Lwt.return (match result with
-        | Error (Core.Circle_wasm_host.Rejected reason) -> Error (Bill.Rejected reason)
+        | Error (Core.Circle_wasm_host.Rejected reason)
+        | Error (Core.Circle_wasm_host.Refused (reason, _)) -> Error (Bill.Rejected reason)
         | Error (Core.Circle_wasm_host.Unavailable reason) -> Error (Bill.Unavailable reason)
         | Ok measured -> Record.Session.bills session measured
           |> Result.map_error (fun reason -> Bill.Rejected reason))

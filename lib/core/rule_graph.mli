@@ -25,6 +25,17 @@ type activation = {
 
 type t
 
+type check = {
+  name : string;
+  activation : activation option;
+  evaluate : epoch:int -> (mode, fault) result;
+}
+
+type start = Awaiting of activation | Checked of mode
+
+val startup_checks : t -> check list
+val check_start : check -> epoch:int -> (start, fault) result
+
 val activation_mode : root_at:(int -> root_read) -> activation option ->
   epoch:int -> (mode, fault) result
 
@@ -46,6 +57,21 @@ val proof_exec_at : chain_id:string -> epoch:int -> mode
 val vm_bytes_activation_for_chain : string -> activation option
 val vm_bytes : t -> epoch:int -> (mode, fault) result
 val vm_bytes_at : chain_id:string -> epoch:int -> mode
+val scalar_work_activation_for_chain : string -> activation option
+val scalar_work : t -> epoch:int -> (mode, fault) result
+val scalar_work_at : chain_id:string -> epoch:int -> mode
+val source_create_activation_for_chain : string -> activation option
+val source_order :
+  source:activation option -> program:activation option -> records:activation option ->
+  scalar:activation option -> proof:activation option -> fhe:activation option ->
+  bytes:activation option -> points:activation option -> (unit, string) result
+val source_create : t -> epoch:int -> (mode, fault) result
+val source_create_at : chain_id:string -> epoch:int -> mode
+val program_result_activation_for_chain : string -> activation option
+val program_result_order : result:activation option -> program:activation option ->
+  envelope:activation option -> bytes:activation option -> (unit, string) result
+val program_result : t -> epoch:int -> (mode, fault) result
+val program_result_at : chain_id:string -> epoch:int -> mode
 
 val settle_activation_for_chain : string -> activation option
 val settle : t -> epoch:int -> (mode, fault) result
@@ -97,6 +123,9 @@ val program_overlap : t -> epoch:int -> (bool, fault) result
 val program_source_at : chain_id:string -> epoch:int -> mode
 val stake_activation_for_chain : string -> activation option
 val stake : t -> epoch:int -> (mode, fault) result
+val seatless_activation_for_chain : string -> activation option
+val seatless : t -> epoch:int -> (mode, fault) result
+val seatless_at : chain_id:string -> epoch:int -> mode
 val program_records_activation_for_chain : string -> activation option
 val program_records : t -> epoch:int -> (mode, fault) result
 val program_records_at : chain_id:string -> epoch:int -> mode

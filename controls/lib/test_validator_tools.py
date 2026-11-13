@@ -3,6 +3,7 @@
 
 import base64
 import sync_tip
+import validator_config
 import datetime
 import hashlib
 import json
@@ -1454,7 +1455,7 @@ class ValidatorToolsTest(unittest.TestCase):
             side_effect=[first, second],
         ) as opened:
             self.assertEqual(
-                upgrade_tool.sync_epoch("https://seed.example"),
+                sync_tip.sync_epoch("https://seed.example"),
                 {"head": 41, "snapshot": 40, "latest": 40, "status": "ready",
                     "advertised_status": "unknown", "source": "https://seed.example", "reason": None},
             )
@@ -1466,7 +1467,7 @@ class ValidatorToolsTest(unittest.TestCase):
         first.__enter__.return_value.read.return_value = b"x" * 65_537
         with mock.patch.object(sync_tip.http, "open", return_value = first):
             with self.assertRaisesRegex(ValidatorError, "byte limit"):
-                upgrade_tool.sync_epoch("https://seed.example")
+                sync_tip.sync_epoch("https://seed.example")
 
     def test_upgrade_snapshot_epoch(self):
         head = json.dumps({
@@ -1490,7 +1491,7 @@ class ValidatorToolsTest(unittest.TestCase):
             side_effect=[first, second],
         ):
             self.assertEqual(
-                upgrade_tool.sync_epoch("https://seed.example"),
+                sync_tip.sync_epoch("https://seed.example"),
                 {"head": 41, "snapshot": 39, "latest": None, "status": "ready",
                     "advertised_status": "unknown", "source": "https://seed.example", "reason": None},
             )
@@ -1517,7 +1518,7 @@ class ValidatorToolsTest(unittest.TestCase):
             "open",
             side_effect=[first, second],
         ):
-            self.assertEqual(upgrade_tool.sync_epoch("https://seed.example"),
+            self.assertEqual(sync_tip.sync_epoch("https://seed.example"),
                 {"head": 41, "snapshot": None, "latest": 40, "status": "unavailable",
                     "advertised_status": "unknown", "source": "https://seed.example",
                     "reason": "state sync root window is unavailable"})
@@ -1544,7 +1545,7 @@ class ValidatorToolsTest(unittest.TestCase):
             "open",
             side_effect=[first, second],
         ):
-            self.assertEqual(upgrade_tool.sync_epoch("https://seed.example"),
+            self.assertEqual(sync_tip.sync_epoch("https://seed.example"),
                 {"head": 41, "snapshot": None, "latest": 40, "status": "unavailable",
                     "advertised_status": "unknown", "source": "https://seed.example",
                     "reason": "state sync certificate epoch differs"})
@@ -1582,18 +1583,22 @@ class ValidatorToolsTest(unittest.TestCase):
             with self.subTest(epoch = epoch), mock.patch.object(upgrade_tool, "sync_head",
                     return_value = {"head": None, "snapshot": epoch}), \
                     mock.patch.object(upgrade_tool.time, "sleep") as sleep:
-                with self.assertRaisesRegex(ValidatorError, "head_status = independent_unavailable"):
-                    upgrade_tool.sync_wait({}, need, 0.0, 0.1)
+                self.assertEqual(upgrade_tool.sync_wait({}, need, 0.0, 0.1),
+                    {"head": None, "snapshot": epoch, "required": need.epoch})
                 sleep.assert_not_called()
 
     def test_wait_route_config(self):
         need = make_need("octra-test", "root", 101, 100, None)
         values = {"OCTRA_STATE_SYNC_SOURCES": "https://a.example", "OCTRA_JOIN_RPC": "https://a.example"}
-        with mock.patch.object(sync_tip.http, "open") as read, \
+        row = {"head": 1000000, "snapshot": None, "latest": None,
+            "status": "unavailable", "advertised_status": "unknown",
+            "source": "https://a.example", "reason": None}
+        with mock.patch.object(sync_tip, "native_tip", return_value = None), \
+                mock.patch.object(sync_tip, "sync_epoch", return_value = row) as read, \
                 mock.patch.object(upgrade_tool.time, "sleep") as sleep:
-            with self.assertRaisesRegex(ValidatorError, "state sync configuration error"):
-                upgrade_tool.sync_wait(values, need, 120.0, 1.0)
-            read.assert_not_called()
+            with self.assertRaisesRegex(ValidatorError, "required = 101.*snapshot_status = unavailable"):
+                upgrade_tool.sync_wait(values, need, 0.0, 1.0)
+            read.assert_called_once_with("https://a.example", manifest=True)
             sleep.assert_not_called()
 
     def test_upgrade_saved_floor(self):
@@ -1645,12 +1650,11 @@ class ValidatorToolsTest(unittest.TestCase):
             )
 
     def test_upgrade_peer_head(self):
-        self.assertEqual(
+        self.assertIsNone(
             sync_target(
                 {"peer_epoch": 1344077},
                 {"head": 1342979, "snapshot": 1342801},
-            ),
-            1344077,
+            )
         )
 
     def test_upgrade_recovery_status(self):
@@ -1952,6 +1956,7 @@ class ValidatorToolsTest(unittest.TestCase):
             "network_sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
         }
         local = {
+            **network_values(),
             "OCTRA_DATA_DIR": str(WORK / "data"),
             "OCTRA_STATE_SYNC_SOURCES": "https://old.example",
             "OCTRA_JOIN_RPC": "https://join-old.example",
@@ -4810,6 +4815,69 @@ class ValidatorToolsTest(unittest.TestCase):
                     path.write_bytes(body)
                     require_network_binding(values, config)
 
+    def test_consensus_input_freeze(self):
+        names = (
+            "OCTRA_BFT_ADMIT_OPS", "OCTRA_BFT_CRYPTO_PROFILE",
+            "OCTRA_BFT_PROPOSAL_MAX_BYTES", "OCTRA_BFT_PROPOSAL_MAX_OU",
+            "OCTRA_BFT_PROPOSAL_MAX_TXS", "OCTRA_BFT_RELEASE_PROFILE",
+            "OCTRA_EMISSION_ACTIVATION_EPOCH", "OCTRA_EMISSION_GUARD",
+            "OCTRA_EMISSION_PROFILE", "OCTRA_FEE_RECIPIENT",
+            "OCTRA_FHE_MAX_PER_EPOCH", "OCTRA_MULTI_EXEC_MAX_CALLS",
+            "OCTRA_PREVERIFY_RECEIPT_ACTIVATION_EPOCH",
+            "OCTRA_PRIVATE_RESULT_ACTIVATION_EPOCH",
+            "OCTRA_PROPOSAL_PROTOCOL_ACTIVATION_EPOCH", "OCTRA_PVAC_MIGRATION_ROOT",
+            "OCTRA_STEALTH_INLINE_VERIFY", "OCTRA_STEALTH_MAX_DEFER",
+            "OCTRA_STEALTH_MAX_PER_EPOCH", "OCTRA_STEALTH_MIN_OU",
+            "OCTRA_VALIDATOR_ADMISSION_ACTIVATION_EPOCH",
+        )
+        self.assertEqual(set(names), validator_config.CONSENSUS_INPUTS)
+        for name in names:
+            for before, after in (({}, {name: "1"}), ({name: "1"}, {}),
+                    ({name: "1"}, {name: "2"})):
+                with self.subTest(name = name, before = before, after = after):
+                    with self.assertRaisesRegex(ValidatorError, "consensus input change refused: " + name):
+                        validator_config.require_consensus_inputs(before, after)
+            validator_config.require_consensus_inputs({name: "1"}, {name: "1"})
+
+    def test_network_adopt_cli(self):
+        config = WORK / "adopt-cli/node.env"
+        installed = config.parent / "network.env"
+        bundle = WORK / "adopt-cli/next.env"
+        current = network_values()
+        write_env(installed, current)
+        initial = {**current, "OCTRA_DATA_DIR": str(WORK / "unused-state"),
+            "OCTRA_OPERATOR_NETWORK_BUNDLE": str(installed),
+            "OCTRA_OPERATOR_NETWORK_SHA256": hashlib.sha256(installed.read_bytes()).hexdigest()}
+        write_env(config, initial)
+        original = {path: path.read_bytes() for path in (config, installed)}
+        for key, value in (("OCTRA_BFT_PROPOSAL_MAX_OU", "4000"),
+                ("OCTRA_STEALTH_MIN_OU", "6000"),
+                ("OCTRA_PRIVATE_RESULT_ACTIVATION_EPOCH", "201")):
+            with self.subTest(key = key):
+                write_env(bundle, {**current, key: value})
+                command = [sys.executable, "-B", validator_config.__file__, "--adopt-network",
+                    "--config", str(config), "--network", str(bundle),
+                    "--network-sha", hashlib.sha256(bundle.read_bytes()).hexdigest()]
+                result = subprocess.run(command, capture_output = True, text = True, timeout = 15)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("consensus input change refused: " + key, result.stdout)
+                self.assertEqual({path: path.read_bytes() for path in original}, original)
+        selected = {**current, "OCTRA_BOOTSTRAP_PEERS": "new-a:19000,new-b:19000",
+            "OCTRA_PEERS": "new-a:19000,new-b:19000", "OCTRA_JOIN_RPC": "https://head.example",
+            "OCTRA_STATE_SYNC_SOURCES": "https://sync.example"}
+        write_env(bundle, selected)
+        command = [sys.executable, "-B", validator_config.__file__, "--adopt-network",
+            "--config", str(config), "--network", str(bundle),
+            "--network-sha", hashlib.sha256(bundle.read_bytes()).hexdigest()]
+        result = subprocess.run(command, capture_output = True, text = True, timeout = 15)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        adopted = parse_env(config)
+        self.assertEqual(adopted["OCTRA_JOIN_RPC"], selected["OCTRA_JOIN_RPC"])
+        self.assertEqual(adopted["OCTRA_STATE_SYNC_SOURCES"], selected["OCTRA_STATE_SYNC_SOURCES"])
+        self.assertEqual(adopted["OCTRA_BOOTSTRAP_PEERS"], selected["OCTRA_BOOTSTRAP_PEERS"])
+        self.assertEqual({key: adopted.get(key) for key in validator_config.CONSENSUS_INPUTS},
+            {key: initial.get(key) for key in validator_config.CONSENSUS_INPUTS})
+
     def test_network_adoption(self):
         config = WORK / "live/.keys/validator/node.env"
         installed = config.parent / "network.env"
@@ -5063,10 +5131,22 @@ class ValidatorToolsTest(unittest.TestCase):
         shutil.copyfile(gate, controls / "check.sh")
         for path in source.glob("*.py"):
             (modules / path.name).write_text("")
-        (modules / "test_validator_tools.py").write_text(
-            'raise RuntimeError("test suite invoked")\n'
-        )
+        for name in ("measure_gate.sh", "measure_sites.txt", "print_style_gate.sh"):
+            shutil.copyfile(source.parent / name, controls / name)
+        shutil.copyfile(source / "measure_scan.py", modules / "measure_scan.py")
+        for area in ("lib", "node_runtime", "bin", "net", "circle_runtime"):
+            (WORK / area).mkdir(exist_ok = True)
+            for path in (source.parents[1] / area).rglob("*.ml*"):
+                if path.suffix in (".ml", ".mli"):
+                    output = WORK / path.relative_to(source.parents[1])
+                    output.parent.mkdir(parents = True, exist_ok = True)
+                    shutil.copyfile(path, output)
+        for name in ("test_gc_source.py", "test_validator_tools.py"):
+            (modules / name).write_text('raise RuntimeError("test suite invoked")\n')
         (WORK / "test").mkdir()
+        cases = WORK / "test/cases"
+        cases.mkdir()
+        shutil.copyfile(source.parents[1] / "test/cases/hfhe_range.bin", cases / "hfhe_range.bin")
         (WORK / "test/python_check.py").write_text("")
         (WORK / "nodes.config").write_text("")
         (WORK / "octra_node.opam.locked").write_text("")
@@ -5079,6 +5159,17 @@ class ValidatorToolsTest(unittest.TestCase):
         command = ["sh", str(controls / "check.sh")]
         result = subprocess.run(command, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = WORK / "MANIFEST.sha256"
+        content = manifest.read_text()
+        sample = WORK / "test/case.ml"
+        sample.write_text('let value = "' + "fixt" + 'ure"\n')
+        manifest.write_text(content +
+            f"{hashlib.sha256(sample.read_bytes()).hexdigest()}  test/case.ml\n")
+        result = subprocess.run(command, capture_output = True, text = True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("reason = test_layout", result.stderr)
+        sample.unlink()
+        manifest.write_text(content)
         readme = WORK / "README.md"
         readme.write_text("documentation is not a node input")
         result = subprocess.run(command, capture_output = True, text = True)
@@ -5643,18 +5734,17 @@ class ValidatorToolsTest(unittest.TestCase):
             self.assertTrue((data / "HEAD.json").is_file())
 
     def test_recover_independent(self):
-        for epoch in [100, 101]:
+        for epoch, floor in [(100, None), (999999, 150)]:
             data, config, _, _ = self.recovery_identity("no-head-" + str(epoch))
             before = (data.stat().st_ino, (data / "HEAD.json").read_bytes())
             with self.subTest(epoch = epoch), \
                     mock.patch("validator_recover.pm2_entries", return_value = []), \
                     mock.patch("validator_recover.sync_head", return_value = {"head": None, "snapshot": epoch}), \
-                    mock.patch("validator_recover.move_state") as move, \
-                    mock.patch("validator_recover.sync_snapshot") as sync:
-                with self.assertRaisesRegex(ValidatorError, "head_status = independent_unavailable"):
-                    recover(config, replace_state = True)
-                move.assert_not_called()
-                sync.assert_not_called()
+                    mock.patch("validator_recover.sync_snapshot",
+                        side_effect = ValidatorError("native certificate rejected")) as sync:
+                with self.assertRaisesRegex(ValidatorError, "native certificate rejected"):
+                    recover(config, replace_state = True, min_epoch = floor)
+                self.assertEqual(sync.call_args.kwargs["min_epoch"], floor or 100)
             self.assertEqual((data.stat().st_ino, (data / "HEAD.json").read_bytes()), before)
 
     def test_recovery_missing_state(self):
@@ -6292,6 +6382,8 @@ class ValidatorToolsTest(unittest.TestCase):
         self.assertNotIn("@all", build)
         self.assertNotIn("runtest", build)
         self.assertNotIn("@runtest", build)
+        self.assertIn(str(WORK / "controls/lib/gc_build.py"), build)
+        self.assertLess(build.index("python3"), build.index("dune"))
         self.assertEqual(
             [arg for arg in build if arg.endswith(".exe")],
             [f"bin/{name}" for name in names],
@@ -6646,8 +6738,8 @@ class ValidatorToolsTest(unittest.TestCase):
         ), mock.patch.object(
             upgrade_tool, "data_pids", return_value=[17, 18],
         ) as owners, mock.patch.object(
-            upgrade_tool.shutil, "disk_usage", return_value=mock.Mock(free=8 * 1024 ** 3),
-        ), mock.patch.object(upgrade_tool, "emit"):
+            upgrade_tool.shutil, "disk_usage", return_value = mock.Mock(free = 9 * 1024 ** 3),
+        ) as usage, mock.patch.object(upgrade_tool, "emit"):
             for kind in ("pm2", "systemd"):
                 supervisor = {"kind": kind, "pid": 17,
                               "restart": {"Restart": "on-failure", "RestartPreventExitStatus": "78"}}
@@ -6658,6 +6750,9 @@ class ValidatorToolsTest(unittest.TestCase):
                 owners.return_value = [17, 18]
             with self.assertRaisesRegex(ValidatorError, "unexpected processes"):
                 upgrade_tool.preflight(WORK, {"kind": "pm2", "pid": 0}, values, False)
+            usage.return_value.free = 8 * 1024 ** 3
+            with self.assertRaisesRegex(ValidatorError, "less than 9 GiB"):
+                upgrade_tool.preflight(WORK, {"kind": "pm2", "pid": 17}, values, False)
 
     def test_rejoin_worker_owners(self):
         root, values = worker_case()

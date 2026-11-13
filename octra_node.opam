@@ -52,6 +52,9 @@ build: [
     "lib/libmcl.a"
   ]
   [
+    "python3"
+    "controls/lib/gc_build.py"
+    "--"
     "dune"
     "build"
     "--root"

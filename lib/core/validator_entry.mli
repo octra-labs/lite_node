@@ -35,20 +35,15 @@ type snapshot = {
 val validate_parameters : parameters -> (unit, string) result
 val validate_entry : entry -> (unit, string) result
 val quorum_weight : Z.t -> (Z.t, string) result
+val select_members :
+  ?incumbents:string list -> parameters -> source_epoch:int64 -> entry list -> member list
+val check_weight_change : before:member list -> after:member list -> (unit, string) result
 val snapshot :
   ?incumbents:string list ->
   parameters ->
   activate_epoch:int64 ->
   entry list ->
   (snapshot, string) result
-val signed_weight :
-  snapshot ->
-  string list ->
-  (Z.t, string) result
-val has_quorum :
-  snapshot ->
-  string list ->
-  (bool, string) result
 val leader :
   snapshot ->
   seed:string ->

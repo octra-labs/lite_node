@@ -1,7 +1,7 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
-From Stdlib Require Import List Bool Arith Lia.
+From Stdlib Require Import List Bool Arith Lia ZArith.
 Import ListNotations.
 
 Record proof := { round : nat; pid : nat; signers : list nat }.
@@ -405,3 +405,108 @@ Theorem future_kept : forall height through,
 Proof. intros. unfold clean. assert (height <=? through = false) by (apply Nat.leb_gt; lia). now rewrite H0. Qed.
 
 End ProposalWork.
+
+Module QueryDelivery.
+
+Inductive phase := Waiting | Offered | Delivered.
+Record query := { epoch : nat; generation : nat; stamp : nat; age : Z; state : phase }.
+
+Definition report height gen attempt (sent : bool) q :=
+  if (epoch q =? height) && (generation q =? gen) &&
+    match attempt with Some value => stamp q =? value | None => false end then
+    {| epoch := epoch q; generation := generation q; stamp := stamp q; age := age q;
+       state := if sent then Delivered else Waiting |}
+  else q.
+
+Definition renew q :=
+  {| epoch := epoch q; generation := generation q; stamp := stamp q; age := age q;
+     state := Waiting |}.
+
+Theorem other_attempt_kept : forall height gen attempt sent q,
+  attempt <> Some (stamp q) -> report height gen attempt sent q = q.
+Proof.
+  intros. unfold report. destruct attempt as [value|]; [|now rewrite andb_false_r].
+  assert (stamp q =? value = false) as E by (apply Nat.eqb_neq; congruence).
+  now rewrite E, andb_false_r.
+Qed.
+
+Theorem other_epoch_kept : forall height gen attempt sent q,
+  epoch q <> height -> report height gen attempt sent q = q.
+Proof. intros. unfold report. apply Nat.eqb_neq in H. now rewrite H. Qed.
+
+Theorem other_generation_kept : forall height gen attempt sent q,
+  generation q <> gen -> report height gen attempt sent q = q.
+Proof.
+  intros. unfold report. apply Nat.eqb_neq in H. rewrite H, andb_false_r. reflexivity.
+Qed.
+
+Theorem current_report : forall sent q,
+  state (report (epoch q) (generation q) (Some (stamp q)) sent q) =
+    if sent then Delivered else Waiting.
+Proof. intros. unfold report. repeat rewrite Nat.eqb_refl. reflexivity. Qed.
+
+Theorem report_keeps_age : forall height gen attempt sent q,
+  age (report height gen attempt sent q) = age q.
+Proof.
+  intros. unfold report. destruct (_ && _ && _); reflexivity.
+Qed.
+
+Theorem renew_keeps_age : forall q, age (renew q) = age q.
+Proof. reflexivity. Qed.
+
+Theorem renew_keeps_identity : forall q,
+  (epoch (renew q), generation (renew q), stamp (renew q)) = (epoch q, generation q, stamp q).
+Proof. reflexivity. Qed.
+
+Theorem renewed_needs_delivery : forall q, state (renew q) = Waiting.
+Proof. reflexivity. Qed.
+
+End QueryDelivery.
+
+Module QuerySweep.
+
+Definition step (through : nat) (state : nat * nat) :=
+  let '(cursor, limit) := state in
+  if limit <=? cursor then (0, through) else (S cursor, limit).
+
+Fixpoint run (count : nat) (heads : nat -> nat) (state : nat * nat) :=
+  match count with
+  | 0 => state
+  | S rest => step (heads rest) (run rest heads state)
+  end.
+
+Theorem fixed_pass : forall count heads cursor limit,
+  cursor + count <= limit -> run count heads (cursor, limit) = (cursor + count, limit).
+Proof.
+  induction count; intros heads cursor limit H; simpl.
+  - now rewrite Nat.add_0_r.
+  - rewrite IHcount by lia. unfold step.
+    assert (limit <=? cursor + count = false) as E by (apply Nat.leb_gt; lia).
+    rewrite E. f_equal. lia.
+Qed.
+
+Theorem every_round : forall heads cursor limit target,
+  cursor <= target <= limit ->
+  fst (run (target - cursor) heads (cursor, limit)) = target.
+Proof.
+  intros. rewrite fixed_pass by lia. simpl. lia.
+Qed.
+
+Theorem pass_returns : forall heads cursor limit,
+  cursor <= limit -> fst (run (S (limit - cursor)) heads (cursor, limit)) = 0.
+Proof.
+  intros. simpl. rewrite fixed_pass by lia.
+  replace (cursor + (limit - cursor)) with limit by lia.
+  unfold step. now rewrite Nat.leb_refl.
+Qed.
+
+Theorem current_head_after_pass : forall heads cursor limit,
+  cursor <= limit ->
+  snd (run (S (limit - cursor)) heads (cursor, limit)) = heads (limit - cursor).
+Proof.
+  intros. simpl. rewrite fixed_pass by lia.
+  replace (cursor + (limit - cursor)) with limit by lia.
+  unfold step. now rewrite Nat.leb_refl.
+Qed.
+
+End QuerySweep.

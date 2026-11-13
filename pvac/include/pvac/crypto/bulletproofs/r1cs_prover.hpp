@@ -270,12 +270,7 @@ public:
         auto Gv = gen.G_vec(N);
         auto Hv = gen.H_vec(N);
 
-        std::vector<RistrettoPoint> H_prime(N);
-        for (size_t i = 0; i < N; i++) {
-            H_prime[i] = rist_scalarmul(Hv[i], y_inv_n[i]);
-        }
-
-        proof.ipp = ipp_prove(transcript, Q, l_eval, r_eval, Gv, H_prime);
+        proof.ipp = ipp_prove(transcript, Q, l_eval, r_eval, Gv, Hv, y_inv_n);
         return proof;
     }
 

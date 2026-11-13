@@ -6,6 +6,7 @@ type tx_deps = {
   has_tx : string -> bool;
   find_tx : string -> Octra_core.Transaction.t option;
   sender_pk : Octra_core.Transaction.t -> string option;
+  find_account : string -> Octra_core.Ledger.account option;
   add_tx : Octra_core.Transaction.t -> (string, string) result;
   send_payload : string -> unit;
   send_batch : (unit -> string option) list -> unit;
@@ -30,4 +31,4 @@ val handle_frame :
   ?bft_mode:bool ->
   deps ->
   Octra_net.P2p_frame.frame ->
-  unit
+  unit Lwt.t

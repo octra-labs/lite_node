@@ -27,11 +27,6 @@ type fatal =
 
 type deps = {
   rules : Octra_core.Rule_graph.t;
-  check_override_receipts :
-    epoch_id:int ->
-    receipts:string list ->
-    Transaction.t list ->
-    (unit, string) result;
   find_finalized : int -> C_types.finalize option;
   cached_bundle : string -> cached_bundle option;
   receipt_root_matches : C_types.epoch_header -> string list -> bool;
@@ -41,11 +36,6 @@ type deps = {
 
 type node_deps = {
   rules : Octra_core.Rule_graph.t;
-  check_override_receipts :
-    epoch_id:int ->
-    receipts:string list ->
-    Transaction.t list ->
-    (unit, string) result;
   find_finalized : int -> C_types.finalize option;
   cached_bundle : string -> cached_bundle option;
   receipt_root_matches : C_types.epoch_header -> string list -> bool;
@@ -121,7 +111,9 @@ let selected rules ~epoch ?(effects = []) txs receipts_json =
       let checked = let ( let* ) = Result.bind in
         let* mode = Octra_core.Rule_graph.vm_bytes rules ~epoch
           |> Result.map_error Octra_core.Rule_graph.fault_message in
-        let* () = Octra_core.Tx_envelope.check_charged mode partition.rejections in
+        let* program = Octra_core.Rule_graph.program_result rules ~epoch
+          |> Result.map_error Octra_core.Rule_graph.fault_message in
+        let* () = Octra_core.Tx_envelope.check_charged ~program mode partition.rejections in
         Octra_core.Tx_envelope.check_rule rules ~epoch inputs in
       match checked with
       | Error error -> Error (Outcome_invalid error)
@@ -142,7 +134,8 @@ let choose_override (deps : deps) request txs =
   | Error _ as error -> error
   | Ok selected ->
     match
-      deps.check_override_receipts
+      Octra_core.Preverify_receipt_policy.check
+        ~rejections:selected.rejections
         ~epoch_id:request.epoch_id
         ~receipts:selected.preverify_json
         txs
@@ -198,7 +191,6 @@ let run (deps : deps) request ~apply_effect ~fatal ~exit =
 let deps_of_node (deps : node_deps) =
   {
     rules = deps.rules;
-    check_override_receipts = deps.check_override_receipts;
     find_finalized = deps.find_finalized;
     cached_bundle = deps.cached_bundle;
     receipt_root_matches = deps.receipt_root_matches;

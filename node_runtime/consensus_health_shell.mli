@@ -4,8 +4,6 @@
 module C_driver = Octra_consensus.C_driver
 
 type config = {
-  active_f : int;
-  validator_count : int;
   state_attest_configured : int;
   snapshot_policy_threshold : int;
   soft_catchup_max_lag : int;
@@ -17,6 +15,9 @@ type config = {
 type deps = {
   normalize_next_epoch_for_head : source:string -> unit;
   committed_head_epoch : unit -> int;
+  head_time : int -> float option;
+  now : unit -> float;
+  root_weights : epoch_id:int64 -> C_driver.root_weights option;
   current_epoch : unit -> int;
   catchup_next_target : unit -> int64 option;
   attested_head : int -> bool;
@@ -48,6 +49,7 @@ type deps = {
   quarantine_reason : unit -> string;
   ahead_streak : unit -> int;
   incr_ahead_streak : unit -> unit;
+  reset_ahead_streak : unit -> unit;
 }
 
 type fork_repair_deps = {

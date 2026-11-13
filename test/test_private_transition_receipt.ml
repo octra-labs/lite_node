@@ -1701,6 +1701,251 @@ let forged_case () =
         expect (account.encrypted_balance = None) "forged cipher"
       | None -> fail "forged account missing")
 
+let preview_usage () =
+  let module Core = Octra_core in
+  let module L = Core.Ledger in
+  let module S = Core.Store_irmin in
+  let module Gate = Core.Preverify_commit in
+  let module Apply = Core.Private_transition in
+  let module Work = Core.Exec_resource in
+  let path, store, ledger, pk, sk = setup "preview_usage" in
+  Fun.protect ~finally:(fun () -> Lwt_main.run (S.close store); clear_case path) (fun () ->
+    let first = tx (payload pk sk false) in
+    let second = {(tx (Yojson.Safe.to_string (`Assoc [
+      "new_pubkey", `String (Base64.encode_exn (Bytes.to_string (P.serialize_pubkey pk)));
+      "aes_kat", `String (FB.aes_kat_hex ())]))) with
+      T.from = "oct" ^ String.make 44 '2'; to_ = "oct" ^ String.make 44 '2';
+      amount = Z.zero; op_type = T.KeySwitch} in
+    expect (L.add_account ledger second.from (Z.of_int 1000) = Ok ()) "preview usage account";
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    Lwt_main.run (S.set_meta store "total_supply" (Z.to_string (L.get_total_supply ledger)));
+    Lwt_main.run (S.set_meta store "emission_remaining" "0");
+    let root = Lwt_main.run (L.hash ledger) in
+    let encrypt = Lwt_main.run (PL.prepare_encrypt_plan ~registered:false
+      ~field_policy:PL.Unique_fields ledger first) |> Result.map PL.(fun plan -> Prepared_encrypt plan) in
+    let switched = Lwt_main.run (PL.prepare_key_switch_plan ~registered:false ~keyed:false
+      ~field_policy:PL.Unique_fields ~cap:false ledger second)
+      |> Result.map PL.(fun plan -> Prepared_key_switch plan) in
+    let receipts = List.map (fun (item, plan) ->
+      let plan = match plan with Ok plan -> plan | Error error -> fail error.PL.reason in
+      receipt ledger item (PL.hash_prepared plan)) [first, encrypt; second, switched] in
+    expect (T.consensus_order [first; second] = [first; second]) "preview usage input order";
+    let execute limited inputs =
+      let omitted = ref [] and visited = ref [] and now = ref 0. in
+      let gate = Gate.create (List.filter (fun receipt ->
+        List.exists (fun item -> T.hash item = receipt.R.tx_hash) inputs) receipts) in
+      let result = Lwt_main.run (Core.State_preview.with_preview ~base_store:store ~base_ledger:ledger
+        ~proof_mode:Core.Rule_graph.Prior ~fold:E.prior_fold ~epoch_id:env.epoch_id
+        ~proposal_id:"preview_usage" (fun backend ->
+          let transition = Apply.create ~registered:false ~keyed:false ~math:false
+            ~preverify:(Some gate) ~ledger:backend.E.ledger ~epoch_id:env.epoch_id
+            ~owner_migration_mode:Core.Rule_graph.Active ~cipher_mode:Core.Rule_graph.Prior
+            ~proof_mode:Core.Rule_graph.Prior ~field_policy:PL.Unique_fields
+            ~result_policy:Core.Private_result_policy.Recoverable ~legacy_replay
+            ~limits:Apply.{max_fhe = 1; max_stealth = 1} in
+          let run () = E.run_core_with ~checkpoint:(Some (fun () -> Apply.checkpoint transition))
+            ~reward:None ~preverify:(Some gate) ~backend ~env:{env with E.prev_state_root = root}
+            ~txs:inputs ~process_tx:(fun ~backend ~env item ->
+              Work.run ~hash:(T.hash item) (fun () -> Work.interrupt (fun () ->
+                let open Lwt.Syntax in
+                let* () = Lwt.pause () in
+                visited := item :: !visited;
+                let* result = Apply.process transition ~backend ~env item in
+                if limited && item = first then begin
+                  expect (result = Ok Z.one) "preview interrupted before private success";
+                  now := !now +. 2.
+                end;
+                Lwt.return (Result.map (fun fee -> E.Confirmed fee) result)))) in
+          if not limited then run () else
+            let open Lwt.Syntax in
+            let* result, partial = Work.preview ~accept:(fun () -> true)
+              ~defer:(fun hash resource ->
+                expect (resource = Work.Time) "preview private cut cause";
+                omitted := hash :: !omitted)
+              (fun () -> Work.select ~limit:1. ~clock:(fun () -> !now) ~running:(fun () -> true) run) in
+            expect partial "preview private cut not marked";
+            Lwt.return result)) in
+      let value = match result with Ok value -> value | Error reason -> fail reason in
+      expect (Lwt_main.run (L.hash ledger) = root) "preview usage changed base";
+      value, List.rev !visited, List.rev !omitted in
+    let selected, visited, omitted = execute true [first; second] in
+    expect (visited = [first; second] && omitted = [T.hash first]) "preview usage execution order";
+    expect (selected.E.artifacts.rejected = [] && selected.artifacts.confirmed = [second, 0])
+      "preview retained private usage";
+    let replay, _, _ = execute false [second] in
+    expect (selected = replay) "preview private usage replay differs")
+
+let preview_shell () =
+  let module Core = Octra_core in
+  let module L = Core.Ledger in
+  let module S = Core.Store_irmin in
+  let module G = Core.Rule_graph in
+  let module Gate = Core.Preverify_commit in
+  let module Work = Core.Exec_resource in
+  let module Shell = Octra_node_runtime.Consensus_proposal_preview_shell in
+  let module Reward = Octra_node_runtime.Consensus_reward_attribution in
+  let path, store, ledger, pk, _ = setup "preview_shell" in
+  Fun.protect ~finally:(fun () -> Lwt_main.run (S.close store); clear_case path) (fun () ->
+    let data = Yojson.Safe.to_string (`Assoc [
+      "new_pubkey", `String (Base64.encode_exn (Bytes.to_string (P.serialize_pubkey pk)));
+      "aes_kat", `String (FB.aes_kat_hex ())]) in
+    let first = {(tx data) with T.amount = Z.zero; op_type = T.KeySwitch} in
+    let second = {first with T.from = "oct" ^ String.make 44 '2';
+      to_ = "oct" ^ String.make 44 '2'} in
+    expect (T.consensus_order [first; second] = [first; second]) "shell input order";
+    expect (L.add_account ledger second.from (Z.of_int 1000) = Ok ()) "shell account";
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    Lwt_main.run (S.set_meta store "total_supply" (Z.to_string (L.get_total_supply ledger)));
+    Lwt_main.run (S.set_meta store "emission_remaining" "0");
+    let root = Lwt_main.run (L.hash ledger) in
+    let commit = Lwt_main.run (S.get_commit_hash store) in
+    let accounts = List.map (fun item -> item.T.from, L.find ledger item.from) [first; second] in
+    let keys = List.map (fun item -> item.T.from,
+      Lwt_main.run (L.get_pvac_pubkey ~registered:false ledger item.from)) [first; second] in
+    let receipts = List.map (fun item ->
+      let plan = Lwt_main.run (PL.prepare_key_switch_plan ~registered:false ~keyed:false
+        ~field_policy:(PL.field_policy_of_mode G.Prior) ~cap:false ledger item) in
+      let plan = match plan with Ok plan -> plan | Error error -> fail error.PL.reason in
+      receipt ledger item (PL.hash_prepared (PL.Prepared_key_switch plan))) [first; second] in
+    let rules = G.create ~chain_id:env.E.chain_id ~root_at:(fun _ -> G.Missing) in
+    let backend = Shell.node_backend ~program_trust:Octra_vm.Program_trust.empty ~rules
+      ~legacy_replay ~private_result_policy:(fun _ -> Core.Private_result_policy.Recoverable)
+      ~max_fhe:1 ~max_stealth:1 store ledger in
+    let reward = Reward.{proposer_addr = env.proposer_addr; proposer_public_key = None;
+      validators = [E.{address = env.proposer_addr; public_key = None; weight = Z.one}]} in
+    let execute limited inputs =
+      List.iter (S.remove_pvac_kat store) [first.from; second.from];
+      let now = ref 0. and cut = ref false and omitted = ref [] in
+      let clock () =
+        if limited && not !cut && L.get_pvac_kat ledger first.from = Some (FB.aes_kat_hex ()) then begin
+          cut := true;
+          now := 2.
+        end;
+        !now in
+      let preverify = Gate.create (List.filter (fun receipt ->
+        List.exists (fun item -> T.hash item = receipt.R.tx_hash) inputs) receipts) in
+      let result, partial = Lwt_main.run (Work.preview ~accept:(fun () -> true)
+        ~defer:(fun hash resource ->
+          expect (resource = Work.Time) "shell cut resource";
+          omitted := hash :: !omitted)
+        (fun () -> Work.select ~limit:1. ~clock ~running:(fun () -> true) (fun () ->
+          backend.run ~epoch_id:env.epoch_id ~proposal_id:"preview-shell"
+            ~expected_prev_root:(Some root) ~preverify ~parent_commit:None ~reward
+            ~env:{env with E.prev_state_root = root} ~txs:inputs))) in
+      let result = match result with Ok result -> result | Error reason -> fail reason in
+      expect (!cut = limited && partial = limited) "shell final cut absent";
+      expect (List.rev !omitted = if limited then [T.hash first] else []) "shell cut identity";
+      expect (Lwt_main.run (L.hash ledger) = root) "shell changed base root";
+      expect (Lwt_main.run (S.get_commit_hash store) = commit) "shell changed base commit";
+      List.iter (fun (address, account) ->
+        expect (L.find ledger address = account) "shell changed base account") accounts;
+      List.iter (fun (address, key) ->
+        expect (Lwt_main.run (L.get_pvac_pubkey ~registered:false ledger address) = key)
+          "shell changed base key") keys;
+      if limited then expect (L.get_pvac_kat ledger first.from = None) "shell cut kat retained";
+      result in
+    let full = execute false [first; second] in
+    expect (full.E.artifacts.confirmed = [first, 0]) "shell first private operation failed";
+    expect (List.map (fun (row : E.tx_reject) -> row.tx, row.error_type, row.charged)
+      full.artifacts.rejected = [second, "fhe_epoch_cap", false]) "shell private usage absent";
+    expect (L.get_pvac_kat ledger first.from = Some (FB.aes_kat_hex ())) "shell first key not applied";
+    let selected = execute true [first; second] in
+    expect (selected.E.artifacts.confirmed = [second, 0] && selected.artifacts.rejected = [])
+      "shell private usage not restored";
+    expect (selected.artifacts.tx_count = 1 && Z.equal selected.artifacts.confirmed_fees second.ou)
+      "shell cut fee retained";
+    expect (L.get_pvac_kat ledger second.from = Some (FB.aes_kat_hex ())) "shell second key not applied";
+    let replay = execute false [second] in
+    expect (selected.post_state_root = replay.post_state_root) "shell retained root differs";
+    expect (selected.artifacts = replay.artifacts) "shell retained artifacts differ")
+
+let account_retry () =
+  let module L = Octra_core.Ledger in
+  let module S = Octra_core.Store_irmin in
+  let module G = Octra_core.Rule_graph in
+  let module A = Octra_node_runtime.Consensus_epoch_apply_shared in
+  let path, store, ledger, pk, _ = setup "account_retry" in
+  Fun.protect ~finally:(fun () ->
+    Lwt_main.run (S.close store);
+    clear_case path) (fun () ->
+    let payload = Yojson.Safe.to_string (`Assoc [
+      "new_pubkey", `String (Base64.encode_exn (Bytes.to_string (P.serialize_pubkey pk)));
+      "aes_kat", `String (FB.aes_kat_hex ())]) in
+    let signed seed =
+      let secret = Bytes.to_string (bytes seed) in
+      let public = Mirage_crypto_ec.Ed25519.priv_of_octets secret |> Result.get_ok
+        |> Mirage_crypto_ec.Ed25519.pub_of_priv |> Mirage_crypto_ec.Ed25519.pub_to_octets
+        |> Base64.encode_exn in
+      let address = Octra_core.Crypto.Address.address_from_pubkey public in
+      let item = T.sign_with_privkey {(tx payload) with T.from = address; to_ = address;
+        amount = Z.zero; op_type = T.KeySwitch; public_key = Some public; signature = ""}
+        (Base64.encode_exn secret) in
+      expect (T.verify item public) "retry transaction signature";
+      expect (L.add_account ledger address (Z.of_int 1000) = Ok ()) "retry account";
+      item in
+    let prior = signed '\072' and first = signed '\073' in
+    Lwt_main.run (L.flush_dirty_lwt ledger);
+    let root = Lwt_main.run (L.hash ledger) in
+    let run mode retries =
+      let open Lwt.Syntax in
+      Lwt_main.run (Octra_core.State_preview.with_state ~base_store:store ~base_ledger:ledger
+        ~epoch_id:env.epoch_id ~proposal_id:"account_retry" (fun store ledger ->
+          let* () = S.begin_epoch_batch store in
+          let base = E.make_live_backend ~proof_mode:mode store ledger in
+          let attempts = ref 0 in
+          let backend = {base with E.sender_key_activation_epoch = Some 0;
+            ops = {base.ops with E.register_public_key = (fun address key ->
+              if address = first.T.from then begin
+                incr attempts;
+                if !attempts <= retries then
+                  raise (Octra_core.Exec_resource.Unavailable Memory)
+              end;
+              base.ops.register_public_key address key)}} in
+          let shared = (A.runtime_deps A.{
+            consensus_mode = true; current_epoch = (fun () -> env.epoch_id);
+            log_shared = (fun ~tx_count:_ -> ()); short = Fun.id; fatal = fail;
+            exit = (fun () -> fail "unexpected retry exit");
+            backend = (fun () -> backend); env = (fun () -> env);
+            max_fhe_per_epoch = 2; max_stealth_per_epoch = 2;
+            process_sender = (fun _ -> fail "unexpected sender path");
+            confirm_tx = ignore; reject_tx = (fun _ _ _ -> ());
+            notify_confirmed = (fun _ _ -> ()); notify_rejected = (fun _ _ -> ());
+            program_trust = Octra_vm.Program_trust.empty;
+            circle_mode = G.Prior; wasm_compute_mode = G.Prior; object_cost = false;
+            owner_migration_mode = G.Active; cipher_mode = G.Prior; proof_mode = mode;
+            math = false; private_field_policy = PL.Unique_fields;
+            private_result_policy = (fun _ -> Octra_core.Private_result_policy.Recoverable);
+            legacy_replay; add_rejected_fee = ignore;
+            advance_validator_set = (fun () -> Lwt.return_unit)}).A.shared in
+          let* previous = shared.process prior in
+          expect (previous = Ok (E.Confirmed Z.one)) "prior private operation failed";
+          let* result = shared.process first in
+          expect (result = Ok (E.Confirmed Z.one)) "private retry retained consumed capacity";
+          expect (!attempts = retries + 1) "private retry attempt count";
+          let accounts = List.map (fun item -> L.find ledger item.T.from) [prior; first] in
+          List.iter (fun (account : Octra_core.Ledger_types.account) ->
+            expect (account.nonce = 1 && Z.equal account.balance (Z.of_int 999))
+              "private retry charged more than once") accounts;
+          let* refused = shared.process {first with T.nonce = 2} in
+          expect (match refused with Error ("fhe_epoch_cap", _) -> true | _ -> false)
+            "private retry forgot committed capacity";
+          expect (List.map (fun item -> L.find ledger item.T.from) [prior; first] = accounts)
+            "private cap refusal changed accounts";
+          expect (not (L.journal_active ledger)) "private retry retained journal";
+          let* () = L.flush_dirty_lwt ledger in
+          let* state = S.get_batch_tree_hash store in
+          let* keys = Lwt_list.map_s (fun item -> L.get_pvac_pubkey ledger item.T.from)
+            [prior; first] in
+          let kats = List.map (fun item -> L.get_pvac_kat ledger item.T.from) [prior; first] in
+          let nonces = Hashtbl.fold (fun nonce () all -> nonce :: all) ledger.L.spent_nonces []
+            |> List.sort compare in
+          S.abort_epoch_batch store;
+          Lwt.return_ok (accounts, state, keys, kats, nonces))) in
+    List.iter (fun mode ->
+      expect (run mode 0 = run mode 2) "private retry state differs";
+      expect (Lwt_main.run (L.hash ledger) = root) "private retry changed source")
+      [G.Prior; G.Active])
+
 let prior_receipt_case () =
   let path, store, ledger, pk, sk = setup "prior_receipt" in
   Fun.protect
@@ -2077,6 +2322,14 @@ let () =
     Unix.mkdir "runtime_data/private_transition_receipt" 0o755;
   Unix.putenv "OCTRA_BFT_CRYPTO_PROFILE" "private_v1";
   match Array.to_list Sys.argv with
+  | [_; "preview_shell"] ->
+    preview_shell ();
+    print_endline "status = pass test = private_transition_receipt case = preview_shell"
+  | [_; "account_retry"] ->
+    preview_usage ();
+    preview_shell ();
+    account_retry ();
+    print_endline "status = pass test = private_transition_receipt case = account_retry"
   | [_; "batch"] ->
     batch_case ();
     print_endline "status = pass test = private_transition_receipt case = batch"
@@ -2135,6 +2388,9 @@ let () =
     math_artifact ();
     amount_link_case ();
     pending_case ();
+    preview_usage ();
+    preview_shell ();
+    account_retry ();
     prior_receipt_case ();
     forged_case ();
     valid_case ();

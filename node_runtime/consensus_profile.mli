@@ -26,6 +26,21 @@ val switch_after :
   applied_epoch:int ->
   bool
 
+val execution_profile :
+  ?policy:Octra_consensus.C_quorum_policy.t ->
+  chain_id:string ->
+  epoch:int ->
+  (string -> string option) ->
+  string option
+
+val check_execution_parent :
+  chain_id:string ->
+  epoch:int ->
+  store:Octra_core.Store_irmin.t ->
+  head:Octra_core.Head_manifest.t option ->
+  (string -> string option) ->
+  (unit, string) result Lwt.t
+
 val epochs : ?policy:Octra_consensus.C_quorum_policy.t -> string -> int list
 val switch_for : Octra_consensus.C_quorum_policy.t -> chain_id:string -> applied_epoch:int -> bool
 

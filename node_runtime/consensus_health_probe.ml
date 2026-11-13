@@ -6,6 +6,7 @@ module C_driver = Octra_consensus.C_driver
 type majority = {
   root : string;
   count : int;
+  weight : Z.t;
 }
 
 type root_quorum =
@@ -51,46 +52,58 @@ type lag_plan =
   | Lagging_soft of int
   | Lagging_quarantine of int
 
-let required_attesters ~active_f ~validator_count ~configured =
-  let max_peer_attesters = max 0 (validator_count - 1) in
-  let base = max (active_f + 1) configured in
-  if max_peer_attesters = 0 then 0 else min max_peer_attesters base
+module Addresses = Map.Make (String)
 
-let peer_root_majority responses =
-  let counts = Hashtbl.create 8 in
-  List.iter
-    (fun (r : C_driver.epoch_root_response_record) ->
-      match r.state_root with
-      | Some root ->
-        let cur = try Hashtbl.find counts root with Not_found -> 0 in
-        Hashtbl.replace counts root (cur + 1)
-      | None -> ())
-    responses;
-  Hashtbl.fold
-    (fun root count best ->
-      match best with
-      | None -> Some { root; count }
-      | Some best when count > best.count -> Some { root; count }
-      | Some _ -> best)
-    counts
-    None
+let eligible (weights : C_driver.root_weights) responses =
+  C_driver.epoch_root_records ~epoch_id:weights.epoch_id responses
+  |> List.filter_map (fun (r : C_driver.epoch_root_response_record) ->
+    match weights.weight r.C_driver.responder_addr with
+    | Some weight when Z.sign weight > 0 -> Some (r, weight)
+    | None | Some _ -> None)
 
-let root_with_quorum ~required majority =
-  match majority with
-  | Some m when m.count >= required -> Some m
-  | _ -> None
+let root_order a b =
+  let by_weight = Z.compare b.weight a.weight in
+  if by_weight <> 0 then by_weight else
+  let by_count = Int.compare b.count a.count in
+  if by_count <> 0 then by_count else String.compare a.root b.root
 
-let compare_root ~required ~local_root majority =
-  match majority with
-  | None -> No_root
-  | Some m when m.count < required -> Missing_quorum m
-  | Some m when m.root = local_root -> Matching_quorum m
-  | Some m -> Mismatching_quorum m
+let peer_roots ~weights responses =
+  eligible weights responses
+  |> List.fold_left (fun roots ((r : C_driver.epoch_root_response_record), weight) ->
+    match r.C_driver.state_root with
+    | Some root when String.length root = 32 ->
+      Addresses.update root (function
+        | None -> Some {root; count = 1; weight}
+        | Some prior -> Some {root; count = prior.count + 1;
+            weight = Z.add prior.weight weight}) roots
+    | None | Some _ -> roots) Addresses.empty
+  |> Addresses.bindings
+  |> List.map snd
+  |> List.sort root_order
 
-let peer_root_quorum ~required ~local_root responses =
-  responses
-  |> peer_root_majority
-  |> compare_root ~required ~local_root
+let peer_root_majority ~weights responses =
+  List.nth_opt (peer_roots ~weights responses) 0
+
+let root_agrees (weights : C_driver.root_weights) root =
+  weights.agrees ~count:root.count ~weight:root.weight
+
+let own_root_proved ~weights ~local_root responses =
+  peer_roots ~weights responses
+  |> List.exists (fun root -> root.root = local_root && root_agrees weights root)
+
+let peer_root_quorum ~(weights : C_driver.root_weights) ~required ~local_root responses =
+  let roots = peer_roots ~weights responses in
+  let own = List.find_opt (fun root -> root.root = local_root) roots in
+  let foreign = List.filter (fun root ->
+    root.root <> local_root && root_agrees weights root) roots in
+  match foreign, own with
+  | [other], own when
+      (match own with None -> true | Some own ->
+        not (root_agrees weights own) && Z.gt other.weight own.weight) ->
+    Mismatching_quorum other
+  | [], Some own when weights.attested ~required ~count:own.count ~weight:own.weight ->
+    Matching_quorum own
+  | _ -> match roots with [] -> No_root | first :: _ -> Missing_quorum first
 
 let root_quorum_count = function
   | No_root -> 0
@@ -99,21 +112,59 @@ let root_quorum_count = function
   | Mismatching_quorum m -> m.count
 
 let root_quorum_has_quorum = function
-  | Matching_quorum _
-  | Mismatching_quorum _ -> true
+  | Matching_quorum _ -> true
+  | Mismatching_quorum _
   | No_root
   | Missing_quorum _ -> false
 
-let peer_root_with_quorum ~required responses =
-  responses
-  |> peer_root_majority
-  |> root_with_quorum ~required
+let target_ceiling ~head ~head_time ~now ~allowance =
+  match head_time with
+  | Some time when head >= 0L && allowance >= 0
+      && Float.is_finite time && Float.is_finite now
+      && time >= 0. && now >= time ->
+    let steps = ceil ((now -. time) /. Octra_consensus.Epoch_time.interval_seconds) in
+    if not (Float.is_finite steps) || steps >= Int64.to_float Int64.max_int then None
+    else
+      let total = Z.(add (of_int64 head)
+        (add (of_int64 (Int64.of_float steps)) (of_int allowance))) in
+      if Z.fits_int64 total then Some (Z.to_int64 total) else None
+  | None | Some _ -> None
+
+let peer_heads ~weights ~ceiling responses =
+  eligible weights responses |> List.filter (fun ((r : C_driver.epoch_root_response_record), _) ->
+    r.C_driver.responder_head_epoch >= -1L
+    && r.responder_head_epoch <= ceiling)
+
+let head_order replies =
+  replies |> List.map (fun ((r : C_driver.epoch_root_response_record), _) -> r.responder_head_epoch)
+  |> List.sort_uniq (fun a b -> Int64.compare b a)
+
+let head_support head replies =
+  List.fold_left (fun (count, weight) ((r : C_driver.epoch_root_response_record), value) ->
+    if r.C_driver.responder_head_epoch >= head then count + 1, Z.add weight value
+    else count, weight) (0, Z.zero) replies
+
+let peer_target ~weights ~ceiling responses =
+  let replies = peer_heads ~weights ~ceiling responses in
+  head_order replies
+  |> List.find_opt (fun head ->
+    let count, weight = head_support head replies in
+    weights.C_driver.agrees ~count ~weight)
+
+let peer_ahead ~(weights : C_driver.root_weights) ~head ~ceiling responses =
+  let replies = peer_heads ~weights ~ceiling responses in
+  let current = snd (head_support head replies) in
+  let below = Z.sub (snd (head_support (-1L) replies)) current in
+  if not (weights.ahead below) || weights.ahead current then None
+  else head_order replies
+    |> List.find_opt (fun target -> target < head
+      && weights.ahead (snd (head_support target replies)))
 
 let in_sync_plan ~required ~has_committed_root ~genesis_attested root_quorum =
   match root_quorum with
   | Mismatching_quorum m -> Peer_root_mismatch m
-  | _ when genesis_attested -> Accept_genesis
-  | _ when required = 0 && has_committed_root -> Accept_current_root
+  | No_root | Missing_quorum _ when genesis_attested -> Accept_genesis
+  | No_root when required = 0 && has_committed_root -> Accept_current_root
   | No_root -> Missing_peer_root_quorum 0
   | Missing_quorum m -> Missing_peer_root_quorum m.count
   | Matching_quorum _ -> Accept_current_root

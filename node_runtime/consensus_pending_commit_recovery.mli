@@ -6,7 +6,7 @@ exception Store_fault of string
 type decision =
   | Confirmed_elsewhere of {
       agreed : int;
-      quorum : int;
+      level : string;
     }
   | All_peers_missing of {
       responses : int;
@@ -15,7 +15,7 @@ type decision =
       agreed : int;
       peers : int;
       responses : int;
-      quorum : int;
+      level : string;
     }
 
 type recovered = {
@@ -35,7 +35,8 @@ val raw32_of_hex : string -> string option
 
 val decide :
   validator_count:int ->
-  peer_quorum:int ->
+  reached:(string list -> bool) ->
+  level:string ->
   promised_root_raw:string option ->
   Octra_consensus.C_driver.epoch_root_response_record list ->
   decision
@@ -75,7 +76,8 @@ type 'driver driver_runtime = {
     Octra_core.Wal.pending_commit ->
     restore_result;
   validator_count : int;
-  peer_quorum : int;
+  reached : string list -> bool;
+  level : string;
 }
 
 type node_driver_runtime = {
@@ -96,7 +98,8 @@ type node_driver_runtime = {
     receipts_json:string list ->
     unit;
   validator_count : int;
-  quorum : int;
+  reached : string list -> bool;
+  level : string;
 }
 
 val driver_runtime :
@@ -107,7 +110,8 @@ val driver_runtime :
   delete_pending_commit:(epoch_id:int -> round:int -> unit) ->
   restore_pending:('driver -> Octra_core.Wal.pending_commit -> restore_result) ->
   validator_count:int ->
-  quorum:int ->
+  reached:(string list -> bool) ->
+  level:string ->
   'driver driver_runtime
 
 val node_driver_runtime :
@@ -126,7 +130,8 @@ val deps_of_driver_runtime :
 val run_once :
   deps ->
   validator_count:int ->
-  peer_quorum:int ->
+  reached:(string list -> bool) ->
+  level:string ->
   bool Lwt.t
 
 val run_with_driver :

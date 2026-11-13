@@ -3,5 +3,7 @@
 
 type t = private {text : string; count : int; chars : int}
 
+val fold : string -> init:'a -> visit:('a -> int -> int -> 'a option) -> 'a option
+
 val plan : capacity:int -> fits:(count:int -> chars:int -> bool) -> string -> t option
 val read : strict:bool -> t -> Z.t array option

@@ -594,6 +594,12 @@ let read_local ?policy deps epoch =
       when mark.height = epoch && (Anchor.finality anchor).epoch_id = epoch
         && parent.epoch_id = Int64.pred epoch && parent.chain_id = deps.chain_id ->
       Ok (source, anchor)
+    | [{source = Pending; finalize = parent; update; _}]
+      when (Anchor.finality anchor).epoch_id = epoch
+        && parent.epoch_id = Int64.pred epoch && parent.chain_id = deps.chain_id ->
+      let* plan = Update.of_string update in
+      if Option.is_some plan.eviction then Ok (source, anchor)
+      else Error "local pending proof is not an eviction"
     | _ -> Error "local relief proof height differs"
   with exn -> Error (Printexc.to_string exn)
 
@@ -634,6 +640,20 @@ let build ?policy deps ~head_epoch trusted active =
   in
   gather 0 head_epoch active
 
+let write_local deps source anchor =
+  let* trusted = Anchor.encoded_validator_set source in
+  let wire = Anchor.encode anchor in
+  let* _ = Anchor.verify_path ~validator_set:trusted wire in
+  let json = `Assoc ["source", `String (Octra_consensus.C_codec.encode_validator_set
+    source |> Base64.encode_exn); "proof", `String wire] in
+  if String.length (Yojson.Safe.to_string json) > Manifest.manifest_limit then
+    Error "local relief proof size exceeds limit" else
+  try
+    Manifest.write_json (Filename.concat (local_dir deps.data_dir)
+      (local_name (Anchor.finality anchor).epoch_id)) json;
+    Ok ()
+  with exn -> Error (Printexc.to_string exn)
+
 let keep_new_relief deps validator_set finalize =
   match validator_set.C_types.authors with
   | None -> Lwt.return_ok ()
@@ -655,29 +675,47 @@ let keep_new_relief deps validator_set finalize =
       | Ok steps when List.length steps <> 1 -> Lwt.return_error "local relief step count differs"
       | Ok steps ->
       let anchor = Anchor.make ~steps ~finalize ~validator_set in
-      Lwt_preemptive.detach (fun () ->
-        let* trusted = Anchor.encoded_validator_set parent.validator_set in
-        let wire = Anchor.encode anchor in
-        let* _ = Anchor.verify_path ~validator_set:trusted wire in
-        let json = `Assoc ["source", `String (Octra_consensus.C_codec.encode_validator_set
-          parent.validator_set |> Base64.encode_exn); "proof", `String wire] in
-        if String.length (Yojson.Safe.to_string json) > Manifest.manifest_limit then
-          Error "local relief proof size exceeds limit" else
-        try
-          Manifest.write_json (Filename.concat (local_dir deps.data_dir)
-            (local_name finalize.epoch_id)) json;
-          Ok ()
-        with exn -> Error (Printexc.to_string exn)) ()
+      Lwt_preemptive.detach (fun () -> write_local deps parent.validator_set anchor) ()
+
+let keep_eviction_step deps validator_set finalize raw plan =
+  match transition_epoch plan with
+  | Error reason -> Lwt.return_error reason
+  | Ok (epoch, epoch_int) ->
+    Lwt_preemptive.detach (fun () -> transition_record deps epoch epoch_int) () >>= function
+    | Error Finality_missing -> Lwt.return_error "local eviction parent is missing"
+    | Error (Transition_invalid reason) -> Lwt.return_error reason
+    | Ok (parent, _) ->
+      transition_step deps raw plan >>= function
+      | Error Finality_missing -> Lwt.return_error "local eviction parent is missing"
+      | Error (Transition_invalid reason) -> Lwt.return_error reason
+      | Ok step ->
+        let anchor = Anchor.make ~steps:[step] ~finalize ~validator_set in
+        Lwt_preemptive.detach (fun () -> write_local deps parent.validator_set anchor) ()
+
+let keep_new_eviction deps validator_set finalize =
+  Irmin.get_meta deps.store Update.pending_meta_key >>= function
+  | None -> Lwt.return_ok ()
+  | Some raw ->
+    match Update.of_string raw with
+    | Error reason -> Lwt.return_error reason
+    | Ok plan when plan.eviction = None -> Lwt.return_ok ()
+    | Ok plan when plan.activate_epoch <> finalize.C_types.epoch_id ->
+      Lwt.return_error "local eviction activation epoch differs"
+    | Ok plan -> keep_eviction_step deps validator_set finalize raw plan
 
 let keep_relief deps validator_set finalize =
   let path = Filename.concat (local_dir deps.data_dir) (local_name finalize.C_types.epoch_id) in
-  if validator_set.C_types.authors = None then Lwt.return_ok ()
-  else if not (Sys.file_exists path) then keep_new_relief deps validator_set finalize
-  else Lwt_preemptive.detach (fun () ->
+  let eviction = finalize.epoch_id >= 0L && finalize.epoch_id < Int64.of_int max_int
+    && Octra_core.Rule_graph.seatless_at ~chain_id:deps.chain_id
+      ~epoch:(Int64.to_int finalize.epoch_id) = Octra_core.Rule_graph.Active in
+  if validator_set.C_types.authors = None && not eviction then Lwt.return_ok ()
+  else if Sys.file_exists path then Lwt_preemptive.detach (fun () ->
     let* _, saved = read_local deps finalize.epoch_id in
     if (Anchor.finality saved).proposal_id = finalize.proposal_id
       && same_set (Anchor.validator_set saved) validator_set then Ok ()
     else Error "local relief proof conflicts with applied value") ()
+  else if validator_set.C_types.authors <> None then keep_new_relief deps validator_set finalize
+  else keep_new_eviction deps validator_set finalize
 
 let prune_local data_dir ~through_epoch =
   List.iter (fun epoch -> Unix.unlink (Filename.concat (local_dir data_dir) (local_name epoch)))

@@ -4,6 +4,25 @@
 let max_ou = Z.of_int 10_000_000_000
 let max_staging_txs = 100_000
 let staging_ttl = 600.
+let byte_config = Staging_bytes.of_env Sys.getenv_opt
+
+let check_config () = Result.map (fun _ -> ()) byte_config
+
+type preview_hold = {head : int64; count : int; after : int64}
+type hold_mode = Grow | Renew
+
+let hold_after ?(mode = Grow) head previous =
+  match previous with
+  | Some previous when previous.head = head -> previous
+  | _ ->
+    let count = match mode, previous with
+      | Grow, _ -> min 6 (1 + Option.fold ~none:0 ~some:(fun value -> value.count) previous)
+      | Renew, Some value -> value.count
+      | Renew, None -> invalid_arg "preview hold missing" in
+    let delay = Int64.of_int (1 lsl (count - 1)) in
+    let after = if head > Int64.sub Int64.max_int delay then Int64.max_int
+      else Int64.add head delay in
+    {head; count; after}
 
 type entry = {
   tx : Transaction.t;
@@ -11,7 +30,9 @@ type entry = {
   key : string;
   added_at : float;
   hash : string;
-  mutable preview_head : int64 option;
+  bytes : int;
+  usage : Staging_bytes.usage;
+  mutable preview : preview_hold option;
 }
 
 let staging : (string, entry) Hashtbl.t = Hashtbl.create 200
@@ -24,6 +45,8 @@ module Preview : sig
     | Ready of int64 option * string
     | Refuse of { head : int64; epoch : int64; hash : string }
     | Hold of { head : int64; epoch : int64; hash : string }
+    | Renew of { head : int64; epoch : int64; hash : string }
+    | Sweep
   val empty : state
   val step : limit:int -> state -> message -> state * (unit, string) result
   val send : message -> (unit, string) result
@@ -35,6 +58,8 @@ end = struct
     | Ready of int64 option * string
     | Refuse of { head : int64; epoch : int64; hash : string }
     | Hold of { head : int64; epoch : int64; hash : string }
+    | Renew of { head : int64; epoch : int64; hash : string }
+    | Sweep
 
   let empty = { head = -1L; hashes = Hashes.empty; size = 0; full = false }
 
@@ -43,6 +68,7 @@ end = struct
     | _ -> state
 
   let step ~limit state = function
+    | Sweep -> {state with full = false}, Ok ()
     | Check (head, hash) ->
       let state = advance state head in
       let result =
@@ -64,7 +90,8 @@ end = struct
         else if state.size >= limit then
           { state with full = true }, Ok ()
         else { state with hashes = Hashes.add hash state.hashes; size = state.size + 1 }, Ok ()
-    | Hold { head; epoch; hash = _ } ->
+    | Hold { head; epoch; hash = _ }
+    | Renew { head; epoch; hash = _ } ->
       if head < 0L || head = Int64.max_int || head < state.head
          || epoch <> Int64.succ head then
         state, Error "preview epoch changed"
@@ -74,18 +101,26 @@ end = struct
     let state = ref empty in
     let lock = Mutex.create () in
     fun message ->
-      if not (Mutex.try_lock lock) then Error "pre_verify_busy preview queue"
-      else Fun.protect ~finally:(fun () -> Mutex.unlock lock) (fun () ->
+      Mutex.lock lock;
+      Fun.protect ~finally:(fun () -> Mutex.unlock lock) (fun () ->
         let next, result = step ~limit:max_staging_txs !state message in
         let next, result = match message, result with
           | Hold {head; hash; _}, Ok () ->
             begin match Hashtbl.find_opt hash_index hash with
             | None -> next, Ok ()
-            | Some entry -> entry.preview_head <- Some head; next, Ok ()
+            | Some entry -> entry.preview <- Some (hold_after head entry.preview); next, Ok ()
+            end
+          | Renew {head; hash; _}, Ok () ->
+            begin match Hashtbl.find_opt hash_index hash with
+            | Some ({preview = Some _; _} as entry) ->
+              entry.preview <- Some (hold_after ~mode:Renew head entry.preview);
+              next, Ok ()
+            | _ -> next, Error "preview hold missing"
             end
           | (Check (_, hash) | Ready (_, hash)), _ ->
             let held = match Hashtbl.find_opt hash_index hash with
-              | Some entry -> entry.preview_head = Some next.head
+              | Some entry -> Option.fold ~none:false
+                  ~some:(fun held -> next.head < held.after) entry.preview
               | None -> false in
             next, (if held then Error "preview refused in this epoch" else result)
           | _ -> next, result in
@@ -100,6 +135,7 @@ let public_balance_cost (tx : Transaction.t) =
 
 type queue_state =
   | Ready of { expires_at : float }
+  | Wait_preview of { after : int64; attempts : int; expires_at : float }
   | Wait_nonce of { expected : int; expires_at : float }
   | Nonce_used of { confirmed : int; expires_at : float }
 
@@ -144,6 +180,16 @@ module Evict_index = Set.Make(struct
       if hash <> 0 then hash else String.compare a.key b.key
 end)
 
+module Byte_index = Set.Make(struct
+  type t = entry
+
+  let compare a b =
+    let rate = Z.compare
+      (Z.mul a.tx.Transaction.ou (Z.of_int b.bytes))
+      (Z.mul b.tx.Transaction.ou (Z.of_int a.bytes)) in
+    if rate <> 0 then rate else String.compare a.key b.key
+end)
+
 module Recent_index = Set.Make(struct
   type t = entry
 
@@ -159,8 +205,16 @@ end)
 
 let view_index = ref Index.empty
 let evict_index = ref Evict_index.empty
+let byte_index = ref Byte_index.empty
 let recent_index = ref Recent_index.empty
 let total_ou = ref Z.zero
+let byte_usage = ref Staging_bytes.zero
+let sender_byte_usage : (string, Staging_bytes.usage) Hashtbl.t = Hashtbl.create 100
+
+let sender_bytes sender =
+  Option.value (Hashtbl.find_opt sender_byte_usage sender) ~default:Staging_bytes.zero
+
+let staging_bytes () = !byte_usage
 
 let virtual_balances : (string, Z.t) Hashtbl.t = Hashtbl.create 100
 let virtual_nonces : (string, int) Hashtbl.t = Hashtbl.create 100
@@ -312,7 +366,12 @@ let duty_expired ?(marks = false) ?(mode = Rule_graph.Prior) ~head (tx : Transac
     end
   | _ -> false
 
-let queue_state ~confirmed hash =
+let preview_limit hash base =
+  match Hashtbl.find_opt hash_index hash with
+  | Some {preview = Some held; _} -> min 90. (base *. float_of_int (1 lsl held.count))
+  | _ -> base
+
+let queue_state ?head ~confirmed hash =
   match Hashtbl.find_opt hash_index hash with
   | None -> None
   | Some entry ->
@@ -323,8 +382,10 @@ let queue_state ~confirmed hash =
       let expected = first_missing_nonce entry.tx.from confirmed in
       if expected < entry.tx.nonce then
         Some (Wait_nonce { expected; expires_at })
-      else
-        Some (Ready { expires_at })
+      else match entry.preview with
+        | Some held when Option.fold ~none:true ~some:(fun head -> head < held.after) head ->
+          Some (Wait_preview { after = held.after; attempts = held.count; expires_at })
+        | _ -> Some (Ready { expires_at })
 
 let sample limit =
   first (max 0 limit) (Index.to_seq !view_index) []
@@ -338,36 +399,54 @@ let clear () =
   List.iter Hashtbl.clear [staging; hash_index];
   view_index := Index.empty;
   evict_index := Evict_index.empty;
+  byte_index := Byte_index.empty;
   recent_index := Recent_index.empty;
   Hashtbl.clear virtual_balances;
   Hashtbl.clear virtual_nonces;
-  total_ou := Z.zero
+  total_ou := Z.zero;
+  byte_usage := Staging_bytes.zero;
+  Hashtbl.clear sender_byte_usage
 
 let find_by_hash h =
   Hashtbl.find_opt hash_index h |> Option.map (fun e -> e.tx)
 
-let insert tx ou =
+let insert ~bytes ~usage tx ou =
   let key = tx.Transaction.from ^ string_of_int tx.nonce in
   let hash = Transaction.hash tx in
-  let entry = { tx; ou; key; added_at = Unix.gettimeofday (); hash; preview_head = None } in
+  let added = usage in
+  let total = Staging_bytes.add !byte_usage added in
+  let sender = Staging_bytes.add (sender_bytes tx.from) added in
+  let entry = { tx; ou; key; added_at = Unix.gettimeofday (); hash; bytes; usage;
+    preview = None } in
   Hashtbl.add staging key entry;
   Hashtbl.add hash_index hash entry;
   view_index := Index.add (index_key entry) entry !view_index;
   evict_index := Evict_index.add entry !evict_index;
+  if usage.regular > 0 then
+    byte_index := Byte_index.add entry !byte_index;
   recent_index := Recent_index.add entry !recent_index;
   total_ou := Z.add !total_ou ou;
+  byte_usage := total;
+  Hashtbl.replace sender_byte_usage tx.from sender;
   Hashtbl.replace virtual_balances tx.from
     (Z.sub (Hashtbl.find virtual_balances tx.from) (public_balance_cost tx));
   Hashtbl.replace virtual_nonces tx.from
     (max (Hashtbl.find virtual_nonces tx.from) tx.nonce)
 
 let evict entry =
+  let removed = entry.usage in
+  let total = Staging_bytes.remove !byte_usage removed in
+  let sender = Staging_bytes.remove (sender_bytes entry.tx.from) removed in
   Hashtbl.remove staging entry.key;
   Hashtbl.remove hash_index entry.hash;
   view_index := Index.remove (index_key entry) !view_index;
   evict_index := Evict_index.remove entry !evict_index;
+  byte_index := Byte_index.remove entry !byte_index;
   recent_index := Recent_index.remove entry !recent_index;
   total_ou := Z.sub !total_ou entry.ou;
+  byte_usage := total;
+  if sender = Staging_bytes.zero then Hashtbl.remove sender_byte_usage entry.tx.from
+  else Hashtbl.replace sender_byte_usage entry.tx.from sender;
   Hashtbl.replace virtual_balances entry.tx.from
     (Z.add (Hashtbl.find virtual_balances entry.tx.from)
        (public_balance_cost entry.tx))
@@ -420,18 +499,91 @@ let rbf_bump_ok new_tx new_ou old =
     (Z.mul (Z.mul new_tx.Transaction.ou old.ou) (Z.of_int 100))
     (Z.mul (Z.mul old.tx.Transaction.ou new_ou) (Z.of_int 110))
 
-let add_smart ?head ?(ou_limit=max_ou) ?(tx_limit=max_staging_txs) ~lookup tx =
+let pending_balance_check ~balance ~confirmed tx =
+  let existing = Hashtbl.find_opt staging (tx.Transaction.from ^ string_of_int tx.nonce) in
+  if Option.fold ~none:false ~some:(fun old ->
+      not (rbf_bump_ok tx (Transaction.ou_cost tx) old)) existing then
+    Error "duplicate nonce (fee rate bump < 10%)"
+  else
+    let reserved = sender_entries tx.from |> List.fold_left (fun total entry ->
+      if entry.tx.nonce > confirmed && entry.tx.nonce <> tx.nonce then
+        Z.add total (public_balance_cost entry.tx) else total) Z.zero in
+    if Z.gt (Z.add reserved (public_balance_cost tx)) balance then
+      Error "insufficient balance (including pending)"
+    else Ok ()
+
+let byte_plan limits ~ou_limit ~tx_limit ~added tx ou bytes =
+  let sender = sender_bytes tx.Transaction.from in
+  let check total = Staging_bytes.plan limits ~total ~sender
+    ~removed:Staging_bytes.zero ~added in
+  match check sender with
+  | Error _ as error -> error
+  | Ok () ->
+    match check !byte_usage with
+    | Ok () -> Ok []
+    | Error reason when added.duty > 0 -> Error reason
+    | Error reason ->
+      let compute_full = Z.gt (Z.add !total_ou ou) ou_limit
+        || Hashtbl.length staging >= tx_limit in
+      let better entry =
+        entry.usage.regular > 0
+        && not (String.equal tx.from entry.tx.from)
+        && Z.gt (Z.mul tx.ou (Z.of_int entry.bytes))
+          (Z.mul entry.tx.ou (Z.of_int bytes))
+        && (not compute_full || better_rate tx.ou ou entry) in
+      let last index sender =
+        match Index.find_last_opt (fun (address, _, _) -> String.compare address sender <= 0) index with
+        | Some (_, entry) when String.equal entry.tx.from sender -> Some entry
+        | _ -> None in
+      let rec choose pending index selected total cost count =
+        if check total = Ok () && Z.leq (Z.add cost ou) ou_limit
+           && count < tx_limit then Ok (Byte_index.elements selected)
+        else match Byte_index.min_elt_opt pending with
+        | None -> Error reason
+        | Some entry ->
+          let pending = Byte_index.remove entry pending in
+          let final = match last index entry.tx.from with
+            | Some final -> String.equal entry.key final.key
+            | None -> false in
+          if not final || not (better entry) then
+            choose pending index selected total cost count
+          else
+            let index = Index.remove (index_key entry) index in
+            let pending = match last index entry.tx.from with
+              | Some previous when previous.usage.regular > 0 ->
+                Byte_index.add previous pending
+              | _ -> pending in
+            choose pending index (Byte_index.add entry selected)
+              (Staging_bytes.remove total entry.usage)
+              (Z.sub cost entry.ou) (count - 1) in
+      choose !byte_index !view_index Byte_index.empty
+        !byte_usage !total_ou (Hashtbl.length staging)
+
+let add_planned ?head ?(ou_limit = max_ou) ?(tx_limit = max_staging_txs) ?byte_limits
+    ~accept ~lookup tx =
   let ( let* ) = Result.bind in
+  let* byte_limits = match byte_limits with
+    | Some limits -> Ok limits
+    | None -> byte_config in
+  let* bytes = Staging_bytes.measure tx in
   let* () = Preview.send (Check (head, Transaction.hash tx)) in
   let ou = Transaction.ou_cost tx in
   let key = tx.Transaction.from ^ string_of_int tx.nonce in
   let total_cost = public_balance_cost tx in
+  let existing = Hashtbl.find_opt staging key in
+  let base_nonce = match lookup tx.from with
+    | Some (_, n) -> n | None -> 0 in
+  let usage =
+    if tx.op_type = Transaction.ValidatorReady
+       && Int64.of_int tx.nonce <> Int64.succ (Int64.of_int base_nonce) then
+      Staging_bytes.{regular = bytes; duty = 0}
+    else Staging_bytes.of_tx tx bytes in
+  let check_bytes removed = Staging_bytes.plan byte_limits
+    ~total:!byte_usage ~sender:(sender_bytes tx.from) ~removed
+    ~added:usage in
   match init_virtual_state ~lookup tx.from with
   | Error _ as error -> error
   | Ok () ->
-  let base_nonce = match lookup tx.from with
-    | Some (_, n) -> n | None -> 0
-  in
   if Z.sign ou_limit <= 0 || tx_limit <= 0 then
     Error "staging limits must be positive"
   else if tx.nonce <= base_nonce then Error "nonce too low (already used)"
@@ -439,7 +591,7 @@ let add_smart ?head ?(ou_limit=max_ou) ?(tx_limit=max_staging_txs) ~lookup tx =
   else if Z.gt ou ou_limit then
     Error "transaction too large for staging capacity"
   else
-    match Hashtbl.find_opt staging key with
+    match existing with
     | Some existing ->
       if not (rbf_bump_ok tx ou existing) then
         Error "duplicate nonce (fee rate bump < 10%)"
@@ -450,7 +602,10 @@ let add_smart ?head ?(ou_limit=max_ou) ?(tx_limit=max_staging_txs) ~lookup tx =
           Error "staging full (insufficient evictable capacity)"
         else if Z.gt delta Z.zero && not (check_virtual_balance tx.from delta) then
           Error "insufficient balance for replacement"
-        else begin
+        else
+          let* () = check_bytes existing.usage in
+          let* () = accept () in
+          begin
           evict existing;
           let dropped =
             record_drop
@@ -459,12 +614,22 @@ let add_smart ?head ?(ou_limit=max_ou) ?(tx_limit=max_staging_txs) ~lookup tx =
               Evicted
               "replaced by higher fee-rate"
           in
-          insert tx ou;
+          insert ~bytes ~usage tx ou;
           Ok [dropped]
         end
     | None ->
       if not (check_virtual_balance tx.from total_cost) then
         Error "insufficient balance (including pending)"
+      else
+      let* removals = byte_plan byte_limits ~ou_limit ~tx_limit ~added:usage tx ou bytes in
+      if removals <> [] then begin
+        let* () = accept () in
+        let dropped = List.map (fun entry ->
+          evict entry;
+          record_drop entry.hash entry.tx Evicted "outbid by higher byte fee") removals in
+        insert ~bytes ~usage tx ou;
+        Ok dropped
+      end
       else
         let needs_eviction =
           Z.gt (Z.add !total_ou ou) ou_limit || Hashtbl.length staging >= tx_limit in
@@ -476,6 +641,7 @@ let add_smart ?head ?(ou_limit=max_ou) ?(tx_limit=max_staging_txs) ~lookup tx =
             when count_deficit <= 1
                  && Z.geq entry.ou ou_deficit
                  && better_rate tx.Transaction.ou ou entry ->
+            let* () = accept () in
             evict entry;
             let dropped =
               record_drop
@@ -489,12 +655,26 @@ let add_smart ?head ?(ou_limit=max_ou) ?(tx_limit=max_staging_txs) ~lookup tx =
                 entry.tx.Transaction.from
                 entry.tx.Transaction.nonce
             in
-            insert tx ou;
+            insert ~bytes ~usage tx ou;
             Ok (dropped :: deps)
           | _ ->
             Error "staging full (insufficient evictable capacity)"
         end
-        else begin insert tx ou; Ok [] end
+        else let* () = accept () in insert ~bytes ~usage tx ou; Ok []
+
+let add_smart ?head ?ou_limit ?tx_limit ?byte_limits ?(accept = fun () -> Ok ()) ~lookup tx =
+  let clean sender =
+    if not (sender_has_pending sender) then begin
+      Hashtbl.remove virtual_balances sender;
+      Hashtbl.remove virtual_nonces sender
+    end in
+  Fun.protect ~finally:(fun () -> clean tx.Transaction.from) (fun () ->
+    let result = add_planned ?head ?ou_limit ?tx_limit ?byte_limits ~accept ~lookup tx in
+    begin match result with
+    | Ok drops -> List.iter (fun drop -> clean drop.d_from) drops
+    | Error _ -> ()
+    end;
+    result)
 
 let get_ordered_txs () =
   let by_sender = Hashtbl.create 50 in
@@ -677,8 +857,8 @@ let expiry_reason ~confirmed ~received =
   else
     "TTL exceeded: transaction was not included"
 
-let expire_old ?(confirmed_nonce = fun _ -> None) () =
-  let now = Unix.gettimeofday () in
+let expire_old ?(confirmed_nonce = fun _ -> None) ?now () =
+  let now = match now with Some now -> now | None -> Unix.gettimeofday () in
   let expired = Hashtbl.fold (fun _ (e : entry) acc ->
     if now -. e.added_at > staging_ttl then e :: acc else acc
   ) staging [] in
@@ -707,6 +887,7 @@ let expire_old ?(confirmed_nonce = fun _ -> None) () =
     ) expired
   in
   clear_virtual_state touched;
+  if records <> [] then ignore (Preview.send Sweep);
   records
 
 let staging_total_ou () = !total_ou

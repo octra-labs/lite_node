@@ -10,6 +10,7 @@ type rpc_result = (Yojson.Safe.t, Rpc.rpc_error) result
 
 let view_effort_limit =
   Z.to_int (Octra_core.Resource_lanes.default_budget Program).max_ou
+let view_params_limit = Octra_core.Tx_payload.standard.message_program_len
 let view_circle_effort_limit =
   Z.to_int (Octra_core.Resource_lanes.default_budget Circle_compute).max_ou
 let view_byte_limits =
@@ -314,7 +315,7 @@ let compile_result_response ?deploy_payload (result : Oct_compile.compile_result
   in
   let bytecode_b64 = Base64.encode_exn executable in
   let disasm =
-    match Code_check.decode result.bytecode with
+    match Code_check.decode ~view:true result.bytecode with
     | Ok admitted -> Assembler.emit (Code_check.code admitted)
     | Error _ -> ""
   in
@@ -373,7 +374,7 @@ let source_is_program source =
 
 let compile_program_source ?(loops = false) ?(compiler = Program_package.Protocol) ~point_ops source =
   match
-    Program_package.compile_sources_at ~metered:true ~loops ~compiler
+    Program_package.compile_sources_in ~view:true ~metered:true ~loops ~compiler
       ~point_ops
       ~main:"main.aml"
       ~sources:[Program_package.{ path = "main.aml"; body = source }]
@@ -490,7 +491,7 @@ let compile_aml_multi_with ~compiler ~point_ops ~loops ~json =
           | _ -> []
         in
         begin
-          match Program_package.compile_sources_at ~metered:true ~loops ~compiler ~point_ops ~main:main_path ~sources with
+          match Program_package.compile_sources_in ~view:true ~metered:true ~loops ~compiler ~point_ops ~main:main_path ~sources with
           | Error error ->
             err_lwt
               (Rpc.err
@@ -796,16 +797,17 @@ let verify_compilation ~main ~meta ~source ~files_json =
            Some Program_package.{ path; body }
          | None -> None))
     in
-    let compile = Program_package.compile_sources_at ~metered:true ~loops:false in
+    let compile = Program_package.compile_sources_in ~view:true ~metered:true ~loops:false in
     let current = compile ~compiler:Program_package.Protocol ~point_ops:true ~main ~sources in
     let source_result = compile ~compiler:Program_package.Source
       ~point_ops:true ~main ~sources in
     let preview = compile ~compiler:Program_package.Preview
       ~point_ops:true ~main ~sources in
-    let prior = Program_package.compile_for ~point_ops:false
+    let prior = Program_package.compile_sources_in ~view:true ~metered:false ~loops:false
+      ~compiler:Program_package.Protocol ~point_ops:false
       ~main ~sources in
     let scoped = List.map (fun compiler ->
-      Program_package.compile_sources_at ~metered:true ~loops:true ~compiler ~point_ops:true ~main ~sources)
+      Program_package.compile_sources_in ~view:true ~metered:true ~loops:true ~compiler ~point_ops:true ~main ~sources)
       [Program_package.Protocol; Program_package.Source; Program_package.Preview] in
     let results = List.filter_map (function
       | Ok (compiled : Program_package.compiled) ->
@@ -908,7 +910,7 @@ let publication ~main ~source ~files_json ~meta ~stored record =
     List.find_map (fun (compiler, loops) ->
       let sources = Program_record.{main; files; compiler; loops} in
       let metered = compiler <> "historical" && compiler <> "package_historical" in
-      match Program_record.verify ~metered sources ~exact:(meta.Store_irmin.check = "source") ~stored with
+      match Program_record.verify ~view:true ~metered sources ~exact:(meta.Store_irmin.check = "source") ~stored with
       | Ok checked when Program_record.matches_verification record checked -> Some sources
       | Ok _ | Error _ -> None) Program_record.profiles
 
@@ -1206,7 +1208,7 @@ let view_clock () =
   in
   running, (fun () -> Atomic.set active false)
 
-let run_view ?(seconds = view_seconds) ?(stop = Fun.id) handler =
+let run_view ?(seconds = view_seconds) ?clock ?(stop = Fun.id) handler =
   if !view_active then
     Lwt.return_error
       (Rpc.err (-32005) "Program view busy" None)
@@ -1215,10 +1217,13 @@ let run_view ?(seconds = view_seconds) ?(stop = Fun.id) handler =
     let work = Lwt.finalize
       (fun () ->
         Lwt.catch
-          (fun () -> Octra_core.Exec_resource.protect handler ()
+          (fun () -> Octra_core.Exec_resource.select ?clock ~limit:seconds ~running:(fun () -> true) (fun () ->
+            Octra_core.Exec_resource.run ~hash:"program-view" (fun () ->
+              Octra_core.Exec_resource.protect handler ()))
             |> Lwt.map (Octra_core.Exec_resource.protect (fun value -> Ok value)))
           (function
-            | Octra_core.Exec_resource.Unavailable _ | Out_of_memory | Stack_overflow ->
+            | Octra_core.Exec_resource.Unavailable _ | Octra_core.Exec_resource.Exhausted _
+            | Out_of_memory | Stack_overflow ->
               Lwt.return_error (Rpc.err (-32005) "Program view resources unavailable" None)
             | error -> Lwt.fail error))
       (fun () ->
@@ -1306,6 +1311,7 @@ let make_view_ctx ?snapshot ?running ~trusted ~profile ~store ~ledger ~get_fhe_p
     get_fhe_pubkey;
     allow_fhe_capability;
     int_work = profile.int_work;
+    scalar_work = true;
     byte_work = Some (Byte_work.create view_byte_limits);
     fhe_work = profile.fhe_work;
     proof_exec = profile.proof_exec;
@@ -1373,6 +1379,9 @@ let call_result ?snapshot ~store ~addr ~include_storage ~storage_json value =
 
 let call ~trusted ~profile ~store ~ledger ~get_fhe_pubkey ~storage_json
     ~addr ~method_name ~call_params ~caller_addr ~include_storage =
+  if String.length (Yojson.Safe.to_string (`List call_params)) > view_params_limit then
+    err_lwt (Rpc.invalid_params "program view params exceed limit")
+  else
   let ( let* ) work next = Lwt.bind work (Octra_core.Exec_resource.protect next) in
   let running, stop = view_clock () in
   let* executed =

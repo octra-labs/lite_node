@@ -75,3 +75,44 @@ let decode payload =
         Tx { hash; tx_json }
       | _ -> failwith "p2p_tx_gossip: bad kind")
     payload
+
+let is_control payload =
+  String.length payload <= 4 + max_hashes * 68
+  && try match decode payload with Inv _ | Get _ -> true | Tx _ -> false
+    with Failure _ | Invalid_argument _ -> false
+
+type parse_kind = Direct | Encrypted | Program
+
+let parse_kind = function
+  | "encrypt" | "decrypt" | "key_switch" | "stealth" | "claim" -> Some Encrypted
+  | "program_deploy" -> Some Program
+  | "standard" | "private" | "deploy" | "call" | "program_exec" | "multi_exec"
+  | "upgrade" | "deploy_circle" | "circle_program_update" | "circle_asset_put"
+  | "circle_asset_put_encrypted" | "circle_sealed_slot_put" | "circle_slot_policy_put"
+  | "circle_state_descriptor_put" | "circle_balance_cell_put" | "circle_register_cell_put"
+  | "circle_transport_policy_put" | "circle_hfhe_policy_put" | "circle_key_policy_put"
+  | "circle_key_grant" | "circle_key_extend" | "circle_key_revoke" | "circle_key_erase"
+  | "circle_outbox_open" | "circle_relay_claim" | "circle_relay_cancel" | "circle_ingress_commit"
+  | "circle_call" | "validator_set_update" | "validator_ready" | "validator_bond"
+  | "validator_exit" | "validator_withdraw" | "validator_evidence" | "recrypt"
+  | "op01_burn" | "compute_fund" | "compute_return" | "compute_settle" -> Some Direct
+  | _ -> None
+
+let is_light payload =
+  String.length payload <= 16_384 &&
+  try
+    let raw = match decode payload with
+      | Tx {tx_json; _} -> tx_json
+      | Inv _ | Get _ -> "null"
+      | exception (Failure _ | Invalid_argument _) ->
+        Oce1.decode Oce1.get_string payload in
+    match Yojson.Safe.from_string raw with
+    | `Assoc fields ->
+      let names = List.map fst fields in
+      List.length names = List.length (List.sort_uniq String.compare names)
+      && (match List.assoc_opt "op_type" fields with
+        | None -> true
+        | Some (`String op) -> parse_kind op = Some Direct
+        | _ -> false)
+    | _ -> false
+  with Failure _ | Invalid_argument _ | Yojson.Json_error _ -> false

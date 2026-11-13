@@ -431,6 +431,181 @@ let node_status ~tree_ref ~validator =
        ~timestamp:(Unix.gettimeofday ())
        ~head:(Octra_core.Head_manifest.get_cached ()))
 
+let sync_result chain_id head stamp status target =
+  ok (`Assoc [
+    "chainId", `String chain_id;
+    "status", `String status;
+    "localEpoch", (match head with None -> `Null
+      | Some (head : Octra_core.Head_manifest.t) -> `String (string_of_int head.epoch_id));
+    "headRoot", (match head with None -> `Null | Some head -> `String head.state_root);
+    "setStamp", (match stamp with None -> `Null | Some value -> `String value);
+    "targetEpoch", (match target with None -> `Null | Some value -> `String (Int64.to_string value));
+  ])
+
+let sync_head_data ~chain_id ~data_dir ~chaindata () =
+  let ( let* ) = Result.bind in
+  let* head = match Octra_core.Head_manifest.load_result data_dir with
+    | Present head when head.epoch_id >= 0 && head.epoch_id < max_int
+        && (Text.is_hex_len 64 head.state_root || Text.is_hex_len 128 head.state_root) -> Ok head
+    | _ -> Error "sync head is unavailable" in
+  let* source = Consensus_parent_commit.create ~chain_id ~data_dir ~chaindata Sys.getenv_opt in
+  let* validators = Consensus_parent_commit.set_at_head source
+    ~epoch_id:(Int64.of_int head.epoch_id) head in
+  let* header = Store_chaindata.get_bound_epoch_header chaindata head.epoch_id in
+  if header.id <> head.epoch_id || header.state_root <> head.state_root then
+    Error "sync head time differs" else
+  Ok (head, validators, header.finalized_at)
+
+let sync_head_packet ~chain_id ~data_dir ~base_dir ~keep () =
+  let chaindata = Store_chaindata.open_chaindata ~readonly:true base_dir in
+  Fun.protect ~finally:(fun () ->
+    Store_chaindata.close chaindata; ignore (Sys.opaque_identity keep)) (fun () ->
+    let packet = match sync_head_data ~chain_id ~data_dir ~chaindata () with
+      | Error _ -> `Null
+      | Ok (head, validators, time) -> `Assoc [
+          "head", `String (Octra_core.Head_manifest.to_json head);
+          "validators", `String (Base64.encode_exn
+            (Octra_consensus.C_codec.encode_validator_set validators));
+          "time", `Float time;
+        ] in
+    Yojson.Safe.to_string packet)
+
+let sync_head_read ~chain_id ~data_dir ~chaindata () =
+  let open Lwt.Syntax in
+  let base_dir = Filename.dirname chaindata.Store_chaindata.txlog.dir in
+  let+ raw = Sync_probe.read_child (sync_head_packet ~chain_id ~data_dir ~base_dir ~keep:chaindata) in
+  match Yojson.Safe.from_string raw with
+  | `Assoc ["head", `String head; "validators", `String validators; "time", time] ->
+    let head = Octra_core.Head_manifest.of_json head in
+    let validators = Base64.decode_exn validators |> Octra_consensus.C_codec.decode_validator_set in
+    let time = Yojson.Safe.Util.to_number time in
+    if Float.is_finite time && time >= 0. then Ok (head, validators, time)
+    else Error "sync head time is invalid"
+  | _ -> Error "sync head is unavailable"
+
+let sync_driver_current driver_ref driver head generation height =
+  match !driver_ref with
+  | Some current when current == driver ->
+    driver.Octra_consensus.C_driver.running
+    && driver.config.local_head_epoch () = Int64.of_int head.Octra_core.Head_manifest.epoch_id
+    && driver.engine.generation = generation && driver.engine.state.height = height
+  | None | Some _ -> false
+
+type sync_key = {
+  driver : Octra_consensus.C_driver.t;
+  head : Octra_core.Head_manifest.t;
+  generation : int;
+  height : int64;
+  validators : Octra_consensus.C_types.validator_set;
+  stamp : string;
+  file : int * int * int * float * float;
+}
+
+type sync_sample = {
+  value : (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result;
+  key : sync_key option;
+}
+
+type sync_target = {
+  chain : string;
+  current : sync_sample -> bool;
+  probe : sync_sample Sync_probe.t;
+}
+
+let sync_head_file data_dir =
+  let file = Unix.lstat (Octra_core.Head_manifest.path data_dir) in
+  if file.Unix.st_kind <> Unix.S_REG then failwith "sync head is not a regular file";
+  file.st_dev, file.st_ino, file.st_size, file.st_mtime, file.st_ctime
+
+let sync_key_current ~data_dir ~driver_ref key =
+  sync_driver_current driver_ref key.driver key.head key.generation key.height
+  && (try sync_head_file data_dir = key.file with _ -> false)
+  && match Octra_consensus.C_driver.epoch_root_weights ~validator_set:key.validators
+      key.driver ~epoch_id:(Int64.of_int key.head.epoch_id) with
+    | Some weights -> weights.stamp = key.stamp
+    | None -> false
+
+let probe_sync_target ~chain_id ~data_dir ~chaindata ~driver_ref driver =
+  let module D = Octra_consensus.C_driver in
+  let module H = Consensus_health_probe in
+  let open Lwt.Syntax in
+  let read = sync_head_read ~chain_id ~data_dir ~chaindata in
+  let deadline = Sync_probe.monotonic () +. 2.5 in
+  let reply head stamp status target =
+    let+ value = sync_result chain_id head stamp status target in {value; key = None} in
+  let file = sync_head_file data_dir in
+  let* sample = read () in
+  match sample with
+  | Error _ -> reply None None "unavailable" None
+  | Ok (head, validators, head_time) ->
+    let epoch_id = Int64.of_int head.epoch_id in
+    let generation = driver.D.engine.generation and height = driver.engine.state.height in
+    match D.epoch_root_weights ~validator_set:validators driver ~epoch_id with
+    | None -> reply (Some head) None "unavailable" None
+    | Some weights when not (sync_driver_current driver_ref driver head generation height) ->
+      reply (Some head) (Some weights.stamp) "changed" None
+    | Some weights when Sync_probe.monotonic () >= deadline ->
+      reply (Some head) (Some weights.stamp) "unavailable" None
+    | Some weights ->
+      let remaining = deadline -. Sync_probe.monotonic () in
+      let* replies = Lwt.catch
+        (fun () -> Lwt_unix.with_timeout remaining (fun () ->
+          let+ replies = D.query_epoch_root ~fresh:true ~request_next:false
+            ~wait_for:D.Collection_window driver ~epoch_id
+            ~timeout_seconds:(min 2.0 remaining) in Some replies))
+        (function Lwt_unix.Timeout -> Lwt.return_none | error -> Lwt.fail error) in
+      match replies with
+      | None -> reply (Some head) (Some weights.stamp) "unavailable" None
+      | Some replies ->
+      let* latest = read () in
+      match latest with
+      | Ok (current, validators, current_time) when current = head && current_time = head_time
+          && Sync_probe.monotonic () < deadline
+          && sync_driver_current driver_ref driver head generation height ->
+        begin match D.epoch_root_weights ~validator_set:validators driver ~epoch_id with
+        | Some current when current.epoch_id = weights.epoch_id && current.stamp = weights.stamp ->
+          let ceiling = H.target_ceiling ~head:epoch_id ~head_time:(Some head_time)
+            ~now:(Unix.gettimeofday ()) ~allowance:2 in
+          let target = Option.bind ceiling (fun ceiling ->
+            match H.peer_target ~weights ~ceiling replies with
+            | Some target when target >= epoch_id -> Some target
+            | None | Some _ -> None) in
+          let key = {driver; head; generation; height; validators; stamp = weights.stamp; file} in
+          if not (sync_key_current ~data_dir ~driver_ref key) then
+            reply (Some head) (Some weights.stamp) "changed" None
+          else
+            let+ value = sync_result chain_id (Some head) (Some weights.stamp)
+              (if Option.is_some target then "agreed" else "no_agreement") target in
+            {value; key = Some key}
+        | None | Some _ -> reply (Some head) (Some weights.stamp) "changed" None
+        end
+      | Error _ | Ok _ -> reply (Some head) (Some weights.stamp) "changed" None
+
+let create_sync_target ~chain_id ~data_dir ~chaindata ~driver_ref =
+  let valid sample = match sample.key with
+    | Some key -> sync_key_current ~data_dir ~driver_ref key
+    | None -> false in
+  let run () = match !driver_ref with
+    | Some driver when driver.Octra_consensus.C_driver.running
+        && driver.config.chain_id = chain_id ->
+      probe_sync_target ~chain_id ~data_dir ~chaindata ~driver_ref driver
+    | None | Some _ ->
+      let open Lwt.Syntax in
+      let+ value = sync_result chain_id None None "unavailable" None in
+      {value; key = None} in
+  {chain = chain_id; current = valid; probe = Sync_probe.create ~valid run}
+
+let sync_target target =
+  let open Lwt.Syntax in
+  let* sample = Sync_probe.query target.probe in
+  match sample with
+  | Some ({key = Some key; _} as sample) when not (target.current sample) ->
+    sync_result target.chain (Some key.head) (Some key.stamp) "changed" None
+  | Some sample -> Lwt.return sample.value
+  | None -> sync_result target.chain None None "unavailable" None
+
+let close_sync_target target = Sync_probe.close target.probe
+
 let node_stats ~ledger ~chaindata ~current_epoch ~total_confirmed ~encrypted =
   let true_total = Ledger.get_total_supply ledger in
   let total_accounts = Ledger.length ledger in
@@ -458,7 +633,7 @@ let node_stats ~ledger ~chaindata ~current_epoch ~total_confirmed ~encrypted =
        ~latest_epochs:recent_epochs
        ~head:(Octra_core.Head_manifest.get_cached ()))
 
-let signer_of_ctx ctx =
+let signer_of_ctx (ctx : read_ctx) =
   let _, _, config_hash =
     current_validator_config
       ~chain_id:ctx.chain_id
@@ -477,7 +652,7 @@ let signer_of_ctx ctx =
 let node_version_params _params _ctx =
   node_version ()
 
-let runtime_version_params _params ctx =
+let runtime_version_params _params (ctx : read_ctx) =
   runtime_version
     ~chain_id:ctx.chain_id
     ~epoch:!(ctx.current_epoch)
@@ -487,27 +662,27 @@ let runtime_version_params _params ctx =
     ~validator_set_ref:ctx.validator_set_ref
     ~scheduled_validator_set_ref:ctx.scheduled_validator_set_ref
 
-let validator_view_pubkey_params _params ctx =
+let validator_view_pubkey_params _params (ctx : read_ctx) =
   validator_view_pubkey
     ~validator_view_pub:ctx.validator_view_pub
     ~validator_address:ctx.validator_address
 
-let epoch_tags_params _params ctx =
+let epoch_tags_params _params (ctx : read_ctx) =
   epoch_tags ctx.store
 
-let signed_root_params _params ctx =
+let signed_root_params _params (ctx : read_ctx) =
   signed_root
     (signer_of_ctx ctx)
     (Octra_core.Head_manifest.get_cached ())
 
-let account_proof_params params ctx =
+let account_proof_params params (ctx : read_ctx) =
   Light_rpc.account_proof_params
     (signer_of_ctx ctx)
     ~store:ctx.store
     ~head:(Octra_core.Head_manifest.get_cached ())
     params
 
-let validator_set_proof_params _params ctx =
+let validator_set_proof_params _params (ctx : read_ctx) =
   validator_set_proof
     ~chain_id:ctx.chain_id
     ~program_trust_hash:ctx.program_trust_hash
@@ -539,7 +714,7 @@ let local_control ~data_dir ~(snapshot : enrollment_snapshot) ~address ~pubkey =
       "error", `String reason;
     ]
 
-let validator_enrollment_params _params ctx =
+let validator_enrollment_params _params (ctx : read_ctx) =
   let open Lwt.Syntax in
   let snapshot = ctx.validator_enrollment () in
   let* response = validator_enrollment
@@ -553,26 +728,26 @@ let validator_enrollment_params _params ctx =
     ok (`Assoc (fields @ ["local_control", control]))
   | _ -> Lwt.return response
 
-let epoch_proof_params params ctx =
+let epoch_proof_params params (ctx : read_ctx) =
   Light_rpc.epoch_proof_params ~chain_id:ctx.chain_id ctx.chaindata params
 
-let tx_inclusion_proof_params params ctx =
+let tx_inclusion_proof_params params (ctx : read_ctx) =
   Light_rpc.tx_inclusion_proof_params ~chain_id:ctx.chain_id ctx.chaindata params
 
-let consensus_peer_states_params _params ctx =
+let consensus_peer_states_params _params (ctx : read_ctx) =
   consensus_peer_states
     ~swarm:(ctx.swarm ())
     ~driver_ref:ctx.driver_ref
 
-let round_witness_params params ctx =
+let round_witness_params params (ctx : read_ctx) =
   round_witness params ~driver_ref:ctx.driver_ref
 
-let node_status_params _params ctx =
+let node_status_params _params (ctx : read_ctx) =
   node_status
     ~tree_ref:ctx.tree_ref
     ~validator:ctx.validator_address
 
-let node_stats_params _params ctx =
+let node_stats_params _params (ctx : read_ctx) =
   node_stats
     ~ledger:ctx.ledger
     ~chaindata:ctx.chaindata
@@ -583,7 +758,7 @@ let node_stats_params _params ctx =
 let node_metrics_params _params _ctx =
   ok (Metrics.get_metrics ())
 
-let epoch_page_params params ctx =
+let epoch_page_params params (ctx : read_ctx) =
   match Epoch_page.parse params with
   | Error error -> Lwt.return (Error error)
   | Ok request ->

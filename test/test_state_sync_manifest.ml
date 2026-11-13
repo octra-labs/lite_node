@@ -1041,6 +1041,98 @@ let test_large_manifest () =
     if Sys.readdir root <> [|"draft.json"|] then
       fail "size refusal left staged draft")
 
+let test_execution_import () =
+  let module S = Octra_core.Store_irmin in
+  let module E = Octra_core.Epoch_exec in
+  let module P = Octra_node_runtime.Consensus_profile in
+  let chain_id = "octra-devnet-9871-cluster" in
+  let activation = Option.get (Octra_core.Rule_graph.seatless_activation_for_chain chain_id) in
+  let epoch = activation.activation_epoch in
+  let execution_profile ~chain_id ~epoch = P.execution_profile ~chain_id ~epoch (fun _ -> None) in
+  let profile = Option.get (execution_profile ~chain_id ~epoch) in
+  if String.length profile <> 32 then fail "execution profile is not raw32";
+  let marker epoch profile =
+    Some (expect_ok (E.execution_marker_to_string E.{ epoch; profile })) in
+  let wrong = String.mapi (fun index value ->
+    if index = 0 then Char.chr (Char.code value lxor 1) else value) profile in
+  let rec files path = match (Unix.lstat path).Unix.st_kind with
+    | Unix.S_REG -> [path, Digest.file path]
+    | Unix.S_DIR -> Sys.readdir path |> Array.to_list |> List.sort String.compare
+      |> List.concat_map (fun name -> files (Filename.concat path name))
+    | _ -> fail "unexpected imported store file" in
+  Test_workspace.with_dir "execution_import" (fun root ->
+    let check name target last current marker configured root_matches expected =
+      let data = Filename.concat root name in
+      Unix.mkdir data 0o700;
+      let store = Lwt_main.run (S.open_store (Filename.concat data "irmin_store")) in
+      let ledger_root, commit = Fun.protect ~finally:(fun () -> Lwt_main.run (S.close store)) (fun () ->
+        Lwt_main.run (S.begin_epoch_batch store);
+        List.iter (fun (key, value) -> match value with
+          | None -> () | Some value -> Lwt_main.run (S.set_meta store key value))
+          ["last_epoch", last; "current_epoch", current; E.execution_meta_key, marker];
+        Lwt_main.run (S.commit_epoch_batch store "execution import sample");
+        Option.get (Lwt_main.run (S.get_head_hash store)), Lwt_main.run (S.get_commit_hash store)) in
+      let index = sha "execution import index" in
+      let state_root = Octra_core.Epoch_index_commitment.folded_state_root
+        ~ledger_state_root:ledger_root ~epoch_index_root:index in
+      let head = Octra_node_runtime.Consensus_epoch_commit.head_manifest
+        ~generation:target ~state_root ~ledger_root ~irmin_commit:commit ~txid_hi:(-1L)
+        ~txlog_seg:0 ~txlog_off:0 ~epochlog_off:0 ~commit_id:"execution-import" ~ts:1.
+        ~epoch_index_hash:index ~epoch_index_root:index in
+      let checkpoint = Checkpoint.of_head ~chain_id ~config_hash:(sha "config")
+        ~validator_set_hash:(sha "validators") ~created_at:1L ~valid_until:2L head in
+      let checkpoint = if root_matches then checkpoint
+        else { checkpoint with ledger_state_root = String.make 128 '0' } in
+      let before = files data in
+      let actual = Lwt_main.run (if configured then
+        Verify.verify_irmin ~execution_profile checkpoint data
+        else Verify.verify_irmin checkpoint data) in
+      let wanted = match expected with Ok () -> Ok ledger_root | Error reason -> Error reason in
+      if actual <> wanted then fail (name ^ " imported execution result differs");
+      if files data <> before then fail (name ^ " import verification changed store files") in
+    let number value = Some (string_of_int value) in
+    check "prior" (epoch - 1) (number (epoch - 1)) (number epoch) None true true (Ok ());
+    check "prior_no_callback" (epoch - 1) (number (epoch - 1)) (number epoch) None false true (Ok ());
+    List.iter (fun target ->
+      let last = number target and current = number (target + 1) in
+      let prefix = string_of_int target ^ "_" in
+      check (prefix ^ "authentic") target last current (marker target profile) true true (Ok ());
+      check (prefix ^ "missing") target last current None true true
+        (Error "execution profile marker is missing");
+      check (prefix ^ "profile") target last current (marker target wrong) true true
+        (Error "execution profile hash differs");
+      check (prefix ^ "epoch") target last current (marker (target - 1) profile) true true
+        (Error "execution profile epoch differs");
+      check (prefix ^ "callback") target last current (marker target profile) false true
+        (Ok ());
+      check (prefix ^ "opaque_profile") target last current (marker target wrong) false true
+        (Ok ());
+      check (prefix ^ "required") target last current None false true
+        (Error "execution profile marker is missing");
+      check (prefix ^ "wrong_epoch") target last current (marker (target - 1) profile) false true
+        (Error "execution profile epoch differs");
+      List.iteri (fun index raw ->
+        check (prefix ^ "codec_" ^ string_of_int index) target last current (Some raw) false true
+          (Error "execution profile marker is invalid"))
+        ["{}"; String.make 257 'x';
+         Printf.sprintf "{\"epoch\":%d,\"profile\":\"%s\"}" target (String.make 64 'A');
+         Printf.sprintf "{\"epoch\":%d,\"epoch\":%d,\"profile\":\"%s\"}"
+           target target (String.make 64 'a')];
+      check (prefix ^ "root") target last current (marker target profile) true false
+        (Error "restored Irmin root does not match checkpoint")) [epoch; epoch + 1];
+    check "old_binary" (epoch + 1) (number (epoch + 1)) (number (epoch + 2))
+      (marker epoch profile) true true (Error "execution profile epoch differs");
+    check "last_epoch" epoch (number (epoch - 1)) (number (epoch + 1))
+      (marker epoch profile) true true (Error "execution profile last epoch differs");
+    check "current_epoch" epoch (number epoch) (number (epoch + 2))
+      (marker epoch profile) true true (Error "execution profile current epoch differs");
+    check "structural_last" epoch (number (epoch - 1)) (number (epoch + 1))
+      (marker epoch profile) false true (Error "execution profile last epoch differs");
+    check "structural_current" epoch (number epoch) (number (epoch + 2))
+      (marker epoch profile) false true (Error "execution profile current epoch differs");
+    check "prior_marker" (epoch - 1) (number (epoch - 1)) (number epoch)
+      (marker (epoch - 1) profile) false true (Error "execution profile marker is unexpected"))
+
 let () =
   if not (Octra_bootstrap.State_sync.path_allowed "pvac/migration_state.json") then
     fail "migration state is excluded from state sync";
@@ -1055,6 +1147,7 @@ let () =
   test_snapshot_roots ();
   test_chunks ();
   test_hash_slices ();
+  test_execution_import ();
   test_json_size ();
   test_large_manifest ();
   print_endline "status = pass test = state_sync_manifest"

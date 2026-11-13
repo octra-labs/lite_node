@@ -61,7 +61,7 @@
 (executable
  (name octra_state_sync_client)
  (modules octra_state_sync_client)
- (libraries octra_core octra_bootstrap octra_net lwt.unix cohttp-lwt-unix tls-lwt yojson uri digestif digestif.c)
+ (libraries octra_core octra_bootstrap octra_node_runtime octra_net lwt.unix cohttp-lwt-unix tls-lwt yojson uri digestif digestif.c)
  (flags
   (:standard
    -w @a-4-27-40-41-42-44-45-48-58-66
@@ -71,7 +71,7 @@
 (executable
  (name octra_state_sync_manifest)
  (modules octra_state_sync_manifest)
- (libraries octra_core octra_bootstrap octra_consensus unix yojson)
+ (libraries octra_core octra_bootstrap octra_consensus octra_node_runtime unix yojson)
  (flags
   (:standard
    -w @a-4-27-40-41-42-44-45-48-58-66
@@ -96,7 +96,7 @@
 (executable
  (name fhe_audit)
  (modules fhe_audit)
- (libraries octra_core lwt.unix unix digestif irmin-pack.unix))
+ (libraries octra_core lwt.unix unix digestif irmin-pack.unix yojson))
 
 (executable
  (name check_store)

@@ -66,15 +66,17 @@ let same_generation t generation =
 
 let read ?(retries=2) t read_value =
   let rec attempt remaining =
-    let open Lwt.Syntax in
-    let* generation = await_stable t in
-    let* value = read_value () in
-    if same_generation t generation then
-      Lwt.return_some value
-    else if remaining <= 0 then
-      Lwt.return_none
-    else
-      attempt (remaining - 1)
+    match t.phase with
+    | Applying _ -> Lwt.return_none
+    | Stable generation ->
+      let open Lwt.Syntax in
+      let* value = read_value () in
+      if same_generation t generation then
+        Lwt.return_some value
+      else if remaining <= 0 then
+        Lwt.return_none
+      else
+        attempt (remaining - 1)
   in
   attempt retries
 

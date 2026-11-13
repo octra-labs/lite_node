@@ -240,7 +240,7 @@ let standard_profiles ?policy ~chain_id ?program_trust_hash getenv =
       profile_hash;
     })
 
-let startup_config ~env ~chain_id ~consensus_mode ~current_height ~profile_plan
+let startup_config ?eviction_source ~env ~chain_id ~consensus_mode ~current_height ~profile_plan
     ~current_entries ~next_entries ~chain_pending_entries
     ~next_activation_epoch ?program_trust_hash
     ?runtime_profile_hash ?active_raw ?pending_raw () =
@@ -258,6 +258,7 @@ let startup_config ~env ~chain_id ~consensus_mode ~current_height ~profile_plan
   in
   let validator =
     Validator_config.bind_persistent_updates
+      ?eviction_source
       ~chain_id
       ~consensus_mode
       ~current_height
@@ -309,8 +310,8 @@ let startup_config ~env ~chain_id ~consensus_mode ~current_height ~profile_plan
         upgrade_logs = upgrade_logs upgrade_plan;
       }
 
-let node_startup_config ~getenv ~chain_id ~consensus_mode ~current_height
-    ~chain_active_raw ~chain_pending_raw ~chain_pending_entries =
+let startup_with_source ?eviction_source ~getenv ~chain_id ~consensus_mode ~current_height
+    ~chain_active_raw ~chain_pending_raw ~chain_pending_entries () =
   let max_head = Int64.of_int (max_int - 1) in
   if Int64.compare current_height (-1L) < 0
      || Int64.compare current_height max_head > 0 then
@@ -346,6 +347,7 @@ let node_startup_config ~getenv ~chain_id ~consensus_mode ~current_height
           getenv
       in
       startup_config
+        ?eviction_source
         ~env
         ~chain_id
         ~consensus_mode
@@ -360,6 +362,11 @@ let node_startup_config ~getenv ~chain_id ~consensus_mode ~current_height
         ?active_raw:chain_active_raw
         ?pending_raw:chain_pending_raw
         ()
+
+let node_startup_config ~getenv ~chain_id ~consensus_mode ~current_height
+    ~chain_active_raw ~chain_pending_raw ~chain_pending_entries =
+  startup_with_source ~getenv ~chain_id ~consensus_mode ~current_height
+    ~chain_active_raw ~chain_pending_raw ~chain_pending_entries ()
 
 let install_node_startup_config deps ~current_height startup =
   let validator = startup.validator in
@@ -535,9 +542,10 @@ let start_node_swarm deps ~listen_port ~chain_id ~node_addr ~priv_b64
   deps.set_swarm swarm;
   { swarm; params }
 
-let node_stack deps =
+let node_stack ?eviction_source deps =
   match
-    node_startup_config
+    startup_with_source
+      ?eviction_source
       ~getenv:deps.getenv
       ~chain_id:deps.chain_id
       ~consensus_mode:deps.consensus_mode
@@ -545,6 +553,7 @@ let node_stack deps =
       ~chain_active_raw:deps.chain_active_raw
       ~chain_pending_raw:deps.chain_pending_raw
       ~chain_pending_entries:deps.chain_pending_entries
+      ()
   with
   | Error e -> Error e
   | Ok startup ->

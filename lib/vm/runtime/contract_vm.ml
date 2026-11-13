@@ -233,6 +233,7 @@ type exec_ctx = {
   object_cost : bool;
   object_quorum : Octra_core.Circle_object_apply.quorum;
   int_work : Int_work.mode;
+  scalar_work : bool;
   fhe_work : Octra_core.Rule_graph.mode;
   proof_exec : Octra_core.Rule_graph.mode;
   proof_key : Octra_core.Rule_graph.mode;
@@ -267,6 +268,7 @@ let default_ctx = {
   object_cost = false;
   object_quorum = Octra_core.Circle_object_apply.Machine;
   int_work = Int_work.Prior;
+  scalar_work = false;
   fhe_work = Octra_core.Rule_graph.Prior;
   proof_exec = Octra_core.Rule_graph.Prior;
   proof_key = Octra_core.Rule_graph.Prior;
@@ -331,6 +333,7 @@ type s = {
   mutable is_view : bool;
   strict_values : bool;
   storage_kinds : (string, storage_kind) Hashtbl.t;
+  mutable storage_decoded : (storage_kind * string * v option) list;
   decoded_chunk_cache : (string * string, string) Hashtbl.t;
   mutable closes : cap list;
 }
@@ -468,6 +471,7 @@ let create_state ?(limit = 1_000_000) ?(ctx = default_ctx) ?(depth = 0) ?(is_vie
     is_view;
     strict_values;
     storage_kinds = Hashtbl.of_seq (List.to_seq storage_kinds);
+    storage_decoded = [];
     decoded_chunk_cache = Hashtbl.create 512;
     closes = [];
   }
@@ -575,6 +579,16 @@ let storage_decode kind raw =
   with (Out_of_memory | Stack_overflow) as error -> raise error | _ ->
     None
 
+let scalar_valid = function
+  | VInt number | VU64 number | VU128 number | VU256 number -> Scalar_work.valid number
+  | _ -> true
+
+let scalar_charge st cost =
+  if not st.ctx.scalar_work then true
+  else match Cost.charge_z ~used:st.effort_used ~cost ~limit:st.effort_limit with
+    | None -> false
+    | Some effort -> st.effort_used <- effort; true
+
 let load_storage_value st key =
   match Hashtbl.find_opt st.storage_kinds key with
   | None ->
@@ -585,7 +599,37 @@ let load_storage_value st key =
   | Some kind ->
     match Hashtbl.find_opt st.storage key with
     | None -> Some (storage_default kind)
-    | Some raw -> storage_decode kind raw
+    | Some raw ->
+      let numeric = match kind with
+        | StorageInt | StorageU64 | StorageU128 | StorageU256 -> true
+        | _ -> false in
+      let cost = if numeric then Scalar_work.parse (String.length raw)
+        else Scalar_work.scan (String.length raw) in
+      if st.ctx.scalar_work && numeric && not (Scalar_work.text_ok raw) then None
+      else if not (scalar_charge st cost) then None
+      else
+      let decoded = match List.find_opt (fun (saved_kind, saved_raw, _) ->
+        kind = saved_kind && raw == saved_raw) st.storage_decoded with
+        | Some (_, _, value) -> value
+        | None ->
+          let value = storage_decode kind raw in
+          let size (_, text, value) = String.length text +
+            Option.fold ~none:0 ~some:(fun item ->
+              if numeric_value item then (Z.numbits (to_z item) + 7) / 8 else 0) value in
+          let entry = kind, raw, value in
+          if size entry <= 8_388_608 then begin
+            let rec take count remaining = function
+              | _ when count = 0 -> []
+              | [] -> []
+              | item :: rest ->
+                let bytes = size item in
+                if bytes > remaining then take count remaining rest
+                else item :: take (count - 1) (remaining - bytes) rest in
+            st.storage_decoded <- entry :: take 31 (8_388_608 - size entry) st.storage_decoded
+          end;
+          value in
+      Option.bind decoded (fun value ->
+        if st.ctx.scalar_work && not (scalar_valid value) then None else Some value)
 
 let round_float_to_int f =
   if Float.is_nan f || Float.is_integer f then int_of_float f
@@ -793,6 +837,12 @@ let value_work budget ~used ~limit value =
   Option.map (fun used -> used, to_string value) ready
 
 let output_work ctx ~used ~limit value =
+  let work = match value with
+    | VInt number | VU64 number | VU128 number | VU256 number when ctx.scalar_work ->
+      if Scalar_work.valid number then Cost.charge_z ~used ~limit ~cost:(Scalar_work.decimal number)
+      else None
+    | _ -> Some used in
+  Option.bind work (fun used ->
   match ctx.byte_work with
   | None -> Some used
   | Some budget ->
@@ -805,7 +855,7 @@ let output_work ctx ~used ~limit value =
               (Byte_work.encoded_size (String.length text))
           | _ -> Some size in
         Option.bind size (fun size ->
-          Byte_work.output budget ~used ~limit (size + 16))))
+          Byte_work.output budget ~used ~limit (size + 16)))))
 
 let event_work ctx ~used ~limit (record : event_record) =
   match ctx.byte_work with
@@ -852,8 +902,27 @@ let view_guard st =
     ignore (revert st); false
   end else true
 
-let getr st r = st.regs.(r)
-let setr st r v = st.regs.(r) <- v
+let getr st r =
+  let value = st.regs.(r) in
+  if st.ctx.scalar_work && not (scalar_valid value) then failwith "integer width exceeds limit";
+  value
+
+let setr st r value =
+  if st.ctx.scalar_work && not (scalar_valid value) then failwith "integer width exceeds limit";
+  st.regs.(r) <- value
+
+let text_equal left right =
+  match left, right with
+  | (VInt a | VU64 a | VU128 a | VU256 a),
+    (VInt b | VU64 b | VU128 b | VU256 b) -> Z.equal a b
+  | (VInt _ | VU64 _ | VU128 _ | VU256 _), (VBool _ | VCap _)
+  | (VBool _ | VCap _), (VInt _ | VU64 _ | VU128 _ | VU256 _) -> false
+  | (VInt number | VU64 number | VU128 number | VU256 number),
+    (VString text | VBytes text | VBytes32 text | VAddr text)
+  | (VString text | VBytes text | VBytes32 text | VAddr text),
+    (VInt number | VU64 number | VU128 number | VU256 number) ->
+    Scalar_work.decimal_equal number text
+  | _ -> String.equal (to_string left) (to_string right)
 
 let cap_equal left right =
   String.equal left.scope right.scope
@@ -1136,6 +1205,14 @@ let memory_offset st base index width =
   st.ctx.byte_work = None || Mem_span.offset base index width <> None
 
 let read_number st value =
+  if st.ctx.scalar_work then begin
+    match value with
+    | VString input ->
+      if not (Scalar_work.text_ok input
+        && scalar_charge st (Scalar_work.parse (String.length input))) then
+        failwith "numeric work limit"
+    | _ -> if not (scalar_valid value) then failwith "integer width exceeds limit"
+  end;
   begin match st.ctx.byte_work, value with
   | Some budget, VString input ->
     let quoted = Option.bind (Byte_work.parsing ~length:(String.length input) ~cells:1)
@@ -1147,7 +1224,15 @@ let read_number st value =
     end
   | _ -> ()
   end;
-  to_z value
+  let number = to_z value in
+  if st.ctx.scalar_work && not (Scalar_work.valid number) then
+    failwith "integer width exceeds limit";
+  number
+
+let store_number st index number =
+  if st.ctx.scalar_work && not (Scalar_work.valid number) then
+    failwith "integer width exceeds limit";
+  Hashtbl.replace st.memory.data index (VInt number)
 
 let read_q16 st addr n =
   if not (valid_mem_span addr n) then None
@@ -1304,8 +1389,19 @@ let number_inputs ~strict op =
   | _ -> []
 
 let reserve_numbers st op =
+  let inputs = number_inputs ~strict:st.strict_values op in
+  let scalar = not st.ctx.scalar_work || List.for_all (function
+    | Numeric (index, passes) | Machine (index, passes) ->
+      match getr st index with
+      | VString input -> Scalar_work.text_ok input
+        && scalar_charge st (Z.mul (Z.of_int (passes + 1))
+          (Scalar_work.parse (String.length input)))
+      | value -> scalar_valid value) inputs in
+  let converted () = not st.ctx.scalar_work || List.for_all (function
+    | Numeric (index, _) | Machine (index, _) -> Scalar_work.valid (to_z (getr st index))) inputs in
+  if not scalar then false else
   match st.ctx.byte_work with
-  | None -> true
+  | None -> converted ()
   | Some budget ->
     let inputs = number_inputs ~strict:st.strict_values op in
     let rec plan base requests = function
@@ -1327,7 +1423,7 @@ let reserve_numbers st op =
           ~limit:st.effort_limit ~base:(base + effort_cost op) requests with
         | None -> false
         | Some _ -> charge_bytes st ~base ~prior:0 requests in
-    admitted && List.for_all (function
+    admitted && converted () && List.for_all (function
       | Numeric _ -> true
       | Machine (index, _) -> Z.fits_int (to_z (getr st index))) inputs
 
@@ -1349,7 +1445,14 @@ let parse_integers st input base =
     | Some plan ->
       match quote ~count:plan.count ~chars:plan.chars with
       | Some (base, requests) when charge_bytes st ~base ~prior:0 requests ->
-        Int_text.read ~strict:st.strict_values plan
+        let scalar = not st.ctx.scalar_work ||
+          Option.is_some (Int_text.fold input ~init:() ~visit:(fun () _ length ->
+            if length <= Scalar_work.text_limit && scalar_charge st (Scalar_work.parse length)
+            then Some () else None)) in
+        if not scalar then None else
+          Option.bind (Int_text.read ~strict:st.strict_values plan) (fun values ->
+            if st.ctx.scalar_work && not (Array.for_all Scalar_work.valid values)
+            then None else Some values)
       | Some _ | None -> None
 
 let spawn_input st input =
@@ -1443,6 +1546,61 @@ let byte_inputs_ok st op =
         span keys && span values && check 0
     | _ -> true
 
+let scalar_text st = function
+  | VInt number | VU64 number | VU128 number | VU256 number ->
+    Scalar_work.valid number && scalar_charge st (Scalar_work.decimal number)
+  | VString text | VBytes text | VBytes32 text | VAddr text ->
+    scalar_charge st (Scalar_work.scan (String.length text))
+  | _ -> true
+
+let scalar_inputs st op =
+  if not st.ctx.scalar_work then true else
+  let text index = scalar_text st (getr st index) in
+  let indices = match op with
+    | EQ (_, a, b) | NEQ (_, a, b) | CONCAT (_, a, b) | INDEXOF (_, a, b)
+    | SSTOREK (a, b) | OBJECT_HAS_MEMBER (_, a, b) -> [a; b]
+    | SSTORE (_, a) | SLOADK (_, a) | SDELK a | FSTORE (_, a) | FLOAD (_, a)
+    | ISHEX (_, a) | ISADDR (_, a) | ASSERT_ADDR a | STATE_PATH_KEY (_, a)
+    | STRLEN (_, a) | SHA256 (_, a) | KECCAK256 (_, a) | FHE_LOAD_PK (_, a)
+    | OBJECT_MEMBER_COUNT (_, a) | OBJECT_MEMBER_REF_AT (_, a, _)
+    | SUBSTR (_, a, _, _) | SKEYS (_, a, _) | PARSE_INTS (_, a, _)
+    | SPAWN (_, a) | SPAWN2 (_, a, _, _) | TRANSFER (_, a, _) -> [a]
+    | SKEYS_PAGE (_, _, a, b, _) -> [a; b]
+    | LOAD_INT8_BYTES_TO_MEM (_, a, _, _, _)
+    | LOAD_INT8_B64_TO_MEM (_, a, _, _, _)
+    | LOAD_INT8_Q16 (_, a, _, _, _) | LOAD_INT8_FP (_, a, _, _, _) -> [a]
+    | OBJECT_TRANSITION_APPLY (_, a, b, c, d, e, f, g, h, i, j) ->
+      [a; b; c; d; e; f; g; h; i; j]
+    | XCALL (_, target, method_name, first, count) when valid_reg_span first count ->
+      target :: method_name :: List.init count (fun index -> first + index)
+    | EMIT (_, indices) -> indices
+    | _ -> [] in
+  let batch keys values count =
+    let count = to_z (getr st count) in
+    let keys = to_z (getr st keys) in
+    let values = Option.map (fun index -> to_z (getr st index)) values in
+    let in_range cap value = Z.sign value >= 0 && Z.leq value (Z.of_int cap) in
+    if not (in_range 1000 count && in_range 16_777_216 keys
+      && Option.fold ~none:true ~some:(in_range 16_777_216) values) then false
+    else
+      let count = Z.to_int count in
+      let keys = Z.to_int keys in
+      let values = Option.map Z.to_int values in
+      let span base = count <= 16_777_216 - base in
+      let cell index = Option.fold ~none:true ~some:(scalar_text st)
+        (Hashtbl.find_opt st.memory.data index) in
+      let rec check index = index = count ||
+        (cell (keys + index)
+          && Option.fold ~none:true ~some:(fun base -> cell (base + index)) values
+          && check (index + 1)) in
+      span keys && Option.fold ~none:true ~some:span values && check 0 in
+  List.for_all text indices && match op with
+  | SLOADN (keys, _, count) -> batch keys None count
+  | SSTOREN (keys, values, count) -> batch keys (Some values) count
+  | SPAWN2 (_, _, first, count) when valid_reg_span first count ->
+    List.for_all text (List.init count (fun index -> first + index))
+  | _ -> true
+
 let copy_key_page st ~prefix ~after ~base =
   if base < 0 || base >= 16_777_216 then Some (0, "")
   else
@@ -1496,6 +1654,11 @@ let op_effort st op =
   | MOD (_, left, right) -> binary Int_work.Mod left right
   | NEG (_, source) -> unary Int_work.Neg source
   | ABS (_, source) -> unary Int_work.Abs source
+  | LT (_, left, right) | GT (_, left, right)
+  | BITAND (_, left, right) | BITOR (_, left, right) | BITXOR (_, left, right)
+    when st.ctx.scalar_work ->
+    Int_work.cost Int_work.Active ~base:(effort_cost op) Int_work.Add
+      (to_z (getr st left)) (to_z (getr st right))
   | _ -> Z.of_int (effort_cost op)
 
 type int_values = Live | Fixed of (Z.t * Z.t) array
@@ -1656,6 +1819,7 @@ let finish_fhe st rd reason = function
   | Error (Fhe_task.Resource Memory) -> raise Out_of_memory
   | Error (Fhe_task.Resource Stack) -> raise Stack_overflow
   | Error (Fhe_task.Resource Host) -> raise (Octra_core.Exec_resource.Unavailable Host)
+  | Error (Fhe_task.Resource Time) -> raise (Octra_core.Exec_resource.Unavailable Time)
 
 let eval_fhe ?reason st rd request =
   let active = st.ctx.proof_exec = Octra_core.Rule_graph.Active in
@@ -1675,6 +1839,7 @@ let pack_proof st rd kind key cipher proof =
   | Error (Fhe_task.Resource Memory) -> raise Out_of_memory
   | Error (Fhe_task.Resource Stack) -> raise Stack_overflow
   | Ok _ | Error (Fhe_task.Resource Host) -> Fhe_unavailable
+  | Error (Fhe_task.Resource Time) -> raise (Octra_core.Exec_resource.Unavailable Time)
 
 let charge_fhe_key st source =
   let active = st.is_view || st.ctx.proof_exec = Octra_core.Rule_graph.Active in
@@ -1788,7 +1953,7 @@ let rec apply_object_writes st = function
       false
 
 let exec_one st op =
-  if not (reserve_numbers st op) then revert st
+  if not (reserve_numbers st op && scalar_inputs st op) then revert st
   else
   let strict = strict_ok st op in
   let work = if strict then op_effort st op else Z.of_int (effort_cost op) in
@@ -1829,7 +1994,7 @@ let exec_one st op =
 
      | VCipher _, _ | _, VCipher _ | VPubKey _, _ | _, VPubKey _ ->
        setr st rd (VBool false); true
-     | _ -> setr st rd (VBool (to_string a = to_string b)); true)
+     | _ -> setr st rd (VBool (text_equal a b)); true)
   | LT (rd, rs1, rs2) ->
     let a = getr st rs1 and b = getr st rs2 in
     (match a, b with
@@ -1853,7 +2018,7 @@ let exec_one st op =
      | VPubKey a, VPubKey b -> setr st rd (VBool (a != b)); true
      | VCipher _, _ | _, VCipher _ | VPubKey _, _ | _, VPubKey _ ->
        setr st rd (VBool true); true
-     | _ -> setr st rd (VBool (to_string a <> to_string b)); true)
+     | _ -> setr st rd (VBool (not (text_equal a b))); true)
   | LDI (_, VCap _) -> revert st
   | LDI (rd, v) ->
     setr st rd v; true
@@ -2026,10 +2191,13 @@ let exec_one st op =
       end
     end
   | ISADDR (rd, rs) ->
-    setr st rd (VBool (is_valid_addr (to_string (getr st rs)))); true
+    let value = getr st rs in
+    setr st rd (VBool (not (numeric_value value) && is_valid_addr (to_string value))); true
   | ISHEX (rd, rs) ->
-    let s = to_string (getr st rs) in
-    let is_hex = String.length s > 0 && try
+    let value = getr st rs in
+    let is_hex = if numeric_value value then Z.sign (to_z value) >= 0 else
+    let s = to_string value in
+    String.length s > 0 && try
       String.iter (fun c -> match c with
         | '0'..'9' | 'a'..'f' | 'A'..'F' -> ()
         | _ -> raise Exit
@@ -2038,7 +2206,11 @@ let exec_one st op =
     setr st rd (VBool is_hex); true
   | STATE_PATH_KEY (rd, rs) ->
     begin
-      match Octra_core.Circles.path_key_of_state_ref (to_string (getr st rs)) with
+      let value = getr st rs in
+      let impossible = numeric_value value &&
+        (Z.sign (to_z value) < 0 || Z.numbits (to_z value) > 256) in
+      match if impossible then Error "state reference invalid"
+        else Octra_core.Circles.path_key_of_state_ref (to_string value) with
       | Ok (_, _, path_key) ->
         setr st rd (VString path_key);
         true
@@ -2135,8 +2307,8 @@ let exec_one st op =
             revert st
       end
   | ASSERT_ADDR rs ->
-    let s = to_string (getr st rs) in
-    if is_valid_addr s then true
+    let value = getr st rs in
+    if not (numeric_value value) && is_valid_addr (to_string value) then true
     else begin
       ignore (append_event st { contract = st.address; depth = st.call_depth;
         event = "Require"; values = [VString "invalid address"] });
@@ -2474,7 +2646,7 @@ let exec_one st op =
                 acc := Z.add !acc (Z.mul lv rv)
               done;
               let cell = dst_addr + r * n + c in
-              Hashtbl.replace st.memory.data cell (VInt !acc);
+              store_number st cell !acc;
               if cell >= st.memory.size then st.memory.size <- cell + 1
             done
           done;
@@ -2799,8 +2971,7 @@ let exec_one st op =
         | Some values ->
           for i = 0 to n - 1 do
             let first, second = int_values st Int_work.Mul values i operands in
-            Hashtbl.replace st.memory.data (dst + i)
-              (VInt (Fixed_q16.trunc_mul first second))
+            store_number st (dst + i) (Fixed_q16.trunc_mul first second)
           done;
           true
     end
@@ -2840,7 +3011,7 @@ let exec_one st op =
           let b = Char.code src_str.[off + i] in
           let signed = if b >= 128 then b - 256 else b in
           let v = Z.mul (Z.of_int signed) scale_z in
-          Hashtbl.replace st.memory.data (dst + i) (VInt v)
+          store_number st (dst + i) v
         done;
         true
       end
@@ -2872,8 +3043,7 @@ let exec_one st op =
         | Some values ->
           for i = 0 to n - 1 do
             let first, second = int_values st Int_work.Add values i operands in
-            Hashtbl.replace st.memory.data (dst + i)
-              (VInt (Z.add first second))
+            store_number st (dst + i) (Z.add first second)
           done;
           true
     end
@@ -2971,7 +3141,7 @@ let exec_one st op =
               let b = Char.code decoded.[off + i] in
               let signed = if b >= 128 then b - 256 else b in
               let v = Z.mul (Z.of_int signed) scale_z in
-              Hashtbl.replace st.memory.data (dst + i) (VInt v)
+              store_number st (dst + i) v
             done;
             true
           end
@@ -3565,7 +3735,8 @@ let exec_one st op =
   | TRANSFER (rd, ra, rv) ->
     if not (view_guard st) then false
     else
-      let to_addr = to_string (getr st ra) in
+      let target = getr st ra in
+      let to_addr = if numeric_value target then "" else to_string target in
       if not (is_valid_addr to_addr) then (setr st rd (VBool false); true)
       else
         let amount = to_z (getr st rv) in
@@ -4025,7 +4196,8 @@ let proof_host run =
     | Stack_overflow -> Lwt.fail (Octra_core.Exec_resource.Unavailable Stack)
     | _ -> Lwt.fail (Octra_core.Exec_resource.Unavailable Host))
 
-let run_async ?(running = fun () -> true) ?(view_seconds = 10.) state program =
+let run_async ?(running = fun () -> true) ?(view_seconds = 10.)
+    ?(clock = Mtime_clock.elapsed_ns) ?(yield = Lwt.pause) state program =
   if not (Float.is_finite view_seconds) || view_seconds <= 0. then
     invalid_arg "view duration must be finite and positive";
   let ( let* ) work next = Lwt.bind work (Octra_core.Exec_resource.protect next) in
@@ -4110,7 +4282,8 @@ let run_async ?(running = fun () -> true) ?(view_seconds = 10.) state program =
       let* result = state.ctx.call_async state.address target method_name args (child_scope state) in
       valid ();
       begin match result with
-      | Ok sub when add_dyn_effort state sub.effort_used ->
+      | Ok sub when add_dyn_effort state sub.effort_used
+          && (not state.ctx.scalar_work || scalar_valid sub.return_value) ->
         state.logs := List.rev_append sub.events !(state.logs);
         setr state rd sub.return_value;
         Lwt.return_true
@@ -4129,20 +4302,21 @@ let run_async ?(running = fun () -> true) ?(view_seconds = 10.) state program =
         Lwt.return (revert state)
       end
   in
-  let rec loop quota =
+  let rec loop quota started =
     valid ();
-    match step state program with
+    match Octra_core.Exec_resource.work (fun () -> step state program) with
     | Finished -> Lwt.return_true
     | Refused -> Lwt.return_false
-    | Running when quota > 0 -> loop (quota - 1)
+    | Running when quota > 0 && Int64.sub (clock ()) started < 2_000_000L ->
+      loop (quota - 1) started
     | Running ->
-      let* () = Lwt.pause () in
-      loop 4096
+      let* () = yield () in
+      loop 4096 (clock ())
     | exception Suspend request ->
       let* continued = resume request in
-      if continued then loop 4096 else Lwt.return_false
+      if continued then loop 4096 (clock ()) else Lwt.return_false
   in
-  Lwt.catch (fun () -> Octra_core.Exec_resource.protect (fun () -> loop 4096) ()) (fun error ->
+  Lwt.catch (fun () -> Octra_core.Exec_resource.protect (fun () -> loop 4096 (clock ())) ()) (fun error ->
     ignore (refuse state);
     match error with
     | Lwt_unix.Timeout -> Lwt.fail (Octra_core.Exec_resource.Unavailable Host)

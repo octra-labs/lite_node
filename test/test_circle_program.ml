@@ -481,7 +481,7 @@ let wasm_descriptor methods =
     manifest = Some (`Assoc ["methods", `List methods]);
   }
 
-let read_module ?hfhe_request ?inspect_stage ?event ?table_elements ?(functions = 3) ?(compute = false) manifest response =
+let read_module ?hfhe_request ?inspect_stage ?event ?write ?table_elements ?(functions = 3) ?(compute = false) manifest response =
   let byte value = String.make 1 (Char.chr value) in
   let rec number limit value =
     if value < limit then byte value
@@ -495,7 +495,8 @@ let read_module ?hfhe_request ?inspect_stage ?event ?table_elements ?(functions 
   let body instructions = text ("\000" ^ instructions ^ "\011") in
   let plain = manifest ^ response ^ Option.value ~default:"" hfhe_request in
   let contents = plain ^ Option.fold ~none:"" ~some:(fun (topic, value) -> topic ^ value) event in
-  let data = if compute then contents ^ String.make 8 '\000' else contents in
+  let stored = contents ^ Option.fold ~none:"" ~some:(fun (key, value) -> key ^ value) write in
+  let data = if compute then stored ^ String.make 8 '\000' else stored in
   let imports = [text "octra" ^ text "host_response_write" ^ "\000\000"]
     @ (match hfhe_request with
       | None -> []
@@ -506,27 +507,36 @@ let read_module ?hfhe_request ?inspect_stage ?event ?table_elements ?(functions 
       | Some _ -> [text "octra" ^ text "host_session_put" ^ "\000\002"])
     @ (match event with
       | None -> []
-      | Some _ -> [text "octra" ^ text "host_emit_event" ^ "\000\002"]) in
+      | Some _ -> [text "octra" ^ text "host_emit_event" ^ "\000\002"])
+    @ (match write with
+      | None -> []
+      | Some _ -> [text "octra" ^ text "host_kv_put" ^ "\000\002"]) in
   let first = List.length imports in
   let session = const 0 ^ const 1 ^ const 0 ^ const 1
-    ^ "\016" ^ size (first - (if Option.is_none event then 1 else 2)) ^ "\026" in
+    ^ "\016" ^ size (first - (if Option.is_none event then 1 else 2)
+      - (if Option.is_none write then 0 else 1)) ^ "\026" in
   let inspect stage = if inspect_stage = Some stage then session else "" in
   let invoke = match hfhe_request with
     | None -> ""
     | Some request -> const (String.length manifest + String.length response)
       ^ const (String.length request) ^ "\016\001\026" in
-  let math = if compute then const (String.length contents) ^ const 1
+  let math = if compute then const (String.length stored) ^ const 1
     ^ "\016" ^ size (if Option.is_none hfhe_request then 1 else 2) ^ "\026" else "" in
   let emit = match event with
     | None -> ""
     | Some (topic, value) -> const (String.length plain) ^ const (String.length topic)
       ^ const (String.length plain + String.length topic) ^ const (String.length value)
+      ^ "\016" ^ size (first - 1 - (if Option.is_none write then 0 else 1)) ^ "\026" in
+  let store = match write with
+    | None -> ""
+    | Some (key, value) -> const (String.length contents) ^ const (String.length key)
+      ^ const (String.length contents + String.length key) ^ const (String.length value)
       ^ "\016" ^ size (first - 1) ^ "\026" in
-  let write offset length = const offset ^ const length ^ "\016\000\026" ^ const 0 in
+  let respond offset length = const offset ^ const length ^ "\016\000\026" ^ const 0 in
   String.concat "" [
     "\000asm\001\000\000\000";
     section 1 (vector (["\096\002\127\127\001\127"; "\096\001\127\001\127"]
-      @ (if Option.is_none inspect_stage && Option.is_none event then [] else
+      @ (if Option.is_none inspect_stage && Option.is_none event && Option.is_none write then [] else
         ["\096\004\127\127\127\127\001\127"; "\096\000\000"])));
     section 2 (vector imports);
     section 3 (vector ([size 1; size 0; size 0]
@@ -535,14 +545,14 @@ let read_module ?hfhe_request ?inspect_stage ?event ?table_elements ?(functions 
     (match table_elements with
       | None -> ""
       | Some elements -> section 4 (vector ["\112\000" ^ size elements]));
-    section 5 (vector ["\000\001"]);
+    section 5 (vector ["\000" ^ size (max 1 ((String.length data + 65_535) / 65_536))]);
     section 7 (vector [export "memory" 2 0; export "octra_alloc" 0 first;
       export "octra_query" 0 (first + 1); export "octra_update" 0 (first + 1);
       export "octra_manifest" 0 (first + 2)]);
     (if inspect_stage = Some 0 then section 8 (size (first + 3)) else "");
     section 10 (vector ([body (inspect 1 ^ const (String.length data));
-      body (inspect 4 ^ invoke ^ math ^ emit ^ write (String.length manifest) (String.length response));
-      body (inspect 2 ^ write 0 (String.length manifest))]
+      body (inspect 4 ^ invoke ^ math ^ emit ^ store ^ respond (String.length manifest) (String.length response));
+      body (inspect 2 ^ respond 0 (String.length manifest))]
       @ (if inspect_stage = Some 0 then [body session] else [])
       @ List.init (functions - 3) (fun _ -> body (const 0))));
     section 11 (vector ["\000" ^ const 0 ^ "\011" ^ text data]);
@@ -711,6 +721,7 @@ let test_wasm_inspect () =
       require (Host.string_starts_with
         ~prefix:"nonpersistent wasm import during inspection:" reason)
         "inspection refusal class changed"
+    | Error (Host.Refused _) -> fail "inspection refusal carried entries"
     | Error (Host.Unavailable _) -> fail "inspection became unavailable"
     | Ok _ -> fail "inspection accepted session effect" in
   with_store (fun store ->
@@ -1285,6 +1296,41 @@ let test_code_seed () =
   run large false;
   require (not (Host.code_seeded key)) "large missing code retry kept seed"
 
+let test_wasm_slice () =
+  let module Host = Octra_core.Circle_wasm_host in
+  let module Rule = Octra_core.Rule_graph in
+  let module R = Octra_core.Exec_resource in
+  let owner = Thread.id (Thread.self ()) in
+  let now = ref 0. in
+  let clock () =
+    if Thread.id (Thread.self ()) <> owner then now := !now +. 1.;
+    !now in
+  let code_b64 = Base64.encode_exn (read_module "slice" "OCWS1\000\000\000\000\000") in
+  let execute session () =
+    let call = if session then Some (fun _ -> failwith "unexpected wasm callback") else None in
+    Host.execute ~table_mode:Rule.Prior ~keyed:false ~inspect_mode:Rule.Prior
+      ~proof_mode:Rule.Prior ~call ~code_b64 ~export_name:"octra_update"
+      ~request_bytes:"" ~storage_tbl:(Hashtbl.create 0) ~storage_cache_key:None
+      ~caller:"slice" ~address:"slice" ~tx_hash:"slice" ~current_epoch:0
+      ~hfhe_caps:[] ~hfhe_pubkeys:[] ~hfhe_active_key:None ~hfhe_strict:false
+      ~math:false ~float_mode:Rule.Prior ~public_reads:[]
+      ~hfhe_mode:Octra_core.Circle_hfhe_transcript.Direct ~fuel_limit:10_000_000
+      ~is_view:false ~update_policy:session in
+  List.iter (fun session ->
+    now := 0.;
+    let refused = Lwt_main.run (Lwt.catch (fun () ->
+      let action () = R.run ~hash:"wasm" (fun () ->
+        Lwt.map (fun _ -> false) (execute session ())) in
+      if Array.exists (String.equal "wasm") Sys.argv then action ()
+      else R.select ~limit:0.1 ~clock ~running:(fun () -> true) action)
+      (function R.Exhausted ("wasm", R.Time) -> Lwt.return_true
+        | error -> Lwt.fail error)) in
+    require refused "native wasm bypassed execution slice";
+    match Lwt_main.run (R.run ~hash:"foreign" (execute session)) with
+    | Ok result -> require result.Host.success "foreign wasm inherited deadline"
+    | Error error -> failwith (Host.error_message error)) [false; true];
+  Printf.printf "event = wasm_slice status = passed\n%!"
+
 let test_wasm_inputs () =
   let module Host = Octra_core.Circle_wasm_host in
   let module Native = Octra_core.Circle_wasm_native in
@@ -1510,6 +1556,115 @@ let test_wasm_effort () =
         && receipt.error = Some "wasm response integer is invalid")
         "invalid wasm response lost execution effort") [false; true])
 
+let number_frame value =
+  let length = Bytes.create 4 in
+  Bytes.set_int32_be length 0 (Int32.of_int (String.length value));
+  "OCWS1\003" ^ Bytes.to_string length ^ value
+
+let test_wasm_scalar () =
+  let module VM = Vm.Contract_vm in
+  with_store (fun store ->
+    let owner = "octNUMBER_OWNER" in
+    let circle = "octNUMBER" in
+    let method_info name view = `Assoc ["name", `String name; "view", `Bool view] in
+    let manifest = Yojson.Safe.to_string (`Assoc ["methods", `List [
+      method_info "read" true; method_info "write" false]]) in
+    let install value =
+      let response = number_frame value in
+      let code = Base64.encode_exn (read_module manifest response) in
+      save_circle ~runtime:Circles.Wasm_v1 store circle owner code in
+    let run scalar_work view =
+      let ctx = {VM.default_ctx with current_epoch = 2_000_000; scalar_work} in
+      if view then Lwt_main.run (Circle_exec.execute_view_call ~ctx ~limit:20_000_000
+        store circle "read" [] owner)
+      else (Lwt_main.run (Circle_exec.execute_call ~ctx ~limit:20_000_000
+        store circle "write" [] owner Z.zero)).receipt in
+    List.iter (fun value ->
+      install value;
+      List.iter (fun view ->
+        let before = run false view in
+        require before.success "prior wasm number refused";
+        let after = run true view in
+        require (not after.success) "wasm scalar limit bypassed";
+        require (Option.is_some after.error) "wasm scalar refusal missing") [false; true])
+      ["0x1" ^ String.make 16_384 '0'; String.make 65_537 '0'];
+    List.iter (fun value ->
+      install value;
+      List.iter (fun view ->
+        List.iter (fun active ->
+          let result = run active view in
+          require result.success "valid wasm number refused";
+          require (result.return_value = Some (VM.VInt (Z.of_string value)))
+            "wasm number changed")
+          [false; true])
+        [false; true]) ["42"; "-0x2a"; "0b10_1010"; String.make 65_536 '0']);
+  Printf.printf "event = wasm_scalar status = passed\n%!"
+
+let test_wasm_number_tx () =
+  let module Epoch = Octra_core.Epoch_exec in
+  let module Rule = Octra_core.Rule_graph in
+  let module Ledger = Octra_core.Ledger in
+  let module Transition = Octra_node_runtime.Consensus_vm_transition in
+  let chain_id = "octra-devnet-9871-cluster" in
+  let plan = Rule.scalar_work_activation_for_chain chain_id in
+  let at = Option.fold ~none:1_769_492 ~some:(fun (value : Rule.activation) -> value.activation_epoch) plan in
+  let run epoch value accepted = with_store (fun store ->
+    let owner = "oct11111111111111111111111111111111111111111" in
+    let circle = "oct22222222222222222222222222222222222222222" in
+    let manifest = "{\"methods\":[{\"name\":\"write\",\"view\":false}]}" in
+    let code = read_module ~write:("number", "saved") manifest (number_frame value) in
+    save_circle ~runtime:Circles.Wasm_v1 store circle owner (Base64.encode_exn code);
+    let ledger = Ledger.create store in
+    Ledger.add_account ledger owner (Z.of_int 40_000_000) |> Result.get_ok;
+    Lwt_main.run (Ledger.flush_dirty_lwt ledger);
+    let backend = Epoch.make_live_backend store ledger in
+    Lwt_main.run (backend.begin_batch Rule.Prior);
+    let snapshot () = Lwt_main.run (Store.load_circle_stable_storage store circle)
+      |> Result.get_ok |> Hashtbl.to_seq |> List.of_seq |> List.sort compare in
+    let saved = snapshot () in
+    let transaction = Octra_core.Transaction.{from = owner; to_ = circle; amount = Z.zero;
+      nonce = 1; ou = Z.of_int 20_000_000; timestamp = 0.; signature = ""; public_key = None;
+      message = Some "[]"; op_type = CircleCall; encrypted_data = Some "write"} in
+    let env = Epoch.{chain_id; epoch_id = epoch; proposer_addr = "oct_proposer";
+      validator_addrs = []; validator_pubkeys = []; prev_state_root = String.make 64 'b';
+      epoch_ts = 170.; ready_state_root_at = None; ready_max_lag = -1} in
+    let receipts = ref [] in
+    let result = Lwt_main.run (Octra_core.Tx_savepoint.run ~ledger ~store (fun () ->
+      Transition.process_tx ~backend ~env ~circle_mode:Rule.Prior
+        ~wasm_compute_mode:Rule.Active ~program_trust:Vm.Program_trust.empty ~object_cost:false
+        ~save_receipt_raw:(fun ~tx_hash ~json -> receipts := (tx_hash, json) :: !receipts)
+        transaction)) in
+    begin match result with
+    | Ok (Epoch.Confirmed fee) ->
+      require accepted "wide wasm transaction accepted";
+      require (fee = transaction.ou) "wasm transaction fee changed";
+      require (List.assoc_opt "number" (snapshot ()) = Some "saved") "wasm update missing"
+    | Ok (Epoch.Rejected_after_fee rejected) ->
+      require (not accepted) ("valid wasm transaction refused: " ^ rejected.reason);
+      require (rejected.reason = "wasm response integer width exceeds limit"
+        || rejected.reason = "wasm response integer text exceeds limit")
+        "wasm transaction refused before scalar check";
+      require (rejected.fee = transaction.ou && saved = snapshot ())
+        "wasm refusal changed fee or storage"
+    | Error (_, reason) -> fail reason
+    end;
+    let account = Option.get (Ledger.find_opt ledger owner) in
+    require (account.balance = Z.of_int 20_000_000 && account.nonce = 1)
+      "wasm refusal changed account";
+    require (List.length !receipts = 1) "wasm receipt missing";
+    Lwt_main.run (Ledger.flush_dirty_lwt ledger);
+    let result = Lwt_main.run (Store.get_batch_tree_hash store), !receipts in
+    Store.abort_epoch_batch store;
+    result) in
+  List.iter (fun value -> List.iter (fun epoch ->
+    let accepted = value = "42" || Option.fold ~none:true
+      ~some:(fun (plan : Rule.activation) -> epoch < plan.activation_epoch) plan in
+    require (run epoch value accepted = run epoch value accepted)
+      "wasm scalar replay changed root or receipt")
+    [at - 1; at; at + 1])
+    ["42"; "0x1" ^ String.make 16_384 '0'; String.make 65_537 '0'];
+  Printf.printf "event = wasm_number_tx status = passed\n%!"
+
 let test_compute_manifest () =
   let descriptor =
     wasm_descriptor [
@@ -1574,7 +1729,10 @@ let test_cache_program_identity () =
     "program upgrade reused prior manifest cache"
 
 let () =
-  if Array.exists (String.equal "--code-seed") Sys.argv then test_code_seed ()
+  if Array.exists (String.equal "--number-tx") Sys.argv then test_wasm_number_tx ()
+  else if Array.exists (String.equal "--numbers") Sys.argv then test_wasm_scalar ()
+  else if Array.exists (String.equal "--slice") Sys.argv then test_wasm_slice ()
+  else if Array.exists (String.equal "--code-seed") Sys.argv then test_code_seed ()
   else if Array.exists (String.equal "--wasm-inputs") Sys.argv then test_wasm_inputs ()
   else if Array.exists (String.equal "--events") Sys.argv then test_wasm_events ()
   else if Array.exists (String.equal "--inspect") Sys.argv then begin
@@ -1596,6 +1754,8 @@ let () =
   test_async_policy ();
   test_wasm_keys ();
   test_wasm_effort ();
+  test_wasm_scalar ();
+  test_wasm_number_tx ();
   test_wasm_events ();
   test_wasm_table ();
   test_table_tx ();

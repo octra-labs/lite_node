@@ -100,12 +100,16 @@ let check_rule rules ~epoch txs =
     | Rule_graph.Active -> Tx_signature.Network (Rule_graph.chain_id rules) in
   Tx_signature.check_active signing txs
 
-let check_charged mode rejections =
+let charged_operation ~compute ~program ~error_type = function
+  | Tx.ComputeFund | Tx.ComputeReturn | Tx.ComputeSettle -> compute = Rule_graph.Active
+  | Tx.ProgramExec -> program = Rule_graph.Active && error_type = "program_exec_failed"
+  | Tx.CircleCall -> program = Rule_graph.Active && error_type = "circle_call_failed"
+  | _ -> false
+
+let check_charged ~program mode rejections =
   if List.for_all (fun (item : Tx_outcome.rejection) ->
-    not item.charged || (mode = Rule_graph.Active
-      && match item.tx.op_type with
-        | Tx.ComputeFund | Tx.ComputeReturn | Tx.ComputeSettle -> true
-        | _ -> false)) rejections then Ok ()
+    not item.charged || charged_operation ~compute:mode ~program
+      ~error_type:item.error_type item.tx.op_type) rejections then Ok ()
   else Error "charged outcome not active"
 
 let check_outcome ~chain_id ~epoch ~receipts txs =
@@ -115,6 +119,7 @@ let check_outcome ~chain_id ~epoch ~receipts txs =
     let* partition = Tx_outcome.decode_final ~confirmed:txs receipts in
     let height = Int64.to_int (Int64.min (Int64.of_int max_int) epoch) in
     let* () = check_charged (Rule_graph.vm_bytes_at ~chain_id ~epoch:height)
+      ~program:(Rule_graph.program_result_at ~chain_id ~epoch:height)
       partition.rejections in
     let* inputs = Tx_outcome.merge ~confirmed:txs ~rejections:partition.rejections in
     check_epoch ~chain_id ~epoch inputs

@@ -78,6 +78,8 @@ val withdraw :
   t ->
   ((t * Z.t), string) result
 val apply_slash :
+  ?retain_rewards:bool ->
+  ?retain_offenders:string list ->
   current_epoch:int64 ->
   evidence_epochs:int64 ->
   Validator_evidence.verified ->

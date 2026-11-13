@@ -6,6 +6,7 @@ type tx_deps = {
   has_tx : string -> bool;
   find_tx : string -> Octra_core.Transaction.t option;
   sender_pk : Octra_core.Transaction.t -> string option;
+  find_account : string -> Octra_core.Ledger.account option;
   add_tx : Octra_core.Transaction.t -> (string, string) result;
   send_payload : string -> unit;
   send_batch : (unit -> string option) list -> unit;
@@ -56,6 +57,7 @@ let handle_tx ~duty_head ?bft_mode deps frame =
     has_tx = deps.tx.has_tx;
     find_tx = deps.tx.find_tx;
     sender_pk = deps.tx.sender_pk;
+    find_account = deps.tx.find_account;
     add_tx = deps.tx.add_tx;
     send_payload = deps.tx.send_payload;
     send_batch = deps.tx.send_batch;
@@ -75,8 +77,8 @@ let handle_unknown frame t =
 let handle_frame ?(duty_head = fun () -> None) ?bft_mode deps frame =
   log_recv frame;
   match P2p_message.classify frame.Octra_net.P2p_frame.msg_type with
-  | P2p_message.Legacy_epoch -> handle_legacy deps frame
+  | P2p_message.Legacy_epoch -> handle_legacy deps frame; Lwt.return_unit
   | P2p_message.Tx_gossip -> handle_tx ~duty_head ?bft_mode deps frame
-  | P2p_message.Consensus -> deps.on_consensus ()
-  | P2p_message.Resource_compute -> deps.on_resource_compute ()
-  | P2p_message.Unknown t -> handle_unknown frame t
+  | P2p_message.Consensus -> deps.on_consensus (); Lwt.return_unit
+  | P2p_message.Resource_compute -> deps.on_resource_compute (); Lwt.return_unit
+  | P2p_message.Unknown t -> handle_unknown frame t; Lwt.return_unit

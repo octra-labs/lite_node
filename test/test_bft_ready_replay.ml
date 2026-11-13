@@ -77,8 +77,7 @@ let proposal ?(members = validator_set) chain_id ~epoch_id ~round =
     signature = sign proposer (C_hash.propose_sign_bytes unsigned);
   }
 
-let swarm chain_id =
-  let address = "v0" in
+let swarm ?(address = "v0") chain_id =
   let public_key = public_key address in
   Octra_net.P2p_swarm.create
     Octra_net.P2p_swarm.{
@@ -104,6 +103,7 @@ let driver
     ?(vote_log = C_vote_log.memory ())
     ?policy
     ?(members = validator_set)
+    ?(address = "v0")
     ?scheduled_validator_set_config
     ?(load_scheduled_validator_set_config = fun () -> Lwt.return_none)
     ?(verify_proposal = fun _ -> Lwt.return C_driver.Proposal_accept)
@@ -113,8 +113,8 @@ let driver
   let config =
     C_driver.{
       chain_id;
-      my_addr = "v0";
-      sign_fn = sign "v0";
+      my_addr = address;
+      sign_fn = sign address;
       verify_fn = verify;
       role_can_vote = (fun () -> true);
       can_vote = (fun () -> true);
@@ -148,7 +148,7 @@ let driver
     (Option.value policy ~default:(C_quorum_policy.for_chain chain_id))
     ~config
     ~validator_set:members
-    ~swarm:(swarm chain_id)
+    ~swarm:(swarm ~address chain_id)
     ~start_height:1L
     ~sync_log:(C_sync_log.memory ())
     ~relief_log:(C_relief_log.memory ())
@@ -964,6 +964,7 @@ let test_activation_vote_replay () =
     activate_epoch = 2L;
     validator_set = next_set;
     fingerprint = "activation-vote-reentry";
+    eviction = None;
   } in
   let plan = ref None in
   let driver =
@@ -1022,6 +1023,7 @@ let test_activation_vote_signer () =
     activate_epoch = 2L;
     validator_set = next_set;
     fingerprint = "activation-evidence";
+    eviction = None;
   } in
   let source = driver ~scheduled_validator_set_config chain_id in
   source.running <- true;
@@ -1385,71 +1387,240 @@ let test_past_vote_reply mode =
   if mode = "invalid" && driver.vote_log_issue = None then
     failwith "invalid saved signature did not hold voting"
 
-let test_progress_clock () =
-  let members = match C_types.make_weighted_validator_set
-    (List.map (fun member -> member, Z.one) validator_set.validators) with
-    | Ok value -> value | Error reason -> failwith reason in
-  List.iter (fun active ->
-    let policy = C_quorum_policy.make ~count_epoch:0L
-      ~stake_epoch:(if active then Some 1L else Some 2L)
-      ~round_epoch:(if active then Some 1L else Some 2L) in
-    let node = driver ~members ~policy "octra-test-progress-clock" in
-    let local, remote = Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
-    let conn = Octra_net.P2p_conn.create ~peer_class:Octra_net.P2p_frame_budget.Validator
-      local ~peer_id:"progress-peer" ~addr:"local" ~direction:Octra_net.P2p_conn.Inbound in
-    Hashtbl.add node.swarm.peers conn.peer_id conn;
-    let syncs = ref [] in
-    let rec consume () =
-      let open Lwt.Syntax in
-      let* frame = Lwt_mvar.take conn.write_queue in
-      if frame.Octra_net.P2p_frame.msg_type = Octra_net.P2p_frame.msg_cons_round_sync then
-        syncs := C_codec.decode_round_sync frame.payload :: !syncs;
-      consume () in
-    let reading = consume () in
+let progress_members () =
+  let members = List.mapi (fun index address ->
+    let key = Mirage_crypto_ec.Ed25519.priv_of_octets
+      (String.make 32 (Char.chr (index + 1))) |> Result.get_ok in
+    let pubkey = Mirage_crypto_ec.Ed25519.(pub_of_priv key |> pub_to_octets) in
+    Hashtbl.replace keys address (key, pubkey);
+    C_types.{address; pubkey}, Z.one)
+    ["progress_a"; "progress_b"; "progress_c"; "progress_d"] in
+  match C_types.make_weighted_validator_set members with
+  | Ok value -> value
+  | Error reason -> failwith reason
+
+let progress_run pending =
+  let rec run turns = match Lwt.state pending with
+    | Lwt.Return value -> value
+    | Lwt.Fail error -> raise error
+    | Lwt.Sleep ->
+      if Lwt.paused_count () = 0 then failwith "progress clock awaited an external event";
+      if turns = 0 then failwith "progress clock pause limit exceeded";
+      Lwt.wakeup_paused ();
+      run (turns - 1) in
+  Fun.protect ~finally:(fun () -> Lwt.cancel pending) (fun () -> run 32)
+
+let progress_syncs (conn : Octra_net.P2p_conn.t) action =
+  let open Lwt.Syntax in
+  let marker = Octra_net.P2p_frame.{msg_type = 0; payload = ""} in
+  let rec consume frames =
+    let* frame = Lwt_mvar.take conn.write_queue in
+    if frame == marker then Lwt.return (List.rev frames)
+    else consume (frame :: frames) in
+  let reading = consume [] in
+  Lwt.finalize (fun () ->
+    let* () = action () in
+    let* () = Lwt_mvar.put conn.write_queue marker in
+    reading)
+    (fun () -> Lwt.cancel reading; Lwt.return_unit)
+
+let check_progress_syncs (node : C_driver.t) frames expected =
+  let actual = List.map (fun (frame : Octra_net.P2p_frame.frame) ->
+    if frame.msg_type <> Octra_net.P2p_frame.msg_cons_round_sync then
+      failwith "progress clock emitted unexpected frame";
+    let sync = C_codec.decode_round_sync frame.payload in
+    if sync.chain_id <> node.config.chain_id || sync.epoch_id <> 1L
+       || sync.validator <> node.config.my_addr
+       || not (C_hash.verify_round_sync ~pubkey_raw:(public_key node.config.my_addr) sync) then
+      failwith "progress clock emitted invalid signed sync";
+    sync.round, sync.step, sync.request) frames in
+  if actual <> expected then failwith "progress clock did not repeat signed requests"
+
+let progress_queue at pending last events =
+  let take pending last =
+    let due = Option.fold ~none:true ~some:(fun sent ->
+      at >= sent && Int64.sub at sent >= 1_100_000_000L) last in
+    match pending with
+    | target :: rest when due -> rest, Some at, [target, C_types.PrevoteStep, true]
+    | _ -> pending, last, [] in
+  List.fold_left (fun (pending, last, frames) event ->
+    let pending, last, emitted = match event with
+      | `Offer target ->
+        take (if List.mem target pending then pending else pending @ [target]) last
+      | `Take -> take pending last
+      | `Notice sync -> pending, Some at, [sync] in
+    pending, last, frames @ emitted) (pending, last, []) events
+
+let progress_advance round retry search =
+  (if search then [`Offer 0] else []) @
+  [`Offer (round - 1); `Offer retry;
+   `Notice (round, C_types.ProposeStep, false); `Take;
+   `Notice (round, C_types.ProposeStep, true); `Take]
+
+let progress_wake round search =
+  List.map (fun target -> `Offer target) search @
+  [`Take; `Notice (round, C_types.ProposeStep, true); `Take]
+
+let check_progress_retry (node : C_driver.t) ~floor tick =
+  let leader round =
+    (C_engine.leader_of node.engine.vs ~epoch_id:1L ~round).address = node.config.my_addr in
+  let at, target = if leader 8 then 362_099_999_999L, 2 else 362_100_000_000L, 1 in
+  tick (Int64.pred at) 100 None (progress_wake floor []);
+  tick at 100 None (progress_wake floor (if leader floor then [target] else []));
+  if node.engine.state.round <> floor then failwith "proof retry changed the signed floor"
+
+let check_progress_steps (node : C_driver.t) ~floor tick =
+  let engine = node.engine in
+  let reports = List.filter (fun (member : C_types.validator_info) ->
+    member.address <> node.config.my_addr) engine.vs.validators in
+  let leader round =
+    (C_engine.leader_of engine.vs ~epoch_id:1L ~round).address = node.config.my_addr in
+  Hashtbl.replace engine.higher_round_evidence (List.nth reports 0).address 100;
+  tick 179_999_999_999L 100 None (progress_wake 7 (if leader 7 then [1] else []));
+  if engine.state.round <> 7 then failwith "single report bypassed stall interval";
+  tick 180_000_000_000L 100 (Some 8) (progress_advance 8 6 (leader 8));
+  if engine.state.round <> 8 then failwith "signed stall did not advance exactly one round";
+  tick 180_000_000_000L 100 None (progress_wake 8 []);
+  tick 359_999_999_999L 100 None (progress_wake 8 (if leader 8 then [1] else []));
+  if engine.state.round <> 8 then failwith "repeated report bypassed step interval";
+  Hashtbl.replace engine.higher_round_evidence (List.nth reports 1).address floor;
+  C_engine.set_round_skip_ready engine (fun () -> false);
+  tick 360_000_000_000L 100 None (progress_wake 8 []);
+  if engine.state.round <> 8 then failwith "progress clock interrupted proposal work";
+  C_engine.set_round_skip_ready engine (fun () -> true);
+  tick 360_000_000_000L 100 (Some floor)
+    (progress_advance floor 7 (leader floor && not (leader 8)));
+  if engine.state.round <> floor then failwith "progress clock did not use signed floor";
+  check_progress_retry node ~floor tick
+
+let check_progress_case members ~round_wait ~address ~floor =
+  let chain_id = "octra-test-progress-clock" in
+  let policy = C_quorum_policy.make ~count_epoch:0L
+    ~stake_epoch:(if round_wait then Some 1L else Some 2L)
+    ~round_epoch:(if round_wait then Some 1L else Some 2L) in
+  let rule = if round_wait then C_quorum_policy.Stake else C_quorum_policy.Capped in
+  if C_quorum_policy.select policy 1L <> rule
+     || C_quorum_policy.round_wait policy 1L <> round_wait then
+    failwith "progress clock policy differs";
+  let now = ref 0L in
+  let base = driver ~members ~policy ~address chain_id in
+  let node = {base with C_driver.proof_clock = (fun () -> !now); progress_step_at = !now} in
+  let local, remote = Lwt_unix.socketpair Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+  let conn = Octra_net.P2p_conn.create ~peer_class:Octra_net.P2p_frame_budget.Validator
+    local ~peer_id:"progress-peer" ~addr:"local" ~direction:Octra_net.P2p_conn.Inbound in
+  Hashtbl.add node.swarm.peers conn.peer_id conn;
+  let prior = Lwt_engine.get () in
+  let timers = new Lwt_engine.select in
+  let timer_count = if round_wait then 2 else 3 in
+  let completed = ref false in
+  Lwt_engine.set ~transfer:false ~destroy:false timers;
+  Fun.protect ~finally:(fun () ->
+    Lwt_engine.set ~transfer:false ~destroy:false prior;
+    Fun.protect ~finally:(fun () -> timers#destroy) (fun () ->
+      Lwt_main.run (let open Lwt.Syntax in
+        let* () = C_driver.stop node in
+        let* () = Octra_net.P2p_conn.close conn in
+        Lwt_unix.close remote);
+      if !completed && timers#timer_count <> timer_count then
+        failwith "progress clock stop changed scheduled timers")) (fun () ->
     let engine = node.engine in
     C_engine.realign_round engine 7;
-    let offer = proposal engine.chain_id ~epoch_id:1L ~round:6 in
+    let leader = address = "progress_c" in
+    if C_engine.am_i_leader engine <> leader then failwith "progress clock leader differs";
+    let offer = proposal ~members:engine.vs engine.chain_id ~epoch_id:1L ~round:6 in
     engine.state <- {engine.state with locked_round = 6; locked_value = Some offer.header};
     ignore (C_engine.drain_outputs engine);
-    let generation = engine.generation in
-    for _ = 1 to 3 do
-      Lwt_main.run (C_driver.realign_progress node ~height:1L ~round:7)
-    done;
-    let expected = if active then 7 else 10 in
+    let generation = 1 in
+    if engine.generation <> generation then failwith "progress clock initial generation differs";
+    let expected_generation = ref generation and expected_round = ref 7 in
+    let pending = ref [] and last_send = ref None in
+    let check_state () =
+      if engine.state.height <> 1L || engine.state.round <> !expected_round
+         || engine.generation <> !expected_generation then
+        failwith "progress clock transition differs";
+      let scope : C_round_request.scope = {height = 1L; generation = !expected_generation} in
+      let mark : C_round_request.token = {scope; life = 0} in
+      if node.round_requests.scope <> scope || node.round_requests.life <> 0
+         || node.round_requests.closed || node.round_requests.active <> None
+         || node.round_requests.notices <> 0 || node.round_requests.last <> !last_send then
+        failwith "progress clock request scope differs";
+      let expected = List.map (fun round -> mark, round) !pending in
+      let actual = List.map (fun (query : C_round_request.query) -> query.token, query.round)
+        node.round_requests.queue in
+      if actual <> expected then
+        failwith "progress clock lost deferred requests" in
+    let expect at events =
+      let queue, last, frames = progress_queue at !pending !last_send events in
+      pending := queue;
+      last_send := last;
+      frames in
+    let tick at round advance events =
+      if at < !now then failwith "progress clock moved backwards";
+      now := at;
+      (match advance with
+       | None -> ()
+       | Some target ->
+         if target <= !expected_round then failwith "progress clock expected round did not advance";
+         expected_round := target;
+         incr expected_generation;
+         pending := []);
+      let expected = expect at events in
+      let frames = progress_run (progress_syncs conn (fun () ->
+        C_driver.realign_progress_at node ~now:!now ~height:1L ~round)) in
+      check_progress_syncs node frames expected;
+      check_state () in
+    if round_wait then begin
+      tick 0L 7 None (progress_wake 7 (if leader then [0] else []));
+      tick 0L 7 None (progress_wake 7 []);
+      tick 0L 7 None (progress_wake 7 [])
+    end else List.iter (fun (round, retry) ->
+      tick 0L 7 (Some round) (progress_advance round retry false)) [8, 6; 9, 7; 10, 6];
+    let expected = if round_wait then 7 else 10 in
     if engine.state.round <> expected then failwith "progress clock advanced without evidence";
-    if active && engine.generation <> generation then failwith "progress clock restarted the round";
-    settle ();
-    if active && (List.length !syncs < 3 || not (List.for_all (fun sync ->
-      sync.C_codec.request && sync.round = 7
-      && C_hash.verify_round_sync ~pubkey_raw:(public_key "v0") sync) !syncs)) then
-      failwith "progress clock did not repeat signed requests";
-    if active then begin
-      node.progress_step_at <- 0L;
-      Hashtbl.replace engine.higher_round_evidence "v1" 100;
-      let tick now = Lwt_main.run
-        (C_driver.realign_progress_at node ~now ~height:1L ~round:100) in
-      tick 179_999_999_999L;
-      if engine.state.round <> 7 then failwith "single report bypassed stall interval";
-      tick 180_000_000_000L;
-      if engine.state.round <> 8 then failwith "signed stall did not advance exactly one round";
-      tick 180_000_000_000L;
-      tick 359_999_999_999L;
-      if engine.state.round <> 8 then failwith "repeated report bypassed step interval";
-      Hashtbl.replace engine.higher_round_evidence "v2" 20;
-      C_engine.set_round_skip_ready engine (fun () -> false);
-      tick 360_000_000_000L;
-      if engine.state.round <> 8 then failwith "progress clock interrupted proposal work";
-      C_engine.set_round_skip_ready engine (fun () -> true);
-      tick 360_000_000_000L;
-      if engine.state.round <> 20 then failwith "progress clock did not use signed floor"
-    end;
+    if round_wait && engine.generation <> generation then failwith "progress clock restarted the round";
+    if round_wait then check_progress_steps node ~floor tick;
+    List.iter (fun target ->
+      let before = Int64.sub (Int64.add !now 1_100_000_000L) 1L in
+      now := before;
+      let expected = expect !now [`Take] in
+      if expected <> [] then failwith "progress clock expected an early request";
+      let frames = progress_run (progress_syncs conn (fun () ->
+        C_driver.drain_round_requests node)) in
+      check_progress_syncs node frames [];
+      check_state ();
+      now := Int64.succ before;
+      let expected = expect !now [`Take] in
+      if expected <> [target, C_types.PrevoteStep, true] then
+        failwith "progress clock expected drain order differs";
+      let frames = progress_run (progress_syncs conn (fun () ->
+        C_driver.drain_round_requests node)) in
+      check_progress_syncs node frames [target, C_types.PrevoteStep, true];
+      check_state ()) !pending;
+    if node.round_requests.queue <> [] || node.round_requests.active <> None then
+      failwith "progress clock did not drain deferred requests";
+    if timers#timer_count <> timer_count then
+      failwith "progress clock timer count differs";
     if engine.state.locked_round <> 6 || engine.state.locked_value <> Some offer.header then
       failwith "progress clock discarded the lock";
-    Lwt.cancel reading;
-    Lwt_main.run (C_driver.stop node);
-    Lwt_main.run (Octra_net.P2p_conn.close conn);
-    Lwt_main.run (Lwt_unix.close remote)
-  ) [false; true]
+    completed := true)
+
+let test_progress_clock () =
+  let pending, last, frames = progress_queue 1_100_000_000L [2] (Some 0L)
+    [`Offer 3; `Offer 2] in
+  if pending <> [3; 2] || last <> Some 1_100_000_000L
+     || frames <> [2, C_types.PrevoteStep, true] then
+    failwith "progress queue repeated offer order differs";
+  let members = progress_members () in
+  List.iter (fun (round, address) ->
+    if (C_engine.leader_of members ~epoch_id:1L ~round).address <> address then
+      failwith "progress clock leader schedule differs")
+    [7, "progress_c"; 8, "progress_b"; 10, "progress_d"; 20, "progress_b"];
+  List.iter (fun address ->
+    check_progress_case members ~round_wait:false ~address ~floor:20)
+    ["progress_a"; "progress_c"];
+  List.iter (fun (address, floor) ->
+    check_progress_case members ~round_wait:true ~address ~floor)
+    ["progress_a", 20; "progress_b", 20; "progress_c", 20; "progress_d", 10]
 
 let test_locked_round_restart () =
   let chain_id = "octra-test-locked-round" in
@@ -1528,7 +1699,7 @@ let test_relief_wait_plan () =
     C_types.{address; pubkey = public_key address}, Z.one)) with
     | Ok value -> value | Error reason -> failwith reason in
   let plan = ref (Some C_driver.{activate_epoch = Int64.add epoch 10L;
-    validator_set = make 6; fingerprint = String.make 64 'a'}) in
+    validator_set = make 6; fingerprint = String.make 64 'a'; eviction = None}) in
   let after = ref (fun () -> ()) in
   let base = driver ~load_scheduled_validator_set_config:(fun () ->
     (!after) (); Lwt.return !plan)
@@ -1571,7 +1742,7 @@ let test_relief_plan_race () =
     if change_set then C_engine.reconfigure_validator_set node.engine ~round:(C_relief.min_round + 1) (make 8)
     else C_engine.start_height node.engine (Int64.succ epoch);
     Lwt.wakeup wake (Some C_driver.{activate_epoch = Int64.add epoch 10L;
-      validator_set = make 6; fingerprint = String.make 64 'a'});
+      validator_set = make 6; fingerprint = String.make 64 'a'; eviction = None});
     Lwt_main.run work;
     if node.engine.relief_limit <> None || node.relief_plan <> None then
       failwith "changed relief context installed old plan";

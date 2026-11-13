@@ -61,7 +61,7 @@ val validate_and_submit_tx :
   runtime ->
   Ledger.t ->
   Transaction.t ->
-  (string, string * string) result
+  (string, string * string) result Lwt.t
 
 val list_saved_epochs :
   Store_chaindata.t ->

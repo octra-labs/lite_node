@@ -16,6 +16,45 @@ let verify challenge att proof =
   R.verify_storage_attestation ~challenge ~commitment:att.commitment
     ~max_weight:1L ~leaf_count:2L att proof
 
+let check_index_edges () =
+  let least = R.u64_prefix ("\128" ^ String.make 31 '\000') in
+  let largest = Int64.max_int in
+  check "index prefix signed edge" (least = Int64.min_int);
+  check "index signed edge" (R.storage_index ~leaf_count:3L least = Some 2L);
+  List.iter (fun (prefix, leaf_count, expected) ->
+    check "index vector" (R.storage_index ~leaf_count prefix = Some expected))
+    [least, 1L, 0L; least, 2L, 0L; least, 5L, 3L;
+     least, largest, 1L; least, Int64.pred largest, 2L;
+     largest, 3L, 1L; -5L, 3L, 2L; 5L, 3L, 2L; 0L, largest, 0L];
+  let challenge = String.make 32 '\001' in
+  List.iter (fun leaf_count ->
+    List.iter (fun prefix ->
+      check "index invalid count" (R.storage_index ~leaf_count prefix = None))
+      [least; 0L; largest];
+    check "challenge invalid count"
+      (R.storage_challenge_index ~challenge ~leaf_count (claim challenge) = None))
+    [0L; -1L; least]
+
+let check_index_parity () =
+  let bits = List.init 63 Fun.id in
+  let prefixes = [0L; Int64.max_int; Int64.succ Int64.min_int]
+    @ List.concat_map (fun bit ->
+      let positive = Int64.shift_left 1L bit in
+      let negative = Int64.neg positive in
+      [Int64.pred positive; positive; Int64.succ positive;
+       Int64.pred negative; negative; Int64.succ negative]) bits in
+  let counts = List.init 64 (fun index -> Int64.of_int (index + 1))
+    @ List.map (Int64.shift_left 1L) bits
+    @ [Int64.pred Int64.max_int; Int64.max_int] in
+  List.iter (fun prefix ->
+    check "index parity domain" (prefix <> Int64.min_int);
+    List.iter (fun leaf_count ->
+      check "index positive count" (leaf_count > 0L);
+      let index = Option.get (R.storage_index ~leaf_count prefix) in
+      check "index range" (index >= 0L && index < leaf_count);
+      check "index old parity" (index = Int64.rem (Int64.abs prefix) leaf_count)) counts)
+    prefixes
+
 let check_leaf_swap () =
   let left = "left" and right = "right" in
   let root = R.storage_parent_hash (R.storage_leaf_hash left) (R.storage_leaf_hash right) in
@@ -85,6 +124,8 @@ let check_shape () =
     (R.storage_challenge_index ~challenge:"short" ~leaf_count:1L (claim hash) = None)
 
 let () =
+  check_index_edges ();
+  check_index_parity ();
   check_leaf_swap ();
   check_shape ();
   Printf.printf "status = pass test = resource_path\n"

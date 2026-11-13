@@ -204,6 +204,12 @@ let runtime_shared ?preverify ?save_receipt_raw (runtime : runtime) =
       let* result =
         worker_retry (fun () ->
           Octra_core.Tx_savepoint.run
+            ~checkpoint:(fun () ->
+              if Lazy.is_val private_transition
+                 || (Transaction.bft_crypto_active ()
+                     && Transaction.bft_crypto_op tx.Transaction.op_type)
+              then Octra_core.Private_transition.checkpoint (Lazy.force private_transition)
+              else Fun.id)
             ~ledger:(Lazy.force backend).Epoch_exec.ledger
             ~store:(Lazy.force backend).Epoch_exec.store
             (fun () ->
@@ -288,7 +294,7 @@ let run_runtime ?preverify ?save_receipt_raw (runtime : runtime) txs =
   in
   runtime.advance_validator_set ()
 
-let run_node ?compute ?preverify ?parent_commit (runtime : node_runtime) ordered_txs =
+let run_node ?compute ?preverify ?parent_commit ?voting_set (runtime : node_runtime) ordered_txs =
   let open Lwt.Syntax in
   let tx_sink =
     Sender.live_tx_sink
@@ -426,6 +432,9 @@ let run_node ?compute ?preverify ?parent_commit (runtime : node_runtime) ordered
       | Ok ctx -> ctx.Octra_core.Epoch_exec.standard_mode, ctx.math
       | Error error -> failwith error
     in
+    let backend = Epoch_exec.make_live_backend ?compute ?voting_set ~proof_mode ~math ~fold
+      runtime.store runtime.ledger in
+    let* () = Epoch_exec.prepare_validator_penalties ~backend ~env in
     let* () =
       run_runtime
         ?preverify
@@ -441,14 +450,7 @@ let run_node ?compute ?preverify ?parent_commit (runtime : node_runtime) ordered
         short = runtime.short;
         fatal = runtime.fatal;
         exit = runtime.exit;
-        backend = (fun () ->
-          Epoch_exec.make_live_backend
-            ?compute
-            ~proof_mode
-            ~math
-            ~fold
-            runtime.store
-            runtime.ledger);
+        backend = (fun () -> backend);
         env = (fun () -> env);
         max_fhe_per_epoch = runtime.max_fhe_per_epoch;
         max_stealth_per_epoch = runtime.max_stealth_per_epoch;
@@ -474,6 +476,7 @@ let run_node ?compute ?preverify ?parent_commit (runtime : node_runtime) ordered
         advance_validator_set = (fun () ->
           let backend =
             Epoch_exec.make_live_backend
+              ?voting_set
               ~proof_mode
               ~math
               ~fold

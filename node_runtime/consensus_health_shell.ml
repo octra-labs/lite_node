@@ -7,8 +7,6 @@ module H = Consensus_health_probe
 module Log = Octra_log
 
 type config = {
-  active_f : int;
-  validator_count : int;
   state_attest_configured : int;
   snapshot_policy_threshold : int;
   soft_catchup_max_lag : int;
@@ -20,6 +18,9 @@ type config = {
 type deps = {
   normalize_next_epoch_for_head : source:string -> unit;
   committed_head_epoch : unit -> int;
+  head_time : int -> float option;
+  now : unit -> float;
+  root_weights : epoch_id:int64 -> C_driver.root_weights option;
   current_epoch : unit -> int;
   catchup_next_target : unit -> int64 option;
   attested_head : int -> bool;
@@ -51,6 +52,7 @@ type deps = {
   quarantine_reason : unit -> string;
   ahead_streak : unit -> int;
   incr_ahead_streak : unit -> unit;
+  reset_ahead_streak : unit -> unit;
 }
 
 type fork_repair_deps = {
@@ -128,46 +130,45 @@ let prove_target_root deps ~source_head ~target_epoch ~required =
   if Int64.compare target_epoch (Int64.of_int source_head) >= 0 then
     Lwt.return_none
   else
+    let weights = deps.root_weights ~epoch_id:target_epoch in
     let* responses =
       deps.query_epoch_root ~epoch_id:target_epoch ~timeout_seconds:5.0
     in
-    match H.peer_root_with_quorum ~required responses with
-    | Some majority
-      when deps.root_consensus_quorum
-             ~epoch_id:target_epoch
-             ~root:majority.H.root
-             responses ->
-      Lwt.return_some majority
-    | Some majority ->
-      Log.warn "catchup"
-        "event = fork_target_root_unproved target = %Ld count = %d required = %d"
-        target_epoch majority.H.count required;
-      Lwt.return_none
-    | None ->
+    match weights, deps.root_weights ~epoch_id:target_epoch with
+    | Some weights, Some current when weights.epoch_id = target_epoch
+        && current.epoch_id = target_epoch && weights.stamp = current.stamp ->
+      H.peer_roots ~weights responses
+      |> List.find_opt (fun root -> deps.root_consensus_quorum
+        ~epoch_id:target_epoch ~root:root.H.root responses)
+      |> Lwt.return
+    | _ ->
       Log.warn "catchup"
         "event = fork_target_root_missing target = %Ld required = %d"
         target_epoch required;
       Lwt.return_none
 
-let peer_target_epoch (deps : deps) ~active_f ~our_head responses =
-  let peer_heads =
-    List.map
-      (fun (r : C_driver.epoch_root_response_record) ->
-        {
-          C_catchup.responder_addr = r.responder_addr;
-          responder_head_epoch = r.responder_head_epoch;
-        })
-      responses
-  in
-  let peer_target =
-    C_catchup.pick_target_epoch
-      ~responses:peer_heads
-      ~f:active_f
-      ~fallback:our_head
-  in
-  match deps.catchup_next_target () with
-  | Some queued when Int64.compare queued peer_target > 0 -> queued
-  | _ -> peer_target
+let peer_target_epoch (deps : deps) ~weights ~our_head responses =
+  if our_head = -1L then
+    match H.peer_target ~weights ~ceiling:Int64.max_int responses with
+    | Some (-1L) -> H.peer_target ~weights ~ceiling:(-1L) responses
+    | Some _ | None -> None
+  else match H.target_ceiling ~head:our_head
+    ~head_time:(deps.head_time (Int64.to_int our_head)) ~now:(deps.now ())
+    ~allowance:2 with
+  | Some ceiling ->
+    begin match H.peer_ahead ~weights ~head:our_head ~ceiling responses with
+    | Some _ as ahead -> ahead
+    | None -> match H.peer_target ~weights ~ceiling responses with
+      | Some target when target >= our_head -> Some target
+      | Some _ | None -> None
+    end
+  | None -> None
+
+let weights_current deps epoch (weights : C_driver.root_weights) =
+  match deps.root_weights ~epoch_id:epoch with
+  | Some current -> weights.epoch_id = epoch && current.epoch_id = epoch
+      && current.stamp = weights.stamp
+  | None -> false
 
 let clear_unattested_current_head (deps : deps) head =
   if not (deps.attested_head head) then deps.clear_state_attested ()
@@ -178,14 +179,19 @@ let quarantine_peer_root_mismatch (deps : deps) ~head count =
 
 let accept_current_root
     (deps : deps)
+    ?(ready = deps.wake_ready)
+    ~weights
     ~head
     ~root
     ~matching
-    ~consensus_proved
+    ~source_proved
     reason =
   let open Lwt.Syntax in
-  if deps.catchup_active () || deps.committed_head_epoch () <> head then
+  if deps.catchup_active () || deps.committed_head_epoch () <> head
+      || not (weights_current deps (Int64.of_int head) weights) then begin
+    deps.reset_ahead_streak ();
     Lwt.return_unit
+  end
   else
   let quarantine_active = deps.quarantine_active () in
   let quarantine_reason = deps.quarantine_reason () in
@@ -196,34 +202,43 @@ let accept_current_root
       Consensus_runtime_state.root_recovery_evidence
         ~reason:quarantine_reason
         ~evidence:reason
-        ~consensus_proved
+        ~source_proved
   in
   match clear_evidence with
   | None ->
     deps.clear_state_attested ();
     Log.warn "catchup"
-      "event = quarantine_preserved reason = %s evidence = %s head = %d matching = %d consensus_proved = %b"
-      quarantine_reason reason head matching consensus_proved;
+      "event = quarantine_preserved reason = %s evidence = %s head = %d matching = %d source_proved = %b"
+      quarantine_reason reason head matching source_proved;
     Lwt.return_unit
   | Some clear_evidence ->
     deps.set_state_attested ~head ~root;
     deps.clear_quarantine clear_evidence;
     let* () = deps.drain_pending_finalized () in
-    if deps.catchup_active () || deps.committed_head_epoch () <> head then
+    if deps.catchup_active () || deps.committed_head_epoch () <> head
+        || not (weights_current deps (Int64.of_int head) weights) then begin
+      deps.reset_ahead_streak ();
       Lwt.return_unit
+    end
     else
-      deps.wake_ready ()
+      ready ()
 
-let wake_if_ready (deps : deps) wake_ready =
+let wake_if_ready (deps : deps) ~weights ~head wake_ready =
   let open Lwt.Syntax in
   if wake_ready && not (deps.catchup_active ()) then
     let* () = deps.drain_pending_finalized () in
-    if deps.catchup_active () then Lwt.return_unit else deps.wake_ready ()
+    if deps.catchup_active () || deps.committed_head_epoch () <> head
+        || not (weights_current deps (Int64.of_int head) weights) then begin
+      deps.reset_ahead_streak ();
+      Lwt.return_unit
+    end
+    else deps.wake_ready ()
   else
     Lwt.return_unit
 
 let range_recovery_reason reason =
-  String.starts_with ~prefix:"catchup_failed:" reason
+  Consensus_runtime_state.root_range_recovers reason
+  || String.starts_with ~prefix:"catchup_failed:" reason
   || String.starts_with ~prefix:"catchup_apply_failed:" reason
   || String.starts_with ~prefix:"lag_" reason
   || String.starts_with ~prefix:"bundle_wait_timeout_epoch_" reason
@@ -233,17 +248,15 @@ let range_recovery_reason reason =
 let run ?(stale_retries = 1) ?repair
     ?(http_target = fun () -> Lwt.return_none) cfg deps =
   let open Lwt.Syntax in
-  let state_attest_required =
-    H.required_attesters
-      ~active_f:cfg.active_f
-      ~validator_count:cfg.validator_count
-      ~configured:cfg.state_attest_configured
-  in
+  let stop () =
+    deps.reset_ahead_streak ();
+    Lwt.return_unit in
   let rec attempt stale_retries =
-    if deps.catchup_active () then Lwt.return_unit else
+    if deps.catchup_active () then stop () else
     let () = deps.normalize_next_epoch_for_head ~source:"probe_consensus_health" in
     let our_head_int = deps.committed_head_epoch () in
     let our_head = Int64.of_int our_head_int in
+    let weights = deps.root_weights ~epoch_id:our_head in
     let already_attested = deps.attested_head our_head_int in
     let query_log = if already_attested then Log.trace else Log.info in
     query_log "catchup" "event = query_peers head = %d" our_head_int;
@@ -251,17 +264,44 @@ let run ?(stale_retries = 1) ?repair
       deps.query_epoch_root ~epoch_id:our_head ~timeout_seconds:5.0
     in
     let head_after_query = deps.committed_head_epoch () in
-    if deps.catchup_active () then Lwt.return_unit
+    if deps.catchup_active () then stop ()
     else if head_after_query <> our_head_int then begin
+      deps.reset_ahead_streak ();
       Log.trace "catchup"
         "event = moving_head phase = query start_head = %d head_after_query = %d retries_left = %d"
         our_head_int head_after_query stale_retries;
       match H.moving_head_plan ~stale_retries with
       | H.Retry_probe next_retries -> attempt next_retries
       | H.Stop_probe -> Lwt.return_unit
-    end else
+    end else match weights with
+    | None ->
+      deps.reset_ahead_streak ();
+      Log.warn "catchup" "event = root_weights_unavailable head = %d" our_head_int;
+      let* live_root = deps.read_local_root_raw () in
+      if not (deps.catchup_active ()) && deps.committed_head_epoch () = our_head_int
+          && deps.current_epoch () = our_head_int + 1 then begin
+        match deps.committed_epoch_root_raw our_head_int with
+        | Some committed when committed <> live_root ->
+          deps.mark_quarantine
+            (Printf.sprintf "local_state_root_mismatch_at_head_%d" our_head_int);
+          deps.clear_state_attested ()
+        | _ -> ()
+      end;
+      Lwt.return_unit
+    | Some weights when not (weights_current deps our_head weights) ->
+      stop ()
+    | Some weights ->
+      let state_attest_required =
+        weights.required ~configured:cfg.state_attest_configured in
+      let responses = C_driver.epoch_root_records ~epoch_id:our_head responses in
+      let proved_target = peer_target_epoch deps ~weights ~our_head responses in
       let n_resp = List.length responses in
-      if n_resp < state_attest_required then begin
+      let root_agreement = H.peer_roots ~weights responses
+        |> List.exists (fun root ->
+          weights.agrees ~count:root.H.count ~weight:root.weight) in
+      if n_resp < state_attest_required && proved_target = None
+          && not root_agreement then begin
+        deps.reset_ahead_streak ();
         let has_head = deps.attested_head our_head_int in
         let log = if has_head then Log.trace else Log.warn in
         log "catchup"
@@ -276,13 +316,10 @@ let run ?(stale_retries = 1) ?repair
         in
         if range_allowed then begin
           let* http = http_target () in
-          let target = match http, deps.catchup_next_target () with
-            | Some left, Some right ->
-              Some (if Int64.compare left right >= 0 then left else right)
-            | Some value, None | None, Some value -> Some value
-            | None, None -> None in
+          let target = http in
           let current_head = deps.committed_head_epoch () in
-          if deps.catchup_active () || current_head <> our_head_int then
+          if deps.catchup_active () || current_head <> our_head_int
+              || not (weights_current deps our_head weights) then
             Lwt.return_unit
           else
             match target with
@@ -298,14 +335,13 @@ let run ?(stale_retries = 1) ?repair
         end else
           Lwt.return_unit
       end else
-        let target_epoch =
-          peer_target_epoch deps ~active_f:cfg.active_f ~our_head responses
-        in
+        let target_epoch = Option.value ~default:our_head proved_target in
         let live_epoch_before_root = deps.current_epoch () - 1 in
         match C_catchup.classify_probe_sample
                 ~start_head:our_head_int
                 ~live_head:live_epoch_before_root with
         | C_catchup.Stale _ ->
+          deps.reset_ahead_streak ();
           Log.trace "catchup"
             "event = stale_sample phase = query start_head = %d live_head = %d responses = %d retries_left = %d"
             our_head_int live_epoch_before_root n_resp stale_retries;
@@ -319,8 +355,10 @@ let run ?(stale_retries = 1) ?repair
         | C_catchup.Fresh ->
           let* live_root = deps.read_local_root_raw () in
           let head_after_root = deps.committed_head_epoch () in
-          if deps.catchup_active () then Lwt.return_unit
+          if deps.catchup_active () || not (weights_current deps our_head weights)
+          then stop ()
           else if head_after_root <> our_head_int then begin
+            deps.reset_ahead_streak ();
             Log.trace "catchup"
               "event = moving_head phase = root_read start_head = %d head_after_root = %d retries_left = %d"
               our_head_int head_after_root stale_retries;
@@ -333,6 +371,7 @@ let run ?(stale_retries = 1) ?repair
                     ~start_head:our_head_int
                     ~live_head:live_epoch_after_root with
             | C_catchup.Stale _ ->
+              deps.reset_ahead_streak ();
               Log.trace "catchup"
                 "event = stale_sample phase = root_read start_head = %d live_head = %d responses = %d retries_left = %d"
                 our_head_int live_epoch_after_root n_resp stale_retries;
@@ -348,6 +387,7 @@ let run ?(stale_retries = 1) ?repair
               let peer_snapshot = deps.peer_snapshot () in
               match committed_root_opt with
               | Some committed_root when committed_root <> live_root ->
+                deps.reset_ahead_streak ();
                 Log.error "catchup"
                   "event = local_root_mismatch head = %d live = %s committed = %s peers = %s"
                   our_head_int (short_hex8 live_root) (short_hex8 committed_root)
@@ -359,6 +399,7 @@ let run ?(stale_retries = 1) ?repair
               | _ ->
                 let peer_root_quorum =
                   H.peer_root_quorum
+                    ~weights
                     ~required:state_attest_required
                     ~local_root:live_root
                     responses
@@ -366,21 +407,25 @@ let run ?(stale_retries = 1) ?repair
                 let peer_root_quorum_count =
                   H.root_quorum_count peer_root_quorum
                 in
-                let root_consensus_proved =
-                  deps.root_consensus_quorum
+                let root_source_proved =
+                  H.own_root_proved ~weights ~local_root:live_root responses
+                  || deps.root_consensus_quorum
                     ~epoch_id:our_head
                     ~root:live_root
                     responses
                 in
-                let genesis_attested =
+                let genesis_attested = proved_target = Some (-1L) &&
                   C_catchup.genesis_state_attested
                     ~head:our_head_int
                     ~target:target_epoch
                     ~has_committed_root:(committed_root_opt <> None)
                     ~responses:n_resp
                     ~required:state_attest_required
+                  && not (H.peer_roots ~weights responses |> List.exists (fun root ->
+                    root.H.root <> live_root
+                    && weights.agrees ~count:root.count ~weight:root.weight))
                 in
-                let majority_peer_root = H.peer_root_majority responses in
+                let majority_peer_root = H.peer_root_majority ~weights responses in
                 let attestation_log =
                   if already_attested then Log.trace else Log.info
                 in
@@ -393,8 +438,8 @@ let run ?(stale_retries = 1) ?repair
                   state_attest_required
                   target_epoch
                   (match majority_peer_root with
-                   | Some { H.root; count } ->
-                     Printf.sprintf "%s:%d" (short_hex8 root) count
+                   | Some { H.root; count; weight } ->
+                     Printf.sprintf "%s:%d:%s" (short_hex8 root) count (Z.to_string weight)
                    | None -> "-")
                   peer_snapshot;
                 match C_catchup.classify_lag
@@ -402,6 +447,7 @@ let run ?(stale_retries = 1) ?repair
                         ~our_head
                         ~max_lag:cfg.snapshot_policy_threshold with
                 | C_catchup.In_sync ->
+                  deps.reset_ahead_streak ();
                   begin
                     match H.in_sync_plan
                             ~required:state_attest_required
@@ -412,9 +458,9 @@ let run ?(stale_retries = 1) ?repair
                       quarantine_peer_root_mismatch deps ~head:our_head_int count;
                       Lwt.return_unit
                     | H.Accept_genesis ->
-                      accept_current_root deps ~head:our_head_int ~root:live_root
+                      accept_current_root deps ~weights ~head:our_head_int ~root:live_root
                         ~matching:peer_root_quorum_count
-                        ~consensus_proved:root_consensus_proved
+                        ~source_proved:root_source_proved
                         "genesis_in_sync"
                     | H.Missing_peer_root_quorum count ->
                       Log.warn "catchup"
@@ -423,14 +469,47 @@ let run ?(stale_retries = 1) ?repair
                       clear_unattested_current_head deps our_head_int;
                       Lwt.return_unit
                     | H.Accept_current_root ->
-                      accept_current_root deps ~head:our_head_int ~root:live_root
+                      accept_current_root deps ~weights ~head:our_head_int ~root:live_root
                         ~matching:peer_root_quorum_count
-                        ~consensus_proved:root_consensus_proved
+                        ~source_proved:root_source_proved
                         "in_sync"
                   end
                 | C_catchup.Ahead_of_target n ->
-                  deps.incr_ahead_streak ();
-                  if not (H.root_quorum_has_quorum peer_root_quorum) then begin
+                  if H.within_ahead_grace ~head:our_head_int ~ahead_by:n
+                      ~grace_epochs:cfg.quarantine_ahead_grace_epochs
+                      ~drift_tolerance:cfg.quarantine_ahead_drift_tolerance then
+                    deps.reset_ahead_streak ()
+                  else deps.incr_ahead_streak ();
+                  if (match peer_root_quorum with
+                    | H.Mismatching_quorum _ -> true | _ -> false) then begin
+                    deps.reset_ahead_streak ();
+                    quarantine_peer_root_mismatch deps ~head:our_head_int
+                      peer_root_quorum_count;
+                    Lwt.return_unit
+                  end else if not (H.root_quorum_has_quorum peer_root_quorum) then begin
+                    let ahead_plan () = H.ahead_quorum_plan
+                        ~head:our_head_int
+                        ~ahead_by:n
+                        ~streak:(deps.ahead_streak ())
+                        ~grace_epochs:cfg.quarantine_ahead_grace_epochs
+                        ~drift_tolerance:cfg.quarantine_ahead_drift_tolerance
+                        ~streak_threshold:cfg.quarantine_ahead_streak_threshold
+                        ~quarantine_active:(deps.quarantine_active ()) in
+                    let finish_ahead ~wake () =
+                      if deps.catchup_active ()
+                          || deps.committed_head_epoch () <> our_head_int
+                          || deps.current_epoch () <> our_head_int + 1
+                          || not (weights_current deps our_head weights) then stop ()
+                      else match ahead_plan () with
+                      | H.Quarantine_ahead ->
+                        deps.mark_quarantine
+                          (Printf.sprintf "ahead_of_target_by_%d_streak_%d"
+                             n (deps.ahead_streak ()));
+                        Lwt.return_unit
+                      | H.Stay_active { wake_ready }
+                      | H.Delay_quarantine { wake_ready } ->
+                        if wake && wake_ready then deps.wake_ready () else Lwt.return_unit
+                    in
                     Log.warn "catchup"
                       "event = ahead_no_quorum ahead = %d count = %d required = %d"
                       n peer_root_quorum_count state_attest_required;
@@ -445,10 +524,7 @@ let run ?(stale_retries = 1) ?repair
                         "event = ahead_wait_current_head ahead = %d head = %d current_quorum = false grace = %d tolerance = %d"
                         n our_head_int cfg.quarantine_ahead_grace_epochs
                         cfg.quarantine_ahead_drift_tolerance;
-                      accept_current_root deps ~head:our_head_int ~root:live_root
-                        ~matching:peer_root_quorum_count
-                        ~consensus_proved:root_consensus_proved
-                        "ahead_wait_current_head"
+                      Lwt.return_unit
                     | H.Probe_current_head ->
                       let* head_responses =
                         deps.query_epoch_root
@@ -456,28 +532,47 @@ let run ?(stale_retries = 1) ?repair
                           ~timeout_seconds:2.0
                       in
                       if deps.catchup_active ()
-                        || deps.committed_head_epoch () <> our_head_int then
-                        Lwt.return_unit
+                        || deps.committed_head_epoch () <> our_head_int
+                        || deps.current_epoch () <> our_head_int + 1
+                        || not (weights_current deps our_head weights) then
+                        stop ()
+                      else
+                      let* checked_root = deps.read_local_root_raw () in
+                      if checked_root <> live_root || deps.catchup_active ()
+                          || deps.committed_head_epoch () <> our_head_int
+                          || deps.current_epoch () <> our_head_int + 1
+                          || not (weights_current deps our_head weights) then
+                        stop ()
                       else
                       let head_root_quorum =
                         H.peer_root_quorum
+                          ~weights
                           ~required:state_attest_required
                           ~local_root:live_root
                           head_responses
                       in
-                      let head_root_consensus_proved =
-                        deps.root_consensus_quorum
+                      let head_root_source_proved =
+                        H.own_root_proved ~weights ~local_root:live_root head_responses
+                        || deps.root_consensus_quorum
                           ~epoch_id:our_head
                           ~root:live_root
                           head_responses
                       in
                       match H.ahead_current_root_plan head_root_quorum with
                       | H.Current_root_matches ->
-                        accept_current_root deps ~head:our_head_int ~root:live_root
-                          ~matching:(H.root_quorum_count head_root_quorum)
-                          ~consensus_proved:head_root_consensus_proved
-                          "ahead_current_root_quorum"
-                      | H.Current_root_mismatch { root; count } ->
+                        begin match ahead_plan () with
+                        | H.Quarantine_ahead
+                        | H.Delay_quarantine { wake_ready = false } ->
+                          finish_ahead ~wake:false ()
+                        | H.Stay_active _ | H.Delay_quarantine _ ->
+                          accept_current_root deps ~weights ~head:our_head_int ~root:live_root
+                            ~ready:(finish_ahead ~wake:true)
+                            ~matching:(H.root_quorum_count head_root_quorum)
+                            ~source_proved:head_root_source_proved
+                            "ahead_current_root_quorum"
+                        end
+                      | H.Current_root_mismatch { root; count; _ } ->
+                        deps.reset_ahead_streak ();
                         quarantine_peer_root_mismatch deps ~head:our_head_int count;
                         Log.error "catchup"
                           "event = fresh_root_mismatch head = %d live = %s peer = %s count = %d"
@@ -485,14 +580,15 @@ let run ?(stale_retries = 1) ?repair
                         Lwt.return_unit
                       | H.Wait_current_root_quorum ->
                         begin
-                          match repair with
-                          | None ->
+                          match repair, ahead_plan () with
+                          | None, _
+                          | Some _, (H.Stay_active _ | H.Delay_quarantine _) ->
                             Log.warn "catchup"
                               "event = ahead_wait_current_root_quorum head = %d target = %Ld"
                               our_head_int
                               target_epoch;
-                            Lwt.return_unit
-                          | Some repair ->
+                            finish_ahead ~wake:false ()
+                          | Some repair, H.Quarantine_ahead ->
                             let* target_root =
                               prove_target_root
                                 deps
@@ -504,7 +600,9 @@ let run ?(stale_retries = 1) ?repair
                               match target_root with
                               | Some majority
                                 when deps.committed_head_epoch () = our_head_int
-                                  && not (deps.catchup_active ()) ->
+                                  && deps.current_epoch () = our_head_int + 1
+                                  && not (deps.catchup_active ())
+                                  && weights_current deps our_head weights ->
                                 let* repaired =
                                   repair
                                     ~target_epoch
@@ -512,31 +610,38 @@ let run ?(stale_retries = 1) ?repair
                                     ~required:state_attest_required
                                     ~current_root_quorum:false
                                 in
-                                if repaired then Lwt.return_unit
+                                if repaired || deps.catchup_active ()
+                                    || deps.committed_head_epoch () <> our_head_int
+                                    || deps.current_epoch () <> our_head_int + 1
+                                    || not (weights_current deps our_head weights) then stop ()
                                 else begin
                                   Log.warn "catchup"
                                     "event = ahead_wait_current_root_quorum head = %d target = %Ld"
                                     our_head_int
                                     target_epoch;
-                                  Lwt.return_unit
+                                  finish_ahead ~wake:false ()
                                 end
                               | Some _ when deps.catchup_active () ->
                                 Log.info "catchup"
                                   "event = fork_repair_skipped reason = catchup_active head = %d"
                                   our_head_int;
-                                Lwt.return_unit
+                                stop ()
                               | Some _ ->
                                 Log.trace "catchup"
                                   "event = moving_head phase = fork_proof start_head = %d head_after_query = %d"
                                   our_head_int
                                   (deps.committed_head_epoch ());
-                                Lwt.return_unit
+                                stop ()
+                              | None when deps.catchup_active ()
+                                  || deps.committed_head_epoch () <> our_head_int
+                                  || deps.current_epoch () <> our_head_int + 1
+                                  || not (weights_current deps our_head weights) -> stop ()
                               | None ->
                                 Log.warn "catchup"
                                   "event = ahead_wait_current_root_quorum head = %d target = %Ld"
                                   our_head_int
                                   target_epoch;
-                                Lwt.return_unit
+                                finish_ahead ~wake:false ()
                             end
                         end
                   end else begin
@@ -555,13 +660,13 @@ let run ?(stale_retries = 1) ?repair
                         n our_head_int cfg.quarantine_ahead_grace_epochs
                         cfg.quarantine_ahead_drift_tolerance
                         (deps.ahead_streak ());
-                      wake_if_ready deps wake_ready
+                      wake_if_ready deps ~weights ~head:our_head_int wake_ready
                     | H.Delay_quarantine { wake_ready } ->
                       Log.warn "catchup"
                         "event = ahead_delay_quarantine ahead = %d head = %d streak = %d threshold = %d"
                         n our_head_int (deps.ahead_streak ())
                         cfg.quarantine_ahead_streak_threshold;
-                      wake_if_ready deps wake_ready
+                      wake_if_ready deps ~weights ~head:our_head_int wake_ready
                     | H.Quarantine_ahead ->
                       deps.mark_quarantine
                         (Printf.sprintf "ahead_of_target_by_%d_streak_%d"
@@ -569,6 +674,25 @@ let run ?(stale_retries = 1) ?repair
                       Lwt.return_unit
                   end
                 | C_catchup.Snapshot_required lag ->
+                  deps.reset_ahead_streak ();
+                  let* confirmed = deps.query_epoch_root
+                    ~epoch_id:our_head ~timeout_seconds:5.0 in
+                  let* confirmed_root = deps.read_local_root_raw () in
+                  let confirmed_target =
+                    peer_target_epoch deps ~weights ~our_head confirmed in
+                  if deps.catchup_active ()
+                      || deps.committed_head_epoch () <> our_head_int
+                      || deps.current_epoch () <> our_head_int + 1
+                      || confirmed_root <> live_root
+                      || not (weights_current deps our_head weights)
+                      || not (Option.fold ~none:false
+                        ~some:(fun head -> head >= target_epoch) confirmed_target)
+                  then begin
+                    Log.warn "catchup"
+                      "event = sync_target_unconfirmed head = %d target = %Ld"
+                      our_head_int target_epoch;
+                    Lwt.return_unit
+                  end else begin
                   Log.warn "catchup"
                     "event = signed_snapshot_required head = %d target = %Ld lag = %d"
                     our_head_int
@@ -582,16 +706,20 @@ let run ?(stale_retries = 1) ?repair
                     deps.require_sync need;
                     Lwt.return_unit
                   end
+                  end
                 | C_catchup.Do_catchup lag ->
+                  deps.reset_ahead_streak ();
                   begin
                     match H.catchup_lag_plan
                             ~lag
                             ~soft_lag:cfg.soft_catchup_max_lag with
                     | H.Lagging_soft lag ->
                       let* () = deps.drain_pending_finalized () in
-                      if deps.catchup_active () then Lwt.return_unit else
+                      if deps.catchup_active () || not (weights_current deps our_head weights)
+                      then Lwt.return_unit else
                       let refreshed_head = deps.committed_head_epoch () in
-                      if refreshed_head > our_head_int then begin
+                      if refreshed_head <> our_head_int
+                          || deps.current_epoch () <> our_head_int + 1 then begin
                         Log.info "catchup"
                           "event = soft_catchup_local_finalize head_before = %d head_after = %d target = %Ld"
                           our_head_int refreshed_head target_epoch;
@@ -602,9 +730,9 @@ let run ?(stale_retries = 1) ?repair
                           Log.info "catchup"
                             "event = soft_lag_current_root lag = %d target = %Ld head = %Ld"
                             lag target_epoch our_head;
-                          accept_current_root deps ~head:our_head_int ~root:live_root
+                          accept_current_root deps ~weights ~head:our_head_int ~root:live_root
                             ~matching:peer_root_quorum_count
-                            ~consensus_proved:root_consensus_proved
+                            ~source_proved:root_source_proved
                             "soft_lag_current_root"
                         | _ ->
                           Log.info "catchup"
@@ -622,4 +750,6 @@ let run ?(stale_retries = 1) ?repair
                     | _ -> Lwt.return_unit
                   end
   in
-  attempt stale_retries
+  Lwt.catch
+    (fun () -> attempt stale_retries)
+    (fun exn -> deps.reset_ahead_streak (); Lwt.fail exn)

@@ -17,7 +17,7 @@ let round_limit = 8
 let window_ns = 60_000_000_000L
 let window_limit = 1024
 
-let step ?(validators = 31) prior ~height ~round ~known ~enabled ~now =
+let step ?(validators = 31) ?(paced = false) prior ~height ~round ~known ~enabled ~now =
   let prior = match prior with
     | Some prior when prior.height = height -> Some prior
     | _ -> None in
@@ -30,7 +30,8 @@ let step ?(validators = 31) prior ~height ~round ~known ~enabled ~now =
         | Some prior when prior.target + 1 < round -> prior.target + 1
         | _ -> 0 in
     let attempts, requests = match prior with
-      | Some prior when prior.round = round ->
+      | Some prior when prior.round = round
+          && not (paced && now >= prior.sent_at && Int64.sub now prior.sent_at >= window_ns) ->
         (if prior.target = target then prior.attempts else 0), prior.requests
       | _ -> 0, 0 in
     let delay = Int64.mul interval (Int64.of_int (1 lsl max 0 (attempts - 1))) in
@@ -42,8 +43,8 @@ let step ?(validators = 31) prior ~height ~round ~known ~enabled ~now =
     let ready = match prior with
       | Some prior -> now >= prior.sent_at && Int64.sub now prior.sent_at >= delay
       | None -> true in
-    if not ready || attempts >= target_limit || requests >= round_limit
+    if not ready || attempts >= target_limit || (not paced && requests >= round_limit)
       || used + cost > window_limit then prior, None
     else Some {height; target; sent_at = now; round;
-      attempts = attempts + 1; requests = requests + 1;
+      attempts = attempts + 1; requests = min round_limit (requests + 1);
       recent = (now, cost) :: recent}, Some target

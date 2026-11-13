@@ -79,6 +79,13 @@ let run deps =
     chain_id;
   } = network_config in
   let refs = deps.refs in
+  let eviction_source epoch_id =
+    let ( let* ) = Result.bind in
+    let* source = Consensus_parent_commit.create ~chain_id ~data_dir:deps.data_dir
+      ~chaindata:deps.chaindata deps.env in
+    match Octra_core.Head_manifest.get_cached () with
+    | None -> Error "validator source durable head is missing"
+    | Some head -> Consensus_parent_commit.set_at_head source ~epoch_id head in
   let validator_anchor = Consensus_validator_anchor.{
     getenv = deps.env;
     chain_id;
@@ -105,6 +112,7 @@ let run deps =
           Result.map
             Octra_consensus.C_config.validator_set_hash
             (Consensus_validator_anchor.expected_set
+               ~eviction_source
                validator_anchor
                ~epoch));
         fetch_json = Consensus_join_rpc.http_get_json;

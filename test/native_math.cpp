@@ -488,7 +488,8 @@ void proof_peak_cases(const std::string& mode, const std::string& path) {
     using namespace pvac::bp;
     peak_meter_cases();
     const bool writing = mode == "peak-write";
-    const bool reading = mode == "peak-read";
+    const bool reading = mode == "peak-read" || mode == "peak-ready";
+    if (mode == "peak-ready") ready_table().build(1024);
     std::vector<uint8_t> input;
     if (reading) {
         std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -1087,9 +1088,10 @@ int main(int argc, char** argv) {
             key_sample(argv[2]);
             return 0;
         }
-        if (mode == "peak-write" || mode == "peak-read") {
+        if (mode == "peak-write" || mode == "peak-read" || mode == "peak-ready") {
             check(argc == 3, "proof file missing");
             proof_peak_cases(mode, argv[2]);
+            if (mode == "peak-ready") check(pvac::bp::ready_table().sums() >= 10, "ready peak unused");
             return 0;
         }
         if (mode == "all") check(vector_digest() == "ef53594fe19cae770e67aea7ac2f7ead7b881e968843c40fd881f9441f440839", "prior vector");

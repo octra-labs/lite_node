@@ -332,11 +332,15 @@ let evidence_fresh ~current_epoch ~evidence_epochs record =
        (Int64.sub current_epoch record.evidence_epoch)
        evidence_epochs < 0
 
-let apply_slash ~current_epoch ~evidence_epochs
+let apply_slash ?(retain_rewards = false) ?(retain_offenders = []) ~current_epoch ~evidence_epochs
     (evidence : Validator_evidence.verified) (registry : t) =
   let retained =
     List.filter
-      (evidence_fresh ~current_epoch ~evidence_epochs)
+      (fun record -> evidence_fresh ~current_epoch ~evidence_epochs record
+        || List.mem record.offender retain_offenders
+        || (retain_rewards && current_epoch > 0L
+          && record.applied_epoch <= current_epoch
+          && record.applied_epoch >= Int64.pred current_epoch))
       registry.slashes
   in
   if List.exists (fun record -> String.equal record.id evidence.id) retained then

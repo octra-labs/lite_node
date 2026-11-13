@@ -11,7 +11,7 @@ if [ "$#" -gt 1 ] || { [ -n "$MODE" ] && [ "$MODE" != --flat ]; }; then
   exit 2
 fi
 cd "$ROOT"
-opam exec -- dune build --root . --build-dir "$BUILD_DIR" --profile release \
+opam exec -- python3 "$ROOT/controls/lib/gc_build.py" -- dune build --root . --build-dir "$BUILD_DIR" --profile release \
   bin/octra_state_sync_manifest.exe \
   test/test_sync_files.exe test/test_image_count.exe test/test_image.exe test/test_state_sync_client.exe \
   test/test_state_sync_manifest.exe test/test_state_sync_reliability.exe \

@@ -99,7 +99,7 @@ let test_worker_queue_is_not_held () =
         ~proof:"proof"
         ~commitment:"commitment");
     (fun () ->
-      Backend.verify_bound_worker ~keyed:false ~math:false
+      Backend.verify_claim_worker ~keyed:false ~math:false
         ~strict:false
         ~pubkey:"pubkey"
         ~cipher:"cipher"

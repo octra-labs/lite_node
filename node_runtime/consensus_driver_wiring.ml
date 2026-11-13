@@ -518,7 +518,7 @@ let preview_with_optional_catch ~catch_exn ~warn run =
     Lwt.catch
       run
       (function
-      | Octra_core.Exec_resource.Exhausted _ as exn -> Lwt.fail exn
+      | (Octra_core.Exec_resource.Exhausted _ | Octra_core.Exec_resource.Window_expired _) as exn -> Lwt.fail exn
       | exn ->
         let reason = Printexc.to_string exn in
         warn reason;

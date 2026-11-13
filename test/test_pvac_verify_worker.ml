@@ -197,15 +197,10 @@ let math_protocol () =
     check "math ping rejected" response.accepted)
     [P.Ping; P.Math P.Ping; P.Ping; P.Math P.Ping]
 
-let rss_status_parser () =
-  check "tab separated RSS rejected"
-    (W.rss_mb_of_status_line "VmRSS:\t65537 kB" = Some 65);
-  check "space separated RSS rejected"
-    (W.rss_mb_of_status_line "VmRSS: 1024 kB" = Some 1);
-  check "unrelated status accepted"
-    (W.rss_mb_of_status_line "VmSize:\t65537 kB" = None);
-  check "invalid RSS accepted"
-    (W.rss_mb_of_status_line "VmRSS:\tinvalid kB" = None)
+let process_memory () =
+  check "current process memory missing"
+    (match W.read_rss_mb (Unix.getpid ()) with Some value -> value > 0 | None -> false);
+  check "invalid process memory accepted" (W.read_rss_mb (-1) = None)
 
 let worker_capacity_disjoint () =
   let getenv values name = List.assoc_opt name values in
@@ -567,7 +562,7 @@ let () =
     run "timeout_config" timeout_config;
     run "protocol_roundtrip" protocol_roundtrip;
     run "math_protocol" math_protocol;
-    run "rss_status_parser" rss_status_parser;
+    run "process_memory" process_memory;
     run "worker_capacity_disjoint" worker_capacity_disjoint;
     run "health_succeeds" health_succeeds;
     run "proof_mode_required" proof_mode_required;

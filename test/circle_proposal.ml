@@ -18,6 +18,14 @@ let unwrap = function Ok value -> value | Error error -> failwith error
 let chain = "octra-devnet-9871-cluster"
 let config = String.make 64 'c'
 
+let seed_execution store epoch =
+  Lwt_main.run (S.set_meta store "last_epoch" (string_of_int epoch));
+  Lwt_main.run (S.set_meta store "current_epoch" (string_of_int (epoch + 1)));
+  Option.iter (fun profile ->
+    let marker = X.execution_marker_to_string X.{epoch; profile} |> unwrap in
+    Lwt_main.run (S.set_meta store X.execution_meta_key marker))
+    (Node.Consensus_profile.execution_profile ~chain_id:chain ~epoch Sys.getenv_opt)
+
 type identity = {
   address : string;
   secret : Mirage_crypto_ec.Ed25519.priv;
@@ -118,11 +126,18 @@ Program CircleRetry {
   Option.iter failwith compiled.error;
   install store owner ("oct" ^ String.make 44 '2') Core.Circles.Octb compiled.bytecode
 
-let host_code () =
-  let key, _ = Pvac_ffi.keygen_from_seed (Pvac_ffi.default_params ()) (Bytes.make 32 '\071') in
-  let request = Core.Circle_wasm_codec.encode_request ~method_name:"fhe_verify_zero"
-    [`String (Pvac_ffi.serialize_pubkey key |> Bytes.to_string |> Base64.encode_exn);
-     `String "ciphertext"; `String "proof"] |> unwrap in
+let host_inputs request =
+  List.init ((String.length request + 65_535) / 65_536) (fun index ->
+    let offset = index * 65_536 in
+    "input_" ^ string_of_int index,
+    String.sub request offset (min 65_536 (String.length request - offset)))
+
+let host_code ?request ?(checked = false) ?(stored = false) ?(following = []) () =
+  let request = match request with Some request -> request | None ->
+    let key, _ = Pvac_ffi.keygen_from_seed (Pvac_ffi.default_params ()) (Bytes.make 32 '\071') in
+    Core.Circle_wasm_codec.encode_request ~method_name:"fhe_verify_zero"
+      [`String (Pvac_ffi.serialize_pubkey key |> Bytes.to_string |> Base64.encode_exn);
+       `String "ciphertext"; `String "proof"] |> unwrap in
   let byte value = String.make 1 (Char.chr value) in
   let rec number limit value =
     if value < limit then byte value
@@ -134,22 +149,52 @@ let host_code () =
   let const value = "\065" ^ number 64 value in
   let export name kind index = string name ^ byte kind ^ size index in
   let body instructions = string ("\000" ^ instructions ^ "\011") in
-  let key_pos = String.length request in
-  let data = request ^ "counter1" in
+  let requests = request :: following in
+  if List.length requests > 8 then invalid_arg "host calls";
+  let request = String.concat "" requests in
+  let length = String.length request in
+  let key_pos = if stored then 0 else length in
+  let key = if checked then "paid" else "counter" in
+  let inputs = if stored then host_inputs request else [] in
+  let data = (if stored then "" else request) ^ key ^ "1"
+    ^ String.concat "" (List.map fst inputs) in
   let data_end = String.length data in
+  let request_pos = if stored then data_end + 32 else 0 in
+  let result_pos = if stored then request_pos + length + 32 else data_end + 32 in
+  let _, _, loads = List.fold_left (fun (key_offset, output_offset, loads) (name, value) ->
+    let count = String.length value in
+    let load = const key_offset ^ const (String.length name) ^ const output_offset ^ const count
+      ^ "\016\002" ^ const count ^ "\071\004\064\000\011" in
+    key_offset + String.length name, output_offset + count, load :: loads)
+    (String.length key + 1, request_pos, []) inputs in
+  let load = String.concat "" (List.rev loads) in
+  let put pointer length = const key_pos ^ const (String.length key)
+    ^ const pointer ^ const length ^ "\016\001\026" in
+  let invoke offset length = if checked then
+    const offset ^ const length ^ const result_pos ^ const 16 ^ "\016\000"
+    ^ const 10 ^ "\071\004\064\000\011"
+    ^ const (result_pos + 5) ^ "\045\000\000" ^ const 2 ^ "\071\004\064\000\011"
+    ^ put result_pos 10
+    else const offset ^ const length ^ "\016\000\026" in
+  let _, calls = List.fold_left (fun (offset, calls) request ->
+    let length = String.length request in
+    offset + length, invoke offset length :: calls) (request_pos, []) requests in
   String.concat "" [
     "\000asm\001\000\000\000";
     section 1 (vector ["\096\002\127\127\001\127"; "\096\001\127\001\127";
       "\096\004\127\127\127\127\001\127"]);
-    section 2 (vector [string "octra" ^ string "host_hfhe_invoke_len" ^ "\000\000";
-      string "octra" ^ string "host_kv_put" ^ "\000\002"]);
+    section 2 (vector ([string "octra"
+      ^ string (if checked then "host_hfhe_invoke" else "host_hfhe_invoke_len")
+      ^ "\000" ^ size (if checked then 2 else 0);
+      string "octra" ^ string "host_kv_put" ^ "\000\002"]
+      @ if stored then [string "octra" ^ string "host_kv_get" ^ "\000\002"] else []));
     section 3 (vector [size 1; size 0]);
-    section 5 (vector ["\000" ^ size ((data_end + 65_535 + 128) / 65_536)]);
-    section 7 (vector [export "memory" 2 0; export "octra_alloc" 0 2;
-      export "octra_update" 0 3]);
+    section 5 (vector ["\000" ^ size (((if stored then result_pos else data_end) + 65_535 + 128) / 65_536)]);
+    section 7 (vector [export "memory" 2 0; export "octra_alloc" 0 (if stored then 3 else 2);
+      export "octra_update" 0 (if stored then 4 else 3)]);
     section 10 (vector [body (const data_end);
-      body (const key_pos ^ const 7 ^ const (key_pos + 7) ^ const 1 ^ "\016\001\026"
-        ^ const 0 ^ const key_pos ^ "\016\000\026" ^ const 0)]);
+      body (put (key_pos + String.length key) 1 ^ load
+        ^ String.concat "" (List.rev calls) ^ const 0)]);
     section 11 (vector ["\000" ^ const 0 ^ "\011" ^ string data]);
   ]
 
@@ -157,6 +202,36 @@ let with_host_busy action =
   let lane = Core.Circle_wasm_hfhe_backend.verifier_lane in
   Mutex.lock lane;
   Fun.protect ~finally:(fun () -> Mutex.unlock lane) action
+
+let test_host_reason () =
+  let module Shell = Node.Consensus_proposal_preview_shell in
+  List.iter (fun (input, expected) ->
+    expect "host reason differs" (Shell.host_reason input = expected))
+    ["hfhe verifier busy", "hfhe_verifier_busy";
+     "proof worker queue is full", "proof_queue_full";
+     "proof worker timed out", "proof_timeout";
+     "proof worker memory limit exceeded", "proof_memory";
+     "proof worker unavailable: worker_missing", "proof_unavailable";
+     "proof worker failed: child_exit", "proof_failed";
+     "compute memory busy", "compute_memory";
+     "secret\nreason = injected", "native_other"];
+  let tx = signed (identity 1) ~op_type:T.CircleCall ~to_:(identity 8).address
+    ~nonce:1 ~message:"[]" ~method_:(Some "accept") in
+  let invoke action = Lwt_main.run (Shell.circle_work ~epoch:123 ~tx action) in
+  expect "host wrapper changed success" (invoke (fun () -> Lwt.return 7) = 7);
+  List.iter (fun error ->
+    expect "host wrapper changed resource" (try
+      ignore (invoke (fun () -> Lwt.fail error)); false
+    with caught -> caught = error))
+    [Core.Exec_resource.Unavailable Memory; Core.Exec_resource.Unavailable Stack;
+     Core.Exec_resource.Unavailable Time; Lwt.Canceled; Failure "test"];
+  List.iter (fun reason ->
+    expect "host refusal became transaction result" (try
+      ignore (invoke (fun () -> Lwt.fail
+        (Octra_circle_runtime.Circle_exec.Execution_unavailable reason)));
+      false
+    with Core.Exec_resource.Unavailable Host -> true))
+    ["hfhe verifier busy"; "secret\nreason = injected"]
 
 let root_raw root =
   let root = Core.Epoch_index_commitment.root_hex root in
@@ -198,7 +273,7 @@ let test_work () =
     (Z.equal (List.assoc Lane.Program exact).ou (Z.of_int 10_000_000));
   expect "vm work over capacity admitted"
     (consume Gate.check_work (ten @ [program 11]) = Error "lane_budget:program:ou");
-  expect "declared admission changed"
+  expect "declared entry changed"
     (Result.is_ok (consume Gate.check_budget (ten @ [program 11])));
   let deploy = {tx with T.op_type = ProgramDeploy; ou = Z.one} in
   expect "constructor work omitted" (Z.geq (Lane.work deploy).ou (Z.of_int floor));
@@ -379,7 +454,7 @@ let test_turn () =
     (Turn.previous ~chain_id:chain ~epoch:12L ~lookup:(fun _ -> Some [payment])
       (Some (previous [payment])) = Some false)
 
-let run_epoch ~make_deps ~verify_deps ~limits epoch =
+let run_epoch ~focus ~make_deps ~verify_deps ~limits epoch =
   ignore (unwrap (Core.Tx_staging.Preview.send
     (Check (Some (Int64.of_int (epoch - 1)), ""))));
   Test_workspace.with_dir "circle_proposal" (fun dir ->
@@ -401,6 +476,7 @@ let run_epoch ~make_deps ~verify_deps ~limits epoch =
       Lwt_main.run (L.flush_dirty_lwt ledger);
       Lwt_main.run (S.set_meta store "total_supply" (Z.to_string (L.get_total_supply ledger)));
       Lwt_main.run (S.set_meta store "emission_remaining" "0");
+      seed_execution store (epoch - 1);
       let registry = `Assoc [
         "standard", `String Core.Validator_policy.standard_name;
         "candidates", `List [`Assoc [
@@ -782,9 +858,10 @@ program WorkCase {
       in
       let run ?next ?fault ?(live = false) ?(starved = []) ?(after_refusal = false)
           ?(after_preview = false) ?(held = []) ?(resume = false) ?(cut = false)
-          ?(busy = false) ?(ordered = false) ?(cached = true) ?(rejects = 0)
+          ?(busy = false) ?(local_failure = false) ?(ordered = false) ?(cached = true) ?(rejects = 0)
           ?(removed = []) ?(drain = false)
           ?(history = []) ?(missing = false) ?(excluded = []) txs expected =
+        let marked = if live then Node.Circle_refill.first (held @ starved) else held in
         let adapters = if live then Node.Consensus_driver_wiring.node_standard_adapters
           {standard with cached_head = (fun () -> Some head)} else adapters in
         let prepare = if ordered then Some prepare else None in
@@ -806,7 +883,9 @@ program WorkCase {
         let deps = make_deps ~epoch ~staging:txs ~root in
         let deps = C.{deps with
           hold_preview = (fun ~epoch tx ->
-            expect "unexpected preview hold" (List.mem tx held);
+            expect "unexpected preview hold" (List.mem tx (held @ starved)
+              || (Option.is_some fault && tx = bad)
+              || ((busy || local_failure) && tx.T.to_ = wasm));
             if live then adapters.hold_preview ~epoch tx);
           evict_preview = (fun ?epoch tx ->
             adapters.evict_preview ?epoch:(if live then epoch else None) tx);
@@ -852,9 +931,15 @@ program WorkCase {
                 let rejected = List.map (fun row ->
                   if row.X.tx = bad then {row with X.error_type} else row) artifacts.rejected in
                 {result with execution = {execution with artifacts = {artifacts with rejected}}}))
-              (prepare request)) prepare in
+              (if local_failure && !unavailable && List.exists (fun tx -> tx.T.to_ = wasm) request.C.txs then begin
+                unavailable := false;
+                let previous = Sys.getenv "OCTRA_PVAC_VERIFY_WORKER" in
+                Unix.putenv "OCTRA_PVAC_VERIFY_WORKER" "/no-worker";
+                Lwt.finalize (fun () -> prepare request) (fun () ->
+                  Unix.putenv "OCTRA_PVAC_VERIFY_WORKER" previous; Lwt.return_unit)
+              end else prepare request)) prepare in
         let make ?(occupied = busy) deps =
-          let action () = C.make_proposal ?prepare:build deps ~chain_id:chain ~root_to_raw32:root_raw
+          let action () = C.make_proposal ~clock:(fun () -> 0.) ?prepare:build deps ~chain_id:chain ~root_to_raw32:root_raw
             ~limits ~epoch_id:(Int64.of_int epoch) |> Lwt_main.run in
           if occupied then with_host_busy action else action () in
         let proposal = match make deps with
@@ -906,16 +991,19 @@ program WorkCase {
         let wire = CT.{chain_id = chain; epoch_id = Int64.of_int epoch; round = 3;
           header = proposal.header; tx_hashes = proposal.tx_hashes; parent_commit = Some parent;
           valid_round = None; proposer = proposer.address; signature = ""} in
+        let before_verify = List.length !captures in
         let verdict = C.verify_proposal ?prepare deps ~chain_id:chain wire |> Lwt_main.run in
         expect "validator refused circle selection"
           (verdict = Octra_consensus.C_driver.Proposal_accept);
+        if ordered && prepared.rejections = [] then
+          expect "validator repeated circle execution" (List.length !captures - before_verify = 1);
         if ordered then expect "deferred work became a chain rejection"
           (List.length prepared.rejections = rejects);
         if live then List.iter (fun tx ->
           let result = Core.Tx_staging.Preview.send
             (Check (Some (Int64.of_int head.epoch_id), T.hash tx)) in
           expect "live refusal differs from stable witness"
-            (result = if List.mem tx (removed @ held) then Error "preview refused in this epoch" else Ok ())) txs;
+            (result = if List.mem tx (removed @ marked) then Error "preview refused in this epoch" else Ok ())) txs;
         if held <> [] then begin
           captures := [];
           frozen := None;
@@ -953,9 +1041,10 @@ program WorkCase {
               (Core.Tx_staging.find_by_hash (T.hash tx)
                = if List.mem tx removed then None else Some tx)) txs;
           if List.exists (fun tx -> tx.T.to_ = wasm) confirmed then begin
-            expect "busy host rejected a valid proposal"
+            expect "hfhe lane rejected standard proposal"
               (with_host_busy (fun () -> C.verify_proposal ?prepare deps ~chain_id:chain wire
-                 |> Lwt_main.run) = Octra_consensus.C_driver.Proposal_wait);
+                 |> Lwt_main.run) = (if G.proof_key rules ~epoch = Ok G.Prior
+                   then Octra_consensus.C_driver.Proposal_wait else Proposal_accept));
             unchanged ();
             expect "released host retained proposal refusal"
               (C.verify_proposal ?prepare deps ~chain_id:chain wire |> Lwt_main.run
@@ -1067,6 +1156,18 @@ program WorkCase {
         end;
         Core.Tx_staging.clear ()
       in
+      if focus then begin
+        let host_call = signed ~ou:19_000_000 caller ~op_type:T.CircleCall ~to_:wasm ~nonce:1
+          ~message:"[]" ~method_:(Some "fhe_verify_zero") in
+        run ~ordered:true ~busy:true [host_call; dependent; payment; ready]
+          (T.consensus_order (if G.proof_key rules ~epoch = Ok G.Prior
+            then [payment; ready] else [host_call; dependent; payment; ready]));
+        run ~ordered:true ~local_failure:true [host_call; dependent; payment; ready]
+          (T.consensus_order (if G.proof_key rules ~epoch = Ok G.Prior
+            then [host_call; dependent; payment; ready] else [payment; ready]));
+        run ~ordered:true ~live:true ~starved:[good] ~held:[good]
+          [good; dependent; payment] [payment]
+      end else begin
       run [payment; ready] [payment; ready];
       run [good; payment; ready] [good];
       run ~history:[good] [good; payment; dependent] [payment];
@@ -1087,12 +1188,17 @@ program WorkCase {
       run ~ordered:true ~cached:false [host_call; payment; ready]
         (T.consensus_order [host_call; payment; ready]);
       run ~ordered:true ~busy:true [host_call; dependent; payment; ready]
-        (T.consensus_order [payment; ready]);
+        (T.consensus_order (if G.proof_key rules ~epoch = Ok G.Prior
+          then [payment; ready] else [host_call; dependent; payment; ready]));
+      run ~ordered:true ~local_failure:true [host_call; dependent; payment; ready]
+        (T.consensus_order (if G.proof_key rules ~epoch = Ok G.Prior
+          then [host_call; dependent; payment; ready] else [payment; ready]));
       let first = transfer caller 1 in
       let second = signed ~ou:19_000_000 caller ~op_type:T.CircleCall ~to_:wasm ~nonce:2
         ~message:"[]" ~method_:(Some "fhe_verify_zero") in
       run ~ordered:true ~busy:true [first; second; transfer caller 3; payment; ready]
-        (T.consensus_order [first; payment; ready]);
+        (T.consensus_order (if G.proof_key rules ~epoch = Ok G.Prior
+          then [first; payment; ready] else [first; second; transfer caller 3; payment; ready]));
       List.iter (fun op_type ->
         let cell = signed other ~op_type ~to_:circle ~nonce:1
           ~message:"{}" ~method_:None in
@@ -1214,9 +1320,11 @@ program WorkCase {
         run ~ordered:true ~live:true ~after_preview:true ~starved:blocked ~held:[denied]
           ([denied; dependent; later; replacement; payment] @ blocked)
           (T.consensus_order [replacement; payment])
+      end
       end))
 
-let run ~make_deps ~verify_deps ~limits =
+let run ?(focus = false) ~make_deps ~verify_deps ~limits () =
+  test_host_reason ();
   test_work ();
   test_select ();
   test_drop ();
@@ -1228,5 +1336,5 @@ let run ~make_deps ~verify_deps ~limits =
   Fun.protect ~finally:(fun () -> List.iter (fun (name, value) ->
     Unix.putenv name value) before) (fun () ->
     List.iter (fun (name, value) -> Unix.putenv name value) settings;
-    List.iter (run_epoch ~make_deps ~verify_deps ~limits)
-      [1_614_499; 1_614_500; 1_662_999; 1_663_000; 1_663_001])
+    List.iter (run_epoch ~focus ~make_deps ~verify_deps ~limits)
+      (if focus then [1_663_000] else [1_614_499; 1_614_500; 1_662_999; 1_663_000; 1_663_001]))

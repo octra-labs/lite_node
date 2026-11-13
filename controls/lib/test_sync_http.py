@@ -52,7 +52,7 @@ class SyncHttpTest(unittest.TestCase):
                                 server.bad_path = "/a/state-sync/" + path
                                 server.code, server.location = code, location
                                 tip = sync_tip.sync_head(values)
-                                self.assertEqual((tip["head"], tip["snapshot"]), (5000, 4000))
+                                self.assertEqual((tip["head"], tip["snapshot"]), (None, 4000))
                                 self.assertEqual(server.paths, (["/a/state-sync/head"] if path == "head"
                                     else ["/a/state-sync/head", "/a/state-sync/manifest"])
                                     + ["/b/state-sync/head", "/b/state-sync/manifest", "/c/state-sync/head"])

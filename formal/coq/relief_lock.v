@@ -238,6 +238,61 @@ Proof.
   eapply single; eauto.
 Qed.
 
+Definition weighted_check total qw target_qw :=
+  total - qw <? qw + target_qw - total.
+
+Theorem weighted_overlap weight left right ids qw target_qw :
+  (forall id, In id ids -> 0 <= weight id) ->
+  qw <= Stake.score weight left ids ->
+  target_qw <= Stake.score weight right ids ->
+  weighted_check (Stake.score weight (fun _ => true) ids) qw target_qw = true ->
+  Stake.score weight (fun _ => true) ids - qw <
+    Stake.score weight (fun id => left id && right id) ids.
+Proof.
+  intros positive first second checked.
+  unfold weighted_check in checked. apply Z.ltb_lt in checked.
+  pose proof (Stake.score_join weight left right ids) as joined.
+  pose proof (Stake.score_cap weight (fun id => left id || right id) ids positive) as cap.
+  lia.
+Qed.
+
+Theorem weighted_honest weight left right bad ids qw target_qw :
+  (forall id, In id ids -> 0 <= weight id) ->
+  qw <= Stake.score weight left ids ->
+  target_qw <= Stake.score weight right ids ->
+  Stake.score weight bad ids <= Stake.score weight (fun _ => true) ids - qw ->
+  weighted_check (Stake.score weight (fun _ => true) ids) qw target_qw = true ->
+  exists id, In id ids /\ left id = true /\ right id = true /\ bad id = false.
+Proof.
+  intros positive first second faults checked.
+  pose proof (weighted_overlap weight left right ids qw target_qw positive first second checked).
+  apply (honest_overlap weight left right bad ids); [exact positive|lia].
+Qed.
+
+Lemma quota_gap small large :
+  0 <= small <= large -> Stake.quota large - Stake.quota small <= large - small.
+Proof.
+  intros ordered. unfold Stake.quota.
+  pose proof (Z.div_mod (2 * small) 3 ltac:(lia)).
+  pose proof (Z.div_mod (2 * large) 3 ltac:(lia)).
+  pose proof (Z.mod_pos_bound (2 * small) 3 ltac:(lia)).
+  pose proof (Z.mod_pos_bound (2 * large) 3 ltac:(lia)).
+  destruct (Z.eq_dec small large); [subst; lia|nia].
+Qed.
+
+Theorem weighted_target small large :
+  0 <= small <= large ->
+  weighted_check large (Stake.quota large) (Stake.quota small) = true ->
+  large - Stake.quota large < 2 * Stake.quota small - small.
+Proof.
+  intros ordered checked. unfold weighted_check in checked.
+  apply Z.ltb_lt in checked. pose proof (quota_gap small large ordered). lia.
+Qed.
+
+Print Assumptions weighted_overlap.
+Print Assumptions weighted_honest.
+Print Assumptions weighted_target.
+
 Print Assumptions reconfigure_floor.
 Print Assumptions restart_floor.
 Print Assumptions restart_same_polc.

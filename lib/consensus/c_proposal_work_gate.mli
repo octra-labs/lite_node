@@ -4,6 +4,8 @@
 type t
 
 val create : unit -> t
+val start : t -> delay:float -> duration:float -> unit
+val window : unit -> (float * float) option
 
 val run :
   t ->

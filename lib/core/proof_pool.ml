@@ -28,12 +28,12 @@ let scheduler =
     ~required_burst:Resource_lanes.preverify_required_burst
     ()
 
-let try_run ?(priority = Required) task =
-  Scheduler.run_threaded scheduler priority (fun () -> task ()) ()
+let try_run ?(priority = Required) ~bytes task =
+  Scheduler.run_threaded ~bytes scheduler priority (fun () -> task ()) ()
 
-let run ?(priority = Required) task =
+let run ?(priority = Required) ~bytes task =
   let open Lwt.Syntax in
-  let* result = try_run ~priority task in
+  let* result = try_run ~priority ~bytes task in
   match result with
   | Some value -> Lwt.return value
-  | None -> Lwt.fail_with "proof_pool_queue_full"
+  | None -> Lwt.fail (Exec_resource.Unavailable Host)

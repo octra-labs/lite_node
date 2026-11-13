@@ -63,9 +63,9 @@ type loaded = {
   profile : Code_check.profile;
 }
 
-let decode_loaded ?(trusted = []) ?(point_ops = false) raw =
+let decode_loaded ?(view = false) ?(trusted = []) ?(point_ops = false) raw =
   try
-    match Code_check.decode_deploy ~trusted ~point_ops raw with
+    match Code_check.decode_deploy ~view ~trusted ~point_ops raw with
     | Ok admitted ->
       Some { code = Code_check.code admitted; profile = Code_check.profile admitted }
     | Error _ -> None
@@ -73,10 +73,10 @@ let decode_loaded ?(trusted = []) ?(point_ops = false) raw =
   | (Stack_overflow | Out_of_memory) as error -> raise error
   | _ -> None
 
-let decode_mode ?(trusted = []) ?(point_ops = false) mode raw =
+let decode_mode ?(view = false) ?(trusted = []) ?(point_ops = false) mode raw =
   if String.equal mode "source" then
     try
-      match Code_check.decode_program_source ~point_ops raw with
+      match Code_check.decode_program_source ~view ~point_ops raw with
       | Ok admitted ->
         Some {
           code = Code_check.code admitted;
@@ -87,9 +87,9 @@ let decode_mode ?(trusted = []) ?(point_ops = false) mode raw =
     | (Stack_overflow | Out_of_memory) as error -> raise error
     | _ -> None
   else
-    decode_loaded ~trusted ~point_ops raw
+    decode_loaded ~view ~trusted ~point_ops raw
 
-let load_loaded ?snapshot ?(trusted = []) ?(point_ops = false) store contract_addr =
+let load_encoded ?snapshot store contract_addr =
   match run_s (Octra_core.Store_irmin.load_bytecode ?snapshot store contract_addr) with
   | Some b64 ->
     let mode =
@@ -97,27 +97,42 @@ let load_loaded ?snapshot ?(trusted = []) ?(point_ops = false) store contract_ad
       | Some meta -> meta.check
       | None -> "binary"
     in
-    (try
-       decode_mode
-         ~trusted
-         ~point_ops
-         mode
-         (Base64.decode_exn b64)
-     with
-     | (Stack_overflow | Out_of_memory) as error -> raise error
-     | _ -> None)
+    Some (mode, b64)
   | None -> None
+
+let decode_encoded ?(view = false) ~trusted ~point_ops (mode, encoded) =
+  try decode_mode ~view ~trusted ~point_ops mode (Base64.decode_exn encoded)
+  with
+  | (Stack_overflow | Out_of_memory) as error -> raise error
+  | _ -> None
+
+let priced_load ?(view = false) ~active ~limit ~spent ~trusted ~point_ops encoded =
+  if not active then Some (spent, Option.bind encoded (decode_encoded ~view ~trusted ~point_ops))
+  else match encoded with
+    | None -> Some (spent, None)
+    | Some (mode, encoded) ->
+      match Base64.decode encoded with
+      | Error _ -> Some (spent, None)
+      | Ok raw ->
+        Option.bind (Code_check.scalar_cost raw) (fun cost ->
+          Option.map (fun spent -> spent, decode_mode ~view ~trusted ~point_ops mode raw)
+            (Cost.charge_z ~used:spent ~cost ~limit))
+
+let load_loaded ?snapshot ?(trusted = []) ?(point_ops = false) store contract_addr =
+  Option.bind (load_encoded ?snapshot store contract_addr)
+    (decode_encoded ~trusted ~point_ops)
 
 let load_bytecode ?(trusted = []) ?(point_ops = false) store contract_addr =
   Option.map (fun loaded -> loaded.code)
     (load_loaded ~trusted ~point_ops store contract_addr)
 
-let read_async ?snapshot store address decode =
+let read_async ?snapshot ?(before = fun _ -> true) store address decode =
   let ( let* ) work next = Lwt.bind work (Octra_core.Exec_resource.protect next) in
   let* encoded = Octra_core.Store_irmin.load_bytecode ?snapshot store address in
   match encoded with
   | None -> Lwt.return_none
   | Some encoded ->
+    if not (before encoded) then Lwt.return_none else
     let* meta = Octra_core.Store_irmin.get_contract_meta ?snapshot store address in
     let mode = match meta with Some meta -> meta.check | None -> "binary" in
     Octra_core.Exec_resource.joined (fun () ->
@@ -125,8 +140,8 @@ let read_async ?snapshot store address decode =
       | Error _ -> None
       | Ok raw -> decode mode raw) ()
 
-let load_async ?snapshot ~trusted ~point_ops store address =
-  read_async ?snapshot store address (decode_mode ~trusted ~point_ops)
+let load_async ?snapshot ?before ~trusted ~point_ops store address =
+  read_async ?snapshot ?before store address (decode_mode ~trusted ~point_ops)
 
 let load_storage ?snapshot store contract_addr =
   run_s (Octra_core.Store_irmin.load_contract_storage ?snapshot store contract_addr)
@@ -207,8 +222,8 @@ let method_cache : ((string * bool) list * int) Code_cache.t = Code_cache.create
 let methods_checked ~source ~trusted ~point_ops raw =
   let key = Code_cache.key ~mode:(if source then 1 else 0) ~point_ops ~trusted raw in
   Code_cache.run method_cache key (fun () ->
-    let checked = if source then Code_check.decode_program_source ~point_ops raw
-      else Code_check.decode_deploy ~trusted ~point_ops raw in
+    let checked = if source then Code_check.decode_program_source ~view:true ~point_ops raw
+      else Code_check.decode_deploy ~view:true ~trusted ~point_ops raw in
     Result.map (fun checked ->
       let code = Code_check.code checked in
       extract_methods code, Array.length code) checked)
@@ -287,10 +302,15 @@ let entry_kinds facts target =
   |> List.sort (fun (left, _) (right, _) -> compare left right)
   |> List.map snd
 
-let runtime_params profile target params =
-  match profile with
-  | Code_check.Legacy -> Ok (List.rev (List.rev_map parse_param params))
-  | Code_check.Program facts -> Program_input.parse (entry_kinds facts target) params
+let runtime_params ?(scalar_work = false) profile target params =
+  if scalar_work && Scalar_work.json_cost params = None then Error Program_input.limit_error
+  else
+    let parsed = match profile with
+      | Code_check.Legacy -> Ok (List.rev (List.rev_map parse_param params))
+      | Code_check.Program facts -> Program_input.parse (entry_kinds facts target) params in
+    Result.bind parsed (fun values ->
+      if scalar_work && not (List.for_all Contract_vm.scalar_valid values)
+      then Error Program_input.limit_error else Ok values)
 
 let runtime_values profile target values =
   match profile with
@@ -414,7 +434,18 @@ let exec_result_to_result r =
   else
     Error (trim_error (Option.value r.error ~default:"execution failed"))
 
+let creation_work active limit raw params =
+  if not active then Some 0
+  else if not (Program_envelope.is_program raw) then None
+  else
+    Option.bind (Scalar_work.json_cost params) (fun inputs ->
+      Option.bind (Cost.charge_z ~used:0
+        ~cost:(Z.add inputs (Scalar_work.load (String.length raw))) ~limit) (fun spent ->
+        Option.bind (Code_check.scalar_cost raw) (fun cost ->
+          Cost.charge_z ~used:spent ~cost ~limit)))
+
 let deploy_with ~async_exec ~return ~bind ~run ~journal ?(trusted = []) ?admitted ?(ctx = Contract_vm.default_ctx)
+    ?(spent = 0) ?(limit = 1_000_000)
     ?(params = []) store deployer ctype (_code : Contract_vm.instr array) bytecode_raw nonce =
   let ctx = { ctx with async_exec } in
   let addr = addr_from_code bytecode_raw deployer nonce in
@@ -423,12 +454,15 @@ let deploy_with ~async_exec ~return ~bind ~run ~journal ?(trusted = []) ?admitte
     addr (String.sub deployer 0 (min 12 (String.length deployer)))
     (String.length bytecode_raw) (String.sub hash 0 16);
   let source_checked = Option.is_some admitted in
+  let work = Option.bind (creation_work ctx.scalar_work limit bytecode_raw params)
+    (fun cost -> Cost.charge ~used:spent ~cost ~limit) in
   let checked =
-    match admitted with
-    | Some value ->
+    match work, admitted with
+    | None, _ -> Error (Code_check.Unsafe_error "program creation work refused")
+    | Some _, Some value ->
       Result.map (fun () -> value)
         (Code_check.check_standard ~point_ops:ctx.point_ops value)
-    | None -> Code_check.decode_deploy ~trusted ~point_ops:ctx.point_ops bytecode_raw
+    | Some _, None -> Code_check.decode_deploy ~trusted ~point_ops:ctx.point_ops bytecode_raw
   in
   match checked with
   | Error error ->
@@ -452,15 +486,16 @@ let deploy_with ~async_exec ~return ~bind ~run ~journal ?(trusted = []) ?admitte
     return (addr, { success = true; return_value = None; effort_used = 0;
              events = []; error = None; storage_writes = 0 })
   ) else
-    match runtime_params (Code_check.profile admitted) 0 params with
+    match runtime_params ~scalar_work:ctx.scalar_work (Code_check.profile admitted) 0 params with
     | Error error ->
       return (addr, { success = false; return_value = None; effort_used = 0;
                events = []; error = Some (Program_input.error_message error); storage_writes = 0 })
     | Ok values ->
       let storage_tbl = Hashtbl.create 100 in
-      let state = Contract_vm.create_state ~ctx ~strict_values ~storage_kinds
+      let state = Contract_vm.create_state ~ctx ~limit ~strict_values ~storage_kinds
         ~caller:deployer ~origin:deployer ~address:addr ~value:Z.zero
         ~storage:storage_tbl () in
+      state.effort_used <- Option.get work;
       state.memory.data <- Hashtbl.create 1024;
       Hashtbl.add state.memory.data 999 (Contract_vm.VString "constructor");
       Hashtbl.add state.memory.data 1000 (Contract_vm.VString "constructor");
@@ -510,6 +545,9 @@ let deploy_async = deploy_with ~async_exec:true ~return:Lwt.return
 let spawn_with ~async_exec ~return ~bind ~run ~journal ?(trusted = []) ~(ctx : Contract_vm.exec_ctx) ~depth ?(limit = 1_000_000) ?(params = []) store ~deployer
     ~bytecode_raw ~nonce =
   let ctx = { ctx with async_exec } in
+  let work = creation_work ctx.scalar_work limit bytecode_raw [] in
+  if work = None || (ctx.scalar_work && not (List.for_all Contract_vm.scalar_valid params))
+  then return (Error "program creation work refused") else
   match Code_check.decode_deploy ~trusted ~point_ops:ctx.point_ops bytecode_raw with
   | Error (Code_check.Decode_error error) -> return (Error (Printf.sprintf "bad bytecode: %s" error))
   | Error (Code_check.Verify_error _) -> return (Error "verify failed")
@@ -537,6 +575,7 @@ let spawn_with ~async_exec ~return ~bind ~run ~journal ?(trusted = []) ~(ctx : C
           let state = Contract_vm.create_state ~ctx ~depth ~limit ~strict_values ~storage_kinds
             ~caller:deployer ~origin:deployer ~address:addr ~value:Z.zero
             ~storage:storage_tbl () in
+          state.effort_used <- Option.get work;
           state.memory.data <- Hashtbl.create 1024;
           Hashtbl.add state.memory.data 999 (Contract_vm.VString "constructor");
           Hashtbl.add state.memory.data 1000 (Contract_vm.VString "constructor");
@@ -621,31 +660,26 @@ let load_storage_with_overlay journal store program_addr =
   | Some storage -> storage
   | None -> load_storage store program_addr
 
-let load_loaded_with_overlay ?(trusted = []) ?(point_ops = false) journal store program_addr =
+let encoded_with_overlay journal store program_addr =
   match Program_journal.find_upgrade journal program_addr with
   | Some upgrade ->
-    (try
-       decode_mode
-         ~trusted
-         ~point_ops
-         upgrade.check
-         (Base64.decode_exn upgrade.bytecode_b64)
-     with
-     | (Stack_overflow | Out_of_memory) as error -> raise error
-     | _ -> None)
+    Some (upgrade.check, upgrade.bytecode_b64)
   | None ->
     match Program_journal.find_deploy journal program_addr with
     | Some deploy ->
-      (try
-         decode_mode
-           ~trusted
-           ~point_ops
-           deploy.check
-           (Base64.decode_exn deploy.bytecode_b64)
-       with
-       | (Stack_overflow | Out_of_memory) as error -> raise error
-       | _ -> None)
-    | None -> load_loaded ~trusted ~point_ops store program_addr
+      Some (deploy.check, deploy.bytecode_b64)
+    | None -> load_encoded store program_addr
+
+let load_loaded_with_overlay ?(trusted = []) ?(point_ops = false) journal store program_addr =
+  Option.bind (encoded_with_overlay journal store program_addr)
+    (decode_encoded ~trusted ~point_ops)
+
+let call_work ~active ~limit ~spent encoded params =
+  if not active then Some spent
+  else Option.bind (Scalar_work.json_cost params) (fun input ->
+    let loading = Option.fold ~none:Z.zero
+      ~some:(fun (_, raw) -> Scalar_work.load (String.length raw)) encoded in
+    Cost.charge_z ~used:spent ~cost:(Z.add input loading) ~limit)
 
 let load_bytecode_with_overlay ?(trusted = []) ?(point_ops = false) journal store program_addr =
   Option.map (fun loaded -> loaded.code)
@@ -668,8 +702,9 @@ let run_checked ~journal ~(ctx : Contract_vm.exec_ctx) action =
       Program_journal.restore journal saved;
       raise error
 
-let call_with ~return ~run ?(trusted = []) ?(ctx = Contract_vm.default_ctx) ?(depth = 0) ?(limit = 1_000_000)
+let call_with ~return ~bind ~load ~run ?(trusted = []) ?(ctx = Contract_vm.default_ctx) ?(depth = 0) ?(limit = 1_000_000)
     ~journal store program_addr method_name params caller value =
+  let ( let* ) = bind in
   Octra_log.info "program"
     "event = call_start addr = %s method = %s depth = %d limit = %d"
     program_addr method_name depth limit;
@@ -681,17 +716,30 @@ let call_with ~return ~run ?(trusted = []) ?(ctx = Contract_vm.default_ctx) ?(de
     return {success = false; return_value = None; effort_used = limit;
       events = []; error = Some "call journal effort exceeds limit"; storage_writes = 0}
   | Some spent ->
-  let limit = limit - spent in
-  match load_loaded_with_overlay
-    ~trusted ~point_ops:ctx.point_ops journal store program_addr with
+  let encoded = encoded_with_overlay journal store program_addr in
+  match call_work ~active:ctx.scalar_work ~limit ~spent encoded params with
   | None ->
-    return { success = false; return_value = None; effort_used = 0;
+    return {success = false; return_value = None; effort_used = limit;
+      events = []; error = Some "program input effort exceeds limit"; storage_writes = 0}
+  | Some spent ->
+  let* loaded = load (fun () -> priced_load ~active:ctx.scalar_work ~limit ~spent
+    ~trusted ~point_ops:ctx.point_ops encoded) in
+  match loaded with
+  | None ->
+    return {success = false; return_value = None; effort_used = limit;
+      events = []; error = Some "program scalar effort exceeds limit"; storage_writes = 0}
+  | Some (spent, loaded) ->
+  let limit = limit - spent in
+  let used = if ctx.scalar_work then spent else 0 in
+  match loaded with
+  | None ->
+    return { success = false; return_value = None; effort_used = used;
       events = []; error = Some "bytecode not found"; storage_writes = 0 }
   | Some loaded ->
     let fixed = fix_jumps loaded.code in
     match extract_method_arity fixed method_name with
     | Some arity when arity <> List.length params ->
-      return { success = false; return_value = None; effort_used = 0;
+      return { success = false; return_value = None; effort_used = used;
         events = [];
         error = Some (Printf.sprintf "arity mismatch: %s expects %d args, got %d"
           method_name arity (List.length params));
@@ -699,12 +747,12 @@ let call_with ~return ~run ?(trusted = []) ?(ctx = Contract_vm.default_ctx) ?(de
     | _ ->
       (match extract_method_target fixed method_name with
        | None ->
-         return { success = false; return_value = None; effort_used = 0;
+         return { success = false; return_value = None; effort_used = used;
            events = []; error = Some "method not found"; storage_writes = 0 }
        | Some target ->
-         match runtime_params loaded.profile target params with
+         match runtime_params ~scalar_work:ctx.scalar_work loaded.profile target params with
          | Error error ->
-           return { success = false; return_value = None; effort_used = 0;
+           return { success = false; return_value = None; effort_used = used;
              events = []; error = Some (Program_input.error_message error); storage_writes = 0 }
          | Ok values ->
            run ~journal ~ctx ~spent (fun () ->
@@ -718,13 +766,15 @@ let call_with ~return ~run ?(trusted = []) ?(ctx = Contract_vm.default_ctx) ?(de
                ~address:program_addr ~value ~storage_tbl ~method_name ~params:values () in
              state, fixed))
 
-let execute_call = call_with ~return:Fun.id ~run:(fun ~journal ~ctx ~spent prepare ->
+let execute_call = call_with ~return:Fun.id ~bind:(fun value next -> next value)
+  ~load:(fun action -> action ()) ~run:(fun ~journal ~ctx ~spent prepare ->
   let result = run_checked ~journal ~ctx (fun () ->
     let state, fixed = prepare () in
     run_fixed_from_dispatcher state fixed) in
   {result with effort_used = result.effort_used + spent})
 
-let execute_call_async = call_with ~return:Lwt.return ~run:(fun ~journal ~ctx ~spent prepare ->
+let execute_call_async = call_with ~return:Lwt.return ~bind:Octra_core.Exec_resource.bind
+  ~load:(fun action -> Octra_core.Exec_resource.joined action ()) ~run:(fun ~journal ~ctx ~spent prepare ->
   let saved = Program_journal.snapshot journal in
   Octra_core.Exec_resource.catch (fun () ->
     let state, fixed = prepare () in
@@ -738,7 +788,7 @@ let execute_call_async = call_with ~return:Lwt.return ~run:(fun ~journal ~ctx ~s
       Program_journal.restore journal saved;
       Lwt.fail error))
 
-let view_plan loaded method_name params =
+let view_plan ?(scalar_work = false) loaded method_name params =
   match loaded with
   | None ->
     Error { success = false; return_value = None; effort_used = 0;
@@ -758,7 +808,7 @@ let view_plan loaded method_name params =
          Error { success = false; return_value = None; effort_used = 0;
            events = []; error = Some "method not found"; storage_writes = 0 }
        | Some target ->
-         match runtime_params loaded.profile target params with
+         match runtime_params ~scalar_work loaded.profile target params with
          | Error error ->
            Error { success = false; return_value = None; effort_used = 0;
              events = []; error = Some (Program_input.error_message error); storage_writes = 0 }
@@ -775,26 +825,44 @@ let view_state ~ctx ~depth ~limit ~caller ~address ~method_name loaded values st
 
 let execute_view_call ?snapshot ?running ?(trusted = []) ?(ctx = Contract_vm.default_ctx)
     ?(depth = 0) ?(limit = 2_000_000_000) store address method_name params caller =
-  let loaded = load_loaded ?snapshot ~trusted ~point_ops:ctx.point_ops store address in
-  match view_plan loaded method_name params with
+  let limit = if ctx.scalar_work then min limit 10_000_000 else limit in
+  let encoded = load_encoded ?snapshot store address in
+  let spent = call_work ~active:ctx.scalar_work ~limit ~spent:0 encoded params in
+  let loaded = Option.bind spent (fun spent ->
+    priced_load ~view:true ~active:ctx.scalar_work ~limit ~spent ~trusted ~point_ops:ctx.point_ops encoded) in
+  let spent, loaded = Option.value loaded ~default:(limit, None) in
+  match view_plan ~scalar_work:ctx.scalar_work loaded method_name params with
   | Error result -> result
   | Ok (loaded, fixed, values) ->
     let storage = load_storage ?snapshot store address in
     let state = view_state ~ctx ~depth ~limit ~caller ~address ~method_name
       loaded values storage in
+    state.effort_used <- spent;
     run_fixed_from_dispatcher ?running state fixed
 
 let view_async ?snapshot ?running ?(trusted = []) ?(ctx = Contract_vm.default_ctx)
     ?(depth = 0) ?(limit = 2_000_000_000) store address method_name params caller =
   let ( let* ) work next = Lwt.bind work (Octra_core.Exec_resource.protect next) in
-  let* loaded = load_async ?snapshot ~trusted ~point_ops:ctx.point_ops store address in
-  match view_plan loaded method_name params with
+  let limit = if ctx.scalar_work then min limit 10_000_000 else limit in
+  let spent = ref 0 in
+  let before encoded =
+    match call_work ~active:ctx.scalar_work ~limit ~spent:0 (Some ("", encoded)) params with
+    | None -> false
+    | Some cost -> spent := cost; true in
+  let* loaded = read_async ?snapshot ~before store address (fun mode raw ->
+    let cost = if ctx.scalar_work then Code_check.scalar_cost raw else Some Z.zero in
+    Option.bind cost (fun cost ->
+      Option.bind (Cost.charge_z ~used:!spent ~cost ~limit) (fun used ->
+        spent := used;
+        decode_mode ~view:true ~trusted ~point_ops:ctx.point_ops mode raw))) in
+  match view_plan ~scalar_work:ctx.scalar_work loaded method_name params with
   | Error result -> Lwt.return result
   | Ok (loaded, fixed, values) ->
     let* storage = Octra_core.Store_irmin.load_contract_storage ?snapshot store address in
     let ctx = {ctx with async_exec = true} in
     let state = view_state ~ctx ~depth ~limit ~caller ~address ~method_name
       loaded values storage in
+    state.effort_used <- !spent;
     run_fixed_async ?running state fixed
 
 let contract_exists store addr =

@@ -2,7 +2,12 @@
 # Copyright (c) 2023-2026 Octra Labs <dev@octra.org>
 
 import json
+import os
+import socket
+import stat
+import time
 from http.client import HTTPException
+from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, HTTPRedirectHandler, build_opener
 from validator_common import ValidatorError, state_sync_sources
@@ -26,6 +31,83 @@ def epoch_value(value):
     if not 0 <= epoch < 2 ** 63:
         raise ValidatorError("state sync epoch is invalid")
     return epoch
+
+def decode_target(payload, chain):
+    fields = {"chainId", "status", "localEpoch", "headRoot", "setStamp", "targetEpoch"}
+    if not isinstance(payload, dict) or set(payload) != fields:
+        return None
+    if not isinstance(chain, str) or not chain or payload["chainId"] != chain or payload["status"] != "agreed":
+        return None
+    if any(not isinstance(payload[name], str) or not 0 < len(payload[name]) <= 19
+            for name in ("localEpoch", "targetEpoch")):
+        return None
+    try:
+        local = epoch_value(payload["localEpoch"])
+        target = epoch_value(payload["targetEpoch"])
+    except ValidatorError:
+        return None
+    root, stamp = payload["headRoot"], payload["setStamp"]
+    if (str(local) != payload["localEpoch"] or str(target) != payload["targetEpoch"]
+            or target < local or not isinstance(root, str) or len(root) not in (64, 128)
+            or any(value not in "0123456789abcdef" for value in root)
+            or not isinstance(stamp, str) or not 0 < len(stamp) <= 1024
+            or any(not 33 <= ord(value) <= 126 for value in stamp)):
+        return None
+    return {"head": target, "local": local, "root": root, "stamp": stamp}
+
+def control_path(data_dir):
+    data = Path(data_dir).expanduser().resolve(strict = True)
+    folder = data / "control"
+    path = folder / "sync.sock"
+    entries = [item.lstat() for item in (data, folder, path)]
+    parent, directory, endpoint = entries
+    if (not stat.S_ISDIR(parent.st_mode) or parent.st_mode & 0o022
+            or not stat.S_ISDIR(directory.st_mode) or directory.st_mode & 0o077
+            or not stat.S_ISSOCK(endpoint.st_mode) or endpoint.st_mode & 0o077
+            or any(item.st_uid != parent.st_uid for item in entries)):
+        raise ValueError("sync control ownership differs")
+    return path, (endpoint.st_dev, endpoint.st_ino)
+
+def control_target(data_dir):
+    path, identity = control_path(data_dir)
+    deadline = time.monotonic() + 3.0
+    request = {"jsonrpc": "2.0", "id": 1, "method": "octra_syncTarget", "params": []}
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(3.0)
+        address = min(os.fspath(path), os.path.relpath(path), key = lambda value: len(os.fsencode(value)))
+        client.connect(address)
+        if control_path(data_dir) != (path, identity):
+            raise ValueError("sync control socket changed")
+        client.sendall(json.dumps(request).encode("ascii") + b"\n")
+        raw = bytearray()
+        while b"\n" not in raw:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("sync control deadline expired")
+            client.settimeout(remaining)
+            chunk = client.recv(4097 - len(raw))
+            if not chunk or len(raw) + len(chunk) > 4096:
+                raise ValueError("sync control response exceeds frame")
+            raw.extend(chunk)
+        if raw.count(b"\n") != 1 or not raw.endswith(b"\n"):
+            raise ValueError("sync control response framing differs")
+    if control_path(data_dir) != (path, identity):
+        raise ValueError("sync control socket changed")
+    reply = json.loads(raw.decode("utf-8"))
+    if (not isinstance(reply, dict) or set(reply) != {"jsonrpc", "id", "result"}
+            or reply["jsonrpc"] != "2.0" or type(reply["id"]) is not int or reply["id"] != 1):
+        raise ValueError("sync control response differs")
+    return reply["result"]
+
+def native_tip(values, *, query=None):
+    data = values.get("OCTRA_DATA_DIR")
+    if not values.get("OCTRA_CHAIN_ID") or not isinstance(data, str) or not data:
+        return None
+    try:
+        payload = control_target(data)
+    except (OSError, ValueError, TypeError, RecursionError):
+        return None
+    return decode_target(payload, values["OCTRA_CHAIN_ID"])
 
 def cert_epoch(source):
     request = Request(source + "/state-sync/manifest", headers = HEADERS)
@@ -108,15 +190,9 @@ def head_routes(values, sources):
 
 def sync_head(values):
     tips = []
-    if not values.get("OCTRA_STATE_SYNC_SOURCES"):
-        return None
-    sources = state_sync_sources(values["OCTRA_STATE_SYNC_SOURCES"])
+    sources = state_sync_sources(values["OCTRA_STATE_SYNC_SOURCES"]) if values.get("OCTRA_STATE_SYNC_SOURCES") else []
     heads = state_sync_sources(values["OCTRA_JOIN_RPC"]) if values.get("OCTRA_JOIN_RPC") else []
-    if not head_routes(values, sources):
-        return {"head": None, "snapshot": None, "latest": None,
-            "status": "unavailable", "advertised_status": "unknown", "sources": [],
-            "reason": "configure OCTRA_JOIN_RPC with a route outside OCTRA_STATE_SYNC_SOURCES",
-            "head_status": "independent_missing"}
+    native = native_tip(values)
     for source in dict.fromkeys(sources + heads):
         try:
             tips.append(sync_epoch(source, manifest = source in sources))
@@ -126,21 +202,19 @@ def sync_head(values):
             tips.append({"head": None, "snapshot": None, "latest": None,
                 "status": "unavailable", "advertised_status": "unknown",
                 "source": source, "reason": source_reason(error)})
-    if not tips:
+    if not tips and native is None:
         return None
     snapshots = [value["snapshot"] for value in tips if value["snapshot"] is not None]
-    independent = any(value["head"] is not None and value["source"] in heads
-        and value["source"] not in sources for value in tips)
     latest = max((value for value in tips if value["source"] in sources),
         key = lambda value: value["latest"] if value["latest"] is not None else -1,
         default = {"latest": None, "status": "unavailable", "advertised_status": "unknown",
             "reason": "snapshot sources unavailable"})
-    head = max((value["head"] for value in tips if value["head"] is not None), default = None)
-    return {"head": head if independent else None,
+    return {"head": native["head"] if native is not None else None,
         "snapshot": max(snapshots, default = None), "latest": latest["latest"],
         "status": "ready" if snapshots else latest["status"],
         "advertised_status": latest["advertised_status"],
-        "reason": None if snapshots else latest["reason"], "sources": tips}
+        "reason": None if snapshots else latest["reason"], "sources": tips,
+        "native": native, "head_status": "ready" if native is not None else "native_unavailable"}
 
 def sync_fields(tip, floor):
     tip = tip or {}
@@ -158,13 +232,10 @@ def sync_fields(tip, floor):
         "source_errors": json.dumps({row["source"]: row["reason"]
             for row in tip.get("sources", []) if row.get("reason") is not None},
             ensure_ascii = True, sort_keys = True),
-        "head_status": "ready" if head is not None else tip.get("head_status", "independent_unavailable")}
+        "head_status": "ready" if head is not None else tip.get("head_status", "native_unavailable")}
 
 def sync_issue(tip, floor):
-    if (tip is not None and tip["head"] is not None
-            and tip["snapshot"] is not None and tip["snapshot"] >= floor):
+    if tip is not None and tip["snapshot"] is not None and tip["snapshot"] >= floor:
         return None
-    prefix = "state sync configuration error: " if tip and tip.get("head_status") == "independent_missing" \
-        else "wait for signed snapshot: "
-    return prefix + " ".join(
+    return "wait for signed snapshot: " + " ".join(
         f"{key} = {value}" for key, value in sync_fields(tip, floor).items())

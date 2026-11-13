@@ -256,6 +256,26 @@ let verify_signature ~signer_set ~message signature =
 
 let verify_quorum ~validator_set body signatures =
   let* () = validate body in
+  let* () =
+    let module C = Octra_consensus.C_types in
+    let policy = Octra_consensus.C_quorum_policy.for_chain body.chain_id in
+    if not (Octra_consensus.C_quorum_policy.seatless policy body.epoch) then Ok ()
+    else
+      let decode (member : C.validator_info) =
+        let* pubkey = raw_pubkey member.pubkey in Ok C.{member with pubkey} in
+      let* validators = List.fold_left (fun state member ->
+        let* rest = state in let* member = decode member in Ok (member :: rest))
+        (Ok []) validator_set.C.validators |> Result.map List.rev in
+      let* authors = match validator_set.authors with
+        | None -> Ok None
+        | Some (height, entries) ->
+          let* entries = List.fold_left (fun state (member, weight) ->
+            let* rest = state in let* member = decode member in Ok ((member, weight) :: rest))
+            (Ok []) entries |> Result.map List.rev in
+          Ok (Some (height, entries)) in
+      C.structural_validator_set_for_epoch
+        ~policy ~chain_id:body.chain_id ~epoch_id:body.epoch {validator_set with validators; authors}
+      |> Result.map (fun _ -> ()) |> Result.map_error C.set_error_message in
   let signers = List.map (fun item -> item.signer) signatures in
   if signers <> List.sort_uniq String.compare signers then
     Error "checkpoint signatures are not canonical"

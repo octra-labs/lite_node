@@ -5,7 +5,7 @@ type lease
 type 'a t
 
 val empty : 'a t
-val join : epoch:int64 -> 'a t -> ('a t * lease, string) result
+val join : ?fresh:bool -> ?capacity:int -> epoch:int64 -> 'a t -> ('a t * lease, string) result
 val listening : epoch:int64 -> 'a t -> bool
 val add : epoch:int64 -> same:('a -> 'a -> bool) -> 'a -> 'a t -> 'a t
 val read : lease -> 'a t -> 'a list

@@ -11,12 +11,14 @@ type source = {
 }
 
 val expected_set :
+  ?eviction_source:(int64 -> (Octra_consensus.C_types.validator_set, string) result) ->
   ?round:int ->
   source ->
   epoch:int64 ->
   (Octra_consensus.C_types.validator_set, string) result
 
 val stake_set :
+  ?eviction_source:(int64 -> (Octra_consensus.C_types.validator_set, string) result) ->
   source ->
   epoch:int64 ->
   (Octra_consensus.C_types.validator_set, string) result

@@ -268,6 +268,9 @@ let batch_plan requests =
     let metered = match request with
       | Ok req -> (match req.Rpc.method_ with
         | "octra_programAbi" | "octra_contractAbi"
+        | "contract_call" | "octra_programCall"
+        | "circle_view" | "octra_circleView"
+        | "circle_view_auth" | "octra_circleViewAuth"
         | "circle_program_info" | "octra_circleProgramInfo"
         | "circle_program_info_auth" | "octra_circleProgramInfoAuth" -> true
         | _ -> false)

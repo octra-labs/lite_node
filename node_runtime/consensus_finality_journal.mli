@@ -128,6 +128,14 @@ val read_committed_epoch_validated :
   string ->
   read_result
 
+val read_at_head :
+  chain_id:string ->
+  epoch:int64 ->
+  state_root:string ->
+  txid_hi:int64 ->
+  string ->
+  read_result
+
 val rebind_committed :
   chain_id:string ->
   validator_set:Octra_consensus.C_types.validator_set ->

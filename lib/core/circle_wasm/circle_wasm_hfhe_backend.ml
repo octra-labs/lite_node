@@ -39,24 +39,21 @@ let verification_value = function
   | Error (VW.Proof_rejected _) -> Ok false
   | Error failure -> Error (VW.verification_failure_message failure)
 
-let verify_zero_worker ~keyed ~math ~pubkey ~cipher ~proof =
-  VW.try_verify_zero_sync_classified ~keyed ~math ~pubkey ~cipher ~proof
+let verify_request request =
+  VW.try_run_sync request |> VW.classified_outcome_result
 
-let verify_range_worker ~keyed ~math ~strict ~pubkey ~cipher ~proof ~commitment =
-  VW.try_verify_range_bound_sync_classified ~keyed ~math
-    ~strict
-    ~pubkey
-    ~cipher
-    ~proof
-    ~commitment
+let verify_zero_using verify ~keyed ~math ~pubkey ~cipher ~proof =
+  verify (VW.with_rules ~keyed ~math (VW.P.Zero {pubkey; cipher; proof}))
 
-let verify_bound_worker ~keyed ~math ~strict ~pubkey ~cipher ~proof ~commitment =
-  VW.try_verify_claim_sync_classified ~keyed ~math
-    ~strict
-    ~pubkey
-    ~cipher
-    ~proof
-    ~commitment
+let verify_range_using verify ~keyed ~math ~strict ~pubkey ~cipher ~proof ~commitment =
+  verify (VW.with_rules ~keyed ~math (VW.P.Range_bound {pubkey; cipher; proof; commitment; strict}))
+
+let verify_claim_using verify ~keyed ~math ~strict ~pubkey ~cipher ~proof ~commitment =
+  verify (VW.with_rules ~keyed ~math (VW.P.Claim {pubkey; cipher; proof; commitment; strict}))
+
+let verify_zero_worker = verify_zero_using verify_request
+let verify_range_worker = verify_range_using verify_request
+let verify_claim_worker = verify_claim_using verify_request
 
 let require_string fields key =
   match List.assoc_opt key fields with
@@ -240,10 +237,10 @@ let decode_range_proof_cap value =
     with _ ->
       Error "invalid range proof"
 
-let verify_zero_cap ~keyed ~math ~cap pk ciphertext proof =
+let verify_zero_cap ?(verify = verify_request) ~keyed ~math ~cap pk ciphertext proof =
   match decode_verifier_cipher ~cap ciphertext, decode_zero_proof_cap proof with
   | Ok cipher, Ok _ ->
-    verify_zero_worker ~keyed ~math
+    verify_zero_using verify ~keyed ~math
       ~pubkey:(Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
       ~cipher:(Crypto.FheBalance.encode_cipher cipher)
       ~proof
@@ -251,14 +248,14 @@ let verify_zero_cap ~keyed ~math ~cap pk ciphertext proof =
   | _ ->
     Ok false
 
-let verify_range_cap ~keyed ~math ~strict ~cap pk ciphertext proof amount_commitment =
+let verify_range_cap ?(verify = verify_request) ~keyed ~math ~strict ~cap pk ciphertext proof amount_commitment =
   match
     decode_verifier_cipher ~cap ciphertext,
     decode_range_proof_cap proof,
     require_blinding ["amount_commitment", `String amount_commitment] "amount_commitment"
   with
   | Ok cipher, Ok range_proof, Ok commitment ->
-    verify_range_worker ~keyed ~math
+    verify_range_using verify ~keyed ~math
       ~strict
       ~pubkey:(Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
       ~cipher:(Crypto.FheBalance.encode_cipher cipher)
@@ -270,14 +267,14 @@ let verify_range_cap ~keyed ~math ~strict ~cap pk ciphertext proof amount_commit
   | _ ->
     Ok false
 
-let verify_bound_cap ~keyed ~math ~strict ~cap pk ciphertext proof amount_commitment =
+let verify_claim_cap ?(verify = verify_request) ~keyed ~math ~strict ~cap pk ciphertext proof amount_commitment =
   match
     decode_verifier_cipher ~cap ciphertext,
     decode_zero_proof_cap proof,
     require_blinding ["amount_commitment", `String amount_commitment] "amount_commitment"
   with
   | Ok cipher, Ok _, Ok commitment ->
-    verify_bound_worker ~keyed ~math
+    verify_claim_using verify ~keyed ~math
       ~strict
       ~pubkey:(Bytes.to_string (Pvac_ffi.serialize_pubkey pk))
       ~cipher:(Crypto.FheBalance.encode_cipher cipher)
@@ -296,7 +293,7 @@ let cipher_pair ~pairs operation pk lhs rhs =
   else
     value_json (`String (Crypto.FheBalance.encode_cipher (operation pk lhs rhs)))
 
-let run_action_cap ~pairs ~keyed ~math ~cap fields =
+let run_action_cap ?(verify = verify_request) ~pairs ~keyed ~math ~cap fields =
   let open Crypto.FheBalance in
   match List.assoc_opt "action" fields with
   | Some (`String "encrypt_value_seeded") ->
@@ -479,7 +476,7 @@ let run_action_cap ~pairs ~keyed ~math ~cap fields =
         begin
           match
             with_verifier_lane
-              (fun () -> verify_zero_cap ~keyed ~math ~cap pk ciphertext proof)
+              (fun () -> verify_zero_cap ~verify ~keyed ~math ~cap pk ciphertext proof)
           with
           | Ok value -> value_json (`Bool value)
           | Error e -> unavailable_json e
@@ -503,7 +500,7 @@ let run_action_cap ~pairs ~keyed ~math ~cap fields =
           match
             with_verifier_lane
               (fun () ->
-                verify_range_cap ~keyed ~math
+                verify_range_cap ~verify ~keyed ~math
                   ~strict
                   ~cap
                   pk
@@ -535,7 +532,7 @@ let run_action_cap ~pairs ~keyed ~math ~cap fields =
           match
             with_verifier_lane
               (fun () ->
-                verify_bound_cap ~keyed ~math
+                verify_claim_cap ~verify ~keyed ~math
                   ~strict
                   ~cap
                   pk
@@ -558,7 +555,7 @@ let run_action_cap ~pairs ~keyed ~math ~cap fields =
   | _ ->
     error_json "missing action"
 
-let run_action fields =
+let run_action ?(verify = verify_request) fields =
   let keyed =
     match List.filter (fun (name, _) -> name = "proof_key") fields with
     | [] -> Ok false
@@ -578,23 +575,25 @@ let run_action fields =
     | _ -> Error "invalid hfhe_pairs"
   in
   match require_cap fields, math, pairs, keyed with
-  | Ok cap, Ok math, Ok pairs, Ok keyed -> run_action_cap ~pairs ~keyed ~math ~cap fields
+  | Ok cap, Ok math, Ok pairs, Ok keyed -> run_action_cap ~verify ~pairs ~keyed ~math ~cap fields
   | Error e, _, _, _ | _, Error e, _, _ | _, _, Error e, _ | _, _, _, Error e -> error_json e
 
-let call_json input_json =
+let call_json_using ?(verify = verify_request) input_json =
   let output_json =
     if not (Hfhe_policy.request_allowed input_json) then
       error_json "hfhe request exceeds resource policy"
     else try
       match Yojson.Safe.from_string input_json with
       | `Assoc fields ->
-        run_action fields
+        run_action ~verify fields
       | _ ->
         error_json "invalid payload"
     with _ ->
       unavailable_json "hfhe backend exception"
   in
   Yojson.Safe.to_string output_json
+
+let call_json input = call_json_using input
 
 let ensure_registered () = ()
 

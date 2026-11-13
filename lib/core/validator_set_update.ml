@@ -13,6 +13,7 @@ type t = {
   validators : validator_entry list;
   weighted : bool;
   fingerprint : string;
+  eviction : Octra_consensus.C_types.eviction option;
 }
 
 type ready = {
@@ -170,6 +171,14 @@ let validator_entry_of_yojson ~weighted = function
     end
   | _ -> Error "validator entry must be object"
 
+let eviction_to_yojson (eviction : Octra_consensus.C_types.eviction) =
+  `Assoc [
+    "epoch", `String (Int64.to_string eviction.epoch);
+    "source", `String (Octra_consensus.C_codec.encode_validator_set eviction.source
+      |> Base64.encode_exn);
+    "offenders", `List (List.map (fun address -> `String address) eviction.offenders);
+  ]
+
 let to_yojson t =
   let fields = [
     "activate_epoch", `String (Int64.to_string t.activate_epoch);
@@ -180,8 +189,7 @@ let to_yojson t =
            (validator_entry_to_yojson ~weighted:t.weighted)
            t.validators);
   ] in
-  if t.weighted then
-    `Assoc (
+  let fields = if t.weighted then
       fields @ [
         "standard", `String Validator_policy.standard_name;
         "weighted", `Bool true;
@@ -189,9 +197,11 @@ let to_yojson t =
           `String
             (Int64.to_string
                (Option.get t.source_epoch));
-      ])
-  else
-    `Assoc fields
+      ]
+    else fields in
+  `Assoc (match t.eviction with
+    | None -> fields
+    | Some eviction -> fields @ ["eviction", eviction_to_yojson eviction])
 
 let parse_epoch label = function
   | `String raw ->
@@ -223,7 +233,7 @@ let validate_standard ~weighted fields =
       when String.equal value Validator_policy.standard_name -> Ok ()
   | true, _ -> Error "weighted validator update standard mismatch"
 
-let of_yojson = function
+let parse_update = function
   | `Assoc fields ->
     begin
       match List.assoc_opt "activate_epoch" fields, List.assoc_opt "validators" fields with
@@ -298,12 +308,107 @@ let of_yojson = function
                                 validators;
                                 weighted;
                                 fingerprint = actual;
+                                eviction = None;
                               }
                           end
                 end
             end
         end
       | _ -> Error "validator_set_update requires activate_epoch and validators"
+    end
+  | _ -> Error "validator_set_update payload must be object"
+
+let eviction_source_limit =
+  5 + Octra_consensus.C_codec.max_validators *
+    (12 + Octra_consensus.C_codec.max_addr_bytes + 32 + 256)
+
+let decode_eviction_source encoded =
+  let module C = Octra_consensus.C_types in
+  if String.length encoded > 4 * ((eviction_source_limit + 2) / 3) then
+    Error "validator eviction source exceeds size limit"
+  else
+    try
+      let raw = Base64.decode_exn encoded in
+      if String.length raw > eviction_source_limit || Base64.encode_exn raw <> encoded then
+        Error "validator eviction source encoding differs"
+      else
+        let source = Octra_consensus.C_codec.decode_validator_set raw in
+        match C.validate_validator_set_shape source with
+        | Error error -> Error (C.set_error_message error)
+        | Ok source when source.authors <> None -> Error "validator eviction source has authors"
+        | Ok source -> Ok source
+    with
+    | (Out_of_memory | Stack_overflow) as error -> raise error
+    | _ -> Error "validator eviction source is invalid"
+
+let eviction_of_yojson = function
+  | `Assoc fields ->
+    begin match List.sort (fun (left, _) (right, _) -> String.compare left right) fields with
+    | ["epoch", `String raw; "offenders", `List items; "source", `String encoded] ->
+      let ( let* ) = Result.bind in
+      let* epoch = parse_epoch "eviction epoch" (`String raw) in
+      if epoch < 0L || epoch = Int64.max_int || Int64.to_string epoch <> raw then
+        Error "validator eviction epoch is invalid"
+      else if items = [] || List.length items > Octra_consensus.C_codec.max_validators then
+        Error "validator eviction offender count is invalid"
+      else
+        let* offenders = List.fold_right (fun item state ->
+          let* rest = state in
+          match item with
+          | `String address when Crypto.Address.is_valid_address address -> Ok (address :: rest)
+          | _ -> Error "validator eviction offender is invalid") items (Ok []) in
+        if offenders <> List.sort_uniq String.compare offenders then
+          Error "validator eviction offenders are not ordered and unique"
+        else
+          let* source = decode_eviction_source encoded in
+          Ok Octra_consensus.C_types.{epoch; source; offenders}
+    | _ -> Error "validator eviction fields differ"
+    end
+  | _ -> Error "validator eviction must be object"
+
+let validate_eviction update (eviction : Octra_consensus.C_types.eviction) =
+  let module C = Octra_consensus.C_types in
+  let ( let* ) = Result.bind in
+  let* source = C.validate_validator_set_shape eviction.source
+    |> Result.map_error C.set_error_message in
+  if source <> eviction.source || source.authors <> None then
+    Error "validator eviction source is not exact"
+  else if eviction.epoch < 0L || eviction.epoch = Int64.max_int
+     || update.source_epoch <> Some eviction.epoch
+     || update.activate_epoch <> Int64.succ eviction.epoch || not update.weighted then
+    Error "validator eviction epoch or weight declaration differs"
+  else if eviction.offenders <> List.sort_uniq String.compare eviction.offenders then
+    Error "validator eviction offenders are not ordered and unique"
+  else if List.length eviction.offenders > Octra_consensus.C_codec.max_validators then
+    Error "validator eviction offender count is invalid"
+  else
+    let* decoded = Octra_consensus.C_codec.encode_validator_set source |> Base64.encode_exn
+      |> decode_eviction_source in
+    if decoded <> source then Error "validator eviction source encoding differs"
+    else
+    let* next, weight = C.evict_validator_set ~offenders:eviction.offenders source in
+    let expected = C.weights_of_set next |> List.map (fun (member, weight) ->
+      {address = member.C.address; pubkey_b64 = Base64.encode_exn member.pubkey; weight}) in
+    if update.validators <> expected
+       || update.fingerprint <> weighted_fingerprint ~source_epoch:eviction.epoch
+         ~activate_epoch:update.activate_epoch expected then
+      Error "validator eviction differs from exact removal"
+    else Ok (next, weight)
+
+let of_yojson json =
+  let ( let* ) = Result.bind in
+  let* update = parse_update json in
+  match json with
+  | `Assoc fields ->
+    begin match List.filter (fun (name, _) -> name = "eviction") fields with
+    | [] -> Ok update
+    | [_, json] ->
+      let* eviction = eviction_of_yojson json in
+      let update = {update with eviction = Some eviction} in
+      let* _ = validate_eviction update eviction in
+      if to_yojson update <> `Assoc fields then Error "validator eviction update encoding differs"
+      else Ok update
+    | _ -> Error "duplicate validator eviction field"
     end
   | _ -> Error "validator_set_update payload must be object"
 
@@ -332,6 +437,7 @@ let make_weighted ~source_epoch ~activate_epoch members =
           source_epoch = Some source_epoch;
           validators;
           weighted = true;
+          eviction = None;
           fingerprint =
             weighted_fingerprint
               ~source_epoch
@@ -342,14 +448,18 @@ let make_weighted ~source_epoch ~activate_epoch members =
 let of_message = function
   | None -> Error "validator_set_update requires message payload"
   | Some payload ->
-    try payload |> Json_tree.read |> of_yojson
+    try payload |> Json_tree.read |> parse_update
     with exn -> Error (Printexc.to_string exn)
 
 let to_string t =
   t |> to_yojson |> Yojson.Safe.to_string
 
 let of_string s =
-  try s |> Yojson.Safe.from_string |> of_yojson
+  try
+    Result.bind (s |> Yojson.Safe.from_string |> of_yojson) (fun update ->
+      if Option.is_some update.eviction && to_string update <> s then
+        Error "validator eviction update encoding differs"
+      else Ok update)
   with exn -> Error (Printexc.to_string exn)
 
 let validator_set update =
@@ -379,6 +489,85 @@ let validator_set update =
         entries
         |> List.map fst
         |> Octra_consensus.C_types.make_validator_set)
+
+let check_set_at ~chain_id ~epoch_id update =
+  let module Q = Octra_consensus.C_quorum_policy in
+  match update.eviction with
+  | Some eviction ->
+    if not (Q.seatless (Q.for_chain chain_id) epoch_id) || epoch_id < eviction.epoch then
+      Error "validator eviction requires active seatless voting"
+    else
+      let ( let* ) = Result.bind in
+      let* set, _ = validate_eviction update eviction in
+      let* _ = Octra_consensus.C_types.structural_validator_set_for_epoch
+        ~chain_id ~epoch_id set |> Result.map_error Octra_consensus.C_types.set_error_message in
+      Ok ()
+  | None when not (Q.seatless (Q.for_chain chain_id) epoch_id) -> Ok ()
+  | None ->
+    let ( let* ) = Result.bind in
+    let* set = validator_set update in
+    let* _ = Octra_consensus.C_types.checked_validator_set_for_epoch
+      ~chain_id ~epoch_id set in
+    Ok ()
+
+let make_eviction ~source_epoch ~activate_epoch ~offenders current =
+  let module C = Octra_consensus.C_types in
+  let ( let* ) = Result.bind in
+  if Int64.compare source_epoch 0L < 0 || source_epoch = Int64.max_int
+     || activate_epoch <> Int64.succ source_epoch then
+    Error "validator eviction must activate in the next epoch"
+  else
+    let* source = C.validate_validator_set_shape current |> Result.map_error C.set_error_message in
+    let source = {source with C.authors = None} in
+    let* next, weight = C.evict_validator_set ~offenders source in
+    let members = C.weights_of_set next |> List.map (fun (member, weight) ->
+      Validator_entry.{address = member.C.address; pubkey = member.pubkey; weight}) in
+    let* update = make_weighted ~source_epoch ~activate_epoch members in
+    let update = {update with eviction = Some C.{epoch = source_epoch; source;
+      offenders = List.sort String.compare offenders}} in
+    let* update = of_yojson (to_yojson update) in
+    Ok (update, weight)
+
+let check_eviction ~source_epoch ~offenders ~current update =
+  let ( let* ) = Result.bind in
+  let* expected, weight = make_eviction ~source_epoch ~activate_epoch:update.activate_epoch
+    ~offenders current in
+  if update <> expected then Error "validator eviction differs from exact removal"
+  else
+    let* next = validator_set expected in
+    Ok (next, weight)
+
+let eviction_offenders ~chain_id ~epoch ~registry ~current =
+  match Rule_graph.seatless_at ~chain_id ~epoch with
+  | Rule_graph.Prior -> Ok []
+  | Rule_graph.Active ->
+    let module C = Octra_consensus.C_types in
+    let ( let* ) = Result.bind in
+    let* current = C.validate_validator_set_shape {current with C.authors = None}
+      |> Result.map_error C.set_error_message in
+    let at = Int64.of_int epoch in
+    Ok (Validator_registry.slashes registry |> List.filter_map
+      (fun (record : Validator_registry.slash_record) ->
+        if List.mem_assoc record.offender current.weights
+           && record.applied_epoch <= at
+        then Some record.offender else None) |> List.sort_uniq String.compare)
+
+let check_eviction_state ~chain_id ~epoch ~registry ~current update =
+  let module C = Octra_consensus.C_types in
+  let ( let* ) = Result.bind in
+  if epoch < 0 || epoch = max_int
+     || Rule_graph.seatless_at ~chain_id ~epoch <> Rule_graph.Active then
+    Error "validator eviction state epoch is not active"
+  else
+    match update.eviction with
+    | None -> Error "validator eviction witness is missing"
+    | Some eviction ->
+      if eviction.epoch <> Int64.of_int epoch || not (C.same_voting_set current eviction.source) then
+        Error "validator eviction source differs from current voting set"
+      else
+        let* offenders = eviction_offenders ~chain_id ~epoch ~registry ~current in
+        if eviction.offenders <> offenders then Error "validator eviction offenders differ from registry"
+        else check_eviction ~source_epoch:(Int64.of_int epoch) ~offenders ~current update
 
 let empty_ready_extra = {
   chain_id = None;

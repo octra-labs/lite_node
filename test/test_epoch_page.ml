@@ -338,8 +338,8 @@ let listen port =
   in
   let submit meta request =
     let validate tx =
-      if tx.Octra_core.Transaction.nonce = 7 then Ok (String.make 64 'a')
-      else Error ("invalid_nonce", "test nonce differs")
+      if tx.Octra_core.Transaction.nonce = 7 then Lwt.return_ok (String.make 64 'a')
+      else Lwt.return_error ("invalid_nonce", "test nonce differs")
     in
     let route params () = Octra_node_runtime.Submit_rpc.submit ~validate params in
     Octra_node_runtime.Rpc_dispatch.handle_request meta request () ["octra_submit", route]

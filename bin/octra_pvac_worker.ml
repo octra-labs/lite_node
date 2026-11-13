@@ -5,14 +5,7 @@ module P = Octra_core.Pvac_verify_protocol
 module D = Octra_core.Pvac_verify_direct
 
 let set_oom_priority () =
-  if Sys.file_exists "/proc/self/oom_score_adj" then
-    try
-      let channel = open_out "/proc/self/oom_score_adj" in
-      Fun.protect
-        ~finally:(fun () -> close_out_noerr channel)
-        (fun () -> output_string channel "1000\n")
-    with _ ->
-      ()
+  try Octra_core.Proof_frame.prefer_oom () with _ -> ()
 
 let read_request () =
   let buffer = Bytes.create 65_536 in
@@ -53,7 +46,13 @@ let run () =
 
 let () =
   try
-    if Array.length Sys.argv = 2 && Sys.argv.(1) = "--fhe-session" then begin
+    if Array.length Sys.argv = 2 && Sys.argv.(1) = "--proof-session" then
+      Octra_core.Proof_serve.serve ()
+    else if Array.length Sys.argv = 2 && Sys.argv.(1) = "--circle-session" then begin
+      Pvac_ffi.isolate_worker ();
+      set_oom_priority ();
+      Octra_core.Circle_wasm_worker.serve ()
+    end else if Array.length Sys.argv = 2 && Sys.argv.(1) = "--fhe-session" then begin
       Pvac_ffi.isolate_worker ();
       set_oom_priority ();
       Octra_core.Fhe_calc.serve_session ()

@@ -61,6 +61,13 @@ type mark_claim = { epoch : int64; signature : string }
 type mark_set = int64 * string * C_types.validator_set
 type evidence = Pulse | Commit of proof | Marks of mark_claim list
 
+type parent_view = {
+  chain : string;
+  with_marks : bool;
+  source : C_types.parent_commit;
+  decoded : final * string list * string list;
+}
+
 let marks_id = "duty_marks:final_round:historic_set:precommit:ordered:atomic:age_2_16:wire_72"
 
 type counts = {
@@ -576,7 +583,11 @@ let read_parent ?(marks = false) ~chain_id (commit : C_types.parent_commit) =
     in
     Ok (final, signers, active)
 
-let advance ?(cap_mode=Reject) ?(marks = false) cfg ~chain_id ~start ~at ~parent state =
+let prepare_parent ~marks ~chain_id source =
+  read_parent ~marks ~chain_id source
+  |> Result.map (fun decoded -> {chain = chain_id; with_marks = marks; source; decoded})
+
+let advance ?prepared ?(cap_mode=Reject) ?(marks = false) cfg ~chain_id ~start ~at ~parent state =
   match state.applied with
   | Some epoch when Int64.equal epoch at -> Ok (state, None, false)
   | Some epoch when Int64.compare epoch at > 0 ->
@@ -598,7 +609,12 @@ let advance ?(cap_mode=Reject) ?(marks = false) cfg ~chain_id ~start ~at ~parent
         | None -> Error "validator duty parent commit missing"
         | Some parent ->
           begin
-            match read_parent ~marks ~chain_id parent with
+            let decoded = match prepared with
+              | None -> read_parent ~marks ~chain_id parent
+              | Some view when view.chain = chain_id && view.with_marks = marks
+                  && view.source = parent -> Ok view.decoded
+              | Some _ -> Error "validator duty prepared parent differs" in
+            match decoded with
             | Error _ as error -> error
             | Ok (final, signers, active) ->
               begin
@@ -795,6 +811,30 @@ let allows cfg ~start ~source ~address state =
   | None -> false
   | Some member ->
     member_allows cfg ~start ~source ~safe_after:state.safe_after member
+
+let change_epochs cfg ~start state =
+  let add epoch set = Int64_set.add epoch set in
+  let marked epochs member =
+    let rec loop bit epochs =
+      if bit >= Z.numbits member.marks.bits then epochs
+      else
+        let epochs = if Z.testbit member.marks.bits bit then
+          let enter = Int64.add (Int64.add member.marks.floor (Int64.of_int bit)) cfg.challenge in
+          epochs |> add enter |> add (Int64.add enter cfg.window)
+        else epochs in
+        loop (bit + 1) epochs
+    in
+    let epochs = loop 0 epochs in
+    match member.phase with
+    | Live since ->
+      epochs |> add (Int64.pred (Int64.add since (Int64.add cfg.challenge cfg.window)))
+    | Shadow None -> epochs
+    | Shadow (Some pulse) ->
+      epochs |> add pulse.last |> add (Int64.succ (Int64.add pulse.last cfg.pulse_gap))
+  in
+  List.fold_left marked
+    (Int64_set.of_list [state.safe_after; warm_end cfg start]) state.members
+  |> Int64_set.elements
 
 let exclusion cfg ~start ~source ~address state =
   match List.find_opt (fun member -> member.address = address) state.members with

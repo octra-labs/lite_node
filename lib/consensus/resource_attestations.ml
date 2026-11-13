@@ -445,6 +445,10 @@ let u64_prefix digest =
   done;
   !value
 
+let storage_index ~leaf_count prefix =
+  if leaf_count <= 0L then None
+  else Some (Int64.abs (Int64.rem prefix leaf_count))
+
 let storage_challenge_index ~challenge ~leaf_count attestation =
   if leaf_count <= 0L || String.length challenge <> 32 then None
   else
@@ -456,7 +460,7 @@ let storage_challenge_index ~challenge ~leaf_count attestation =
         Octra_net.Oce1.put_string buf attestation.node_id;
         Octra_net.Oce1.put_string buf attestation.commitment)
     in
-    Some (Int64.rem (Int64.abs (u64_prefix digest)) leaf_count)
+    storage_index ~leaf_count (u64_prefix digest)
 
 let verify_storage_attestation ~challenge ~commitment ~max_weight
     ~leaf_count attestation evidence =

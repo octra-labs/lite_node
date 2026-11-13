@@ -2,11 +2,13 @@
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
 type error =
+  | Input_limit
   | Invalid_count
   | Invalid_value of int
   | Unsupported_kind of Program_type_flow.kind
 
 let error_message = function
+  | Input_limit -> "program input work exceeds limit"
   | Invalid_count -> "program parameter count mismatch"
   | Invalid_value index -> Printf.sprintf "invalid program parameter at index %d" index
   | Unsupported_kind kind ->
@@ -14,6 +16,7 @@ let error_message = function
       (Program_type_flow.kind_name kind)
 
 let max_u64 = Z.of_string "18446744073709551615"
+let limit_error = Input_limit
 let max_u128 = Z.sub (Z.shift_left Z.one 128) Z.one
 let max_u256 = Z.sub (Z.shift_left Z.one 256) Z.one
 

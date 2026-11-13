@@ -20,14 +20,16 @@ val state_root_streak : t -> int
 val set_state_root_streak : t -> int -> unit
 val ahead_streak : t -> int
 val incr_ahead_streak : t -> unit
+val reset_ahead_streak : t -> unit
 val clear_state_attested : t -> unit
 val set_state_attested : t -> head:int -> root:string -> unit
 val attested_head : t -> int -> bool
 val root_attestation_recovers : string -> bool
+val root_range_recovers : string -> bool
 val root_recovery_evidence :
   reason:string ->
   evidence:string ->
-  consensus_proved:bool ->
+  source_proved:bool ->
   string option
 val enter_quarantine : t -> epoch:int -> reason:string -> bool
 val clear_quarantine : t -> evidence:string -> clear_result

@@ -316,6 +316,19 @@ let of_yojson = function
     | _ -> Error "Malformed JSON: missing or invalid fields")
   | _ -> Error "Expected JSON object"
 
+let network_number_chars = 1_024
+
+let of_network_yojson json =
+  let oversized = match json with
+    | `Assoc fields -> List.find_opt (fun (name, value) ->
+        (name = "amount" || name = "ou") && match value with
+        | `String raw | `Intlit raw -> String.length raw > network_number_chars
+        | _ -> false) fields
+    | _ -> None in
+  match oversized with
+  | Some (name, _) -> Error (name ^ " exceeds network numeric character limit")
+  | None -> of_yojson json
+
 let serialize_for_signing tx =
   let base = [
     "from", `String tx.from; "to_", `String tx.to_;

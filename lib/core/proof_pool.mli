@@ -11,10 +11,12 @@ val capacity_of_getenv : (string -> string option) -> int
 
 val try_run :
   ?priority:priority ->
+  bytes:int ->
   (unit -> 'a) ->
   'a option Lwt.t
 
 val run :
   ?priority:priority ->
+  bytes:int ->
   (unit -> 'a) ->
   'a Lwt.t

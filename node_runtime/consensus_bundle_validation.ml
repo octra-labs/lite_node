@@ -44,7 +44,8 @@ let artifacts ~(header : C_types.epoch_header) receipts_json txs =
   | Ok artifacts ->
     begin
       match
-        Octra_core.Preverify_commit.check_strings artifacts.preverify txs
+        Octra_core.Preverify_commit.check_strings artifacts.preverify
+          (Octra_core.Tx_outcome.executed ~confirmed:txs artifacts.rejections)
       with
       | Error error -> Error ("bundle preverify: " ^ error)
       | Ok () ->

@@ -6,6 +6,7 @@ type tx_callbacks = {
   has_tx : string -> bool;
   find_tx : string -> Octra_core.Transaction.t option;
   sender_pk : Octra_core.Transaction.t -> string option;
+  find_account : string -> Octra_core.Ledger.account option;
   add_tx : Octra_core.Transaction.t -> (string, string) result;
   now : unit -> float;
   max_drift : float;
@@ -58,7 +59,7 @@ val handle_frame_with_transport :
   on_consensus:(unit -> unit) ->
   on_resource_compute:(unit -> unit) ->
   Octra_net.P2p_frame.frame ->
-  unit
+  unit Lwt.t
 
 val start :
   ?duty_head:(unit -> (int64 * Octra_core.Rule_graph.mode) option) ->

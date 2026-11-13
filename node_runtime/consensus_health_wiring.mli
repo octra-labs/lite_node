@@ -7,6 +7,7 @@ type deps = {
   quarantine_active : unit -> bool;
   replay_stashed : source:string -> unit Lwt.t;
   probe_health : unit -> unit Lwt.t;
+  reset_ahead_streak : unit -> unit;
   reset_liveness : source:string -> unit Lwt.t;
 }
 
@@ -51,6 +52,7 @@ type 'driver driver_deps = {
   replay_stashed : source:string -> unit Lwt.t;
   start_driver : 'driver -> unit Lwt.t;
   probe_health : 'driver -> unit Lwt.t;
+  reset_ahead_streak : unit -> unit;
   reset_liveness : 'driver -> source:string -> unit Lwt.t;
   pending_recovery : 'driver -> bool Lwt.t;
   poll_interval : float;
@@ -70,6 +72,10 @@ type fork_repair_runtime = {
 }
 
 type driver_probe_deps = {
+  root_set : int64 -> Octra_consensus.C_types.validator_set option;
+  head_time : int -> float option;
+  now : unit -> float;
+  reset_ahead_streak : unit -> unit;
   probe_range : Octra_consensus.C_driver.t -> unit Lwt.t;
   env_int : string -> int -> int;
   getenv : string -> string option;
@@ -114,6 +120,9 @@ type node_fork_repair_runtime = {
 }
 
 type node_driver_probe_runtime = {
+  root_set : int64 -> Octra_consensus.C_types.validator_set option;
+  head_time : int -> float option;
+  now : unit -> float;
   probe_range : Octra_consensus.C_driver.t -> unit Lwt.t;
   env_int : string -> int -> int;
   getenv : string -> string option;
@@ -176,6 +185,8 @@ type node_liveness_deps = {
 }
 
 type node_driver_health_runtime = {
+  root_set : int64 -> Octra_consensus.C_types.validator_set option;
+  head_time : int -> float option;
   probe_range : Octra_consensus.C_driver.t -> unit Lwt.t;
   env_int : string -> int -> int;
   getenv : string -> string option;
@@ -303,7 +314,6 @@ val node_driver_probe_deps :
 
 val driver_probe_config :
   driver_probe_deps ->
-  Octra_consensus.C_driver.t ->
   Consensus_health_shell.config
 
 val driver_probe_deps :

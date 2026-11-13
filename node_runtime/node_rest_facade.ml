@@ -134,27 +134,23 @@ let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
         ~head ~confirmed_nonce tx with
       | Error _ as error -> error
       | Ok () ->
-      match Staging.add_smart ?head:queue_head ~lookup tx with
+      let accept () =
+        let check =
+          try runtime.preverify_admit tx
+          with exn -> Error ("pre_verify_unavailable reason = " ^ Printexc.to_string exn) in
+        begin match check with
+        | Error reason ->
+          Log.warn "staging"
+            "event = preverify_admit status = deferred tx = %s reason = %s"
+            (Text.hash_short tx_hash) reason
+        | Ok () -> ()
+        end;
+        check in
+      match Staging.add_smart ?head:queue_head ~accept ~lookup tx with
       | Error e -> Error e
       | Ok drops ->
         runtime.save_drops drops;
         begin
-          let check =
-            try runtime.preverify_admit tx
-            with exn ->
-              Error
-                ("pre_verify_unavailable reason = " ^ Printexc.to_string exn)
-          in
-          match check with
-          | Error reason ->
-            ignore (Staging.remove_by_hash tx_hash);
-            Preverify_cache.remove tx_hash;
-            Log.warn "staging"
-              "event = preverify_admit status = deferred tx = %s reason = %s"
-              (Text.hash_short tx_hash)
-              reason;
-            Error reason
-          | Ok () ->
             begin
               match lookup tx.from with
               | Some (_, confirmed) ->
@@ -168,6 +164,7 @@ let add_tx_to_staging ?(relay = true) ?(bft_mode = false) runtime ledger tx =
                       tx.nonce
                       expires_at
                   | Some (Staging.Ready _)
+                  | Some (Staging.Wait_preview _)
                   | Some (Staging.Nonce_used _)
                   | None -> ()
                 end
@@ -227,42 +224,53 @@ let bft_pending_nonce_window () =
   max 1 (Env.int_value "OCTRA_BFT_PENDING_NONCE_WINDOW" 32)
 
 let validate_and_submit_tx runtime ledger (tx : Transaction.t) =
-  let ( let* ) = Result.bind in
-  let* () = Octra_core.Tx_envelope.check_compute ~settle:(runtime.settle_mode ())
-    (runtime.compute_mode ()) [tx]
-    |> Result.map_error (fun reason -> "malformed_transaction", reason) in
-  let now = Unix.gettimeofday () in
-  match Tx_view.submit_pre_signature_check
+  let prepare () =
+    let ( let* ) = Result.bind in
+    let* () = Octra_core.Tx_envelope.check_compute ~settle:(runtime.settle_mode ())
+      (runtime.compute_mode ()) [tx]
+      |> Result.map_error (fun reason -> "malformed_transaction", reason) in
+    let* () = Tx_view.submit_pre_signature_check
           ~duty:(runtime.duty_head ())
-          ~now
+          ~now:(Unix.gettimeofday ())
           ~max_timestamp_drift
           ~observer_rpc_mode:(observer_rejects_submissions ())
           ~bft_mode:(bft_mode ())
           ~limits:Tx_view.payload_limits
           ~sender_exists:(Ledger.mem ledger tx.from)
-          tx with
-  | Error e -> Error e
-  | Ok () ->
-    let acc = Ledger.find ledger tx.from in
-    let ( let* ) = Result.bind in
-    let* tx = prepare_tx ledger tx in
-    match Tx_view.submit_signature_check
-            ~signing:(runtime.signing ())
-            ~account_public_key:acc.Ledger.public_key
+          tx in
+    let* prepared = prepare_tx ledger tx in
+    let* () = Tx_view.payload_account_check ~bft_mode:(bft_mode ())
+      ~bft_window:(bft_pending_nonce_window ()) ~min_ou:(Rest_read_rpc.stealth_floor ())
+      ~min_relay_fee:(Staging.min_relay_fee prepared)
+      ~account:(Ledger.find_opt ledger tx.from) prepared in
+    Ok prepared in
+  match prepare () with
+  | Error e -> Lwt.return_error e
+  | Ok prepared ->
+    let open Lwt.Syntax in
+    let* checked = Tx_view.submit_signature_check
+      ~signing:(runtime.signing ())
+      ~account_public_key:(Ledger.find ledger tx.from).Ledger.public_key
+      prepared in
+    Lwt.return (let ( let* ) = Result.bind in
+      let* () = checked in
+      let* tx = prepare () in
+      let acc = Ledger.find ledger tx.from in
+      let* () = Tx_view.signature_check ~signing:(runtime.signing ())
+        ~account_public_key:acc.Ledger.public_key tx in
+      let* () = Tx_view.post_signature_check
             ~preverify_has_capacity:(Preverify_cache.has_capacity ())
             ~preverify_pending:(Preverify_cache.pending_count ())
             ~preverify_pending_max:(Preverify_cache.pending_max ())
             ~bft_mode:(bft_mode ())
             ~confirmed_nonce:acc.Ledger.nonce
             ~bft_window:(bft_pending_nonce_window ())
-            tx with
-    | Error e -> Error e
-    | Ok () ->
+            tx in
       match add_tx_to_staging ~bft_mode:(bft_mode ()) runtime ledger tx with
       | Error msg ->
         let (t, r) = Tx_view.staging_error msg in
         Error (t, r)
-      | Ok tx_hash -> Ok tx_hash
+      | Ok tx_hash -> Ok tx_hash)
 
 let run_s = Node_rpc_server.run_s
 

@@ -18,22 +18,26 @@ let integer = function
   | `Int value when value >= 0 -> Ok value
   | _ -> Error "circle counter invalid"
 
-let scalar json =
+let scalar ?(active = false) json =
   match field "tag" json, field "value" json with
   | `String "int", `String value ->
-    begin try Ok (Vm.VInt (Z.of_string value))
+    if active && not (Octra_vm.Scalar_work.text_ok value) then Error "circle integer exceeds limit" else
+    begin try
+      let number = Z.of_string value in
+      if active && not (Octra_vm.Scalar_work.valid number) then Error "circle integer exceeds limit"
+      else Ok (Vm.VInt number)
     with Invalid_argument _ -> Error "circle integer invalid" end
   | `String "string", `String value -> Ok (Vm.VString value)
   | `String "bool", `Bool value -> Ok (Vm.VBool value)
   | _ -> Error "circle argument invalid"
 
-let operation json =
+let operation ?(active = false) json =
   let ( let* ) = Result.bind in
   let* params = match field "params" json with
     | `List params ->
       List.fold_left (fun result param ->
         let* values = result in
-        let* value = scalar param in
+        let* value = scalar ~active param in
         Ok (value :: values)) (Ok []) params |> Result.map List.rev
     | _ -> Error "circle arguments invalid" in
   match field "method" json, params with
@@ -108,11 +112,21 @@ let dispatch ~(ctx : Vm.exec_ctx) ~depth ~address ~value ~storage ~events json =
     let ( let* ) = Result.bind in
     let* fuel = integer (field "fuel" json) in
     let* index = integer (field "events" json) in
-    let* action = operation json in
+    let* parsed = if not ctx.scalar_work then Ok 0 else
+      let* params = match field "params" json with
+        | `List values -> Ok values | _ -> Error "circle arguments invalid" in
+      let cost = List.fold_left (fun total param ->
+        match field "tag" param, field "value" param with
+        | `String "int", `String text -> Z.add total (Octra_vm.Scalar_work.parse (String.length text))
+        | _, `String text -> Z.add total (Octra_vm.Scalar_work.scan (String.length text))
+        | _ -> Z.succ total) Z.zero params in
+      match Octra_vm.Cost.charge_z ~used:0 ~cost ~limit:fuel with
+      | None -> Error "circle input work exceeds limit" | Some used -> Ok used in
+    let* action = operation ~active:ctx.scalar_work json in
     let* values = Host.decode_storage_tbl (field "storage_pairs" json) in
     let cost = Z.add (Octra_vm.Program_journal.storage_effort storage)
       (Octra_vm.Program_journal.storage_effort values) in
-    let* spent = match Octra_vm.Cost.charge_z ~used:0 ~cost ~limit:fuel with
+    let* spent = match Octra_vm.Cost.charge_z ~used:parsed ~cost ~limit:fuel with
       | None -> Error "circle storage effort exceeds limit"
       | Some spent -> Ok spent in
     let* () = Circle_runtime_storage.validate_runtime_storage_delta
@@ -148,6 +162,15 @@ let dispatch ~(ctx : Vm.exec_ctx) ~depth ~address ~value ~storage ~events json =
     match result with
     | Error error -> Lwt.return (refused error)
     | Ok (value, effort) ->
+      let cost = if not ctx.scalar_work then Some Z.zero else match value with
+        | Vm.VInt number | Vm.VU64 number | Vm.VU128 number | Vm.VU256 number ->
+          if Octra_vm.Scalar_work.valid number then Some (Octra_vm.Scalar_work.decimal number) else None
+        | Vm.VString text | Vm.VAddr text | Vm.VBytes text | Vm.VBytes32 text ->
+          Some (Octra_vm.Scalar_work.scan (String.length text))
+        | _ -> Some Z.zero in
+      match Option.bind cost (fun cost -> Octra_vm.Cost.charge_z ~used:effort ~cost ~limit:fuel) with
+      | None -> Lwt.return (refused "circle output work exceeds limit")
+      | Some effort ->
       match response value with
       | Error error -> Lwt.return (refused error)
       | Ok bytes -> Lwt.return (match reply ~id ~bytes ~effort:(spent + effort) storage with

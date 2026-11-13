@@ -216,6 +216,10 @@ type proposal_cache_entry = {
   parent_commit : parent_commit option;
 }
 
+type request_state = Waiting | Offered | Delivered
+
+type polc_request = { asked : int; stamp : int; delivery : request_state; returned : bool }
+
 type t = {
   chain_id : string;
   policy : C_quorum_policy.t;
@@ -232,7 +236,12 @@ type t = {
   mutable proposal_cache : (string, proposal_cache_entry) Hashtbl.t;
   mutable proposal_messages : ((string * int), propose) Hashtbl.t;
   mutable polc_by_round : (int, string) Hashtbl.t;
-  mutable polc_requests : (int, int) Hashtbl.t;
+  mutable polc_requests : (int, polc_request) Hashtbl.t;
+  mutable polc_serial : int;
+  mutable polc_sweep : (int * int) option;
+  mutable polc_named : int list;
+  mutable polc_named_round : int;
+  mutable polc_priority : int option;
   mutable proof_search : int option;
   mutable higher_round_evidence : (string, int) Hashtbl.t;
   mutable outputs : output list;
@@ -245,7 +254,15 @@ type t = {
   mutable round_skip_ready : unit -> bool;
 }
 
+let check_voting_set policy ~chain_id ~epoch_id set =
+  if C_quorum_policy.seatless policy epoch_id then
+    match C_types.structural_validator_set_for_epoch ~policy ~chain_id ~epoch_id set
+      |> Result.map_error C_types.set_error_message with
+    | Ok _ -> ()
+    | Error reason -> invalid_arg reason
+
 let create_for_policy policy ~chain_id ~my_addr ~validator_set ~start_height ~can_vote =
+  check_voting_set policy ~chain_id ~epoch_id:start_height validator_set;
   let prevotes = create_vote_set () in
   let prevotes_by_round = Hashtbl.create 8 in
   let precommits = create_vote_set () in
@@ -269,6 +286,11 @@ let create_for_policy policy ~chain_id ~my_addr ~validator_set ~start_height ~ca
     proposal_messages = Hashtbl.create 8;
     polc_by_round = Hashtbl.create 4;
     polc_requests = Hashtbl.create 4;
+    polc_serial = 0;
+    polc_sweep = None;
+    polc_named = [];
+    polc_named_round = -1;
+    polc_priority = None;
     proof_search = None;
     higher_round_evidence = Hashtbl.create 4;
     outputs = [];
@@ -614,6 +636,26 @@ let can_prevote t =
   | ProposeStep | PrevoteStep -> true
   | PrecommitStep -> false
 
+let round_referenced t round =
+  round = t.state.locked_round
+  || round = t.state.valid_round
+  || t.proof_search = Some round
+  || (round >= t.state.locked_round && List.mem round t.polc_named)
+
+let name_polc_request t (proposal : propose) =
+  if proposal.round <= t.polc_named_round then false
+  else begin
+    t.polc_named_round <- proposal.round;
+    t.polc_priority <- proposal.valid_round;
+    Option.iter (fun round ->
+      t.polc_named <- round :: List.filter (fun prior -> prior <> round) t.polc_named
+        |> List.filteri (fun index _ -> index < round_history_limit / 2)) proposal.valid_round;
+    true
+  end
+
+let sweep_step ~through (cursor, limit) =
+  cursor, if cursor >= limit then (0, through) else (cursor + 1, limit)
+
 let round_retained t round =
   let recent_floor = max 0 (t.state.round - round_history_limit) in
   round >= recent_floor
@@ -622,54 +664,97 @@ let round_retained t round =
   || Hashtbl.mem t.polc_requests round
   || t.proof_search = Some round
 
-let oldest_polc_request t =
-  Hashtbl.fold
-    (fun round _ oldest ->
+let oldest_polc_request ?returned ?(priority = false) t =
+  let oldest except = Hashtbl.fold
+    (fun round query oldest ->
+      if except round || Option.fold ~none:false ~some:(fun keep -> keep <> query.returned) returned
+      then oldest else
+      let rank = query.asked, query.delivery = Waiting, round in
       match oldest with
-      | None -> Some round
-      | Some value -> Some (min value round))
+      | None -> Some (rank, round)
+      | Some (prior, _) when rank < prior -> Some (rank, round)
+      | Some _ -> oldest)
     t.polc_requests
-    None
+    None |> Option.map snd in
+  match oldest (round_referenced t) with
+  | Some round -> Some round
+  | None when priority -> oldest (fun round ->
+    round = t.state.locked_round || round = t.state.valid_round || t.proof_search = Some round)
+  | None -> None
 
-let remember_polc_request t round =
+let remember_polc_request ?(priority = false) ?(returned = false) t round =
   if round < 0
      || round >= t.state.round
-     || round <= t.state.locked_round
+     || round < t.state.locked_round
      || Hashtbl.mem t.polc_by_round round
   then
     false
-  else if Hashtbl.mem t.polc_requests round then
-    true
+  else if Hashtbl.mem t.polc_requests round then true
   else begin
-    if Hashtbl.length t.polc_requests >= round_history_limit then
-      Option.iter (Hashtbl.remove t.polc_requests) (oldest_polc_request t);
-    Hashtbl.replace t.polc_requests round (-1);
-    true
+    if t.polc_sweep = None && Hashtbl.length t.polc_requests >= round_history_limit then
+      t.polc_sweep <- Some (0, t.state.round - 1);
+    let limit = if t.polc_sweep = None then round_history_limit
+      else if returned then round_history_limit / 4 else 3 * round_history_limit / 4 in
+    let count () = Hashtbl.fold (fun _ query total ->
+      total + if query.returned = returned then 1 else 0) t.polc_requests 0 in
+    let rec make_room () =
+      if count () >= limit then
+        match oldest_polc_request ~returned ~priority t with
+        | None -> ()
+        | Some old -> Hashtbl.remove t.polc_requests old; make_room () in
+    make_room ();
+    if Hashtbl.length t.polc_requests >= round_history_limit then false
+    else if count () >= limit then false
+    else begin
+      Hashtbl.replace t.polc_requests round { asked = -1; stamp = 0; delivery = Waiting; returned };
+      true
+    end
   end
 
 let emit_polc_request t round =
-  Hashtbl.replace t.polc_requests round t.state.round;
+  t.polc_serial <- t.polc_serial + 1;
+  let query = Hashtbl.find t.polc_requests round in
+  Hashtbl.replace t.polc_requests round {
+    query with asked = t.state.round; stamp = t.polc_serial; delivery = Offered;
+  };
   emit t (RequestRoundEvidence round)
 
-let request_polc t round =
-  if remember_polc_request t round then
+let polc_request_stamp t round =
+  Option.map (fun query -> query.stamp) (Hashtbl.find_opt t.polc_requests round)
+
+let report_polc_request t ~height ~generation ~round ~stamp ~sent =
+  if height = t.state.height && generation = t.generation then
     match Hashtbl.find_opt t.polc_requests round with
-    | Some last_sent when last_sent < t.state.round ->
+    | Some query when Some query.stamp = stamp ->
+      Hashtbl.replace t.polc_requests round {
+        query with delivery = if sent then Delivered else Waiting;
+      }
+    | Some _ | None -> ()
+
+let renew_polc_requests t =
+  Hashtbl.filter_map_inplace (fun round query ->
+    if round < t.state.locked_round || Hashtbl.mem t.polc_by_round round then None
+    else Some {query with delivery = Waiting}) t.polc_requests
+
+let request_polc ?(priority = false) ?(returned = false) t round =
+  if remember_polc_request ~priority ~returned t round then
+    match Hashtbl.find_opt t.polc_requests round with
+    | Some query when query.asked < t.state.round || query.delivery = Waiting ->
       emit_polc_request t round
     | Some _
     | None -> ()
 
 let least_recent_polc_request t ~except =
   Hashtbl.fold
-    (fun round last_sent selected ->
-      if Some round = except || last_sent >= t.state.round then selected
+    (fun round query selected ->
+      if Some round = except || (query.asked >= t.state.round && query.delivery <> Waiting) then selected
       else
         match selected with
-        | None -> Some (round, last_sent)
-        | Some (best_round, best_sent)
-          when last_sent < best_sent
-               || (last_sent = best_sent && round > best_round) ->
-          Some (round, last_sent)
+        | None -> Some (round, query)
+        | Some (best_round, best)
+          when (query.delivery <> Waiting, query.asked, -round)
+             < (best.delivery <> Waiting, best.asked, -best_round) ->
+          Some (round, query)
         | Some _ -> selected)
     t.polc_requests
     None
@@ -677,9 +762,24 @@ let least_recent_polc_request t ~except =
 let retry_polc_request t ~except =
   match least_recent_polc_request t ~except with
   | None -> ()
-  | Some (round, _) ->
-    emit t (RequestRoundEvidence round);
-    Hashtbl.replace t.polc_requests round t.state.round
+  | Some (round, _) -> emit_polc_request t round
+
+let return_polc_requests t =
+  for _ = 1 to 2 do
+    Option.iter (fun sweep ->
+      let round, next = sweep_step ~through:(t.state.round - 1) sweep in
+      t.polc_sweep <- Some next;
+      if not (Hashtbl.mem t.polc_requests round) then
+        request_polc ~returned:true ~priority:true t round) t.polc_sweep
+  done
+
+let renew_named_requests t =
+  t.polc_named |> List.filter (fun round ->
+    match Hashtbl.find_opt t.polc_requests round with
+    | Some query -> query.delivery = Waiting
+    | None -> true)
+  |> List.filteri (fun index _ -> index < 4)
+  |> List.iter (request_polc t)
 
 let prune_round_history t =
   let prune table =
@@ -697,9 +797,12 @@ let start_round t round =
   let precommits = create_vote_set () in
   t.vote_timers <- [];
   t.state <- { t.state with round; step = ProposeStep };
+  t.polc_priority <- None;
   let previous = if round > 0 then Some (round - 1) else None in
   Option.iter (request_polc t) previous;
   retry_polc_request t ~except:previous;
+  return_polc_requests t;
+  renew_named_requests t;
   t.prevotes <- prevotes;
   Hashtbl.replace t.prevotes_by_round round prevotes;
   t.precommits <- precommits;
@@ -718,6 +821,7 @@ let realign_round t round =
   if round <= t.state.round then
     invalid_arg "consensus round must advance";
   t.generation <- t.generation + 1;
+  renew_polc_requests t;
   start_round t round
 
 let project_votes ?policy validator_set votes =
@@ -834,6 +938,7 @@ let projected_state t validator_set =
   prevotes, precommits, polc, valid
 
 let replace_validator_set t validator_set =
+  check_voting_set t.policy ~chain_id:t.chain_id ~epoch_id:t.state.height validator_set;
   if not (String.equal
       (C_config.validator_set_hash t.vs)
       (C_config.validator_set_hash validator_set)) then begin
@@ -847,13 +952,14 @@ let replace_validator_set t validator_set =
     t.prevotes <- current prevotes;
     t.precommits <- current precommits;
     t.polc_by_round <- polc;
-    t.polc_requests <- Hashtbl.create 4;
+    renew_polc_requests t;
     t.higher_round_evidence <- Hashtbl.create 4;
     t.state <- {t.state with valid_round = fst valid; valid_value = snd valid}
   end;
   t.vs <- validator_set
 
 let reconfigure_validator_set t ~round validator_set =
+  check_voting_set t.policy ~chain_id:t.chain_id ~epoch_id:t.state.height validator_set;
   if round <= t.state.round then
     invalid_arg "consensus reconfiguration round must advance";
   let prevotes_by_round, precommits_by_round, polc_by_round, valid =
@@ -868,7 +974,7 @@ let reconfigure_validator_set t ~round validator_set =
     valid_value = snd valid;
   };
   t.polc_by_round <- polc_by_round;
-  t.polc_requests <- Hashtbl.create 4;
+  renew_polc_requests t;
   t.prevotes_by_round <- prevotes_by_round;
   t.precommits_by_round <- precommits_by_round;
   t.higher_round_evidence <- Hashtbl.create 4;
@@ -891,6 +997,7 @@ let reconfigure_validator_set t ~round validator_set =
   start_round t round
 
 let start_height t height =
+  check_voting_set t.policy ~chain_id:t.chain_id ~epoch_id:height t.vs;
   let same_height = Int64.equal height t.state.height in
   let round =
     if not same_height then 0
@@ -912,7 +1019,15 @@ let start_height t height =
     t.proposal_cache <- Hashtbl.create 8;
     t.proposal_messages <- Hashtbl.create 8
   end;
-  t.polc_requests <- Hashtbl.create 4;
+  if same_height then renew_polc_requests t
+  else begin
+    t.polc_requests <- Hashtbl.create 4;
+    t.polc_serial <- 0;
+    t.polc_sweep <- None;
+    t.polc_named <- [];
+    t.polc_named_round <- -1;
+    t.polc_priority <- None
+  end;
   if not same_height then begin
     t.proof_search <- None;
     t.polc_by_round <- Hashtbl.create 4;
@@ -930,6 +1045,8 @@ let polc_matches t ~round ~proposal_id =
 
 let polc_request_pending t round =
   Hashtbl.mem t.polc_requests round || t.proof_search = Some round
+  || (not (Hashtbl.mem t.polc_by_round round)
+    && (round = t.state.locked_round || round = t.state.valid_round))
 
 let past_proposal_needed t (p : propose) =
   p.chain_id = t.chain_id && p.epoch_id = t.state.height
@@ -1085,6 +1202,7 @@ let restore_precommit_lock t (proposal : propose) =
     };
     if C_quorum_policy.round_wait t.policy t.state.height then begin
       t.generation <- t.generation + 1;
+      renew_polc_requests t;
       start_round t proposal.round
     end else realign_round t (proposal.round + 1);
     Ok ()
@@ -1553,7 +1671,8 @@ let on_propose t (p : propose) ~verify_fn ~execute_fn ~sign_fn =
     if proposal_valid then begin
       cache_proposal_message t p;
       if accept then t.current_proposal <- Some p;
-      if not lock_ok then Option.iter (request_polc t) p.valid_round
+      if name_polc_request t p then
+        Option.iter (request_polc ~priority:true t) p.valid_round
     end;
     let finalized_from_cache =
       proposal_valid

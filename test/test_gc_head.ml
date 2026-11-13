@@ -210,7 +210,8 @@ let run path =
     let* tip = head store in
     let branch = Printf.sprintf "pack_split_%d" floor in
     let* () = S.Store.Branch.set store.S.repo branch tip in
-    let* rejected = S.start_pack_gc store ~keep:1 ~floor ~commit 3 in
+    let _, _, generation = S.gc_measure_key store floor commit in
+    let* rejected = S.start_pack_gc store ~keep:1 ~floor ~commit ~generation 3 in
     expect "same epoch replacement entered GC" (rejected = S.Gc_missing floor);
     let* () = S.Store.Branch.set store.S.repo branch commit in
     let* () = S.clear_gc_plan store in
@@ -285,7 +286,7 @@ let test_space_retry path =
     let* _ = S.collect_pack_at store ~keep:1 2 in
     let* () = epoch store 3 "three" in
     let reads = ref 0 in
-    let measure tree = incr reads; S.measure_tree tree in
+    let measure ~free store commit = incr reads; S.measure_pack ~free store commit in
     let collect free = S.collect_pack_at ~free ~measure store ~keep:1 3 in
     let* empty = collect 0L in
     expect "empty disk did not defer GC"
@@ -298,6 +299,10 @@ let test_space_retry path =
     let* again = collect S.gc_reserve in
     expect "repeat changed space decision" (again = first);
     expect "space refusal rescanned the same commit" (!reads = 1);
+    let* () = epoch store 4 "four" in
+    let* appended = collect S.gc_reserve in
+    expect "append changed fixed target estimate" (appended = first);
+    expect "append rescanned fixed target" (!reads = 1);
     let* tip = head store in
     let* () = S.Store.Branch.set store.repo "pack_split_2" tip in
     let* _ = collect S.gc_reserve in
@@ -314,11 +319,232 @@ let test_space_retry path =
     Lwt.return_unit
   ) (fun () -> S.close store)
 
+let test_need_limit path =
+  let* store = S.open_store ~fresh:true path in
+  Lwt.finalize (fun () ->
+    let* () = epoch store 1 "one" in
+    let* () = epoch store 2 "two" in
+    let* split = S.collect_pack_at store ~keep:1 2 in
+    expect "GC limit split missing" (split = S.Gc_split 2);
+    let* () = epoch store 3 "three" in
+    let measure ~free:_ _ _ = Lwt.return (S.{bytes = Int64.max_int; records = 1L}, true) in
+    let* result = S.collect_pack_at ~free:Int64.max_int ~measure store ~keep:1 3 in
+    (match result with S.Gc_error reason -> failwith reason | _ -> ());
+    expect "GC saturated need accepted"
+      (result = S.Gc_space {free = Int64.max_int; need = Int64.max_int});
+    expect "GC saturated need retained planning" (not store.gc_planning);
+    expect "GC saturated need started collection"
+      (S.Store.Gc.is_finished store.repo && store.split_epoch = Some 2
+       && not (Sys.file_exists (Filename.concat path "store.1.prefix"))
+       && not (Sys.file_exists (Filename.concat path "store.1.mapping")));
+    value store "three"
+  ) (fun () -> S.close store)
+
+let test_measure_child () =
+  let reaped () =
+    match Unix.waitpid [Unix.WNOHANG] (-1) with
+    | exception Unix.Unix_error (Unix.ECHILD, _, _) -> ()
+    | _ -> failwith "GC measure child survived" in
+  let size = S.{ records = 1L; bytes = 33L } in
+  let files = List.init 8 (fun _ -> Unix.openfile "/dev/null" [Unix.O_RDONLY] 0) in
+  let inherited = List.hd (List.rev files) in
+  let* () = Lwt.finalize (fun () ->
+    let* _ = S.gc_pack_child (fun () ->
+      match Unix.fstat inherited with
+      | exception Unix.Unix_error (Unix.EBADF, _, _) -> size
+      | _ -> failwith "GC child inherited descriptor") in
+    ignore (Unix.fstat inherited);
+    Lwt.return_unit
+  ) (fun () -> List.iter Unix.close files; Lwt.return_unit) in
+  reaped ();
+  let* actual = S.gc_pack_child (fun () -> size) in
+  expect "GC measure result changed" (actual = size);
+  reaped ();
+  let* failed = Lwt.catch
+    (fun () -> let* _ = S.gc_pack_child (fun () -> failwith "measure failure") in
+      Lwt.return_false)
+    (fun error -> Lwt.return (error = Failure "Failure(\"measure failure\")")) in
+  expect "GC measure failure lost" failed;
+  reaped ();
+  let* expired = Lwt.catch
+    (fun () -> let* _ = S.gc_pack_child ~timeout:0.02
+      (fun () -> Unix.sleepf 1.; size) in Lwt.return_false)
+    (fun error -> Lwt.return (error = Failure "GC measure timed out")) in
+  expect "GC measure deadline ignored" expired;
+  reaped ();
+  let task = S.gc_pack_child (fun () -> Unix.sleepf 1.; size) in
+  Lwt.cancel task;
+  let* cancelled = Lwt.catch
+    (fun () -> let* _ = task in Lwt.return_false)
+    (fun error -> Lwt.return (error = Lwt.Canceled)) in
+  expect "GC measure cancellation lost" cancelled;
+  reaped ();
+  Lwt.return_unit
+
+let test_measure_append path =
+  let* store = S.open_store ~fresh:true path in
+  Lwt.finalize (fun () ->
+    let* () = epoch store 1 "one" in
+    let* () = epoch store 2 "two" in
+    let* _ = S.collect_pack_at store ~keep:1 2 in
+    let* () = epoch store 3 "three" in
+    let measure ~free store commit =
+      let work = S.measure_pack ~free store commit in
+      let* () = epoch store 4 "four" in
+      work in
+    let* result = S.collect_pack_at ~free:S.gc_reserve ~measure store ~keep:1 3 in
+    (match result with S.Gc_error reason -> failwith reason | _ -> ());
+    expect "append invalidated physical measure"
+      (match result with S.Gc_space {need; _} -> need > S.gc_reserve | _ -> false);
+    value store "four"
+  ) (fun () -> S.close store)
+
+let test_measure_close path =
+  let* store = S.open_store ~fresh:true path in
+  let release = Filename.concat path "release" in
+  let work = S.run_gc_measure store (fun () ->
+    while not (Sys.file_exists release) do Unix.sleepf 0.01 done;
+    S.{records = 1L; bytes = 33L}) in
+  expect "GC child not owned" (Option.is_some store.gc_job);
+  let caught = Lwt.catch (fun () -> let* _ = work in Lwt.return_false)
+    (fun error -> Lwt.return (error = Lwt.Canceled)) in
+  Lwt.finalize (fun () ->
+    let* () = S.close store in
+    expect "GC close retained child" (store.gc_job = None);
+    let* cancelled = caught in
+    expect "GC close left measure running" cancelled;
+    let* refused = S.collect_pack_at store ~keep:1 2 in
+    expect "GC entered closed store"
+      (refused = S.Gc_error "GC store is closed");
+    Lwt.return_unit
+  ) (fun () -> Lwt.cancel work; let* _ = caught in Lwt.return_unit)
+
+let test_measure_wait path =
+  let* store = S.open_store ~fresh:true path in
+  Lwt.finalize (fun () ->
+    let release = Filename.concat path "release" in
+    let work = S.run_gc_measure store (fun () ->
+      while not (Sys.file_exists release) do Unix.sleepf 0.01 done;
+      S.{records = 1L; bytes = 33L}) in
+    let waiting = S.wait_pack_gc store in
+    expect "GC wait skipped child" (Lwt.is_sleeping waiting);
+    let file = open_out_gen [Open_wronly; Open_creat; Open_excl] 0o600 release in
+    close_out file;
+    let* _ = work in
+    let* result = waiting in
+    expect "GC wait failed" (result = Ok () && store.gc_job = None);
+    Lwt.return_unit
+  ) (fun () -> S.close store)
+
+let test_plan_cancel path =
+  let* store = S.open_store ~fresh:true path in
+  Lwt.finalize (fun () ->
+    store.gc_planning <- true;
+    let* () = Lwt_mutex.lock store.tag_lock in
+    let cleared = S.clear_gc_plan store in
+    expect "GC plan cleanup did not wait" (Lwt.is_sleeping cleared);
+    Lwt.cancel cleared;
+    Lwt_mutex.unlock store.tag_lock;
+    let* () = cleared in
+    expect "GC cancelled cleanup retained plan" (not store.gc_planning);
+    Lwt.return_unit
+  ) (fun () -> S.close store)
+
+let test_close_tags path =
+  let* store = S.open_store ~fresh:true path in
+  let* () = S.write store ["value"] "one" in
+  let* () = Lwt_list.iter_s (S.tag_epoch store) (List.init 300 (fun index -> index + 1)) in
+  let* split = S.collect_pack_at store ~keep:1 300 in
+  expect "GC tag split missing" (split = S.Gc_split 300);
+  let* () = epoch store 301 "two" in
+  let work = S.collect_pack_at ~free:Int64.max_int store ~keep:1 301 in
+  expect "GC tag removal did not yield" (Lwt.is_sleeping work);
+  let closing = S.close store in
+  expect "GC close skipped active tag operation" (Lwt.is_sleeping closing);
+  let* () = closing in
+  let* result = work in
+  expect "GC worker started while closing" (match result with
+    | S.Gc_error reason -> reason = "GC store closed before worker start"
+    | _ -> false);
+  expect "GC closing retained plan" (not store.gc_planning);
+  expect "GC closing created output"
+    (not (Sys.file_exists (Filename.concat path "store.1.prefix")));
+  Lwt.return_unit
+
+let test_debt_reopen path =
+  let module Debt = Irmin_pack_unix.Gc_debt in
+  let* store = S.open_store ~fresh:true path in
+  let* () = S.write store ["value"] "before" in
+  let* () = S.close store in
+  let retained = Filename.concat path "store.99.prefix" in
+  let channel = open_out_bin retained in
+  output_string channel "retained evidence";
+  close_out channel;
+  Debt.save path { blocked = false; entries = [
+    { path = retained; generation = 99; reason = "unlink refused" } ] };
+  let* store = S.open_store path in
+  expect "GC retired debt remained after node reopen"
+    (S.Store.Gc.cleanup_debt store.repo = []);
+  expect "GC retired file survived node reopen" (not (Sys.file_exists retained));
+  let* () = S.write store ["value"] "after" in
+  let* () = S.close store in
+  let* store = S.open_store path in
+  let* value = S.read store ["value"] in
+  expect "GC debt blocked committed writes" (value = Some "after");
+  expect "GC debt returned on second node reopen"
+    (S.Store.Gc.cleanup_debt store.repo = []);
+  S.close store
+
+let test_open_lease path =
+  let* store = S.open_store ~fresh:true path in
+  let* () = S.write store ["value"] "lease" in
+  let* () = S.close store in
+  let lease = Irmin_pack_unix.Gc_debt.acquire path in
+  let closed = ref false in
+  let release () = if not !closed then (closed := true; Unix.close lease) in
+  Lwt.finalize (fun () ->
+    let* reader = S.open_store ~readonly:true path in
+    let* () = value reader "lease" in
+    let* () = S.close reader in
+    let* refused = Lwt.catch
+      (fun () -> Lwt_unix.with_timeout 1. (fun () ->
+        let* store = S.open_store ~gc_wait_seconds:0.02 path in
+        let+ () = S.close store in false))
+      (function Unix.Unix_error ((Unix.EAGAIN | Unix.EWOULDBLOCK), "flock GC", _) -> Lwt.return_true
+        | error -> Lwt.fail error) in
+    expect "GC lease timeout was ignored" refused;
+    let waiting = S.open_store path in
+    expect "GC lease open did not wait" (Lwt.is_sleeping waiting);
+    release ();
+    let* store = Lwt_unix.with_timeout 1. (fun () -> waiting) in
+    let* () = value store "lease" in
+    let* () = S.close store in
+    let output = open_out_bin (Irmin_pack_unix.Gc_debt.path path) in
+    output_string output "broken";
+    close_out output;
+    let* corrupt = Lwt.catch
+      (fun () -> Lwt_unix.with_timeout 1. (fun () ->
+        let* store = S.open_store path in let+ () = S.close store in false))
+      (function Failure reason when reason = "GC debt record invalid" -> Lwt.return_true
+        | error -> Lwt.fail error) in
+    expect "GC corrupt journal was retried or ignored" corrupt;
+    Lwt.return_unit)
+    (fun () -> release (); Lwt.return_unit)
+
 let () =
   gc_keep_case ();
   repair_source_case ();
   repair_boot_case ();
+  Lwt_main.run (test_measure_child ());
+  Test_workspace.with_dir "gc-need-limit" (fun path -> Lwt_main.run (test_need_limit path));
+  Test_workspace.with_dir "gc-append" (fun path -> Lwt_main.run (test_measure_append path));
+  Test_workspace.with_dir "gc-close" (fun path -> Lwt_main.run (test_measure_close path));
+  Test_workspace.with_dir "gc-wait" (fun path -> Lwt_main.run (test_measure_wait path));
+  Test_workspace.with_dir "gc-cancel" (fun path -> Lwt_main.run (test_plan_cancel path));
+  Test_workspace.with_dir "gc-tags" (fun path -> Lwt_main.run (test_close_tags path));
   Test_workspace.with_dir "gc-space" (fun path -> Lwt_main.run (test_space_retry path));
+  Test_workspace.with_dir "gc-debt" (fun path -> Lwt_main.run (test_debt_reopen path));
+  Test_workspace.with_dir "gc-lease" (fun path -> Lwt_main.run (test_open_lease path));
   let data = Filename.concat (Sys.getcwd ()) "runtime_data" in
   if not (Sys.file_exists data) then Unix.mkdir data 0o700;
   let path = Filename.concat data (Printf.sprintf "gc-head-%d" (Unix.getpid ())) in

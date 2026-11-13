@@ -6,6 +6,7 @@ type tx_callbacks = {
   has_tx : string -> bool;
   find_tx : string -> Octra_core.Transaction.t option;
   sender_pk : Octra_core.Transaction.t -> string option;
+  find_account : string -> Octra_core.Ledger.account option;
   add_tx : Octra_core.Transaction.t -> (string, string) result;
   now : unit -> float;
   max_drift : float;
@@ -72,6 +73,7 @@ let dispatch_tx_deps
     has_tx = tx.has_tx;
     find_tx = tx.find_tx;
     sender_pk = tx.sender_pk;
+    find_account = tx.find_account;
     add_tx = tx.add_tx;
     send_payload = transport.send_tx_gossip;
     send_batch = transport.send_batch;
@@ -106,7 +108,8 @@ let handle_frame_with_transport
     frame
 
 let handle_frame ?duty_head ?bft_mode (deps : deps) swarm conn frame =
-  handle_frame_with_transport
+  let open Lwt.Syntax in
+  let* _ = Octra_net.P2p_conn.until_closed conn (handle_frame_with_transport
     ?duty_head
     ?bft_mode
     ~observer:deps.observer
@@ -115,7 +118,7 @@ let handle_frame ?duty_head ?bft_mode (deps : deps) swarm conn frame =
     ~transport:(transport_of_peer swarm conn)
     ~on_consensus:(fun () -> deps.on_consensus conn frame)
     ~on_resource_compute:(fun () -> deps.on_resource_compute conn frame)
-    frame;
+    frame) in
   Lwt.return_unit
 
 let start ?duty_head ?bft_mode deps swarm =
@@ -130,6 +133,7 @@ let node_tx_callbacks (deps : node_deps) =
       Tx_sender_key.resolve
         ~find_account:deps.find_account
         tx);
+    find_account = deps.find_account;
     add_tx = deps.add_tx;
     now = deps.now;
     max_drift = deps.max_drift;

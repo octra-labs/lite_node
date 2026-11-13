@@ -121,7 +121,7 @@ let check_route route ~epoch ~trusted txs receipts =
     let plan = Graph.tx_envelope_activation_for_chain header.chain_id |> Option.get in
     let rules = Graph.create ~chain_id:header.chain_id
       ~root_at:(fun _ -> Graph.Root plan.anchor_state_root) in
-    let deps = Source.{rules; check_override_receipts = (fun ~epoch_id:_ ~receipts:_ _ -> Ok ());
+    let deps = Source.{rules;
       find_finalized = (fun _ -> None); cached_bundle = (fun _ -> None);
       receipt_root_matches = (fun _ _ -> true); header_has_empty_bundle = (fun _ -> false);
       staging_txs = (fun () -> [])} in
@@ -230,7 +230,6 @@ let test_source_paths () =
     List.iter (fun root ->
       let rules = Graph.create ~chain_id:header.chain_id ~root_at:(fun _ -> root) in
       let deps = Source.{rules;
-        check_override_receipts = (fun ~epoch_id:_ ~receipts:_ _ -> Ok ());
         find_finalized = (fun _ -> Some finalize);
         cached_bundle = (fun _ -> Some ([Tx.hash tx], [tx], []));
         receipt_root_matches = (fun _ _ -> true); header_has_empty_bundle = (fun _ -> true);
@@ -307,7 +306,7 @@ let test_compute_source () =
       (not (check_route route ~epoch:(Int64.of_int epoch)
         ~trusted:(Option.get tx.public_key) [settlement] []))) [0; 1; 2; 3; 4; 5; 6; 7])
     [plan.activation_epoch - 1; plan.activation_epoch; plan.activation_epoch + 1];
-  let deps = Source.{rules; check_override_receipts = (fun ~epoch_id:_ ~receipts:_ _ -> Ok ());
+  let deps = Source.{rules;
     find_finalized = (fun _ -> None); cached_bundle = (fun _ -> None);
     receipt_root_matches = (fun _ _ -> true); header_has_empty_bundle = (fun _ -> false);
     staging_txs = (fun () -> txs)} in
@@ -321,13 +320,181 @@ let test_compute_source () =
           else List.filter (fun item -> item.Tx.op_type <> Tx.ComputeSettle) txs))
     [plan.activation_epoch - 1; plan.activation_epoch; plan.activation_epoch + 1]
 
+let test_paid_rows () =
+  let module Sender = Octra_node_runtime.Consensus_epoch_apply_sender in
+  let confirmed, _ = signed () in
+  let free, _ = signed () in
+  let paid, _ = signed () in
+  let save prior rejections =
+    let processed = ref prior in
+    let saved = ref [] in
+    let notices = ref [] in
+    let result = Sender.save_rejections ~epoch_id:1 ~ts:0. ~processed_hashes:processed
+      {save_rejected = (fun (row : Sender.rejected_record) -> saved := row.hash :: !saved);
+       warn_rejected = ignore;
+       notify_rejected = (fun tx _ -> notices := Tx.hash tx :: !notices)} rejections in
+    result, !saved, !notices, !processed in
+  let rows inputs rejected = Outcome.build ~inputs ~charged:[paid]
+    (List.map (fun tx -> tx, "execution_failed", "test rejection") rejected) |> Result.get_ok in
+  let accepted label prior inputs =
+    match save prior (rows inputs [free; paid]) with
+    | Error error, _, _, _ -> [label ^ " error = " ^ error]
+    | Ok (), saved, notices, _ when saved <> [Tx.hash free] || notices <> saved ->
+      [label ^ " rows differ"]
+    | Ok (), _, _, processed when List.length processed <> List.length prior + 1
+        || List.exists (fun hash -> List.length (List.filter (String.equal hash) processed) <> 1)
+          (Tx.hash free :: prior) ->
+      [label ^ " hashes differ"]
+    | Ok (), _, _, _ -> [] in
+  let prior = [Tx.hash free; Tx.hash confirmed] in
+  let refused = save prior (rows [confirmed; free] [free])
+    = (Error ("rejection_hash_already_processed:" ^ Tx.hash free), [], [], prior) in
+  let faults = accepted "paid rejection rows" [Tx.hash paid] [free; paid]
+    @ accepted "mixed epoch rows" [Tx.hash paid; Tx.hash confirmed] [confirmed; free; paid]
+    @ (if refused then [] else ["repeated free rejection accepted"]) in
+  if faults <> [] then failwith ("paid rows: " ^ String.concat "; " faults)
+
+let extra_receipt ~epoch tx =
+  let module Exec = Octra_core.Epoch_exec in
+  let module Store = Octra_core.Store_irmin in
+  let module Ledger = Octra_core.Ledger in
+  Test_workspace.with_dir "eviction_message" (fun dir ->
+    let store = Lwt_main.run (Store.open_store (Filename.concat dir "store")) in
+    Fun.protect ~finally:(fun () -> Lwt_main.run (Store.close store)) (fun () ->
+      let ledger = Ledger.create store in
+      Ledger.add_account ledger tx.Tx.from (Z.of_int 100_000) |> Result.get_ok;
+      Lwt_main.run (Ledger.flush_dirty_lwt ledger);
+      let account = Ledger.find ledger tx.from in
+      let root = Lwt_main.run (Store.get_head_hash store) in
+      let backend = Exec.make_live_backend ~validator_policy:Octra_core.Validator_policy.Inactive
+        ~emission_policy:Octra_core.Emission_policy.Guard
+        ~emission_schedule:Octra_core.Emission_schedule.Inactive ~legacy_total_supply:"100000"
+        store ledger in
+      let env = Exec.{chain_id = "octra-devnet-9871-cluster"; epoch_id = epoch;
+        proposer_addr = tx.from; validator_addrs = []; validator_pubkeys = [];
+        prev_state_root = ""; epoch_ts = 1.; ready_state_root_at = None; ready_max_lag = 0} in
+      let error_type, reason = match Lwt_main.run (Exec.process_standard_tx ~backend ~env tx) with
+        | Error error -> error
+        | Ok _ -> failwith "manual validator update was executed" in
+      expect "manual validator refusal differs"
+        (error_type = "validator_set_update_rejected" && reason = "manual validator updates are disabled");
+      expect "manual validator refusal changed account" (Ledger.find ledger tx.from = account);
+      expect "manual validator refusal changed store" (Lwt_main.run (Store.get_head_hash store) = root);
+      expect "manual validator refusal wrote pending set"
+        (Lwt_main.run (Store.get_meta store Octra_core.Validator_set_update.pending_meta_key) = None);
+      let rows = Outcome.build ~inputs:[tx] [tx, error_type, reason] |> Result.get_ok in
+      expect "manual validator refusal charged a fee"
+        (List.for_all (fun (row : Outcome.rejection) -> not row.charged) rows);
+      Outcome.encode [] rows))
+
+let extra_finalized ~epoch ~keys ~voters receipts =
+  let module Hash = Octra_consensus.C_hash in
+  let module Graph = Octra_core.Rule_graph in
+  let module Source = Octra_node_runtime.Consensus_epoch_apply_source in
+  let first, _ = List.hd keys in
+  let header = {(header (Int64.of_int epoch) [] receipts) with
+    Types.creator_addr = first.Tx.from;
+    proto_version = Octra_consensus.C_protocol.version_for_epoch (Int64.of_int epoch)} in
+  let proposal_id = Hash.proposal_id header in
+  let precommits = List.map (fun (tx, secret) ->
+    let vote = Types.{chain_id = header.chain_id; epoch_id = header.epoch_id; round = 0;
+      vote_type = Precommit; proposal_id; validator = tx.Tx.from; signature = ""} in
+    let key = Base64.decode_exn secret |> Mirage_crypto_ec.Ed25519.priv_of_octets |> Result.get_ok in
+    {vote with signature = Mirage_crypto_ec.Ed25519.sign ~key (Hash.vote_sign_bytes vote)}) keys in
+  let finalize = Types.{chain_id = header.chain_id; epoch_id = header.epoch_id;
+    commit_round = 0; header; proposal_id; precommits; parent_commit = None} in
+  let verify_vote (vote : Types.vote) =
+    match Types.pubkey_of_addr voters vote.validator with
+    | None -> false
+    | Some pubkey_raw -> Hash.verify_vote ~pubkey_raw vote in
+  expect "eviction receipt certificate is invalid"
+    (Octra_consensus.C_qc.validate_finalize ~chain_id:header.chain_id
+      ~validator_set:voters ~verify_vote finalize = Octra_consensus.C_qc.Valid);
+  let plans = [Graph.vm_bytes_activation_for_chain header.chain_id;
+    Graph.program_result_activation_for_chain header.chain_id;
+    Graph.tx_envelope_activation_for_chain header.chain_id] |> List.filter_map Fun.id in
+  let rules = Graph.create ~chain_id:header.chain_id ~root_at:(fun epoch ->
+    match List.find_opt (fun (plan : Graph.activation) -> plan.anchor_epoch = epoch) plans with
+    | Some plan -> Graph.Root plan.anchor_state_root
+    | None -> Graph.Missing) in
+  let deps = Source.{rules; find_finalized = (fun _ -> Some finalize);
+    cached_bundle = (fun id -> if id = proposal_id then Some ([], [], receipts) else None);
+    receipt_root_matches = (fun header rows -> Hash.receipt_root rows = header.Types.receipt_root);
+    header_has_empty_bundle = (fun _ -> false); staging_txs = (fun () -> [])} in
+  let selected = Source.choose deps Source.{epoch_id = epoch; override_ordered_txs = None;
+    override_receipts_json = None; consensus_mode = true} |> Result.get_ok in
+  expect "finalized eviction receipt changed"
+    (selected.txs = [] && selected.receipts_json = receipts && selected.preverify_json = [])
+
+let test_eviction_extra () =
+  let module Update = Octra_core.Validator_set_update in
+  let module Graph = Octra_core.Rule_graph in
+  let chain_id = "octra-devnet-9871-cluster" in
+  let activation = Graph.seatless_activation_for_chain chain_id |> Option.get in
+  let epoch = activation.activation_epoch - 1 in
+  let height = Int64.of_int epoch in
+  expect "eviction message test is not before activation" (Graph.seatless_at ~chain_id ~epoch = Graph.Prior);
+  let keys = List.init 5 (fun _ -> signed ()) in
+  let original, secret = List.hd keys in
+  let voters = Types.make_weighted_validator_set (List.map (fun (tx, _) ->
+    Types.{address = tx.Tx.from; pubkey = Base64.decode_exn (Option.get tx.public_key)}, Z.one) keys)
+    |> Result.get_ok in
+  let update, _ = Update.make_eviction ~source_epoch:(Int64.succ height)
+    ~activate_epoch:(Int64.add height 2L) ~offenders:[original.from] voters |> Result.get_ok in
+  let plain = {update with Update.eviction = None} in
+  let fields = match Update.to_yojson plain with `Assoc fields -> fields | _ -> assert false in
+  let witness = match Update.to_yojson update with
+    | `Assoc fields -> List.assoc "eviction" fields | _ -> assert false in
+  let vectors = ["scalar", ["eviction", `Int 0], false;
+    "object", ["eviction", `Assoc []], false;
+    "duplicate", ["eviction", witness; "eviction", witness], false;
+    "valid", ["eviction", witness], true] in
+  List.iter (fun (name, extra, persistent) ->
+    let json = `Assoc (fields @ extra) in
+    let message = Yojson.Safe.to_string json in
+    expect ("persistent eviction JSON check differs: " ^ name)
+      (Result.is_ok (Update.of_yojson json) = persistent);
+    expect ("persistent eviction string check differs: " ^ name)
+      (Result.is_ok (Update.of_string message) = persistent);
+    let tx = {original with Tx.to_ = original.from; amount = Z.zero; ou = Z.of_int 1_000;
+      op_type = Tx.ValidatorSetUpdate; message = Some message} in
+    let signing = Octra_core.Tx_signature.at ~chain_id ~epoch:height in
+    let tx = Octra_core.Tx_signature.sign signing tx secret in
+    let hash = Tx.hash tx in
+    expect "eviction message signature is invalid"
+      (Octra_core.Tx_signature.verify signing tx (Option.get tx.public_key));
+    let decoded = match Octra_core.Tx_payload.decode_admit (Tx.to_yojson tx) with
+      | Ok decoded -> decoded
+      | Error reason -> failwith ("eviction extra refused: " ^ name ^ ": " ^ reason) in
+    expect "eviction message changed transaction bytes" (decoded = tx && Tx.hash decoded = hash);
+    expect "transaction message interpreted eviction" (Update.of_message decoded.message = Ok plain);
+    let receipts = extra_receipt ~epoch decoded in
+    let partition = Outcome.split_admit receipts |> Result.get_ok in
+    expect "eviction receipt changed signed transaction"
+      (partition.preverify = [] && match partition.rejections with
+        | [row] -> row.tx = tx && Tx.hash row.tx = hash && not row.charged
+        | _ -> false);
+    List.iter (fun route ->
+      expect ("eviction receipt route refused: " ^ name)
+        (check_route route ~epoch:height ~trusted:(Option.get tx.public_key) [] receipts)) [0; 1; 2];
+    extra_finalized ~epoch ~keys ~voters receipts) vectors;
+  let raw = Update.to_string update in
+  expect "persistent eviction witness changed" (Update.of_string raw = Ok update);
+  let json = match Update.to_yojson update with
+    | `Assoc fields -> `Assoc (fields @ ["extra", `Int 0]) | _ -> assert false in
+  expect "persistent eviction accepted an unknown field" (Result.is_error (Update.of_yojson json));
+  expect "persistent eviction accepted an unknown string field"
+    (Result.is_error (Update.of_string (Yojson.Safe.to_string json)))
+
 let () =
   Mirage_crypto_rng_unix.use_default ();
+  test_eviction_extra ();
   test_compute_source ();
   test_anchor ();
   test_exec_preflight ();
   test_source_paths ();
   test_replay_receipts ();
+  test_paid_rows ();
   let failed = ref 0 in
   List.iter (fun route ->
     try test_route route; Printf.printf "event = test name = tx_rule route = %d status = passed\n%!" route

@@ -75,11 +75,17 @@ type exec_result = {
 
 type exec_error =
   | Rejected of string
+  | Refused of string * Circle_hfhe_transcript.entry list
   | Unavailable of string
 
 let error_message = function
   | Rejected message
+  | Refused (message, _)
   | Unavailable message -> message
+
+let plain = function
+  | Error (Refused (reason, _)) -> Error (Rejected reason)
+  | result -> result
 
 type storage_cache_entry = {
   storage_json : Yojson.Safe.t list;
@@ -123,7 +129,15 @@ let decode_b64_field name = function
 
 let read_process_json ?(optional = false) ?call payload =
   Circle_wasm_hfhe_backend.ensure_registered ();
-  let* native = match call with
+  let isolated = match payload with
+    | `Assoc fields -> List.assoc_opt "stable_errors" fields = Some (`Bool true)
+      && (Option.is_some call || List.assoc_opt "execution_profile" fields = Some (`String "standard"))
+    | _ -> false in
+  let* native = if isolated then
+    Circle_wasm_worker.run ~optional ?call:(Option.map (fun call raw ->
+      let* response = call (Yojson.Safe.from_string raw) in
+      Lwt.return (Yojson.Safe.to_string response)) call) (Yojson.Safe.to_string payload)
+  else match call with
     | None when optional -> Exec_resource.detach (fun () ->
         let body = Yojson.Safe.to_string payload in
         Circle_wasm_native.run_json_classified ~optional:true body) ()
@@ -754,13 +768,15 @@ let rec execute_with_profile
         | Some _ -> Ok ()
         | None -> Error "input too large"
       end in
-  let initial_allow_code_cache_only = code_seeded code_key in
+  let isolated = table_mode = Rule_graph.Active
+    && (execution_profile = Standard || Option.is_some call) in
+  let initial_allow_code_cache_only = not isolated && code_seeded code_key in
   let initial_allow_cache_only =
     match storage_cache_key with
     | Some key ->
       begin
         match Hashtbl.find_opt storage_payload_cache key with
-        | Some entry -> entry.seeded_in_native
+        | Some entry -> not isolated && entry.seeded_in_native
         | None -> false
       end
     | None -> false in
@@ -814,13 +830,13 @@ let rec execute_with_profile
       Lwt.return e
     | Ok json as ok ->
       begin
-        (if not is_view then match json with
+        (if not is_view && not isolated then match json with
          | `Assoc fields when List.assoc_opt "code_retained" fields = Some (`Bool true) ->
            mark_code_seeded code_key
          | _ -> Hashtbl.remove code_seed_cache code_key);
         match storage_entry with
         | Some entry when not use_cache_only ->
-          entry.seeded_in_native <- true
+          entry.seeded_in_native <- not isolated
         | _ ->
           ()
       end;
@@ -883,13 +899,14 @@ and decode_execution ~storage_tbl json_result =
                 | Some value -> value
                 | None -> `Null
               in
+              let transcript = Circle_hfhe_transcript.entries_of_json hfhe_transcript_json in
               match
                 storage_decode_result,
                 decode_events events_json,
                 decode_spawns spawns_json,
                 decode_assets assets_json,
                 decode_encrypted_assets encrypted_assets_json,
-                Circle_hfhe_transcript.entries_of_json hfhe_transcript_json,
+                transcript,
                 decode_compute_trace fields,
                 (match response_json with
                  | `Null -> Ok None
@@ -944,7 +961,9 @@ and decode_execution ~storage_tbl json_result =
               | _, _, _, _, _, Error e, _, _
               | _, _, _, _, _, _, Error e, _
               | _, _, _, _, _, _, _, Error e ->
-                Lwt.return (Error (Rejected e))
+                Lwt.return (Error (match transcript with
+                  | Ok entries -> Refused (e, entries)
+                  | Error _ -> Rejected e))
             end
           | _ ->
             Lwt.return (Error (Rejected "invalid wasm execution response"))
@@ -1014,7 +1033,7 @@ let replay_compute ~code_mode ~table_mode ~code_b64 ~cache_key ~root ~entries ~b
             | [] -> Lwt.return_ok (List.rev saved)
             | raw :: rest ->
               let* result = decode_execution ~storage_tbl:(Hashtbl.create 0) (Ok raw) in
-              (match result with Error _ as error -> Lwt.return error
+              (match plain result with Error _ as error -> Lwt.return error
                 | Ok value -> decode (value :: saved) rest) in
           decode [] replies
         | Ok _ -> Lwt.return_error (Unavailable "compute replay response differs")
@@ -1104,7 +1123,7 @@ let execute_compute_with_storage_inner
     ~hfhe_mode
     ~public_reads
     ~fuel_limit =
-  execute_with_profile
+  Lwt.map plain (execute_with_profile
     ~table_mode
     ~code_mode
     ~memory_bytes
@@ -1135,7 +1154,7 @@ let execute_compute_with_storage_inner
     ~compute_session_scope
     ~execution_profile:Compute
     ~is_view:true
-    ~update_policy:false
+    ~update_policy:false)
 
 let execute_compute_with_storage
     ~table_mode

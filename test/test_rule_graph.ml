@@ -66,6 +66,92 @@ let standard_activation graph =
 let graph root_at =
   Graph.create ~chain_id:"octra-devnet-9871-cluster" ~root_at
 
+let test_start_checks () =
+  let expected = ["circle"; "validator_quorum"; "epoch_time"; "owner_migration";
+    "wasm_compute"; "private_payload"; "set_fold"; "validator_ready"; "ready_ref";
+    "set_live"; "set_fold_cap"; "set_open"; "object_cost"; "account_pack"; "standard";
+    "set_plan"; "math"; "exit"; "ready_exec"; "program_source"; "tx_envelope";
+    "fhe_work"; "wasm_float"; "circle_batch"; "proof_exec"; "vm_bytes"; "scalar_work";
+    "source_create"; "program_result"; "cipher_migration"; "settle"; "stake";
+    "program_records"; "duty_marks"; "proof_key"; "tx_network"; "seatless"] in
+  let checks = Graph.startup_checks (graph (fun _ -> Graph.Missing)) in
+  require (List.map (fun (check : Graph.check) -> check.name) checks = expected)
+    "startup rule inventory differs";
+  let plans = List.filter_map (fun (check : Graph.check) -> check.activation) checks in
+  let roots epoch = match List.find_opt (fun (plan : Graph.activation) ->
+    plan.anchor_epoch = epoch) plans with
+    | None -> Graph.Missing
+    | Some plan -> Graph.Root plan.anchor_state_root in
+  let get name root_at = Graph.startup_checks (graph root_at)
+    |> List.find (fun (check : Graph.check) -> check.name = name) in
+  List.iter (fun (check : Graph.check) -> match check.activation with
+    | None -> ()
+    | Some plan ->
+      require (roots plan.anchor_epoch = Graph.Root plan.anchor_state_root)
+        "startup plans disagree on root";
+      let waiting = get check.name (fun _ -> fail "startup read before anchor") in
+      List.iter (fun epoch ->
+        require (Graph.check_start waiting ~epoch = Ok (Graph.Awaiting plan))
+          "startup did not await anchor") [0; plan.anchor_epoch];
+      List.iter (fun epoch ->
+        require (Graph.check_start (get check.name roots) ~epoch = Ok (Graph.Checked Graph.Active))
+          "startup rejected correct anchor";
+        List.iter (fun (root, fault) ->
+          let read at = if at = plan.anchor_epoch then root else roots at in
+          require (Graph.check_start (get check.name read) ~epoch = Error fault)
+            "startup accepted invalid anchor")
+          [Graph.Missing, Graph.Anchor_missing plan.anchor_epoch;
+           Graph.Unreadable "read", Graph.Anchor_unreadable {epoch = plan.anchor_epoch; reason = "read"};
+           Graph.Root "wrong", Graph.Anchor_mismatch {epoch = plan.anchor_epoch;
+             expected = plan.anchor_state_root; actual = "wrong"}])
+        [plan.anchor_epoch + 1; plan.activation_epoch; plan.activation_epoch + 1]) checks;
+  let chain_id = "octra-devnet-9871-cluster" in
+  let from_floor epoch = match Graph.root_after_floor ~chain_id ~floor_epoch:max_int ~epoch with
+    | Some root -> Graph.Root root | None -> Graph.Missing in
+  List.iter (fun name ->
+    require (Graph.check_start (get name from_floor) ~epoch:max_int = Ok (Graph.Checked Graph.Active))
+      "startup snapshot policy changed") ["scalar_work"; "source_create"; "program_result"];
+  List.iter (fun chain_id ->
+    let rules = Graph.create ~chain_id ~root_at:(fun _ -> fail "other chain anchor read") in
+    Graph.startup_checks rules |> List.iter (fun check ->
+      require (check.Graph.activation = None) "other chain rule scheduled";
+      require (Result.is_ok (Graph.check_start check ~epoch:0)) "other chain start refused"))
+    ["octra-mainnet"; "octra-test"]
+
+let () = test_start_checks ()
+
+let test_seatless_plan () =
+  let chain_id = "octra-devnet-9871-cluster" in
+  match Graph.seatless_activation_for_chain chain_id with
+  | None -> require (not (Array.mem "--seatless-plan" Sys.argv)) "seatless plan is absent"
+  | Some plan ->
+    require (Graph.scalar_work_activation_for_chain chain_id = Some plan)
+      "weight and work schedules differ";
+    let make root = Graph.create ~chain_id ~root_at:(fun epoch ->
+      require (epoch = plan.anchor_epoch) "seatless read another anchor";
+      root) in
+    require (Graph.seatless (make Graph.Missing) ~epoch:(plan.activation_epoch - 1) = Ok Graph.Prior)
+      "seatless enabled early";
+    require (Graph.seatless (make (Graph.Root plan.anchor_state_root))
+      ~epoch:plan.activation_epoch = Ok Graph.Active) "seatless did not activate";
+    List.iter (fun root ->
+      require (Result.is_error (Graph.seatless (make root) ~epoch:plan.activation_epoch))
+        "seatless accepted invalid anchor") [Graph.Missing; Graph.Unreadable "read"; Graph.Root "wrong"];
+    require (List.mem plan.activation_epoch (Graph.profile_epochs ~chain_id))
+      "seatless profile date missing";
+    let id = String.concat ":" [string_of_int plan.anchor_epoch; plan.anchor_state_root;
+      string_of_int plan.activation_epoch] in
+    require (List.mem id (String.split_on_char '|' (Graph.consensus_id ~chain_id ~epoch:plan.activation_epoch)))
+      "seatless profile anchor missing";
+    require (not (List.mem id (String.split_on_char '|'
+      (Graph.consensus_id ~chain_id ~epoch:(plan.activation_epoch - 1))))) "seatless profile changed early";
+    require (Graph.root_after_floor ~chain_id ~floor_epoch:plan.anchor_epoch ~epoch:plan.anchor_epoch
+      = Some plan.anchor_state_root) "seatless anchor missing after floor";
+    List.iter (fun chain_id -> require (Graph.seatless_activation_for_chain chain_id = None)
+      "seatless enabled another chain") ["octra-mainnet"; "other-chain"]
+
+let () = test_seatless_plan ()
+
 let test_live_chain () =
   require (Graph.live_chain ~chain_id:"octra-devnet-9871-cluster")
     "devnet plan rejected";
@@ -99,7 +185,45 @@ let test_live_chain () =
      "OCTRA-DEVNET-9871-CLUSTER"; "octra-devnet-9871-cluster ";
      "octra-devnet-9871-cluster\n"]
 
+let test_work_rules () =
+  let chain_id = "octra-devnet-9871-cluster" in
+  let plan = Option.get (Graph.scalar_work_activation_for_chain chain_id) in
+  require (plan.activation_epoch = 1_842_000) "work release epoch differs";
+  require (Graph.seatless_activation_for_chain chain_id = Some plan) "quorum release epoch differs";
+  require (plan.activation_epoch - plan.anchor_epoch >= 10_000)
+    "work activation notice too short";
+  let cases = [Graph.scalar_work_activation_for_chain, Graph.scalar_work_at, Graph.scalar_work;
+    Graph.source_create_activation_for_chain, Graph.source_create_at, Graph.source_create;
+    Graph.program_result_activation_for_chain, Graph.program_result_at, Graph.program_result] in
+  List.iter (fun (schedule, at, read) ->
+    require (schedule chain_id = Some plan) "work schedule differs from confirmed head";
+    let before = Graph.create ~chain_id ~root_at:(fun _ -> fail "early work anchor read") in
+    List.iter (fun epoch ->
+      require (at ~chain_id ~epoch = Graph.Prior) "work profile enabled early";
+      require (read before ~epoch = Ok Graph.Prior) "work enabled early")
+      [0; 1_769_492; plan.anchor_epoch; plan.activation_epoch - 1];
+    List.iter (fun epoch ->
+      require (at ~chain_id ~epoch = Graph.Active) "work profile disabled";
+      List.iter (fun (root, expected) ->
+        let rules = Graph.create ~chain_id ~root_at:(fun height ->
+          require (height = plan.anchor_epoch) "work read wrong anchor";
+          root) in
+        require (read rules ~epoch = expected) "work anchor result differs")
+        [Graph.Root plan.anchor_state_root, Ok Graph.Active;
+         Graph.Missing, Error (Graph.Anchor_missing plan.anchor_epoch);
+         Graph.Unreadable "read", Error (Graph.Anchor_unreadable {epoch = plan.anchor_epoch; reason = "read"});
+         Graph.Root "wrong", Error (Graph.Anchor_mismatch {epoch = plan.anchor_epoch;
+           expected = plan.anchor_state_root; actual = "wrong"})])
+      [plan.activation_epoch; plan.activation_epoch + 1; max_int];
+    List.iter (fun chain_id ->
+      require (schedule chain_id = None) "work enabled for other chain";
+      let rules = Graph.create ~chain_id ~root_at:(fun _ -> fail "other work anchor read") in
+      require (at ~chain_id ~epoch:max_int = Graph.Prior) "other work profile changed";
+      require (read rules ~epoch:max_int = Ok Graph.Prior) "other work execution changed")
+      ["octra-mainnet"; "octra-test"; ""; "octra-devnet-9871-cluster "]) cases
+
 let test_set_plan () =
+  test_work_rules ();
   let chain_id = "octra-devnet-9871-cluster" in
   let root = "8e7f0e5a6e582070c040a07e7439caf532973fa09cddc79357a5ed964468065d" in
   let seed = graph (fun _ -> fail "set plan read before activation") in
@@ -109,11 +233,21 @@ let test_set_plan () =
      && plan.anchor_state_root = root
      && plan.activation_epoch = 1_510_000)
     "set plan activation changed";
-  require
-    (Graph.profile_epochs ~chain_id =
-      [1_500_000; 1_510_000; 1_572_000; 1_614_500; 1_663_000; 1_688_734;
-       (Option.get (Graph.stake_activation_for_chain chain_id)).activation_epoch])
-    "profile epochs changed";
+  let prior_epochs = [1_500_000; 1_510_000; 1_572_000; 1_614_500; 1_663_000; 1_688_734;
+    (Option.get (Graph.stake_activation_for_chain chain_id)).activation_epoch] in
+  let epochs = Graph.profile_epochs ~chain_id in
+  let seatless = Option.to_list (Graph.seatless_activation_for_chain chain_id)
+    |> List.map (fun (plan : Graph.activation) -> plan.activation_epoch) in
+  if Option.is_some (Graph.scalar_work_activation_for_chain chain_id) then begin
+    let scalar_epoch = (Option.get (Graph.scalar_work_activation_for_chain chain_id)).activation_epoch in
+    require (List.filter (fun epoch -> epoch < scalar_epoch) epochs = prior_epochs)
+      "historical profile epochs changed";
+    require (epochs = List.sort_uniq Int.compare (prior_epochs @ [scalar_epoch] @ seatless))
+      "profile epochs changed"
+  end else begin
+    require (Graph.scalar_work_activation_for_chain chain_id = None) "scalar schedule enabled";
+    require (epochs = List.sort_uniq Int.compare (prior_epochs @ seatless)) "inactive profile epochs changed"
+  end;
   List.iter (fun epoch ->
     require (Graph.set_plan seed ~epoch = Ok Graph.Prior)
       "set plan active before activation";
@@ -378,6 +512,20 @@ let test_pending_rules () =
       epoch = 17; reason = "read"})) "plan accepted unreadable root") [23; 24; max_int]
 
 let () =
+  let plan = Graph.{anchor_epoch = 17; anchor_state_root = String.make 64 'a'; activation_epoch = 23} in
+  let names = ["program_source"; "program_records"; "scalar_work"; "proof_exec"; "fhe_work"; "vm_bytes"; "standard"] in
+  let order source plans = match plans with
+    | [program; records; scalar; proof; fhe; bytes; points] ->
+      Graph.source_order ~source ~program ~records ~scalar ~proof ~fhe ~bytes ~points
+    | _ -> fail "source dependency count" in
+  require (order None (List.map (fun _ -> None) names) = Ok ()) "disabled creation needs schedule";
+  require (order (Some plan) (List.map (fun _ -> Some plan) names) = Ok ()) "equal dependency epoch refused";
+  List.iteri (fun index name ->
+    List.iter (fun (value, prefix) ->
+      let plans = List.mapi (fun at _ -> if at = index then value else Some plan) names in
+      require (order (Some plan) plans = Error (prefix ^ name)) "source dependency order accepted")
+      [None, "source_create requires "; Some {plan with activation_epoch = 24}, "source_create precedes "])
+    names;
   test_pending_rules ();
   test_proof_rule ();
   test_exit ();

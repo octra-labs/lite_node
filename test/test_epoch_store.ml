@@ -215,7 +215,7 @@ let run ~chain_id ~start ~count ~parent path =
       trace.epoch mode trace.ledger_root trace.index_root trace.state_root) traces;
   Lwt.return_unit
 
-let parent ~chain_id keys (cursor : R.J.cursor) =
+let parent ?(weighted = false) ~chain_id keys (cursor : R.J.cursor) =
   let epoch_id = Int64.pred cursor.epoch in
   let header, _ = N.Consensus_replay.parse_header ~default_chain_id:chain_id
     (`Assoc [
@@ -239,8 +239,11 @@ let parent ~chain_id keys (cursor : R.J.cursor) =
     } in
     { vote with signature = Mirage_crypto_ec.Ed25519.sign ~key (H.vote_sign_bytes vote) }
   ) keys in
+  let validator_set = if weighted then R.get (C.make_weighted_validator_set
+    (List.map (fun (member, _) -> member, Z.one) keys))
+    else C.make_validator_set (List.map fst keys) in
   let commit = C.{
-    validator_set = C.make_validator_set (List.map fst keys);
+    validator_set;
     certificate = { chain_id; epoch_id; commit_round = 0; header; proposal_id; precommits };
   } in
   ignore (R.get (Octra_core.Set_fold.read_parent ~chain_id commit));
@@ -545,6 +548,148 @@ let network key =
     (A.network ~getenv:(getenv sample) ~chain_id ~config_hash ~configured_hash:config_hash);
   Printf.printf "event = replay_network status = pass cases = 12\n"
 
+let paid_epoch keys path =
+  let chain_id = "octra-devnet-9871-cluster" in
+  let start = 2_000_000 in
+  let enabled = G.program_result_at ~chain_id ~epoch:start = G.Active in
+  let key = Mirage_crypto_ec.Ed25519.priv_of_octets (String.make 32 '\076') |> Result.get_ok in
+  let public = Mirage_crypto_ec.Ed25519.pub_of_priv key
+    |> Mirage_crypto_ec.Ed25519.pub_to_octets |> Base64.encode_exn in
+  let secret = Mirage_crypto_ec.Ed25519.priv_to_octets key |> Base64.encode_exn in
+  let owner = Octra_core.Crypto.Address.address_from_pubkey public in
+  let payee = "oct" ^ String.make 44 '2' in
+  let module V = Octra_vm in
+  let source = {|
+program PaidReplay {
+  state { counter: int }
+  constructor() { self.counter = 0 }
+  payable fn pay(to: address, refuse: bool) {
+    self.counter += 1
+    require(transfer(to, 1), "payment refused")
+    require(!refuse, "caller refused")
+  }
+}
+|} in
+  let package = V.Program_package.compile_sources_at ~metered:true ~loops:true
+    ~compiler:V.Program_package.Preview ~point_ops:true ~main:"main.aml"
+    ~sources:[V.Program_package.{path = "main.aml"; body = source}]
+    |> Result.map_error (fun _ -> "paid replay compilation refused") |> R.get in
+  let address = V.Contract.addr_from_code package.envelope owner 1 in
+  Unix.mkdir path 0o700;
+  let saved = Lwt_main.run (with_stores path (fun store chaindata ->
+    let ledger = L.create store in
+    R.get (L.add_account_with_pubkey ledger owner (Z.of_int 1_000_000) public);
+    let* () = L.flush_dirty_lwt ledger in
+    let* () = S.begin_epoch_batch store in
+    let* () = Lwt_list.iter_s (fun (name, value) -> S.set_meta store name value)
+      ["total_supply", "1000000"; "emission_remaining", "0";
+       "last_epoch", string_of_int (start - 1); "current_epoch", string_of_int start] in
+    let* () = S.commit_epoch_batch store "paid replay input" in
+    let context = A.{store; chaindata; ledger; chain_id;
+      trust = V.Program_trust.empty;
+      rules = G.create ~chain_id ~root_at:(fun epoch ->
+        match G.root_after_floor ~chain_id ~floor_epoch:start ~epoch with
+        | Some root -> G.Root root | None -> G.Missing);
+      ready_root = (fun _ -> Lwt.return_none);
+      legacy_replay = (fun ~epoch:_ ~address:_ ~cipher:_ -> failwith "paid replay requested private history");
+      result_policy = (fun _ -> Octra_core.Private_result_policy.Recoverable)} in
+    let* initial = S.state_hash store in
+    let cursor = R.J.{epoch = Int64.of_int start; txid = 1L; eic = R.E.genesis_root;
+      prev_root = R.E.folded_state_root ~ledger_state_root:initial ~epoch_index_root:R.E.genesis_root} in
+    let transaction epoch nonce operation payload params amount ou =
+      Octra_core.Tx_signature.sign (Octra_core.Tx_signature.at ~chain_id ~epoch) T.{
+        from = owner; to_ = address; nonce; amount = Z.of_int amount; ou = Z.of_int ou;
+        timestamp = float_of_int (Int64.to_int epoch * 10); signature = "";
+        public_key = Some public; message = Some (Octra_core.Json_tree.write params);
+        op_type = operation; encrypted_data = Some payload} secret in
+    let block cursor inputs confirmed paid =
+      let parent_commit = parent ~weighted:true ~chain_id keys cursor in
+      let make ?(receipts_json = []) root = sample ~chain_id ~parent_commit
+        ~txs:confirmed ~receipts_json cursor root in
+      let provisional = make cursor.prev_root in
+      let deps = A.deps context ~cursor ~prepared:provisional in
+      let* batch = deps.preverify inputs in
+      expect "paid replay omitted input" (batch.skipped = [] && R.W.txs batch = inputs);
+      let gate = R.G.create (R.W.receipts_for_hashes batch.ready (R.hashes inputs)) in
+      let* checked = deps.preview gate inputs in
+      let checked = R.get checked in
+      expect "paid replay confirmation differs" (List.map fst checked.artifacts.confirmed = confirmed);
+      let charged = List.filter_map (fun (item : R.X.tx_reject) ->
+        if item.charged then Some item.tx else None) checked.artifacts.rejected in
+      expect "paid replay charging differs" (charged = paid);
+      let rejections = R.get (R.O.build ~inputs ~charged
+        (List.map (fun (item : R.X.tx_reject) -> item.tx, item.error_type, item.reason)
+          checked.artifacts.rejected)) in
+      let executed = R.O.executed ~confirmed rejections in
+      let* final = deps.preview gate executed in
+      let final = R.get final in
+      let _, index_root = R.E.next_root_from_hashes_i64 ~prev:cursor.eic
+        ~epoch_id:cursor.epoch ~start_txid:cursor.txid (R.hashes confirmed) in
+      let root = R.E.folded_state_root ~ledger_state_root:final.post_state_root ~epoch_index_root:index_root in
+      let receipts_json = R.O.encode
+        (R.W.receipt_json_for_hashes batch.ready (R.hashes confirmed)) rejections in
+      let prepared = make ~receipts_json root in
+      let* trace = R.run (A.deps context ~cursor ~prepared) ~cursor ~prepared in
+      expect "paid replay receipts differ" (trace.rejections = List.map R.O.encode_rejection rejections);
+      let expected_fee = List.fold_left (fun total (tx : T.t) -> Z.add total tx.ou) Z.zero executed in
+      expect "paid replay fee differs" (trace.fees = expected_fee);
+      expect "paid replay indexed refusal" (trace.confirmed = R.hashes confirmed);
+      Lwt.return (prepared.next_cursor, trace) in
+    let deploy = transaction cursor.epoch 1 T.ProgramDeploy (Base64.encode_exn package.package) (`List []) 0 400_000 in
+    let* cursor, first = block cursor [deploy] [deploy] [] in
+    let account addr = Option.get (L.find_opt ledger addr) in
+    let before = account owner in
+    let* storage = S.load_contract_storage store address in
+    let storage = S.sorted_storage_pairs storage in
+    let call cursor nonce refuse = transaction cursor.R.J.epoch nonce T.ProgramExec "pay"
+      (`List [`String payee; `Bool refuse]) 10 1000 in
+    let refused = call cursor 2 true in
+    let* cursor, second = block cursor [refused] [] (if enabled then [refused] else []) in
+    expect "paid replay advanced transaction index" (cursor.txid = 2L);
+    expect "paid replay sender differs"
+      ((account owner).nonce = (if enabled then 2 else 1)
+       && (account owner).balance = Z.sub before.balance (if enabled then Z.of_int 1000 else Z.zero));
+    expect "paid replay retained transfer" (L.find_opt ledger payee = None);
+    expect "paid replay retained value" ((account address).balance = Z.zero);
+    let* after = S.load_contract_storage store address in
+    expect "paid replay retained storage" (S.sorted_storage_pairs after = storage);
+    let denied = call cursor 3 true in
+    let success = call cursor (if enabled then 4 else 2) false in
+    let inputs = if enabled then [denied; success] else [success] in
+    let* cursor, third = block cursor inputs [success] (if enabled then [denied] else []) in
+    expect "paid replay following nonce differs" ((account owner).nonce = (if enabled then 4 else 2));
+    expect "paid replay following balance differs"
+      ((account owner).balance = Z.of_int (if enabled then 596_990 else 598_990));
+    expect "paid replay transfer differs" ((account payee).balance = Z.one && (account address).balance = Z.of_int 9);
+    let* storage = S.load_contract_storage store address in
+    let storage = S.sorted_storage_pairs storage in
+    expect "paid replay storage differs" (List.assoc "counter" storage = "1");
+    expect "paid replay counted refusals" (cursor.txid = 3L);
+    let accounts = List.map (fun addr -> addr, account addr) [owner; payee; address] in
+    Lwt.return (accounts, storage, [first; second; third]))) in
+  Lwt_main.run (with_stores ~readonly:true path (fun store chaindata ->
+    let accounts, storage, traces = saved in
+    let* () = Lwt_list.iter_s (fun (addr, expected) ->
+      let* actual = S.get_account store addr in
+      expect "paid replay reopened account differs" (actual = Some expected);
+      Lwt.return_unit) accounts in
+    let* actual = S.load_contract_storage store address in
+    expect "paid replay reopened storage differs" (S.sorted_storage_pairs actual = storage);
+    let* root = S.state_hash store in
+    expect "paid replay reopened root differs" (root = (List.hd (List.rev traces)).ledger_root);
+    List.iter (fun (trace : R.trace) ->
+      let _, actual = D.get_epoch_index_commitment chaindata (Int64.to_int trace.epoch) in
+      expect "paid replay reopened index differs" (actual = Some trace.index_root)) traces;
+    let output = `Assoc ["status", `String "passed"; "enabled", `Bool enabled;
+      "epochs", `Int 3; "paid_failures", `Int (if enabled then 2 else 0);
+      "indexed_transactions", `Int 2; "reopened", `Bool true; "auth", `String "sample";
+      "execution", `String "production"; "proofs_generated", `Int 0] in
+    Out_channel.with_open_gen [Open_creat; Open_excl; Open_wronly; Open_binary] 0o600
+      (Filename.concat path "result.json") (fun channel ->
+        output_string channel (Yojson.Safe.pretty_to_string output ^ "\n"));
+    Lwt.return_unit));
+  Printf.printf "event = epoch_store_paid status = pass enabled = %b epochs = 3\n" enabled
+
 let () =
   let keys = List.mapi (fun index address ->
     let key = match Mirage_crypto_ec.Ed25519.priv_of_octets
@@ -555,6 +700,12 @@ let () =
     let public = Mirage_crypto_ec.Ed25519.pub_of_priv key in
     C.{ address; pubkey = Mirage_crypto_ec.Ed25519.pub_to_octets public }, key
   ) ["octEpochA"; "octEpochB"; "octEpochC"; "octEpochD"] in
+  if Array.length Sys.argv = 3 && Sys.argv.(1) = "paid" then begin
+    paid_epoch keys Sys.argv.(2);
+    exit 0
+  end;
+  let public_only = Array.length Sys.argv = 2 && Sys.argv.(1) = "public" in
+  expect "epoch store arguments invalid" (Array.length Sys.argv = 1 || public_only);
   network (snd (List.hd keys));
   let data = Filename.concat (node_root (Sys.getcwd ())) "runtime_data" in
   if not (Sys.file_exists data) then Unix.mkdir data 0o700;
@@ -574,5 +725,5 @@ let () =
     check ~chain_id ~start:1_499_999 ~count:3 ~parent:(parent ~chain_id keys);
     check ~chain_id ~start:1_500_001 ~count:2 ~parent:(parent ~chain_id keys);
     circle_epoch keys path;
-    private_epoch keys path);
+    if not public_only then private_epoch keys path);
   Printf.printf "event = epoch_store status = pass scope = adapter_control auth = sample execution = production epochs = 7\n"

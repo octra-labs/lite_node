@@ -721,7 +721,7 @@ let owned t work =
     let* () = Lwt_unix.sleep (float_of_int t.limits.timeout_seconds) in
     abort "resource compute request expired";
     Lwt.return (Error "resource compute request expired") in
-  let result = Lwt.pick [Lwt.protected work; timeout] in
+  let result = Lwt.pick [work; timeout] in
   Lwt.on_cancel result (fun () -> abort "resource compute request cancelled");
   result
 

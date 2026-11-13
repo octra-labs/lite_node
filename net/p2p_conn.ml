@@ -17,6 +17,12 @@ type tx_write = {
   wake : unit Lwt.u;
 }
 
+type tx_input = {
+  packet : P2p_frame.frame;
+  expires : float;
+  digest : string;
+}
+
 type t = {
   fd : Lwt_unix.file_descr;
   peer_id : peer_id;
@@ -33,6 +39,11 @@ type t = {
   mutable tx_bytes : int;
   mutable tx_batches : int;
   tx_gate : Lwt_mutex.t;
+  mutable tx_read : unit Lwt.t option;
+  mutable tx_inputs : tx_input list;
+  mutable tx_input_bytes : int;
+  mutable tx_digest : string option;
+  mutable tx_refused : int;
   closed : unit Lwt.t;
   wake_close : unit Lwt.u;
   mutable msg_count_in : int;
@@ -42,6 +53,8 @@ type t = {
 }
 
 let read_idle_timeout_s = 60.0
+let tx_input_limit = 8 * 1024 * 1024
+let tx_input_count = 8
 
 external socket_codes : unit -> int list = "octra_accept_codes"
 
@@ -81,6 +94,11 @@ let create ~peer_class fd ~peer_id ~addr ~direction =
     tx_bytes = 0;
     tx_batches = 0;
     tx_gate = Lwt_mutex.create ();
+    tx_read = None;
+    tx_inputs = [];
+    tx_input_bytes = 0;
+    tx_digest = None;
+    tx_refused = 0;
     closed;
     wake_close;
     msg_count_in = 0;
@@ -127,6 +145,12 @@ let expected_disconnect = function
 let close t =
   if t.connected then begin
     t.connected <- false;
+    let tx_read = t.tx_read in
+    t.tx_read <- None;
+    t.tx_inputs <- [];
+    t.tx_input_bytes <- 0;
+    t.tx_digest <- None;
+    Option.iter Lwt.cancel tx_read;
     Lwt.wakeup_later t.wake_close ();
     t.tx_writes <- [];
     t.tx_bytes <- 0;
@@ -309,7 +333,55 @@ let write_loop ?idle_s t =
   in
   repeat step
 
-let read_loop t ~on_message =
+let receive_tx ?(idle_s = read_idle_timeout_s) t handle frame =
+  if not t.connected then false else
+  let digest = Digestif.SHA256.(digest_string frame.P2p_frame.payload |> to_raw_string) in
+  let input = {packet = frame; digest; expires = monotonic_seconds () +. idle_s} in
+  if t.tx_digest = Some digest || List.exists (fun item -> item.digest = digest) t.tx_inputs then true
+  else if t.tx_read <> None then
+    let bytes = String.length frame.payload in
+    if List.length t.tx_inputs >= tx_input_count || bytes > tx_input_limit - t.tx_input_bytes then begin
+      t.tx_refused <- min max_int (t.tx_refused + (if t.tx_refused = max_int then 0 else 1));
+      if t.tx_refused = 1 || t.tx_refused land (t.tx_refused - 1) = 0 then
+        err_conn t.addr "event = tx_input_full refused = %d queued = %d bytes = %d"
+          t.tx_refused (List.length t.tx_inputs) t.tx_input_bytes;
+      false
+    end else begin
+      t.tx_inputs <- t.tx_inputs @ [input];
+      t.tx_input_bytes <- t.tx_input_bytes + bytes;
+      true
+    end
+  else
+    let rec consume input =
+      let open Lwt.Syntax in
+      t.tx_digest <- Some input.digest;
+      let remaining = input.expires -. monotonic_seconds () in
+      let* () = if not t.connected then Lwt.return_unit
+        else if remaining <= 0. then begin
+          err_conn t.addr "event = tx_read_refused reason = queue_expired";
+          Lwt.return_unit
+        end else Lwt.catch
+          (fun () -> Lwt_unix.with_timeout remaining (fun () -> handle t input.packet))
+          (function
+            | Lwt.Canceled as error -> Lwt.fail error
+            | error ->
+              err_conn t.addr "event = tx_read_refused reason = %s" (Printexc.to_string error);
+              Lwt.return_unit) in
+      match t.tx_inputs with
+      | next :: rest when t.connected ->
+        t.tx_inputs <- rest;
+        t.tx_input_bytes <- t.tx_input_bytes - String.length next.packet.payload;
+        consume next
+      | _ -> Lwt.return_unit in
+    let work = Lwt.finalize
+      (fun () -> Lwt.catch (fun () -> consume input)
+        (function Lwt.Canceled -> Lwt.return_unit | error -> Lwt.fail error))
+      (fun () -> t.tx_read <- None; t.tx_inputs <- []; t.tx_input_bytes <- 0;
+        t.tx_digest <- None; Lwt.return_unit) in
+    if Lwt.is_sleeping work then t.tx_read <- Some work;
+    true
+
+let read_loop ?tx_idle_s t ~on_message =
   let open Lwt.Syntax in
   let step () =
     if not t.connected then Lwt.return Done
@@ -340,8 +412,13 @@ let read_loop t ~on_message =
           | P2p_frame_budget.Accept ->
             t.msg_count_in <- t.msg_count_in + 1;
             t.last_seen <- Unix.gettimeofday ();
-            let* () = on_message t frame in
-            Lwt.return Again)
+            if frame.msg_type = P2p_frame.msg_tx_gossip
+               && not (P2p_tx_gossip.is_control frame.payload || P2p_tx_gossip.is_light frame.payload) then begin
+              ignore (receive_tx ?idle_s:tx_idle_s t on_message frame);
+              Lwt.return Again
+            end else
+              let* () = on_message t frame in
+              Lwt.return Again)
         (fun exn ->
           let error = Printexc.to_string exn in
           if expected_disconnect exn then

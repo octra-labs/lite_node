@@ -2041,7 +2041,58 @@ let test_source_health () =
   expect "busy response" (S.error "HTTP 429 state_sync_busy" = Busy);
   expect "missing response" (S.error "HTTP 404" = Neutral)
 
+let test_range_probe () =
+  let module S = Octra_node_runtime.Sync_sources in
+  List.iter (fun delayed ->
+    let health = S.create ~now:(fun () -> 0.) ~jitter:(fun () -> 1.) () in
+    S.finish health (S.start health Range "http://secondary") Busy;
+    let calls = ref [] in
+    let fetch_json url =
+      calls := url :: !calls;
+      if String.starts_with ~prefix:"http://primary/" url then
+        if delayed then fst (Lwt.task ()) else Lwt.fail (Failure "offline")
+      else Lwt.map (fun () -> range_json [record_json ()]) (Lwt_unix.sleep 0.02) in
+    let validate response =
+      Octra_node_runtime.Consensus_catchup_shell.check_qcs
+        ~chain_id:"octra-test"
+        ~expected_validator_set_hash:(fun _ -> Ok trusted_validator_set_hash)
+        ~start_txid:7L response.Octra_consensus.C_driver.records
+      |> Result.is_ok in
+    let result = Lwt_main.run (Rpc.http_range ~health ~fetch_json ~budget:0.2
+      http_env ~from_epoch:12L ~max_epochs:1 ~validate) in
+    expect (if delayed then "paused range lost its time share" else "paused range was skipped")
+      (Option.is_some result);
+    expect "paused range order differs" (List.rev !calls = [
+      Join.range_url "http://primary" ~from_epoch:12L ~max_epochs:1;
+      Join.range_url "http://secondary" ~from_epoch:12L ~max_epochs:1])) [false; true]
+
+let test_head_probe () =
+  let module S = Octra_node_runtime.Sync_sources in
+  let health = S.create ~now:(fun () -> 0.) ~jitter:(fun () -> 1.) () in
+  S.finish health (S.start health Head "http://secondary") Busy;
+  let fetch_json url =
+    if String.starts_with ~prefix:"http://primary/" url then fst (Lwt.task ())
+    else if url = Join.head_url "http://secondary" then
+      Lwt.return (head_json ~epoch:12L ~root:(hex_of_raw (raw 's')))
+    else Lwt.map (fun () -> range_json [record_json ()]) (Lwt_unix.sleep 0.02) in
+  let result = Lwt_main.run (Rpc.http_head ~health ~fetch_json ~budget:0.2
+    http_env ~chain_id:"octra-test" ~validator_hash:(fun _ -> trusted_validator_set_hash)
+    ~after:11L) in
+  expect "paused head lost its time share" (result = Some 12L)
+
 let () =
+  if Array.mem "--fleet-range" Sys.argv then begin
+    test_range_probe ();
+    print_endline "event = range_probe status = passed";
+    exit 0
+  end;
+  if Array.mem "--fleet-head" Sys.argv then begin
+    test_head_probe ();
+    print_endline "event = head_probe status = passed";
+    exit 0
+  end;
+  test_range_probe ();
+  test_head_probe ();
   test_source_health ();
   test_pending_start ();
   test_http_pending ();

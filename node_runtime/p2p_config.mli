@@ -167,6 +167,7 @@ val upgrade_log_message :
   string
 
 val startup_config :
+  ?eviction_source:(int64 -> (Octra_consensus.C_types.validator_set, string) result) ->
   env:env ->
   chain_id:string ->
   consensus_mode:bool ->
@@ -270,5 +271,6 @@ val start_node_swarm :
   node_swarm_start
 
 val node_stack :
+  ?eviction_source:(int64 -> (Octra_consensus.C_types.validator_set, string) result) ->
   node_stack_deps ->
   (node_stack, string) result

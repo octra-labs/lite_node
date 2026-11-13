@@ -1123,7 +1123,84 @@ let check_restored_member () =
   expect "confirmed pulse series permits restored member"
     (List.mem "octA" (selected resumed (Int64.add head 64L)))
 
+let check_prepared_parent () =
+  let chain_id = "fold-test" in
+  let commit = parent 99L ["octA"; "octB"; "octC"] in
+  List.iter (fun marks ->
+    let prepared = Fold.prepare_parent ~marks ~chain_id commit |> Result.get_ok in
+    let apply ?prepared ~chain_id ~marks parent state =
+      Fold.advance ?prepared ~marks Fold.participating ~chain_id ~start:100L
+        ~at:100L ~parent:(Some parent) state in
+    let direct = apply ~chain_id ~marks commit Fold.empty |> Result.get_ok in
+    let cached = apply ~prepared ~chain_id ~marks commit Fold.empty |> Result.get_ok in
+    expect "prepared parent changes fold result" (cached = direct);
+    expect "prepared parent cannot be reused"
+      (apply ~prepared ~chain_id ~marks commit Fold.empty = Ok cached);
+    let state, _, _ = cached in
+    let repeated, reason, changed = apply ~prepared ~chain_id ~marks commit state
+      |> Result.get_ok in
+    expect "prepared parent repeat changes state"
+      (Fold.to_string repeated = Fold.to_string state && reason = None && not changed);
+    let refused value = expect "prepared parent mismatch accepted"
+      (value = Error "validator duty prepared parent differs") in
+    refused (apply ~prepared ~chain_id:"another-chain" ~marks commit Fold.empty);
+    refused (apply ~prepared ~chain_id ~marks:(not marks) commit Fold.empty);
+    let other = parent 99L addresses in
+    refused (apply ~prepared ~chain_id ~marks other Fold.empty);
+    let vote = List.hd commit.C_types.certificate.precommits in
+    let damaged = {vote with C_types.signature = String.make 64 '\000'} in
+    let invalid = {commit with C_types.certificate = {commit.certificate with
+      precommits = damaged :: List.tl commit.certificate.precommits}} in
+    expect "invalid parent prepared"
+      (Result.is_error (Fold.prepare_parent ~marks ~chain_id invalid))) [false; true]
+
+let check_weight_changes () =
+  let module V = Octra_core.Validator_entry in
+  let members weights = List.mapi (fun index weight -> V.{
+    address = string_of_int index; pubkey = String.make 32 (Char.chr index);
+    weight = Z.of_int weight}) weights in
+  let check before after allowed =
+    expect "weight change decision differs"
+      (Result.is_ok (V.check_weight_change ~before:(members before)
+        ~after:(members after)) = allowed) in
+  check [1; 1; 1; 1; 1; 1; 1] [2; 1; 1; 1; 1; 1; 1] true;
+  check [1; 1; 1; 1; 1; 1; 1] [4; 1; 1; 1; 1; 1; 1] false;
+  check [3; 1; 1; 1; 1; 1; 1; 1] [3; 1; 1; 1; 1; 1; 1] false;
+  check [4; 1; 1; 1; 1; 1; 1] [4; 2; 1; 1; 1; 1; 1] true;
+  check [100; 1; 1] [100; 1; 1; 1] false
+
+let check_change_epochs () =
+  let cfg = Fold.participating in
+  let state = Fold.note_set cfg ~epoch:100L ~active:addresses Fold.empty
+    |> Result.get_ok in
+  let state = List.init 16 (fun index -> Int64.of_int (117 + index))
+    |> List.fold_left (fun state at ->
+      note_parent_cfg cfg at (parent (Int64.pred at) ["octA"; "octB"; "octC"]) state) state in
+  let state = List.init 17 (fun index -> Int64.of_int (100 + 4 * index))
+    |> List.fold_left (fun state epoch ->
+      Fold.note_pulse cfg ~epoch ~active:false ~address:"octE" state
+      |> Result.get_ok) state in
+  let dates = Fold.change_epochs cfg ~start:100L state in
+  expect "pulse expiry date absent" (List.mem 173L dates);
+  expect "pulse expired too early"
+    (Fold.allows cfg ~start:100L ~source:172L ~address:"octE" state);
+  expect "pulse survived expiry"
+    (not (Fold.allows cfg ~start:100L ~source:173L ~address:"octE" state));
+  List.iter (fun state ->
+    let dates = Fold.change_epochs cfg ~start:100L state in
+    List.iter (fun address ->
+      List.iter (fun source ->
+        let allows source = Fold.allows cfg ~start:100L ~source ~address state in
+        if allows (Int64.pred source) <> allows source then
+          expect "eligibility change date absent" (List.mem source dates))
+        (List.init 200 (fun index -> Int64.of_int (81 + index))))
+      ("octE" :: addresses))
+    [state; Fold.delay cfg ~at:190L state |> Result.get_ok]
+
 let () =
+  check_prepared_parent ();
+  check_weight_changes ();
+  check_change_epochs ();
   check_restored_member ();
   check_window_and_proof ();
   check_rejoin_and_delay ();

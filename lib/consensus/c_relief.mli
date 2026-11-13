@@ -36,6 +36,7 @@ val decide :
   decision
 
 val restore :
+  ?policy:C_quorum_policy.t ->
   chain_id:string ->
   height:int64 ->
   current:C_types.validator_set ->

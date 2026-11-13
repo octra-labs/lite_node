@@ -34,10 +34,17 @@ let run effects apply =
           ("event = epoch_apply_failed reason = " ^ Printexc.to_string exn));
       Lwt.fail exn)
 
-let exit_store ?(code = 1) store () =
-  match Octra_core.Store_irmin.Store.Gc.cancel store.Octra_core.Store_irmin.repo with
-  | _ -> Unix._exit code
-  | exception _ -> Unix._exit code
+let exit_store ?(code = 1) ?(exit = Unix._exit) store () =
+  let result = try Octra_core.Store_irmin.stop_for_exit store
+    with _ -> Octra_core.Store_irmin.retain_for_exit () in
+  match result with
+  | Ok () -> exit code
+  | Error error ->
+      (try
+        Octra_log.fatal "gc" "event = exit_refused action = retained reason = %s"
+          (Printexc.to_string error)
+      with _ -> ());
+      Octra_core.Store_irmin.retain_for_exit ()
 
 let run_store ?(fatal = Octra_log.fatal "epoch" "%s") ~store ~ledger ~chaindata apply =
   run {

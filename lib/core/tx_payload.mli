@@ -1,6 +1,10 @@
 (* SPDX-License-Identifier: BSD-3-Clause *)
 (* Copyright (c) 2023-2026 Octra Labs <dev@octra.org> *)
 
+type parse_kind = Octra_net.P2p_tx_gossip.parse_kind = Direct | Encrypted | Program
+
+val parse_kind : Transaction.op_type -> parse_kind
+
 type limits = {
   encrypted_data_len : int;
   message_len : int;

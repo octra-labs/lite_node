@@ -191,6 +191,44 @@ let of_parent_commit parent =
           participants;
     }
 
+let of_parent_at ?policy ~chain_id ~epoch_id parent =
+  let module Policy = Octra_consensus.C_quorum_policy in
+  let policy = Option.value policy ~default:(Policy.for_chain chain_id) in
+  if not (Policy.seatless policy epoch_id) then of_parent_commit parent
+  else if parent.C_types.certificate.chain_id <> chain_id
+    || parent.certificate.epoch_id <> Int64.pred epoch_id then
+    Error "reward parent epoch or chain differs"
+  else if not parent.validator_set.weighted then
+    Error "reward parent weights are not declared"
+  else
+    let rec members result = function
+      | [] -> Ok (List.rev result)
+      | member :: rest ->
+        begin match C_types.weight_of_addr parent.validator_set member.C_types.address with
+        | Some weight when Z.sign weight > 0 -> members ((member, weight) :: result) rest
+        | _ -> Error "reward parent member weight is missing"
+        end in
+    Result.bind (members [] parent.validator_set.validators) (fun entries ->
+      Result.bind (C_types.make_weighted_validator_set entries) (fun checked ->
+        if checked <> {parent.validator_set with authors = None} then
+          Error "reward parent set fields differ"
+        else
+          let authors = match parent.validator_set.authors with
+            | None -> Ok ()
+            | Some (height, authors) when height = parent.certificate.epoch_id && authors <> [] ->
+              Result.map (fun _ -> ()) (C_types.make_weighted_validator_set (entries @ authors))
+            | Some _ -> Error "reward parent author context differs" in
+          Result.bind authors (fun () -> Result.bind (Parent.proposer parent) (fun proposer ->
+          Ok {
+            proposer_addr = proposer.address;
+            proposer_public_key = Some (Base64.encode_exn proposer.pubkey);
+            validators = List.map (fun (member, weight) -> Epoch_exec.{
+              address = member.C_types.address;
+              public_key = Some (Base64.encode_exn member.pubkey);
+              weight;
+            }) entries;
+          }))))
+
 let legacy_finality_reward ~validator_set finalize =
   let validator_pubkeys =
     List.map
@@ -219,7 +257,14 @@ let standard_mode ~chain_id epoch_id =
       ~chain_id
       ~epoch:(Int64.to_int epoch_id)
 
-let bind_finality ~validator_set finalize supplied =
+let bind_finality ?policy ~validator_set finalize supplied =
+  let policy = Option.value policy
+    ~default:(Octra_consensus.C_quorum_policy.for_chain finalize.C_types.chain_id) in
+  if Octra_consensus.C_quorum_policy.seatless policy finalize.epoch_id
+     && (finalize.header.proto_version <> C_types.proto_version_current
+         || Option.is_none finalize.parent_commit) then
+    Error "weighted reward requires current parent commit"
+  else
   match finalize.C_types.header.proto_version with
   | version when version = C_types.proto_version_parent_legacy ->
     legacy_finality_reward ~validator_set finalize
@@ -235,7 +280,7 @@ let bind_finality ~validator_set finalize supplied =
       with
       | Octra_core.Rule_graph.Prior, _, None -> Ok supplied
       | Octra_core.Rule_graph.Prior, _, Some parent ->
-        of_parent_commit parent
+        of_parent_at ~policy ~chain_id:finalize.chain_id ~epoch_id:finalize.epoch_id parent
         |> fun expected -> require_reward "parent commit" expected supplied
       | Octra_core.Rule_graph.Active, 0L, None ->
         legacy_finality_reward ~validator_set finalize
@@ -245,24 +290,30 @@ let bind_finality ~validator_set finalize supplied =
       | Octra_core.Rule_graph.Active, _, None ->
         Error "current reward parent commit is missing"
       | Octra_core.Rule_graph.Active, _, Some parent ->
-        of_parent_commit parent
+        of_parent_at ~policy ~chain_id:finalize.chain_id ~epoch_id:finalize.epoch_id parent
         |> fun expected -> require_reward "parent commit" expected supplied
     end
   | _ -> Error "reward finality protocol is unsupported"
 
-let prove_finality ~validator_set finalize supplied =
+let prove_finality ?policy ~validator_set finalize supplied =
   if finalize.C_types.header.proto_version = C_types.proto_version_current
      && standard_mode ~chain_id:finalize.chain_id finalize.epoch_id
         = Octra_core.Rule_graph.Prior
      && Option.is_none finalize.parent_commit then
     Error "reward proof is missing"
   else
-    bind_finality ~validator_set finalize supplied
+    bind_finality ?policy ~validator_set finalize supplied
 
-let resolve_for_epoch ~chain_id ~epoch_id ~proposer_addr ~validator_pubkeys
+let resolve_for_epoch ?policy ~chain_id ~epoch_id ~proposer_addr ~validator_pubkeys
     parent =
+  let policy = Option.value policy ~default:(Octra_consensus.C_quorum_policy.for_chain chain_id) in
+  let version = Octra_consensus.C_protocol.version_for_epoch epoch_id in
+  if Octra_consensus.C_quorum_policy.seatless policy epoch_id
+     && (version <> C_types.proto_version_current || Option.is_none parent) then
+    Error "weighted reward requires current parent commit"
+  else
   match
-    Octra_consensus.C_protocol.version_for_epoch epoch_id,
+    version,
     epoch_id,
     parent
   with
@@ -285,5 +336,5 @@ let resolve_for_epoch ~chain_id ~epoch_id ~proposer_addr ~validator_pubkeys
         Error "current reward parent commit is missing"
     end
   | version, _, Some parent when version = C_types.proto_version_current ->
-    of_parent_commit parent
+    of_parent_at ~policy ~chain_id ~epoch_id parent
   | _ -> Error "reward protocol is unsupported"

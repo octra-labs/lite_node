@@ -47,6 +47,12 @@ type validator_set = {
   authors : (int64 * (validator_info * Z.t) list) option;
 }
 
+type eviction = {
+  epoch : int64;
+  source : validator_set;
+  offenders : string list;
+}
+
 type reward_member = {
   reward_address : string;
   reward_public_key : string option;
@@ -158,9 +164,6 @@ let round_step_of_u8 = function
   | 3 -> PrecommitStep
   | _ -> failwith "bad round_step"
 
-let quorum_weight total_weight =
-  Z.(add (div (mul total_weight (of_int 2)) (of_int 3)) one)
-
 let build_validator_set ~weighted entries =
   let sorted =
     List.sort
@@ -180,15 +183,8 @@ let build_validator_set ~weighted entries =
       Z.zero
       sorted
   in
-  let n = List.length validators in
-  let f = (n - 1) / 3 in
-  let quorum =
-    if n <= 0 then 0
-    else if n < 4 then n
-    else n - f in
-  let quorum_weight =
-    if Z.sign total_weight <= 0 then Z.zero
-    else quorum_weight total_weight
+  let C_measure.{ n; f; quorum; total_weight; quorum_weight } =
+    C_measure.shape ~seats:(List.length validators) ~total:total_weight
   in
   {
     validators;
@@ -274,9 +270,7 @@ let largest_weight_sum count entries =
 let count_live_at_cap ~faults cap entries =
   let effective = cap_entries cap entries in
   let total = sum_weights effective in
-  let unavailable = largest_weight_sum faults effective in
-  let remaining = Z.sub total unavailable in
-  Z.geq remaining (quorum_weight total)
+  C_measure.live ~total ~lost:(largest_weight_sum faults effective)
 
 let count_weight_cap (vs : validator_set) =
   let entries = weights_of_set vs in
@@ -325,6 +319,122 @@ let validator_set_for_epoch ?policy ~chain_id ~epoch_id vs =
       {vs with authors = None}
     | _ -> vs in
   validator_set_for_rule rule vs
+
+type set_error = Set_shape of string | Seat_cap
+
+let set_error_message = function
+  | Set_shape reason -> reason
+  | Seat_cap -> "validator weight reaches blocking threshold"
+
+let validate_validator_set_shape (vs : validator_set) =
+  if not vs.weighted then Error (Set_shape "validator weights are not declared")
+  else
+    let ( let* ) = Result.bind in
+    let rec entries members weights =
+      match members, weights with
+      | [], [] -> Ok []
+      | member :: rest, (address, weight) :: remaining
+        when member.address = address ->
+        let* remaining = entries rest remaining in
+        Ok ((member, weight) :: remaining)
+      | _ -> Error (Set_shape "validator weight membership differs")
+    in
+    let members = List.sort (fun left right -> String.compare left.address right.address)
+      vs.validators in
+    let weights = List.sort (fun (left, _) (right, _) -> String.compare left right)
+      vs.weights in
+    let* entries = entries members weights in
+    let build entries = Result.map_error (fun reason -> Set_shape reason)
+      (make_weighted_validator_set entries) in
+    let* checked = build entries in
+    if vs.n <> checked.n || vs.f <> checked.f
+       || vs.quorum <> checked.quorum
+       || not (Z.equal vs.total_weight checked.total_weight)
+       || not (Z.equal vs.quorum_weight checked.quorum_weight) then
+      Error (Set_shape "validator set shape differs")
+    else
+      let* authors = match vs.authors with
+        | None -> Ok None
+        | Some (height, authors) ->
+          let* authors = build authors in
+          let authors = weights_of_set authors in
+          let* _ = build (entries @ authors) in
+          Ok (Some (height, authors)) in
+      Ok {checked with authors}
+
+let same_voting_set (left : validator_set) (right : validator_set) =
+  match validate_validator_set_shape {left with authors = None},
+    validate_validator_set_shape {right with authors = None} with
+  | Ok left, Ok right -> left = right
+  | Error _, _ | _, Error _ -> false
+
+let structural_validator_set_for_epoch ?policy ~chain_id ~epoch_id vs =
+  let policy = Option.value policy ~default:(C_quorum_policy.for_chain chain_id) in
+  let effective = validator_set_for_epoch ~policy ~chain_id ~epoch_id vs in
+  if not (C_quorum_policy.seatless policy epoch_id) then Ok effective
+  else Result.bind (validate_validator_set_shape vs) (fun _ ->
+    validate_validator_set_shape effective)
+
+let validate_validator_set_for_epoch ?policy ~chain_id ~epoch_id vs =
+  let policy = Option.value policy ~default:(C_quorum_policy.for_chain chain_id) in
+  let ( let* ) = Result.bind in
+  let* checked = structural_validator_set_for_epoch ~policy ~chain_id ~epoch_id vs in
+  if not (C_quorum_policy.seatless policy epoch_id) then Ok checked
+  else
+    let shape = C_measure.shape ~seats:checked.n ~total:checked.total_weight in
+    let limit = C_measure.minority shape in
+    if List.exists (fun (_, weight) -> Z.geq weight limit) checked.weights then Error Seat_cap
+    else Ok checked
+
+let checked_validator_set_for_epoch ?policy ~chain_id ~epoch_id vs =
+  validate_validator_set_for_epoch ?policy ~chain_id ~epoch_id vs
+  |> Result.map_error set_error_message
+
+type eviction_choice = Remove_set of validator_set * Z.t | Retain_set of Z.t
+
+let plan_eviction ~offenders vs =
+  let ( let* ) = Result.bind in
+  let* checked = validate_validator_set_shape vs |> Result.map_error set_error_message in
+  let unique = List.sort_uniq String.compare offenders in
+  if unique = [] then Error "validator eviction requires offenders"
+  else if List.length unique <> List.length offenders then Error "duplicate eviction offender"
+  else if List.exists (fun address -> not (List.mem_assoc address checked.weights)) unique then
+    Error "eviction offender is not an active validator"
+  else
+    let removed, remaining = List.partition (fun (member, _) ->
+      List.mem member.address unique) (weights_of_set checked) in
+    let weight = sum_weights removed in
+    if not (C_measure.live ~total:checked.total_weight ~lost:weight) then
+      Ok (Retain_set weight)
+    else
+      let* next = make_weighted_validator_set remaining in
+      Ok (Remove_set (next, weight))
+
+let evict_validator_set ~offenders vs =
+  match plan_eviction ~offenders vs with
+  | Ok (Remove_set (next, weight)) -> Ok (next, weight)
+  | Ok (Retain_set _) -> Error "evicted weight reaches blocking threshold"
+  | Error _ as error -> error
+
+type set_choice = Active_set of validator_set | Pending_set of validator_set
+
+let pending_set_for_epoch ?policy ~chain_id ~epoch_id ~active pending =
+  let policy = Option.value policy ~default:(C_quorum_policy.for_chain chain_id) in
+  let ( let* ) = Result.bind in
+  let* active =
+    if not (C_quorum_policy.seatless policy epoch_id) then Ok None
+    else match active with
+      | None -> Ok None
+      | Some active ->
+        structural_validator_set_for_epoch ~policy ~chain_id ~epoch_id active
+        |> Result.map Option.some in
+  match validate_validator_set_for_epoch ~policy ~chain_id ~epoch_id pending with
+  | Ok set -> Ok (Pending_set set)
+  | Error (Set_shape reason) -> Error (Set_shape reason)
+  | Error Seat_cap ->
+    match active with
+    | None -> Error (Set_shape "active validator set is missing")
+    | Some checked -> Ok (Active_set checked)
 
 let pubkey_of_addr (vs : validator_set) (addr : string) : string option =
   match List.find_opt (fun v -> v.address = addr) vs.validators with
@@ -379,56 +489,50 @@ let unique_signer_count validators =
   |> List.sort_uniq String.compare
   |> List.length
 
-let has_weight_quorum vs validators =
-  match signed_weight vs validators with
-  | None -> false
-  | Some weight -> Z.geq weight vs.quorum_weight
+let space_for_rule rule vs =
+  C_measure.ruled rule ~declared:vs.weighted vs.weights
 
-let has_quorum_values vs ~signer_count ~signed_weight =
-  signer_count >= vs.quorum
-  && Z.geq signed_weight vs.quorum_weight
-
-let has_quorum vs validators =
-  match signed_weight vs validators with
-  | None -> false
-  | Some weight ->
-    has_quorum_values
-      vs
-      ~signer_count:(unique_signer_count validators)
-      ~signed_weight:weight
+let space ?policy ~chain_id ~epoch_id vs =
+  let policy = Option.value policy ~default:(C_quorum_policy.for_chain chain_id) in
+  C_measure.space policy epoch_id ~declared:vs.weighted vs.weights
 
 let weights_valid rule vs =
-  rule <> C_quorum_policy.Stake || vs.weighted
-
-let has_quorum_for_rule rule vs validators =
-  let effective = validator_set_for_rule rule vs in
-  weights_valid rule vs &&
-  match rule with
-  | C_quorum_policy.Prior -> has_weight_quorum effective validators
-  | C_quorum_policy.Capped | C_quorum_policy.Stake -> has_quorum effective validators
+  C_measure.valid (space_for_rule rule vs)
 
 let has_quorum_at ?policy ~chain_id ~epoch_id vs validators =
   let policy = Option.value policy ~default:(C_quorum_policy.for_chain chain_id) in
-  has_quorum_for_rule (C_quorum_policy.select policy epoch_id) vs validators
+  let rule = C_quorum_policy.select policy epoch_id in
+  let effective = validator_set_for_rule rule vs in
+  match signed_weight effective validators with
+  | None -> false
+  | Some weight ->
+    C_measure.meets (space ~policy ~chain_id ~epoch_id effective) C_measure.Quorum
+      ~seats:(unique_signer_count validators) ~weight
 
 let quorum_reached_at ?policy ~chain_id ~epoch_id vs ~signer_count ~signed_weight =
-  let policy = Option.value policy ~default:(C_quorum_policy.for_chain chain_id) in
-  weights_valid (C_quorum_policy.select policy epoch_id) vs &&
-  Z.geq signed_weight vs.quorum_weight
-  &&
-  (C_quorum_policy.select policy epoch_id = C_quorum_policy.Prior
-   || signer_count >= vs.quorum)
+  C_measure.meets (space ?policy ~chain_id ~epoch_id vs) C_measure.Quorum
+    ~seats:signer_count ~weight:signed_weight
+
+let pair_at ?policy ~chain_id ~epoch_id vs validators =
+  match signed_weight vs validators with
+  | None -> false
+  | Some weight ->
+    C_measure.meets (space ?policy ~chain_id ~epoch_id vs) C_measure.Pair
+      ~seats:(unique_signer_count validators) ~weight
+
+let promise_at ?policy ~chain_id ~epoch_id vs responders =
+  let weight = List.sort_uniq String.compare responders
+    |> List.fold_left (fun sum address ->
+      Z.add sum (Option.value (weight_of_addr vs address) ~default:Z.zero)) Z.zero in
+  C_measure.meets (space ?policy ~chain_id ~epoch_id vs) C_measure.Promise
+    ~seats:(List.length responders) ~weight
 
 let round_skip_weight vs =
-  Z.(add (sub vs.total_weight vs.quorum_weight) one)
+  C_measure.minority (C_measure.shape ~seats:vs.n ~total:vs.total_weight)
 
 let round_skip_reached_at ?policy ~chain_id ~epoch_id vs ~signer_count ~signed_weight =
-  let policy = Option.value policy ~default:(C_quorum_policy.for_chain chain_id) in
-  weights_valid (C_quorum_policy.select policy epoch_id) vs &&
-  Z.geq signed_weight (round_skip_weight vs)
-  &&
-  (C_quorum_policy.select policy epoch_id = C_quorum_policy.Prior
-   || signer_count >= vs.f + 1)
+  C_measure.meets (space ?policy ~chain_id ~epoch_id vs) C_measure.Skip
+    ~seats:signer_count ~weight:signed_weight
 
 let weighted_leader (vs : validator_set) ~epoch_id ~round =
   let buffer = Buffer.create 256 in

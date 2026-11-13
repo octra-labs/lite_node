@@ -24,7 +24,7 @@ type verification_failure =
   | Worker_memory_exceeded
   | Worker_failed of string
 
-type control =
+type control = Proof_link.control =
   | Continue
   | Cancel
 
@@ -51,6 +51,7 @@ let capacity = capacity_of_getenv Sys.getenv_opt
 let proof_channel =
   Channel.create
     ~capacity
+    ~reserved_limit:1
     ~required_limit:Resource_lanes.preverify_required_queue_limit
     ~speculative_limit:Resource_lanes.preverify_speculative_queue_limit
     ~required_burst:Resource_lanes.preverify_required_burst
@@ -117,33 +118,9 @@ external wait_io :
   Unix.file_descr -> Unix.file_descr -> Unix.file_descr -> int -> int
   = "octra_io_wait"
 
-let rss_mb_of_status_line line =
-  if not (String.starts_with ~prefix:"VmRSS:" line) then None
-  else
-    let raw =
-      String.trim (String.sub line 6 (String.length line - 6))
-    in
-    try Some ((Scanf.sscanf raw "%d" Fun.id + 1023) / 1024)
-    with _ -> None
-
 let read_rss_mb pid =
-  if Sys.os_type <> "Unix" || not (Sys.file_exists "/proc") then None
-  else
-    let path = Printf.sprintf "/proc/%d/status" pid in
-    try
-      let channel = open_in path in
-      Fun.protect
-        ~finally:(fun () -> close_in_noerr channel)
-        (fun () ->
-          let rec find () =
-            match rss_mb_of_status_line (input_line channel) with
-            | Some _ as rss -> rss
-            | None -> find ()
-          in
-          try find ()
-          with End_of_file -> None)
-    with _ ->
-      None
+  let memory = Proof_frame.rss pid in
+  if memory < 0 then None else Some memory
 
 let close_noerr fd =
   try Unix.close fd
@@ -199,7 +176,7 @@ let write_available fd raw offset =
   else
     try
       let count =
-        Unix.write_substring
+        Proof_frame.write_part
           fd
           raw
           !offset
@@ -248,7 +225,8 @@ let process_response expected_hash stdout stderr status =
 
 let exchange ?(control = Atomic.make Continue)
     ?(pipe = Unix.pipe ~cloexec:true) ?(arguments = [])
-    ?(limit = P.max_response_bytes) ?(deadline = Float.infinity) worker raw =
+    ?(limit = P.max_response_bytes) ?(deadline = Float.infinity)
+    ?(memory = max_rss_mb ()) worker raw =
   if Atomic.get control = Cancel then Error (Unavailable "worker_cancelled")
   else if Float.is_nan deadline || deadline <= monotonic_seconds () then Error Timed_out
   else if limit < 0 || limit > Sys.max_string_length then Error (Failed "output_limit")
@@ -320,7 +298,7 @@ let exchange ?(control = Atomic.make Continue)
         finish (Error Timed_out)
       end else
         match read_rss_mb pid with
-        | Some rss when rss > max_rss_mb () ->
+        | Some rss when rss > memory ->
           stop ();
           finish (Error Memory_exceeded)
         | Some _ | None ->
@@ -391,13 +369,13 @@ let exchange ?(control = Atomic.make Continue)
     close_all ();
     Error (Failed (Printexc.to_string error))
 
-let run_process ?control ?pipe ?deadline worker request =
+let run_process ?control ?pipe ?deadline ?memory worker request =
   if Option.fold ~none:false ~some:(fun signal -> Atomic.get signal = Cancel) control then
     Unavailable "worker_cancelled"
   else
     let raw = P.request_bytes request in
-    let expected_hash = P.request_hash request in
-    match exchange ?control ?pipe ?deadline worker raw with
+    let expected_hash = P.hash_bytes raw in
+    match exchange ?control ?pipe ?deadline ?memory worker raw with
     | Ok (stdout, stderr, status) ->
       begin match process_response expected_hash stdout stderr status with
       | Completed response when not response.accepted
@@ -440,7 +418,7 @@ let retire_session session =
   close_noerr session.output;
   closed
 
-let open_session ?(on_exit = terminate) program =
+let open_session ?(on_exit = terminate) ?(arguments = ["--fhe-session"]) program =
   let descriptors = ref [] in
   let pipe () =
     let left, right = Unix.pipe ~cloexec:true () in
@@ -454,7 +432,7 @@ let open_session ?(on_exit = terminate) program =
     descriptors := error :: !descriptors;
     Unix.set_nonblock write;
     Unix.set_nonblock read;
-    let child = Unix.create_process_env program [|program; "--fhe-session"|]
+    let child = Unix.create_process_env program (Array.of_list (program :: arguments))
       (Unix.environment ()) input output error in
     pid := Some child;
     List.iter close_noerr [input; output; error];
@@ -465,7 +443,8 @@ let open_session ?(on_exit = terminate) program =
     List.iter close_noerr !descriptors;
     raise error
 
-let session_exchange ~control ~deadline session raw =
+let session_exchange ?(read = Unix.read) ?(write = Proof_frame.write_part)
+    ?(wait = wait_io) ~control ~deadline session raw =
   let header = Bytes.create 8 in
   Bytes.set_int64_be header 0 (Int64.of_int (String.length raw));
   let request = Bytes.to_string header ^ raw in
@@ -481,14 +460,15 @@ let session_exchange ~control ~deadline session raw =
     else if !framed && !received = Bytes.length !data && !sent = String.length request then
       Ok (Bytes.unsafe_to_string !data)
     else begin
+      begin try
       let mask = (if !received < Bytes.length !data then 1 else 0)
         lor (if !sent < String.length request then 4 else 0) in
-      let ready = wait_io session.input session.output session.output mask in
+      let ready = wait session.input session.output session.output mask in
       if ready land 4 <> 0 then
-        sent := !sent + Unix.write_substring session.input request !sent
+        sent := !sent + write session.input request !sent
           (min 65_536 (String.length request - !sent));
       if ready land 1 <> 0 then begin
-        let count = Unix.read session.output !data !received (Bytes.length !data - !received) in
+        let count = read session.output !data !received (Bytes.length !data - !received) in
         if count = 0 then raise End_of_file;
         received := !received + count;
         if not !framed && !received = 8 then begin
@@ -499,6 +479,8 @@ let session_exchange ~control ~deadline session raw =
           received := 0;
           framed := true
         end
+      end
+      with Unix.Unix_error ((Unix.EINTR | Unix.EAGAIN | Unix.EWOULDBLOCK), _, _) -> ()
       end;
       loop ()
     end in
@@ -506,35 +488,99 @@ let session_exchange ~control ~deadline session raw =
   | Out_of_memory -> Error Memory_exceeded
   | error -> Error (Failed (Printexc.to_string error))
 
-let run_unmanaged ?control request =
+let run_recovery owner ~control ~memory worker request (ticket : Proof_keeper.recovery) =
+  let finish outcome =
+    let result = match outcome with
+      | Completed response when Atomic.get control = Continue && response.accepted
+          && response.reason = "" && response.request_hash = ticket.hash -> Proof_warm.Cold_accepted
+      | Completed _ when Atomic.get control = Continue -> Proof_warm.Cold_rejected
+      | Completed _ | Timed_out | Memory_exceeded | Busy | Unavailable _ | Failed _ -> Proof_warm.Cold_unfinished in
+    Proof_keeper.recover owner ticket result;
+    outcome in
+  match run_process ~control ~deadline:ticket.deadline ~memory worker request with
+  | outcome -> finish outcome
+  | exception error -> Proof_keeper.recover owner ticket Proof_warm.Cold_unfinished; raise error
+
+let run_unmanaged ?(control = Atomic.make Continue) ?(prepared = true) request =
   match worker_path () with
   | None -> Unavailable "worker_missing"
-  | Some worker -> run_process ?control worker request
+  | Some worker ->
+    let memory = max_rss_mb () in
+    let owner = if capacity = 1 && memory >= Proof_keeper.min_memory_mb && prepared then
+      Proof_keeper.current worker else None in
+    match owner with
+    | None -> run_process ~control ~memory:(max 64 (memory - Proof_keeper.footprint ())) worker request
+    | Some owner ->
+      let deadline = monotonic_seconds () +. timeout_seconds () in
+      match Proof_keeper.run owner ~control ~deadline request with
+      | Proof_keeper.Accepted response -> Completed response
+      | Proof_keeper.Cancelled -> Unavailable "worker_cancelled"
+      | Proof_keeper.Timed_out -> Timed_out
+      | Proof_keeper.Recovery ticket ->
+        run_recovery owner ~control ~memory:(memory - Proof_keeper.reserve_mb) worker request ticket
+      | Proof_keeper.Recheck token ->
+        let settle result = Option.iter (fun token -> Proof_keeper.settle owner token result) token in
+        match run_process ~control ~deadline
+          ~memory:(memory - Proof_keeper.reserve_mb) worker request with
+        | outcome ->
+          settle (match outcome with
+            | Completed response -> if response.accepted then Proof_warm.Disagreed else Proof_warm.Agreed
+            | Timed_out | Memory_exceeded | Busy | Unavailable _ | Failed _ -> Proof_warm.Unfinished);
+          outcome
+        | exception error -> settle Proof_warm.Unfinished; raise error
 
 let run_sync ?(priority = Required) request =
   match
-    Channel.run_sync proof_channel priority (fun () -> run_unmanaged request)
+    Channel.run_sync ~bytes:(P.input_bytes request) proof_channel priority
+      (fun () -> run_unmanaged ~prepared:(priority = Required) request)
   with
   | Some outcome -> outcome
   | None -> Busy
 
 let try_run_sync ?(priority = Speculative) request =
   match
-    Channel.try_run_sync proof_channel priority (fun () -> run_unmanaged request)
+    Channel.try_run_sync ~bytes:(P.input_bytes request) proof_channel priority
+      (fun () -> run_unmanaged ~prepared:(priority = Required) request)
   with
   | Some outcome -> outcome
   | None -> Busy
 
 let run ?(priority = Required) request =
   let control = Atomic.make Continue in
-  let pending = Channel.run_threaded proof_channel priority
-    (run_unmanaged ~control) request in
+  let pending = Channel.run_threaded ~bytes:(P.input_bytes request) proof_channel priority
+    (run_unmanaged ~control ~prepared:(priority = Required)) request in
   Lwt.on_cancel pending (fun () -> Atomic.set control Cancel);
   let open Lwt.Syntax in
   let* outcome = pending in
   match outcome with
   | Some value -> Lwt.return value
   | None -> Lwt.return Busy
+
+let run_joined ?reservation ?(priority = Required) request =
+  let control = Atomic.make Continue in
+  let finished = ref Lwt.return_unit in
+  let pending = Exec_resource.queued (fun resume ->
+    Channel.run_async ?reservation ~bytes:(P.input_bytes request) proof_channel priority
+    (fun () ->
+      resume ();
+      let job, wake = Lwt.wait () in
+      let execute () =
+        let result = try Ok (run_unmanaged ~control ~prepared:(priority = Required) request)
+          with error -> Error error in
+        Lwt_preemptive.run_in_main_dont_wait (fun () ->
+          if Lwt.is_sleeping job then begin match result with
+            | Ok value -> Lwt.wakeup_later wake value
+            | Error error -> Lwt.wakeup_later_exn wake error
+          end;
+          Lwt.return_unit) (fun _ -> ()) in
+      (try ignore (Thread.create execute ()) with error -> Lwt.wakeup_later_exn wake error);
+      finished := Lwt.catch (fun () -> Lwt.map ignore job) (fun _ -> Lwt.return_unit);
+      job)) in
+  Lwt.finalize (fun () ->
+    Lwt.map (Option.value ~default:Busy) (Lwt.protected pending)) (fun () ->
+      Atomic.set control Cancel;
+      Lwt.cancel pending;
+      Lwt.no_cancel !finished)
 
 let channel_stats () =
   Channel.stats proof_channel
@@ -605,16 +651,37 @@ let session_ready () =
         Result.bind (check 0) (fun () -> check 1))
     with _ -> Error "worker_session_unavailable"
 
+let prepared_config ~workers ~memory =
+  if workers <> 1 then Error "worker_count"
+  else if memory < Proof_keeper.min_memory_mb then Error "memory_limit"
+  else Ok ()
+
+let start_prepared () =
+  let memory = max_rss_mb () in
+  match prepared_config ~workers:capacity ~memory with
+  | Error reason ->
+    Octra_log.warn "pre_verify" "event = prepared_disabled reason = %s workers = %d memory_mb = %d required_mb = %d"
+      reason capacity memory Proof_keeper.min_memory_mb
+  | Ok () ->
+    match worker_path () with
+    | Some program -> ignore (Proof_keeper.shared ~memory program)
+    | None -> Octra_log.warn "pre_verify" "event = prepared_disabled reason = worker_missing"
+
 let ready_sync () =
-  Result.bind (result_sync ~keyed:false P.Ping) (fun () ->
-    Result.bind (result_sync ~keyed:true ~math:true P.Ping) session_ready)
+  let result = Result.bind (result_sync ~keyed:false P.Ping) (fun () ->
+    Result.bind (result_sync ~keyed:true ~math:true P.Ping) session_ready) in
+  if Result.is_ok result then start_prepared ();
+  result
 
 let ready () =
   let open Lwt.Syntax in
   let* prior = result ~keyed:false P.Ping in
   match prior with
   | Error _ -> Lwt.return prior
-  | Ok () -> result ~keyed:true ~math:true P.Ping
+  | Ok () ->
+    let* checked = result ~keyed:true ~math:true P.Ping in
+    if Result.is_ok checked then start_prepared ();
+    Lwt.return checked
 
 let verify_encrypt_with_priority ~keyed ~math
     priority

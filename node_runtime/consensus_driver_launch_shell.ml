@@ -205,11 +205,17 @@ let health_runtime_of_node (runtime : runtime) =
       else Lwt.return_false);
   }
 
-let create_driver runtime =
+let create_driver ?resolve ?set_epoch runtime =
   let config =
     Consensus_driver_wiring.node_driver_config runtime.driver_config
   in
-  Octra_consensus.C_driver.create
+  let policy = Octra_consensus.C_quorum_policy.for_chain config.chain_id in
+  let create = match resolve with
+    | _ when not (Octra_consensus.C_quorum_policy.seatless policy runtime.start_height) ->
+      Octra_consensus.C_driver.create
+    | None -> Octra_consensus.C_driver.create
+    | Some resolve -> Octra_consensus.C_driver.create_trusted ~set_epoch ~resolve in
+  create
     ~config
     ~validator_set:runtime.stake_set
     ~swarm:runtime.swarm
@@ -222,8 +228,8 @@ let publish slot on_driver driver =
   slot := Some driver;
   on_driver driver
 
-let run ?resolve runtime =
-  let driver = create_driver runtime in
+let run ?resolve ?set_epoch runtime =
+  let driver = create_driver ?resolve ?set_epoch runtime in
   Octra_consensus.C_driver.set_validator_set_activation_handler
     driver
     runtime.activate_validator_set;

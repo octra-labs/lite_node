@@ -97,4 +97,17 @@ let () =
   if model_state Q.empty <> M.empty then failwith "queue model initial state differs";
   directed ();
   generated ();
-  Printf.printf "event = queue_model steps = %d status = passed\n%!" !checked
+  Printf.printf "event = queue_model steps = %d status = passed\n%!" !checked;
+  let module C = Compute_pool in
+  let module R = M.Reserve in
+  let state = function
+    | C.Available -> R.Available | C.Borrowed -> R.Borrowed
+    | C.Closing -> R.Closing | C.Released -> R.Released in
+  let effect = function C.Grant -> R.Grant | C.Deny -> R.Deny | C.Free -> R.Free in
+  let input = function C.Borrow -> R.Borrow | C.Settle -> R.Settle | C.Close -> R.Close in
+  List.iter (fun current -> List.iter (fun message ->
+    let next, output = C.reservation_step current message in
+    if (state next, List.map effect output) <> R.step (state current) (input message) then
+      failwith "reservation model differs") [C.Borrow; C.Settle; C.Close])
+    [C.Available; C.Borrowed; C.Closing; C.Released];
+  print_endline "event = reservation_model transitions = 12 status = passed"
