@@ -64,14 +64,14 @@ let open_index_map resources readonly card ~key ~value ~name env =
   else
     Lmdb.Map.create card ~key ~value ~name env) Lmdb_handle.close
 
-let open_index ?(readonly = false) path =
+let open_index ?(readonly = false) ?(reader_lock = false) path =
   if not (Sys.file_exists path) && readonly then
     failwith "chaindata index: read-only directory is missing"
   else if not (Sys.file_exists path) then begin
     try Unix.mkdir path 0o755 with Unix.Unix_error (Unix.EEXIST, _, _) -> ()
   end;
   let flags =
-    if readonly then
+    if readonly && not reader_lock then
       Lmdb.Env.Flags.(no_tls + no_read_ahead + no_lock)
     else
       Lmdb.Env.Flags.(no_tls + no_read_ahead)
@@ -598,6 +598,15 @@ let get_epoch_raw t epoch_id =
   with
   | Not_found -> None
   | _ -> None
+
+let read_head t epoch_id =
+  Lmdb.Txn.go Lmdb.Ro t.env (fun txn ->
+    let read map key =
+      try match Lmdb.Map.get map ~txn key with
+      | value when String.length value <= Epochlog.max_record_len -> Ok (Some (copy value))
+      | _ -> Error "head metadata exceeds byte limit"
+      with Not_found -> Ok None | _ -> Error "head metadata read failed" in
+    read t.epoch_meta (Int32.of_int epoch_id), read t.meta "history_floor")
 
 let list_epoch_ids t =
   try

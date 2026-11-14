@@ -849,45 +849,53 @@ let target_keys = List.init 7 (fun index ->
 let target_set = weighted_set (List.map2 (fun (member, _) weight -> member, Z.of_int weight)
   target_keys [3; 2; 1; 1; 1; 1; 1])
 
-let target_final time =
+let target_final ?(epoch = 40L) time =
   let module H = Octra_consensus.C_hash in
-  let header = T.{proto_version = proto_version_current; chain_id; epoch_id = 40L;
+  let header = T.{proto_version = proto_version_current; chain_id; epoch_id = epoch;
     prev_state_root = String.make 32 '\003'; tx_list_hash = E.tx_list_hash_for_header [];
     receipt_root = H.receipt_root []; proposed_state_root = root;
     parent_commit_hash = Octra_net.Hash_domain.nil_hash;
     creator_addr = (fst (List.hd target_keys)).address; txid_hi = 0L; ts = time} in
   let proposal_id = H.proposal_id header in
   let precommits = List.map (fun ((member : T.validator_info), secret) ->
-    let vote = T.{chain_id; epoch_id = 40L; round = 0; vote_type = Precommit;
+    let vote = T.{chain_id; epoch_id = epoch; round = 0; vote_type = Precommit;
       proposal_id; validator = member.address; signature = ""} in
     {vote with signature = H.sign_ed25519 ~priv_raw:secret ~msg:(H.vote_sign_bytes vote)}) target_keys in
-  T.{chain_id; epoch_id = 40L; commit_round = 0; header; proposal_id;
+  T.{chain_id; epoch_id = epoch; commit_round = 0; header; proposal_id;
     precommits; parent_commit = None}
 
-let with_target action =
+let with_target ?(history = 0) action =
   let module Store = Octra_core.Store_chaindata in
   let module Head = Octra_core.Head_manifest in
   let module Log = Octra_core.Epochlog in
   let module J = Octra_node_runtime.Consensus_finality_journal in
   let directory = Test_workspace.unique_dir "sync-target" in
   let chaindata = Store.open_chaindata (Filename.concat directory "chain") in
+  let epoch = 40 + history in
+  let padding = if history = 0 then "" else String.make 32768 'a' in
+  for id = 0 to history - 1 do
+    Log.append chaindata.epochlog {Log.empty_epoch_header with id; parent_commit = padding}
+  done;
   let time = Unix.gettimeofday () -. 2. in
-  let final = target_final time in
-  let head = Head.{schema_version; generation = 40; epoch_id = 40;
+  let final = target_final ~epoch:(Int64.of_int epoch) time in
+  let head = Head.{schema_version; generation = epoch; epoch_id = epoch;
     state_root = Octra_node_runtime.Text.raw_to_hex root; ledger_state_root = None;
     irmin_commit = None; txid_hi = 0L; txlog_seg = None; txlog_off = None;
     epochlog_off = None; commit_id = "sync-target"; ts = time;
     quorum_cert_hash = None; epoch_index_hash = None; epoch_index_root = None} in
   Head.atomic_write directory head;
   Store.begin_batch chaindata;
-  Store.set_epoch chaindata Log.{empty_epoch_header with id = 40;
+  Store.set_epoch chaindata Log.{empty_epoch_header with id = epoch;
     state_root = head.state_root; finalized_at = time};
   Store.commit_batch chaindata;
   Store.fsync chaindata;
+  let head = {head with epochlog_off = Some (Log.current_offset chaindata.epochlog)} in
+  Head.atomic_write directory head;
   (match J.seed ~chain_id ~validator_set:target_set ~finalize:final directory with
    | Ok _ -> () | Error _ -> failwith "target journal seed failed");
   let policy = P.make ~count_epoch:0L ~stake_epoch:(Some 1L) ~round_epoch:(Some 1L) in
-  let driver = make ~policy ~validator_set:target_set () in
+  let driver = make ~head:(fun () -> Int64.of_int epoch) ~policy ~validator_set:target_set () in
+  driver.engine.state <- {driver.engine.state with height = Int64.of_int (epoch + 1)};
   driver.D.running <- true;
   let targets = ref [] in
   let open_target ?(selected = ref (Some driver)) () =
@@ -909,9 +917,10 @@ let send_target driver (index, head, forged) =
   let module Codec = Octra_consensus.C_codec in
   let open Lwt.Syntax in
   let member, secret = List.nth target_keys index in
-  let bytes = H.epoch_root_response_sign_bytes ~chain_id ~epoch_id:40L
+  let epoch_id = driver.D.config.local_head_epoch () in
+  let bytes = H.epoch_root_response_sign_bytes ~chain_id ~epoch_id
     ~state_root:(Some root) ~responder_addr:member.T.address ~responder_head_epoch:head in
-  let response = Codec.{chain_id; epoch_id = 40L; state_root = Some root;
+  let response = Codec.{chain_id; epoch_id; state_root = Some root;
     responder_addr = member.address; responder_head_epoch = head;
     signature = if forged then String.make 64 '\000'
       else H.sign_ed25519 ~priv_raw:secret ~msg:bytes} in
@@ -926,7 +935,7 @@ let send_target driver (index, head, forged) =
 
 let await_target driver =
   let rec wait left =
-    if listening driver 40L then Lwt.return_unit
+    if listening driver (driver.D.config.local_head_epoch ()) then Lwt.return_unit
     else if left = 0 then Lwt.fail_with "target query did not open"
     else let open Lwt.Syntax in let* () = Lwt_unix.sleep 0.005 in wait (left - 1) in
   wait 200
@@ -966,7 +975,7 @@ let target_replies () =
 
 let target_changes () =
   let open Lwt.Syntax in
-  Lwt_list.iter_s (fun change -> with_target (fun directory _ head driver open_target ->
+  Lwt_list.iter_s (fun change -> with_target (fun directory store head driver open_target ->
     let selected = ref (Some driver) in
     let pending = Octra_node_runtime.Status_read_rpc.sync_target (open_target ~selected ()) in
     let* () = await_target driver in
@@ -978,11 +987,27 @@ let target_changes () =
      | "driver" -> selected := None
      | "set" -> driver.engine.vs <- weighted_set
          (List.map (fun (member, weight) -> member, Z.succ weight) (T.weights_of_set target_set))
+     | "index" ->
+       let module Index = Octra_core.Chaindata_index in
+       let module Epoch = Octra_core.Epochlog in
+       let header = Epoch.get store.epochlog head.epoch_id |> Option.get in
+       Index.begin_write store.index;
+       Index.buffer_epoch store.index head.epoch_id
+         (Epoch.epoch_to_json {header with finalized_at = header.finalized_at +. 1.});
+       Index.commit_write store.index
+     | "journal" ->
+       let module Store = Octra_core.Store_chaindata in
+       let module Epoch = Octra_core.Epochlog in
+       let header = Epoch.get store.epochlog head.epoch_id |> Option.get in
+       Store.begin_batch store;
+       Store.set_epoch store {header with finalized_at = header.finalized_at +. 1.};
+       Store.commit_batch store;
+       Store.fsync store
      | _ -> failwith "unknown target mutation");
     let* result = pending in
     expect (change ^ " change was ignored") (target_value "status" result = `String "changed"
       && target_value "targetEpoch" result = `Null);
-    Lwt.return_unit)) ["head"; "generation"; "height"; "driver"; "set"]
+    Lwt.return_unit)) ["head"; "generation"; "height"; "driver"; "set"; "index"; "journal"]
 
 let target_fresh () = with_target (fun _ _ _ driver open_target ->
   let open Lwt.Syntax in
@@ -1020,6 +1045,109 @@ let target_timeout () = with_target (fun _ _ _ driver open_target ->
     expect "blocked target retained query" (not (listening driver 40L));
     Lwt.return_unit)
     (fun () -> Hashtbl.clear driver.swarm.peers; Octra_net.P2p_conn.close conn))
+
+let target_records () =
+  let module Store = Octra_core.Store_chaindata in
+  let module Head = Octra_core.Head_manifest in
+  let module Epoch = Octra_core.Epochlog in
+  let open Lwt.Syntax in
+  Lwt_list.iter_s (fun change -> with_target (fun directory store head driver open_target ->
+    let offset = Hashtbl.find store.Store.epochlog.offsets head.Head.epoch_id in
+    let header = Epoch.get store.epochlog head.epoch_id |> Option.get in
+    (match change with
+     | "missing" -> Hashtbl.remove store.epochlog.offsets head.epoch_id
+     | "offset" -> Hashtbl.replace store.epochlog.offsets head.epoch_id (offset + 1)
+     | "prefix" -> Hashtbl.replace store.epochlog.offsets head.epoch_id 0
+     | "extent" -> Head.atomic_write directory {head with epochlog_off = Some (offset + 4)}
+     | "index" ->
+       Octra_core.Chaindata_index.begin_write store.index;
+       Octra_core.Chaindata_index.buffer_epoch store.index head.epoch_id
+         (Epoch.epoch_to_json {header with finalized_at = header.finalized_at +. 1.});
+       Octra_core.Chaindata_index.commit_write store.index
+     | "checksum" | "length" | "short" | "identity" ->
+       let path = Filename.concat store.epochlog.dir "epochs.dat" in
+       let fd = Unix.openfile path [Unix.O_RDWR; Unix.O_CLOEXEC] 0 in
+       Fun.protect ~finally:(fun () -> Unix.close fd) (fun () ->
+         if change = "short" then Unix.ftruncate fd (offset + 5)
+         else if change = "identity" then begin
+           let payload = Epoch.epoch_to_json {header with id = head.epoch_id + 1} in
+           let bytes = Bytes.create (String.length payload + 8) in
+           Epoch.write_u32_le bytes 0 (String.length payload + 4);
+           Bytes.blit_string payload 0 bytes 4 (String.length payload);
+           Bytes.blit_string (Epoch.checksum payload) 0 bytes (String.length payload + 4) 4;
+           ignore (Unix.lseek fd offset Unix.SEEK_SET);
+           expect "record edit was short" (Unix.write fd bytes 0 (Bytes.length bytes) = Bytes.length bytes)
+         end else begin
+           let at = if change = "length" then offset
+             else Option.get (Epoch.offset_after store.epochlog head.epoch_id) - 4 in
+           ignore (Unix.lseek fd at Unix.SEEK_SET);
+           expect "record edit was short" (Unix.write fd (Bytes.make 4 '\255') 0 4 = 4)
+         end)
+     | _ -> failwith "unknown record edit");
+    let hint = Option.map (fun offset -> head.epoch_id, offset)
+      (Hashtbl.find_opt store.epochlog.offsets head.epoch_id) in
+    let* reason = Octra_node_runtime.Sync_probe.read_child (fun () ->
+      let value = Octra_node_runtime.Status_read_rpc.sync_head_data ~chain_id ~data_dir:directory
+        ~base_dir:(Filename.concat directory "chain") ~hint () in
+      ignore (Sys.opaque_identity store);
+      match value with Error reason -> reason | Ok _ -> "accepted") in
+    let expected = match change with
+      | "missing" -> "sync head location is unavailable"
+      | "prefix" -> "epoch location is invalid"
+      | "extent" -> "sync head journal offset differs"
+      | "index" -> "sync head index differs from journal"
+      | _ -> "epoch record is invalid" in
+    expect (change ^ " refusal cause differs") (reason = expected);
+    let pending = Octra_node_runtime.Status_read_rpc.sync_target (open_target ()) in
+    let opened = ref false in
+    let rec observe () =
+      if listening driver 40L then opened := true;
+      if Lwt.is_sleeping pending then
+        let* () = Lwt_unix.sleep 0.001 in observe () else Lwt.return_unit in
+    let* result, () = Lwt.both pending (observe ()) in
+    expect (change ^ " record was trusted") (target_value "status" result = `String "unavailable"
+      && target_value "targetEpoch" result = `Null);
+    expect "invalid record opened peer query" (not !opened && not (listening driver 40L));
+    Lwt.return_unit)) ["missing"; "offset"; "prefix"; "extent"; "index";
+      "checksum"; "length"; "short"; "identity"]
+
+let target_floor () = with_target (fun directory store head _ _ ->
+  let module Index = Octra_core.Chaindata_index in
+  let module Read = Octra_node_runtime.Status_read_rpc in
+  let open Lwt.Syntax in
+  Index.begin_write store.Octra_core.Store_chaindata.index;
+  Index.buffer_meta store.index "history_floor" (String.make (Octra_core.Epochlog.max_record_len + 1) 'x');
+  Index.commit_write store.index;
+  let hint = Some (head.Octra_core.Head_manifest.epoch_id,
+    Hashtbl.find store.epochlog.offsets head.epoch_id) in
+  let* value = Octra_node_runtime.Sync_probe.read_child (fun () ->
+    let value = Read.sync_head_data ~chain_id ~data_dir:directory
+      ~base_dir:(Filename.concat directory "chain") ~hint () in
+    ignore (Sys.opaque_identity store);
+    match value with Ok _ -> "accepted" | Error reason -> reason) in
+  expect "unused floor rejected valid certificate" (value = "accepted");
+  Lwt.return_unit)
+
+let target_history () = with_target ~history:100000 (fun _ store head driver open_target ->
+  let open Lwt.Syntax in
+  let bytes = (Unix.fstat store.Octra_core.Store_chaindata.epochlog.fd).Unix.st_size in
+  expect "history is smaller than live journal" (bytes > 3_206_236_757);
+  let started = Octra_node_runtime.Sync_probe.monotonic () in
+  let pending = Octra_node_runtime.Status_read_rpc.sync_target (open_target ()) in
+  let target = Int64.of_int (head.Octra_core.Head_manifest.epoch_id + 2) in
+  let rec answer () =
+    if listening driver (Int64.of_int head.epoch_id) then
+      Lwt_list.iter_s (send_target driver) [0, target, false; 1, target, false; 2, target, false]
+    else if not (Lwt.is_sleeping pending) then Lwt.return_unit
+    else let* () = Lwt_unix.sleep 0.005 in answer () in
+  let* (), result = Lwt.both (answer ()) pending in
+  let elapsed = Octra_node_runtime.Sync_probe.monotonic () -. started in
+  let status = match target_value "status" result with `String value -> value | _ -> "invalid" in
+  Printf.printf "event = sync_history bytes = %d seconds = %.6f status = %s\n%!" bytes elapsed status;
+  expect "large history target unavailable" (target_value "status" result = `String "agreed"
+    && target_value "targetEpoch" result = `String (Int64.to_string target));
+  expect "large history exceeded deadline" (elapsed < 2.5);
+  Lwt.return_unit)
 
 let probe_coalesce () =
   let module S = Octra_node_runtime.Sync_probe in
@@ -1290,12 +1418,12 @@ let control_paths () =
       (fun () -> Test_workspace.remove directory; Lwt.return_unit)) ["missing"; "link"; "wide"; "file"]
 
 let () =
-  Lwt_main.run (Lwt_list.iter_s (fun (name, run) ->
-    let open Lwt.Syntax in
-    let* () = run () in
-    Printf.printf "event = root_query case = %s status = pass\n%!" name;
-    Lwt.return_unit)
+  let cases = if Array.to_list Sys.argv = [Sys.argv.(0); "--history"] then
+    ["target_history", target_history]
+    else if Array.to_list Sys.argv = [Sys.argv.(0); "--records"] then
+      ["target_records", target_records; "target_floor", target_floor] else
     ["probe_delta", probe_delta; "probe_child", probe_child;
+     "target_records", target_records; "target_floor", target_floor;
      "probe_coalesce", probe_coalesce; "probe_failure", probe_failure;
      "probe_drain", probe_drain; "control_routes", control_routes;
      "control_socket", control_socket; "control_paths", control_paths;
@@ -1317,4 +1445,10 @@ let () =
      "read_error", read_error; "epochs", epochs; "wait_modes", wait_modes;
      "request_disabled", request_mode false; "request_enabled", request_mode true;
      "send_timeout", send_timeout; "cancel_send", cancel_send;
-     "cancel_send_joined", cancel_send_joined; "cancel_fresh_send", cancel_fresh_send])
+     "cancel_send_joined", cancel_send_joined; "cancel_fresh_send", cancel_fresh_send] in
+  Lwt_main.run (Lwt_list.iter_s (fun (name, run) ->
+    let open Lwt.Syntax in
+    let* () = run () in
+    Printf.printf "event = root_query case = %s status = pass\n%!" name;
+    Lwt.return_unit)
+    cases)

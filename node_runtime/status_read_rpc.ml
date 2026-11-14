@@ -442,25 +442,42 @@ let sync_result chain_id head stamp status target =
     "targetEpoch", (match target with None -> `Null | Some value -> `String (Int64.to_string value));
   ])
 
-let sync_head_data ~chain_id ~data_dir ~chaindata () =
+let sync_head_data ~chain_id ~data_dir ~base_dir ~hint () =
+  let module Index = Octra_core.Chaindata_index in
+  let module Epoch = Octra_core.Epochlog in
   let ( let* ) = Result.bind in
   let* head = match Octra_core.Head_manifest.load_result data_dir with
     | Present head when head.epoch_id >= 0 && head.epoch_id < max_int
         && (Text.is_hex_len 64 head.state_root || Text.is_hex_len 128 head.state_root) -> Ok head
     | _ -> Error "sync head is unavailable" in
-  let* source = Consensus_parent_commit.create ~chain_id ~data_dir ~chaindata Sys.getenv_opt in
-  let* validators = Consensus_parent_commit.set_at_head source
+  let* offset = match hint with
+    | Some (epoch, offset) when epoch = head.epoch_id -> Ok offset
+    | None | Some _ -> Error "sync head location is unavailable" in
+  let* _ = Octra_consensus.C_protocol.activation_epoch_of Sys.getenv_opt in
+  let index = Index.open_index ~readonly:true ~reader_lock:true (Filename.concat base_dir "index") in
+  let* raw, floor = match Fun.protect ~finally:(fun () -> Index.close index)
+    (fun () -> Index.read_head index head.epoch_id) with
+    | None -> Error "sync head index read aborted" | Some value -> Ok value in
+  let* raw = raw in
+  let* indexed = match Option.bind raw Epoch.epoch_of_json with
+    | None -> Error "sync head index is invalid" | Some value -> Ok value in
+  let* header, stop = Epoch.read_location ~path:(Filename.concat base_dir "epochlog/epochs.dat")
+    ~epoch_id:head.epoch_id ~offset in
+  let* () = if indexed <> header then Error "sync head index differs from journal"
+    else if Option.fold ~none:false ~some:((<>) stop) head.epochlog_off then
+      Error "sync head journal offset differs" else Ok () in
+  let read_floor () = let* floor = floor in match floor with
+    | None -> Ok None
+    | Some raw -> Result.map Option.some (Octra_core.History_floor.of_string raw) in
+  let* validators = Consensus_parent_commit.set_at_head_read ~chain_id ~data_dir ~read_floor
     ~epoch_id:(Int64.of_int head.epoch_id) head in
-  let* header = Store_chaindata.get_bound_epoch_header chaindata head.epoch_id in
   if header.id <> head.epoch_id || header.state_root <> head.state_root then
     Error "sync head time differs" else
   Ok (head, validators, header.finalized_at)
 
-let sync_head_packet ~chain_id ~data_dir ~base_dir ~keep () =
-  let chaindata = Store_chaindata.open_chaindata ~readonly:true base_dir in
-  Fun.protect ~finally:(fun () ->
-    Store_chaindata.close chaindata; ignore (Sys.opaque_identity keep)) (fun () ->
-    let packet = match sync_head_data ~chain_id ~data_dir ~chaindata () with
+let sync_head_packet ~chain_id ~data_dir ~base_dir ~hint ~keep () =
+  Fun.protect ~finally:(fun () -> ignore (Sys.opaque_identity keep)) (fun () ->
+    let packet = match sync_head_data ~chain_id ~data_dir ~base_dir ~hint () with
       | Error _ -> `Null
       | Ok (head, validators, time) -> `Assoc [
           "head", `String (Octra_core.Head_manifest.to_json head);
@@ -470,10 +487,13 @@ let sync_head_packet ~chain_id ~data_dir ~base_dir ~keep () =
         ] in
     Yojson.Safe.to_string packet)
 
-let sync_head_read ~chain_id ~data_dir ~chaindata () =
+let sync_head_read ~chain_id ~data_dir ~chaindata ~epoch_id () =
   let open Lwt.Syntax in
   let base_dir = Filename.dirname chaindata.Store_chaindata.txlog.dir in
-  let+ raw = Sync_probe.read_child (sync_head_packet ~chain_id ~data_dir ~base_dir ~keep:chaindata) in
+  let hint = if epoch_id < 0L || epoch_id >= Int64.of_int max_int then None else
+    let epoch = Int64.to_int epoch_id in
+    Option.map (fun offset -> epoch, offset) (Hashtbl.find_opt chaindata.epochlog.offsets epoch) in
+  let+ raw = Sync_probe.read_child (sync_head_packet ~chain_id ~data_dir ~base_dir ~hint ~keep:chaindata) in
   match Yojson.Safe.from_string raw with
   | `Assoc ["head", `String head; "validators", `String validators; "time", time] ->
     let head = Octra_core.Head_manifest.of_json head in
@@ -529,7 +549,8 @@ let probe_sync_target ~chain_id ~data_dir ~chaindata ~driver_ref driver =
   let module D = Octra_consensus.C_driver in
   let module H = Consensus_health_probe in
   let open Lwt.Syntax in
-  let read = sync_head_read ~chain_id ~data_dir ~chaindata in
+  let read () = sync_head_read ~chain_id ~data_dir ~chaindata
+    ~epoch_id:(driver.D.config.local_head_epoch ()) () in
   let deadline = Sync_probe.monotonic () +. 2.5 in
   let reply head stamp status target =
     let+ value = sync_result chain_id head stamp status target in {value; key = None} in

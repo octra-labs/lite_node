@@ -36,6 +36,14 @@ val set_at_head :
   Octra_core.Head_manifest.t ->
   (Octra_consensus.C_types.validator_set, string) result
 
+val set_at_head_read :
+  chain_id:string ->
+  data_dir:string ->
+  read_floor:(unit -> (Octra_core.History_floor.t option, string) result) ->
+  epoch_id:int64 ->
+  Octra_core.Head_manifest.t ->
+  (Octra_consensus.C_types.validator_set, string) result
+
 val verify :
   source ->
   epoch_id:int64 ->

@@ -130,6 +130,14 @@ val node_status :
 
 type sync_target
 
+val sync_head_data :
+  chain_id:string ->
+  data_dir:string ->
+  base_dir:string ->
+  hint:(int * int) option ->
+  unit ->
+  (Octra_core.Head_manifest.t * Octra_consensus.C_types.validator_set * float, string) result
+
 val create_sync_target :
   chain_id:string ->
   data_dir:string ->

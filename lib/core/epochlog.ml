@@ -446,22 +446,20 @@ let truncate_to ?(sync = Unix.fsync) t ~offset =
   t.tip <- tip;
   t.cut <- None
 
-let read_record ~on_error t epoch_id =
+let read_record_at ~on_error fd epoch_id off =
   let refuse reason = on_error reason; None in
   try
-  match Hashtbl.find_opt t.offsets epoch_id with
-  | Some off ->
     let hdr = Bytes.create 4 in
-    if not (read_exact_at t.fd off hdr 0 4) then refuse (Log_prefix_truncated off)
+    if not (read_exact_at fd off hdr 0 4) then refuse (Log_prefix_truncated off)
     else begin
       let record_len = read_u32_le hdr 0 in
-      let file_size = (Unix.fstat t.fd).Unix.st_size in
+      let file_size = (Unix.fstat fd).Unix.st_size in
       let remaining = file_size - off - 4 in
       if not (record_length_valid ~remaining record_len) then refuse (Log_length_invalid (off, record_len))
       else
         let payload_len = record_len - 4 in
         let record_buf = Bytes.create record_len in
-        if not (read_exact_at t.fd (off + 4) record_buf 0 record_len) then refuse (Log_record_truncated off)
+        if not (read_exact_at fd (off + 4) record_buf 0 record_len) then refuse (Log_record_truncated off)
         else
           let payload = Bytes.sub_string record_buf 0 payload_len in
           if checksum payload <> Bytes.sub_string record_buf payload_len 4 then refuse (Log_checksum_mismatch off)
@@ -470,10 +468,29 @@ let read_record ~on_error t epoch_id =
             | Some header when header.id = epoch_id -> Some (off, record_len, header)
             | Some header -> refuse (Log_epoch_identity (off, epoch_id, header.id))
     end
-  | None -> refuse (Log_epoch_missing epoch_id)
   with Unix.Unix_error (error, call, path) as exn ->
     on_error (Log_io (Printf.sprintf "%s: %s: %s" call path (Unix.error_message error)));
     raise exn
+
+let read_record ~on_error t epoch_id =
+  match Hashtbl.find_opt t.offsets epoch_id with
+  | Some offset -> read_record_at ~on_error t.fd epoch_id offset
+  | None -> on_error (Log_epoch_missing epoch_id); None
+
+let read_location ~path ~epoch_id ~offset =
+  if epoch_id < 0 || offset < header_size then Error "epoch location is invalid" else
+  try
+    let fd = Unix.openfile path [Unix.O_RDONLY; Unix.O_CLOEXEC; Unix.O_NONBLOCK] 0 in
+    Fun.protect ~finally:(fun () -> Unix.close fd) (fun () ->
+      let stat = Unix.fstat fd in
+      if stat.st_kind <> Unix.S_REG || offset > stat.st_size - 4 then
+        Error "epoch location exceeds file" else begin
+        validate_file_header fd;
+        match read_record_at ~on_error:ignore fd epoch_id offset with
+        | None -> Error "epoch record is invalid"
+        | Some (_, length, header) -> Ok (header, offset + 4 + length)
+      end)
+  with Unix.Unix_error _ | Failure _ -> Error "epoch file read failed"
 
 let get ?(on_error = fun _ -> ()) t epoch_id =
   Option.map (fun (_, _, header) -> header) (read_record ~on_error t epoch_id)

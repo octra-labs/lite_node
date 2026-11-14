@@ -107,21 +107,21 @@ let load source ~epoch_id =
         | Journal.Valid record ->
           Result.map Option.some (record_parent record)
 
-let set_at_head source ~epoch_id (head : Octra_core.Head_manifest.t) =
+let set_at_head_read ~chain_id ~data_dir ~read_floor ~epoch_id (head : Octra_core.Head_manifest.t) =
   let ( let* ) = Result.bind in
   if epoch_id < 0L || epoch_id = Int64.max_int
      || epoch_id <> Int64.of_int head.epoch_id then
     Error "validator source epoch differs from durable head"
   else
-    match Journal.read_at_head ~chain_id:source.chain_id ~epoch:epoch_id
-      ~state_root:head.state_root ~txid_hi:head.txid_hi source.data_dir with
+    match Journal.read_at_head ~chain_id ~epoch:epoch_id
+      ~state_root:head.state_root ~txid_hi:head.txid_hi data_dir with
     | Journal.Missing ->
       let module Floor = Octra_core.History_floor in
-      let* floor = Octra_core.Store_chaindata.history_floor source.chaindata in
+      let* floor = read_floor () in
       (match floor with
        | None -> Error "validator source certificate is missing"
        | Some floor ->
-         if Floor.chain_id floor <> source.chain_id
+         if Floor.chain_id floor <> chain_id
             || Int64.of_int (Floor.epoch floor) <> epoch_id
             || Floor.state_root floor <> head.state_root
             || Floor.txid_hi floor <> head.txid_hi
@@ -136,6 +136,11 @@ let set_at_head source ~epoch_id (head : Octra_core.Head_manifest.t) =
     | Journal.Valid record ->
       let* parent = record_parent record in
       Ok parent.validator_set
+
+let set_at_head source ~epoch_id head =
+  set_at_head_read ~chain_id:source.chain_id ~data_dir:source.data_dir
+    ~read_floor:(fun () -> Octra_core.Store_chaindata.history_floor source.chaindata)
+    ~epoch_id head
 
 let proposal source ~epoch_id =
   if epoch_id < 0L then Error "proposal epoch is invalid"
