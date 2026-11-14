@@ -93,6 +93,7 @@ let irmin_get_meta store key = Rest.run_s (Store_irmin.get_meta store key)
 let irmin_get_head_hash store = Rest.run_s (Store_irmin.get_head_hash store)
 
   let () =
+    Status_read_rpc.sync_reader ();
     Startup_process_shell.configure_process ~exit_fatal:exit_error;
 
     begin match Staging.check_config () with

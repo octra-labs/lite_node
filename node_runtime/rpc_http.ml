@@ -166,11 +166,17 @@ let control_reply ~query body =
   | Ok (`Batch _) -> error Rpc.invalid_request `Null
   | Ok (`Single request) when request.method_ <> "octra_syncTarget" ->
     error (Rpc.method_not_found request.method_) request.id
-  | Ok (`Single request) when request.params <> `List [] ->
+  | Ok (`Single request) when request.params <> `List []
+      && request.params <> `List [`String "snapshot"] ->
     error (Rpc.invalid_params "octra_syncTarget takes no parameters") request.id
   | Ok (`Single request) ->
     let open Lwt.Syntax in
     let+ result = query () in
+    let result = if request.params <> `List [] then result else
+      Result.map (function
+        | `Assoc fields -> `Assoc (List.filter (fun (name, _) ->
+            name <> "ageMs" && name <> "reason") fields)
+        | value -> value) result in
     Rpc.response_json (match result with
       | Ok value -> Rpc.Result (value, request.id)
       | Error value -> Rpc.Error_ (value, request.id))

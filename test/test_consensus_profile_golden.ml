@@ -465,17 +465,25 @@ let () =
     List.iter (fun epoch ->
       expect "preactivation profile differs"
         (rounds = P.hash ~chain_id ~epoch devnet_env))
-      [second + 1; scalar.anchor_epoch; scalar.activation_epoch - 2];
+      [second + 1; scalar.anchor_epoch; 1_841_999; 1_842_000; 1_842_001;
+        scalar.activation_epoch - 2];
     let scalar_profile = P.hash ~chain_id ~epoch:scalar.activation_epoch devnet_env in
     expect "scalar profile components" (scalar_profile = derived ~epoch:scalar.activation_epoch devnet_env);
     expect ("work profile golden = " ^ raw_hex scalar_profile)
-      (raw_hex scalar_profile = "155bb1154ffec48410b272c849b213067cc8e26ea84c0db4e38d6f46c56f8e3f");
+      (raw_hex scalar_profile = "411961058b28f0c7c8ccbdc33040033aec9fe51b37e2d6210c540c296a13a5d6");
     expect "scalar profile differs" (scalar_profile <> rounds);
+    expect "scalar profile next epoch" (scalar_profile = P.hash ~chain_id ~epoch:(scalar.activation_epoch + 1) devnet_env);
     expect "scalar profile persists" (scalar_profile = P.hash ~chain_id ~epoch:max_int devnet_env);
     expect "scalar profile switching"
       (P.switch_after ~chain_id ~applied_epoch:(scalar.activation_epoch - 1));
-    Printf.printf "event = scalar_profile epoch = %d hash = %s\n%!"
-      scalar.activation_epoch (raw_hex scalar_profile)
+    expect "old profile switch retained"
+      (not (P.switch_after ~chain_id ~applied_epoch:1_841_999));
+    expect "release profile switch missing"
+      (P.switch_after ~chain_id ~applied_epoch:1_844_999);
+    List.iter (fun epoch ->
+      Printf.printf "event = scalar_profile epoch = %d hash = %s\n%!"
+        epoch (raw_hex (P.hash ~chain_id ~epoch devnet_env)))
+      [scalar.activation_epoch - 1; scalar.activation_epoch; scalar.activation_epoch + 1]
   end else begin
     expect "scalar schedule enabled" (Octra_core.Rule_graph.scalar_work_activation_for_chain chain_id = None);
     List.iter (fun epoch ->

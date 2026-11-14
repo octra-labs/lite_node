@@ -637,8 +637,10 @@ let start (cfg : config) =
       Grpc_http2.serve config ~call ~submit ~http
   in
   Lwt.finalize
-    (fun () -> Rpc_http.with_sync_control ~data_dir:cfg.data_dir
-      ~query:(fun () -> Status_read_rpc.sync_target sync_target) serve)
+    (fun () ->
+      Status_read_rpc.start_sync_target sync_target;
+      Rpc_http.with_sync_control ~data_dir:cfg.data_dir
+        ~query:(fun () -> Status_read_rpc.sync_snapshot sync_target) serve)
     (fun () ->
       let open Lwt.Syntax in
       let* stopped = Status_read_rpc.close_sync_target sync_target in

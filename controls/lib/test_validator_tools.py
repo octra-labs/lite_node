@@ -6712,6 +6712,106 @@ class ValidatorToolsTest(unittest.TestCase):
         with mock.patch("validator_process.sha256_file", side_effect=PermissionError):
             self.assertFalse(node_owners([17, 18], 17, values, root=root))
 
+    def reader_case(self):
+        root, worker = worker_case()
+        binary = Path(worker["OCTRA_PVAC_VERIFY_WORKER"])
+        (root / "17/exe").symlink_to(binary)
+        (root / "17/stat").write_text("17 (node) S 1 " + "0 " * 17 + "5\n")
+        args = ["/proc/self/exe", "--sync-head", "17", "chain", str(WORK), str(WORK / "chaindata"), "42", "12"]
+        (root / "18/cmdline").write_bytes("\0".join(args).encode() + b"\0")
+        return root, {"OCTRA_DATA_DIR": str(WORK), "OCTRA_CHAIN_ID": "chain",
+            "OCTRA_BINARY_HASH": worker["OCTRA_PVAC_VERIFY_WORKER_HASH"]}, args
+
+    def test_reader_owner(self):
+        root, values, _ = self.reader_case()
+        self.assertEqual(data_pids(WORK, root = root), [17, 18])
+        self.assertTrue(node_owners([17, 18], 17, values, root = root))
+        self.assertFalse(node_owners([18], 17, values, root = root))
+        self.assertEqual(data_pids(WORK, root = root), [17, 18])
+
+    def test_reader_arguments(self):
+        root, values, original = self.reader_case()
+        cases = [original + ["extra"], original[:-1]]
+        for index, value in ((0, "node"), (1, "--other"), (2, "19"), (3, "other"),
+                (4, "/other"), (5, str(WORK / "other")), (6, "042"), (6, "-2"),
+                (7, "-1"), (7, str(2 ** 62))):
+            changed = list(original)
+            changed[index] = value
+            cases.append(changed)
+        for args in cases:
+            with self.subTest(args = args):
+                (root / "18/cmdline").write_bytes("\0".join(args).encode() + b"\0")
+                self.assertFalse(node_owners([17, 18], 17, values, root = root))
+        original[-2:] = ["-1", "-1"]
+        (root / "18/cmdline").write_bytes("\0".join(original).encode() + b"\0")
+        self.assertTrue(node_owners([17, 18], 17, values, root = root))
+
+    def test_reader_identity(self):
+        root, values, _ = self.reader_case()
+        other = WORK / "other-node"
+        other.write_bytes((WORK / "worker").read_bytes())
+        (root / "18/exe").unlink()
+        (root / "18/exe").symlink_to(other)
+        self.assertFalse(node_owners([17, 18], 17, values, root = root))
+        (root / "18/exe").unlink()
+        (root / "18/exe").symlink_to(WORK / "worker")
+        self.assertFalse(node_owners([17, 18], 17, {**values, "OCTRA_BINARY_HASH": "0" * 64}, root = root))
+        before = (root / "17/stat").read_text()
+        def changed(_):
+            (root / "17/stat").write_text(before.replace("5\n", "6\n"))
+            return values["OCTRA_BINARY_HASH"]
+        with mock.patch("validator_process.sha256_file", side_effect = changed):
+            self.assertFalse(node_owners([17, 18], 17, values, root = root))
+
+    def test_reader_process(self):
+        root, values, _ = self.reader_case()
+        path = root / "18/stat"
+        original = path.read_text()
+        for state in ("invalid", original.replace("S 17", "S 19"),
+                original.replace("10\n", "4\n")):
+            with self.subTest(state = state):
+                path.write_text(state)
+                self.assertFalse(node_owners([17, 18], 17, values, root = root))
+        path.write_text(original)
+        def changed(_):
+            path.write_text(original.replace("10\n", "11\n"))
+            return values["OCTRA_BINARY_HASH"]
+        with mock.patch("validator_process.sha256_file", side_effect = changed):
+            self.assertFalse(node_owners([17, 18], 17, values, root = root))
+
+    def test_reader_uid(self):
+        root, values, _ = self.reader_case()
+        original = Path.stat
+        def changed(path, *args, **kwargs):
+            row = original(path, *args, **kwargs)
+            if path != root / "18":
+                return row
+            fields = list(row)
+            fields[4] += 1
+            return os.stat_result(fields)
+        with mock.patch.object(Path, "stat", changed):
+            self.assertFalse(node_owners([17, 18], 17, values, root = root))
+
+    def test_reader_preflight(self):
+        root, values, _ = self.reader_case()
+        check = lambda pids, pid, config: node_owners(pids, pid, config, root = root)
+        with mock.patch.object(upgrade_tool, "node_owners", side_effect = check), \
+                mock.patch.object(upgrade_tool, "data_pids", return_value = [17, 18]) as owners, \
+                mock.patch.object(upgrade_tool.shutil, "disk_usage",
+                    return_value = mock.Mock(free = 9 * 1024 ** 3)), \
+                mock.patch.object(upgrade_tool, "emit"):
+            for kind in ("pm2", "systemd"):
+                supervisor = {"kind": kind, "pid": 17,
+                    "restart": {"Restart": "on-failure", "RestartPreventExitStatus": "78"}}
+                upgrade_tool.preflight(WORK, supervisor, values, False)
+                owners.return_value = [17, 18, 19]
+                with self.assertRaisesRegex(ValidatorError, "unexpected processes: 17,18,19"):
+                    upgrade_tool.preflight(WORK, supervisor, values, False)
+                owners.return_value = [17, 18]
+            (root / "18/cmdline").write_bytes(b"other\0")
+            with self.assertRaisesRegex(ValidatorError, "unexpected processes: 17,18"):
+                upgrade_tool.preflight(WORK, {"kind": "pm2", "pid": 17}, values, False)
+
     def test_upgrade_artifacts(self):
         root = WORK / "source"
         folder = root / "artifacts"

@@ -272,7 +272,7 @@ let cipher_activation_for_chain = vm_bytes_activation_for_chain
 let devnet_work_activation = {
   anchor_epoch = 1_829_338;
   anchor_state_root = "621bc1164a85fc654cc8aeb34e8b23e8146edbc8448c4fbba5e8f9debcdd70af";
-  activation_epoch = 1_842_000;
+  activation_epoch = 1_845_000;
 }
 
 let scalar_work_activation_for_chain chain_id =

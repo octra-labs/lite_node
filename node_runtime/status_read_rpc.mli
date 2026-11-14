@@ -130,6 +130,16 @@ val node_status :
 
 type sync_target
 
+val sync_reader : unit -> unit
+
+val sync_head_read :
+  chain_id:string ->
+  data_dir:string ->
+  chaindata:Octra_core.Store_chaindata.t ->
+  epoch_id:int64 ->
+  unit ->
+  (Octra_core.Head_manifest.t * Octra_consensus.C_types.validator_set * float, string) result Lwt.t
+
 val sync_head_data :
   chain_id:string ->
   data_dir:string ->
@@ -146,6 +156,8 @@ val create_sync_target :
   sync_target
 
 val sync_target : sync_target -> rpc_result
+val start_sync_target : sync_target -> unit
+val sync_snapshot : sync_target -> rpc_result
 val close_sync_target : sync_target -> bool Lwt.t
 
 val node_stats :

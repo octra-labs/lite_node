@@ -475,17 +475,31 @@ let sync_head_data ~chain_id ~data_dir ~base_dir ~hint () =
     Error "sync head time differs" else
   Ok (head, validators, header.finalized_at)
 
-let sync_head_packet ~chain_id ~data_dir ~base_dir ~hint ~keep () =
-  Fun.protect ~finally:(fun () -> ignore (Sys.opaque_identity keep)) (fun () ->
+let sync_head_packet ~chain_id ~data_dir ~base_dir ~hint () =
     let packet = match sync_head_data ~chain_id ~data_dir ~base_dir ~hint () with
-      | Error _ -> `Null
+      | Error reason -> `String reason
       | Ok (head, validators, time) -> `Assoc [
           "head", `String (Octra_core.Head_manifest.to_json head);
           "validators", `String (Base64.encode_exn
             (Octra_consensus.C_codec.encode_validator_set validators));
           "time", `Float time;
         ] in
-    Yojson.Safe.to_string packet)
+    Yojson.Safe.to_string packet
+
+let sync_reader () =
+  match Array.to_list Sys.argv with
+  | _ :: "--sync-head" :: args ->
+    (try match args with
+      | [parent; chain_id; data_dir; base_dir; epoch; offset] ->
+        let parent = int_of_string parent in
+        if parent <= 1 then Unix._exit 2;
+        Sync_probe.child parent (fun () ->
+          let epoch = int_of_string epoch and offset = int_of_string offset in
+          let hint = if epoch < 0 || offset < 0 then None else Some (epoch, offset) in
+          sync_head_packet ~chain_id ~data_dir ~base_dir ~hint ())
+      | _ -> Unix._exit 2
+    with _ -> Unix._exit 2)
+  | _ -> ()
 
 let sync_head_read ~chain_id ~data_dir ~chaindata ~epoch_id () =
   let open Lwt.Syntax in
@@ -493,7 +507,9 @@ let sync_head_read ~chain_id ~data_dir ~chaindata ~epoch_id () =
   let hint = if epoch_id < 0L || epoch_id >= Int64.of_int max_int then None else
     let epoch = Int64.to_int epoch_id in
     Option.map (fun offset -> epoch, offset) (Hashtbl.find_opt chaindata.epochlog.offsets epoch) in
-  let+ raw = Sync_probe.read_child (sync_head_packet ~chain_id ~data_dir ~base_dir ~hint ~keep:chaindata) in
+  let epoch, offset = Option.value ~default:(-1, -1) hint in
+  let+ raw = Sync_probe.read_child ~mode:"--sync-head"
+    [chain_id; data_dir; base_dir; string_of_int epoch; string_of_int offset] in
   match Yojson.Safe.from_string raw with
   | `Assoc ["head", `String head; "validators", `String validators; "time", time] ->
     let head = Octra_core.Head_manifest.of_json head in
@@ -501,6 +517,7 @@ let sync_head_read ~chain_id ~data_dir ~chaindata ~epoch_id () =
     let time = Yojson.Safe.Util.to_number time in
     if Float.is_finite time && time >= 0. then Ok (head, validators, time)
     else Error "sync head time is invalid"
+  | `String reason -> Error reason
   | _ -> Error "sync head is unavailable"
 
 let sync_driver_current driver_ref driver head generation height =
@@ -529,6 +546,7 @@ type sync_sample = {
 type sync_target = {
   chain : string;
   current : sync_sample -> bool;
+  live : sync_key -> bool;
   probe : sync_sample Sync_probe.t;
 }
 
@@ -537,24 +555,27 @@ let sync_head_file data_dir =
   if file.Unix.st_kind <> Unix.S_REG then failwith "sync head is not a regular file";
   file.st_dev, file.st_ino, file.st_size, file.st_mtime, file.st_ctime
 
-let sync_key_current ~data_dir ~driver_ref key =
+let sync_key_live ~driver_ref key =
   sync_driver_current driver_ref key.driver key.head key.generation key.height
-  && (try sync_head_file data_dir = key.file with _ -> false)
   && match Octra_consensus.C_driver.epoch_root_weights ~validator_set:key.validators
       key.driver ~epoch_id:(Int64.of_int key.head.epoch_id) with
     | Some weights -> weights.stamp = key.stamp
     | None -> false
 
-let probe_sync_target ~chain_id ~data_dir ~chaindata ~driver_ref driver =
+let sync_key_current ~data_dir ~driver_ref key =
+  sync_key_live ~driver_ref key
+  && (try sync_head_file data_dir = key.file with _ -> false)
+
+let probe_sync_target ~background ~deadline ~chain_id ~data_dir ~chaindata ~driver_ref driver =
   let module D = Octra_consensus.C_driver in
   let module H = Consensus_health_probe in
   let open Lwt.Syntax in
   let read () = sync_head_read ~chain_id ~data_dir ~chaindata
     ~epoch_id:(driver.D.config.local_head_epoch ()) () in
-  let deadline = Sync_probe.monotonic () +. 2.5 in
   let reply head stamp status target =
     let+ value = sync_result chain_id head stamp status target in {value; key = None} in
   let file = sync_head_file data_dir in
+  let started = Sync_probe.monotonic () in
   let* sample = read () in
   match sample with
   | Error _ -> reply None None "unavailable" None
@@ -568,29 +589,43 @@ let probe_sync_target ~chain_id ~data_dir ~chaindata ~driver_ref driver =
     | Some weights when Sync_probe.monotonic () >= deadline ->
       reply (Some head) (Some weights.stamp) "unavailable" None
     | Some weights ->
-      let remaining = deadline -. Sync_probe.monotonic () in
+      let read_at = Sync_probe.monotonic () in
+      let target replies =
+        let ceiling = H.target_ceiling ~head:epoch_id ~head_time:(Some head_time)
+          ~now:(Unix.gettimeofday ()) ~allowance:2 in
+        Option.bind ceiling (fun ceiling ->
+          match H.peer_target ~weights ~ceiling replies with
+          | Some target when target >= epoch_id -> Some target
+          | None | Some _ -> None) in
+      let remaining = deadline -. read_at in
+      let window = if background then min 6. (remaining -. 3.) else min 2. remaining in
+      let finish = if background then Some (fun replies ->
+        Sync_probe.monotonic () -. read_at >= 2. && Option.is_some (target replies)) else None in
       let* replies = Lwt.catch
-        (fun () -> Lwt_unix.with_timeout remaining (fun () ->
-          let+ replies = D.query_epoch_root ~fresh:true ~request_next:false
+        (fun () -> if background && window < 2. then Lwt.return_none else
+          Lwt_unix.with_timeout remaining (fun () ->
+          let+ replies = D.query_epoch_root
+            ~deadline:(D.deadline_after window) ?finish ~fresh:true ~request_next:false
             ~wait_for:D.Collection_window driver ~epoch_id
-            ~timeout_seconds:(min 2.0 remaining) in Some replies))
+            ~timeout_seconds:window in Some replies))
         (function Lwt_unix.Timeout -> Lwt.return_none | error -> Lwt.fail error) in
       match replies with
       | None -> reply (Some head) (Some weights.stamp) "unavailable" None
       | Some replies ->
+      let collected_at = Sync_probe.monotonic () in
       let* latest = read () in
+      let completed_at = Sync_probe.monotonic () in
+      Log.info "sync" "sample_head = %d replies = %d read_ms = %.0f collect_ms = %.0f verify_ms = %.0f remaining_ms = %.0f"
+        head.epoch_id (List.length replies) ((read_at -. started) *. 1000.)
+        ((collected_at -. read_at) *. 1000.) ((completed_at -. collected_at) *. 1000.)
+        ((deadline -. completed_at) *. 1000.);
       match latest with
       | Ok (current, validators, current_time) when current = head && current_time = head_time
           && Sync_probe.monotonic () < deadline
           && sync_driver_current driver_ref driver head generation height ->
         begin match D.epoch_root_weights ~validator_set:validators driver ~epoch_id with
         | Some current when current.epoch_id = weights.epoch_id && current.stamp = weights.stamp ->
-          let ceiling = H.target_ceiling ~head:epoch_id ~head_time:(Some head_time)
-            ~now:(Unix.gettimeofday ()) ~allowance:2 in
-          let target = Option.bind ceiling (fun ceiling ->
-            match H.peer_target ~weights ~ceiling replies with
-            | Some target when target >= epoch_id -> Some target
-            | None | Some _ -> None) in
+          let target = target replies in
           let key = {driver; head; generation; height; validators; stamp = weights.stamp; file} in
           if not (sync_key_current ~data_dir ~driver_ref key) then
             reply (Some head) (Some weights.stamp) "changed" None
@@ -603,18 +638,50 @@ let probe_sync_target ~chain_id ~data_dir ~chaindata ~driver_ref driver =
       | Error _ | Ok _ -> reply (Some head) (Some weights.stamp) "changed" None
 
 let create_sync_target ~chain_id ~data_dir ~chaindata ~driver_ref =
+  let retry sample = match sample.value with
+    | Ok (`Assoc fields) -> List.assoc_opt "status" fields <> Some (`String "agreed")
+    | _ -> true in
   let valid sample = match sample.key with
     | Some key -> sync_key_current ~data_dir ~driver_ref key
     | None -> false in
-  let run () = match !driver_ref with
+  let run ~background ~deadline = match !driver_ref with
     | Some driver when driver.Octra_consensus.C_driver.running
         && driver.config.chain_id = chain_id ->
-      probe_sync_target ~chain_id ~data_dir ~chaindata ~driver_ref driver
+      probe_sync_target ~background ~deadline ~chain_id ~data_dir ~chaindata ~driver_ref driver
     | None | Some _ ->
       let open Lwt.Syntax in
       let+ value = sync_result chain_id None None "unavailable" None in
       {value; key = None} in
-  {chain = chain_id; current = valid; probe = Sync_probe.create ~valid run}
+  {chain = chain_id; current = valid; live = sync_key_live ~driver_ref;
+    probe = Sync_probe.create ~retry ~valid run}
+
+let start_sync_target target = Sync_probe.start target.probe
+
+let sync_snapshot target =
+  let open Lwt.Syntax in
+  let reply age reason value =
+    let+ value = value in
+    Result.map (function
+      | `Assoc fields -> `Assoc (fields @ [
+          "ageMs", (match age with None -> `Null
+            | Some age -> `Int (int_of_float (min 2_000_000. (age *. 1000.))));
+          "reason", (match reason with None -> `Null | Some reason -> `String reason)])
+      | value -> value) value in
+  let missing age reason =
+    reply age (Some reason) (sync_result target.chain None None reason None) in
+  match Sync_probe.snapshot target.probe with
+  | Starting -> missing None "starting"
+  | Read_failed -> missing None "read_failed"
+  | Expired age -> missing (Some age) "expired"
+  | Snapshot (age, {key = Some key; value}) when target.live key ->
+    let reason = match value with
+      | Ok (`Assoc fields) -> (match List.assoc_opt "status" fields with
+          | Some (`String "agreed") -> None
+          | Some (`String reason) -> Some reason
+          | _ -> Some "read_failed")
+      | _ -> Some "read_failed" in
+    reply (Some age) reason (Lwt.return value)
+  | Snapshot (age, _) -> missing (Some age) "changed"
 
 let sync_target target =
   let open Lwt.Syntax in

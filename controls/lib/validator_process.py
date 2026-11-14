@@ -150,8 +150,47 @@ def worker_owned(pid, parent, values, root=Path("/proc")):
 def node_owners(pids, pid, values, root=Path("/proc")):
     return isinstance(pid, int) and pid > 0 and pid in pids and all(
         owner == pid or worker_owned(owner, pid, values, root=root)
+        or reader_owned(owner, pid, values, root = root)
         for owner in pids
     )
+
+def reader_owned(pid, parent, values, root = Path("/proc")):
+    try:
+        process, node = root / str(pid), root / str(parent)
+        before = (process / "stat").read_text().rsplit(")", 1)[1].split()
+        parent_before = (node / "stat").read_text().rsplit(")", 1)[1].split()
+        if int(before[1]) != parent or int(before[19]) < int(parent_before[19]):
+            return False
+        if process.stat().st_uid != node.stat().st_uid:
+            return False
+        raw = (process / "cmdline").read_bytes()
+        if not raw.endswith(b"\0"):
+            return False
+        args = raw[:-1].decode("utf-8").split("\0")
+        data = Path(values["OCTRA_DATA_DIR"]).resolve()
+        if len(args) != 8 or args[:6] != ["/proc/self/exe", "--sync-head", str(parent),
+                values["OCTRA_CHAIN_ID"], str(data), str(data / "chaindata")]:
+            return False
+        epoch, offset = int(args[6]), int(args[7])
+        if args[6:] != [str(epoch), str(offset)] or not (
+                (epoch, offset) == (-1, -1) or 0 <= epoch < 2 ** 62 and 0 <= offset < 2 ** 62):
+            return False
+        executable, parent_exe = process / "exe", node / "exe"
+        child_file, parent_file = executable.stat(), parent_exe.stat()
+        file_id = child_file.st_dev, child_file.st_ino
+        if file_id != (parent_file.st_dev, parent_file.st_ino):
+            return False
+        if sha256_file(executable) != values.get("OCTRA_BINARY_HASH"):
+            return False
+        after = (process / "stat").read_text().rsplit(")", 1)[1].split()
+        parent_after = (node / "stat").read_text().rsplit(")", 1)[1].split()
+        child_file, parent_file = executable.stat(), parent_exe.stat()
+        return ((before[1], before[19]) == (after[1], after[19])
+            and parent_before[19] == parent_after[19]
+            and file_id == (child_file.st_dev, child_file.st_ino)
+            and file_id == (parent_file.st_dev, parent_file.st_ino))
+    except (KeyError, IndexError, OSError, ValueError, TypeError, RuntimeError):
+        return False
 
 def pm2_entries(required=True):
     if shutil.which("pm2") is None:

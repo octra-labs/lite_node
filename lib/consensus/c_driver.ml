@@ -118,6 +118,12 @@ type bundle_response_record = {
   receipts_json : string list;
 }
 
+type bundle_query_slot = {
+  epoch : int64;
+  readers : int;
+  replies : bundle_response_record list;
+}
+
 type catchup_range_response_record = {
   responder_addr : string;
   request_id : string;
@@ -296,7 +302,7 @@ type t = {
   mutable progress_step_at : int64;
   mutable pace : pace_wait option;
   mutable epoch_root_queries : epoch_root_response_record C_root_query.t;
-  bundle_responses : (string, bundle_response_record list) Hashtbl.t;
+  bundle_responses : (string, bundle_query_slot) Hashtbl.t;
   catchup_responses : (string, catchup_range_response_record list) Hashtbl.t;
   peer_states : (string, peer_state_record) Hashtbl.t;
   round_peers : (string, round_peer_record) Hashtbl.t;
@@ -4800,7 +4806,9 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
       Lwt.catch (fun () ->
         let r = C_codec.decode_bundle_response frame.payload in
         if r.chain_id <> t.config.chain_id then Lwt.return_unit
-        else if not (Hashtbl.mem t.bundle_responses r.proposal_id) then
+        else if not (match Hashtbl.find_opt t.bundle_responses r.proposal_id with
+          | Some slot -> slot.epoch = r.epoch_id
+          | None -> false) then
           Lwt.return_unit
         else if not (C_types.is_validator t.engine.vs r.responder_addr) then begin
           log_node t.config.my_addr
@@ -4827,11 +4835,12 @@ let rec on_p2p_message t _conn (frame : Frame.frame) =
             txs_json = r.txs_json;
             receipts_json = r.receipts_json;
           } in
-          let prior = try Hashtbl.find t.bundle_responses r.proposal_id with Not_found -> [] in
+          let slot = Hashtbl.find t.bundle_responses r.proposal_id in
           let already_seen = List.exists (fun (rec_ : bundle_response_record) ->
-            rec_.responder_addr = r.responder_addr) prior in
+            rec_.responder_addr = r.responder_addr) slot.replies in
           if not already_seen then
-            Hashtbl.replace t.bundle_responses r.proposal_id (record :: prior);
+            Hashtbl.replace t.bundle_responses r.proposal_id
+              {slot with replies = record :: slot.replies};
           Lwt.return_unit
         end)
         (fun exn ->
@@ -5365,7 +5374,6 @@ let query_bundle ?(now = Mtime_clock.elapsed_ns) ?(sleep = Lwt_unix.sleep)
     t ~epoch_id ~proposal_id ~timeout_seconds
     ~(validate : bundle_response_record -> bool) =
   let open Lwt.Syntax in
-  Hashtbl.replace t.bundle_responses proposal_id [];
   let q = C_codec.{
     chain_id = t.config.chain_id;
     epoch_id;
@@ -5391,7 +5399,9 @@ let query_bundle ?(now = Mtime_clock.elapsed_ns) ?(sleep = Lwt_unix.sleep)
     if deadline_reached ~now deadline then Lwt.return_none
     else
       let responses =
-        try Hashtbl.find t.bundle_responses proposal_id with Not_found -> []
+        match Hashtbl.find_opt t.bundle_responses proposal_id with
+        | Some slot -> slot.replies
+        | None -> []
       in
       match pick_valid responses with
       | Some r -> Lwt.return_some r
@@ -5421,6 +5431,16 @@ let query_bundle ?(now = Mtime_clock.elapsed_ns) ?(sleep = Lwt_unix.sleep)
        | None -> query_waves rest)
   in
   let peer_ids = bundle_query_peer_ids t proposal_id in
+  let joined = match Hashtbl.find_opt t.bundle_responses proposal_id with
+    | Some slot when slot.epoch = epoch_id && slot.readers < 64 ->
+      Hashtbl.replace t.bundle_responses proposal_id {slot with readers = slot.readers + 1};
+      true
+    | Some _ -> false
+    | None when Hashtbl.length t.bundle_responses < 64 ->
+      Hashtbl.add t.bundle_responses proposal_id {epoch = epoch_id; readers = 1; replies = []};
+      true
+    | None -> false in
+  if not joined then Lwt.return_none else
   Lwt.finalize
     (fun () ->
       match bundle_query_waves peer_ids with
@@ -5429,7 +5449,11 @@ let query_bundle ?(now = Mtime_clock.elapsed_ns) ?(sleep = Lwt_unix.sleep)
         wait_valid deadline
       | waves -> query_waves waves)
     (fun () ->
-      Hashtbl.remove t.bundle_responses proposal_id;
+      (match Hashtbl.find_opt t.bundle_responses proposal_id with
+       | Some slot when slot.readers > 1 ->
+         Hashtbl.replace t.bundle_responses proposal_id {slot with readers = slot.readers - 1}
+       | Some _ -> Hashtbl.remove t.bundle_responses proposal_id
+       | None -> ());
       Lwt.return_unit)
 
 let query_catchup_range t ~from_epoch ~max_epochs ~timeout_seconds
@@ -5938,6 +5962,8 @@ let request_finality_proof t ~epoch_id records =
       peer_ids
 
 let query_epoch_root
+    ?deadline
+    ?finish
     ?(wait_for = Source_agreement)
     ?(request_next = true)
     ?(fresh = false)
@@ -5956,11 +5982,14 @@ let query_epoch_root
         let payload = C_codec.encode_epoch_root_query q in
         let* () = Octra_net.P2p_swarm.broadcast t.swarm
           { msg_type = Frame.msg_query_epoch_root; payload } in
-        let deadline = deadline_after timeout_seconds in
+        let deadline = match deadline with
+          | None -> deadline_after timeout_seconds
+          | Some value -> Int64.min value (deadline_after timeout_seconds) in
         let rec wait () =
           let collected = C_root_query.read lease t.epoch_root_queries in
           if deadline_reached deadline
-             || epoch_root_wait_reached t ~epoch_id ~wait_for collected then
+            || epoch_root_wait_reached t ~epoch_id ~wait_for collected
+            || Option.fold ~none:false ~some:(fun ready -> ready collected) finish then
             Lwt.return collected
           else
             let* () = Lwt_unix.sleep 0.1 in

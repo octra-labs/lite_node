@@ -138,6 +138,47 @@ let local_role () =
     require (not added) "observer accepted observer";
     Lwt.return_unit)
 
+let role_keys () =
+  let local = identity () in
+  let first = identity () in
+  let second = identity () in
+  let id key = Handshake.node_id_of_pubkey (fst key) in
+  let swarm = state local in
+  require (Swarm.peer_role swarm (id first) = Swarm.Validator)
+    "open discovery changed role";
+  let check keys =
+    require (Swarm.validator_node_ids swarm = List.map Handshake.node_id_of_pubkey keys)
+      "peer identities differ from public keys";
+    List.iter (fun key ->
+      let expected = if List.mem (fst key) keys then Swarm.Validator else Swarm.Observer in
+      require (Swarm.peer_role swarm (id key) = expected) "peer role differs from set")
+      [local; first; second];
+    require (Swarm.record_keys swarm = keys) "record keys differ from set" in
+  List.iter (fun keys ->
+    require (Swarm.set_validator_pubkeys swarm keys = Ok ()) "key update refused";
+    check keys;
+    List.iter (fun invalid ->
+      require (Result.is_error (Swarm.set_validator_pubkeys swarm invalid))
+        "invalid key update accepted";
+      check keys) [ []; ["short"]; [fst first; fst first] ])
+    [[fst local; fst first]; [fst second]; [fst second]; [fst first; fst local]];
+  Lwt.return_unit
+
+let role_work () =
+  let local = identity () in
+  let keys = fst local :: List.init 63 (fun index -> String.make 32 (Char.chr index)) in
+  let swarm = state ~keys local in
+  let id = Handshake.node_id_of_pubkey (List.nth keys 63) in
+  let before = Gc.allocated_bytes () in
+  for _ = 1 to 2000 do
+    require (Swarm.peer_role swarm id = Swarm.Validator) "active role refused";
+    require (Swarm.peer_role swarm "unknown" = Swarm.Observer) "unknown role accepted"
+  done;
+  let allocated = Gc.allocated_bytes () -. before in
+  Printf.printf "event = peer_role checks = 4000 allocated_bytes = %.0f\n%!" allocated;
+  require (allocated < 1_048_576.) "peer role repeated key derivation";
+  Lwt.return_unit
+
 let slot_reuse () =
   let local = identity () in
   let old = identity () in
@@ -852,7 +893,7 @@ let () =
       Printf.eprintf "case = %s status = fail reason = %s\n%!" name (Printexc.to_string error);
       count + 1) 0 [
       "slot_plan", slot_plan; "set_roles", set_roles; "local_role", local_role; "slot_reuse", slot_reuse;
-      "set_rotate", set_rotate;
+      "set_rotate", set_rotate; "role_keys", role_keys; "role_work", role_work;
       "record_keys", record_keys; "record_limit", record_limit; "accept_limit", accept_limit;
       "record_set", record_set;
       "accept_keys", accept_keys; "dial_keys", dial_keys; "accept_cutover", accept_cutover;

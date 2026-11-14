@@ -1517,7 +1517,7 @@ let run_pending_guard ?(at_start = false) ~expect_rejection store =
   let activation = 1_266_000 in
   let source = if at_start then at - 8 else source_for activation in
   let due = source + 8 in
-  if at_start then expect "pending release phase differs" (due = 1_842_000 && due mod 4 = 0);
+  if at_start then expect "pending release phase differs" (due = 1_845_000 && due mod 4 = 0);
   let identities = List.init 7 (fun _ -> identity ()) in
   let addresses = List.map (fun (item : identity) -> item.address) identities in
   let weights rows = List.map (fun value -> Z.mul Policy.min_bond (Z.of_int value)) rows in

@@ -127,6 +127,13 @@ let test_seatless_plan () =
   | Some plan ->
     require (Graph.scalar_work_activation_for_chain chain_id = Some plan)
       "weight and work schedules differ";
+    let policy = Octra_consensus.C_quorum_policy.for_chain chain_id in
+    List.iter (fun epoch ->
+      require (not (Octra_consensus.C_quorum_policy.seatless policy (Int64.of_int epoch)))
+        "seatless quorum enabled early") [1_841_999; 1_842_000; 1_842_001; 1_844_999];
+    List.iter (fun epoch ->
+      require (Octra_consensus.C_quorum_policy.seatless policy (Int64.of_int epoch))
+        "seatless quorum did not activate") [1_845_000; 1_845_001];
     let make root = Graph.create ~chain_id ~root_at:(fun epoch ->
       require (epoch = plan.anchor_epoch) "seatless read another anchor";
       root) in
@@ -188,7 +195,7 @@ let test_live_chain () =
 let test_work_rules () =
   let chain_id = "octra-devnet-9871-cluster" in
   let plan = Option.get (Graph.scalar_work_activation_for_chain chain_id) in
-  require (plan.activation_epoch = 1_842_000) "work release epoch differs";
+  require (plan.activation_epoch = 1_845_000) "work release epoch differs";
   require (Graph.seatless_activation_for_chain chain_id = Some plan) "quorum release epoch differs";
   require (plan.activation_epoch - plan.anchor_epoch >= 10_000)
     "work activation notice too short";
@@ -201,7 +208,8 @@ let test_work_rules () =
     List.iter (fun epoch ->
       require (at ~chain_id ~epoch = Graph.Prior) "work profile enabled early";
       require (read before ~epoch = Ok Graph.Prior) "work enabled early")
-      [0; 1_769_492; plan.anchor_epoch; plan.activation_epoch - 1];
+      [0; 1_769_492; plan.anchor_epoch; 1_841_999; 1_842_000; 1_842_001;
+        plan.activation_epoch - 1];
     List.iter (fun epoch ->
       require (at ~chain_id ~epoch = Graph.Active) "work profile disabled";
       List.iter (fun (root, expected) ->

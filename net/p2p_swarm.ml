@@ -40,6 +40,11 @@ type peer_profile = {
   mutable offered : (int64 * string) list;
 }
 
+type validator_keys = {
+  pubkeys : string list;
+  node_ids : string list;
+}
+
 type t = {
   config : config;
   mutable active_hash : string;
@@ -54,7 +59,7 @@ type t = {
   mutable relayed_record_accepted : int;
   mutable relayed_record_unchanged : int;
   mutable relayed_record_rejected : int;
-  mutable validator_pubkeys : string list option;
+  mutable membership : validator_keys option;
   mutable on_message : (P2p_conn.t -> P2p_frame.frame -> unit Lwt.t);
   mutable on_peer : (P2p_conn.t -> unit);
   mutable running : bool;
@@ -81,6 +86,9 @@ let record_dial_plan ~now ~due ~active =
     | Some at when now < at -> Hold
     | _ -> Start (now +. record_retry_s)
 
+let validator_keys pubkeys =
+  { pubkeys; node_ids = List.map P2p_handshake.node_id_of_pubkey pubkeys }
+
 let create config =
   {
     config;
@@ -96,9 +104,9 @@ let create config =
     relayed_record_accepted = 0;
     relayed_record_unchanged = 0;
     relayed_record_rejected = 0;
-    validator_pubkeys =
+    membership =
       if config.allowed_pubkeys = [] then None
-      else Some config.allowed_pubkeys;
+      else Some (validator_keys config.allowed_pubkeys);
     on_message = (fun _ _ -> Lwt.return_unit);
     on_peer = (fun _ -> ());
     running = false;
@@ -170,16 +178,15 @@ let relayed_record_stats t =
   }
 
 let validator_node_ids t =
-  match t.validator_pubkeys with
+  match t.membership with
   | None -> []
-  | Some pubkeys ->
-    List.map P2p_handshake.node_id_of_pubkey pubkeys
+  | Some keys -> keys.node_ids
 
 let peer_role t peer_id =
-  match t.validator_pubkeys with
+  match t.membership with
   | None -> Validator
-  | Some _ ->
-    if List.mem peer_id (validator_node_ids t) then Validator
+  | Some keys ->
+    if List.mem peer_id keys.node_ids then Validator
     else Observer
 
 let frame_peer_class = function
@@ -187,16 +194,18 @@ let frame_peer_class = function
   | Observer -> P2p_frame_budget.Observer
 
 let local_is_validator t =
-  match t.validator_pubkeys with
+  match t.membership with
   | None -> true
-  | Some pubkeys -> List.mem t.config.pubkey_raw pubkeys
+  | Some keys -> List.mem t.config.pubkey_raw keys.pubkeys
 
 let local_accepts_observers t =
-  Option.is_some t.validator_pubkeys
+  Option.is_some t.membership
   && local_is_validator t
 
 let record_keys t =
-  Option.value ~default:t.config.allowed_pubkeys t.validator_pubkeys
+  match t.membership with
+  | None -> t.config.allowed_pubkeys
+  | Some keys -> keys.pubkeys
 
 let handshake_keys t =
   let observers = Hashtbl.fold (fun id conn count ->
@@ -238,10 +247,10 @@ let set_validator_pubkeys t pubkeys =
     Error "active validator public key must contain 32 bytes"
   else if List.length (List.sort_uniq String.compare pubkeys) <> List.length pubkeys then
     Error "active validator public keys contain duplicates"
-  else if t.validator_pubkeys = Some pubkeys then
+  else if Option.fold ~none:false ~some:(fun keys -> keys.pubkeys = pubkeys) t.membership then
     Ok ()
   else begin
-    t.validator_pubkeys <- Some pubkeys;
+    t.membership <- Some (validator_keys pubkeys);
     let rows = Hashtbl.fold (fun id conn rows ->
       (id, peer_role t id, P2p_conn.is_connected conn) :: rows) t.peers [] in
     let kept, removed = peer_plan rows in

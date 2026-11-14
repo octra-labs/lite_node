@@ -8,6 +8,25 @@ module Swarm = Octra_net.P2p_swarm
 module Q = Octra_consensus.C_root_query
 module P = Octra_consensus.C_quorum_policy
 
+let () =
+  Octra_node_runtime.Status_read_rpc.sync_reader ();
+  match Array.to_list Sys.argv with
+  | [_; "--sync-test"; parent; action] ->
+    Octra_node_runtime.Sync_probe.child (int_of_string parent) (fun () ->
+      match action with
+      | "sleep" -> Unix.sleep 10; "late"
+      | "ready" -> "ready"
+      | "fail" -> failwith "read refused"
+      | "size" -> String.make (8 * 1024 * 1024 + 1) 'x'
+      | "heap" -> string_of_int (Gc.quick_stat ()).Gc.heap_words
+      | "fds" ->
+        let path = if Sys.file_exists "/proc/self/fd" then "/proc/self/fd" else "/dev/fd" in
+        Sys.readdir path |> Array.to_list
+        |> List.filter (fun name -> Sys.file_exists (Filename.concat path name))
+        |> List.sort String.compare |> String.concat ","
+      | _ -> failwith "unknown child action")
+  | _ -> ()
+
 let expect label value = if not value then failwith label
 let forbid _ = failwith "signing is not part of the query test"
 let chain_id = "octra-test-query"
@@ -83,6 +102,120 @@ let cancelled promise =
   expect "query did not propagate cancellation"
     (match Lwt.state promise with Lwt.Fail Lwt.Canceled -> true | _ -> false);
   Lwt.return_unit
+
+let with_bundle action =
+  let open Lwt.Syntax in
+  let module H = Octra_consensus.C_hash in
+  let module Codec = Octra_consensus.C_codec in
+  let secret = String.make 32 '\029' in
+  let public_key = match Mirage_crypto_ec.Ed25519.priv_of_octets secret with
+    | Error _ -> failwith "invalid bundle test key"
+    | Ok key -> Mirage_crypto_ec.Ed25519.(pub_of_priv key |> pub_to_octets) in
+  let validator_set = T.make_validator_set
+    [T.{address = reply.responder_addr; pubkey = public_key}] in
+  let driver = make ~validator_set () in
+  let proposal_id = String.make 32 '\030' in
+  let expected = D.{responder_addr = reply.responder_addr;
+    tx_hashes = []; txs_json = []; receipts_json = []} in
+  let query ?(epoch = 40L) ?(seconds = 1.) ?(id = proposal_id) validate =
+    D.query_bundle driver ~epoch_id:epoch ~proposal_id:id ~timeout_seconds:seconds ~validate in
+  let receive ?(epoch = 40L) () =
+    let response = Codec.{chain_id; epoch_id = epoch; proposal_id;
+      responder_addr = expected.responder_addr; tx_hashes = []; txs_json = [];
+      receipts_json = []; signature = ""} in
+    let response = {response with signature = H.sign_ed25519 ~priv_raw:secret
+      ~msg:(H.bundle_response_sign_bytes response)} in
+    let frame = Octra_net.P2p_frame.{msg_type = msg_bundle_response;
+      payload = Codec.encode_bundle_response response} in
+    let* fd = Lwt_unix.openfile "/dev/null" [Unix.O_RDONLY] 0 in
+    let conn = Octra_net.P2p_conn.create
+      ~peer_class:Octra_net.P2p_frame_budget.Validator fd
+      ~peer_id:(Octra_net.P2p_handshake.node_id_of_pubkey public_key)
+      ~addr:"bundle-query-test" ~direction:Octra_net.P2p_conn.Inbound in
+    Lwt.finalize (fun () -> D.on_p2p_message driver conn frame)
+      (fun () -> Octra_net.P2p_conn.close conn) in
+  let+ () = action query receive expected in
+  expect "finished bundle query retained slot" (Hashtbl.length driver.bundle_responses = 0)
+
+let bundle_join () = with_bundle (fun query receive expected ->
+  let open Lwt.Syntax in
+  let first = query ~seconds:10. (fun _ -> false) in
+  let* () = receive () in
+  let* result = query (fun _ -> true) in
+  let* () = cancelled first in
+  expect "joined bundle query erased replies" (result = Some expected);
+  Lwt.return_unit)
+
+let bundle_cancel () = with_bundle (fun query receive expected ->
+  let open Lwt.Syntax in
+  let first = query ~seconds:10. (fun _ -> false) in
+  let second = query (fun _ -> true) in
+  let* () = cancelled first in
+  let* () = receive () in
+  let* result = second in
+  expect "bundle cancellation erased another reader" (result = Some expected);
+  let next = query (fun _ -> true) in
+  Lwt.cancel first;
+  let+ result = next in
+  expect "reopened bundle reused prior replies" (result = None))
+
+let bundle_expire () = with_bundle (fun query receive expected ->
+  let open Lwt.Syntax in
+  let first = query ~seconds:0.01 (fun _ -> false) in
+  let second = query (fun _ -> true) in
+  let* result = first in
+  expect "empty bundle query did not expire" (result = None);
+  let* () = receive () in
+  let+ result = second in
+  expect "bundle expiry erased another reader" (result = Some expected))
+
+let bundle_epoch () = with_bundle (fun query receive expected ->
+  let open Lwt.Syntax in
+  let pending = query (fun _ -> true) in
+  let* wrong = query ~epoch:41L (fun _ -> true) in
+  expect "bundle query joined a different epoch" (wrong = None);
+  let* () = receive ~epoch:41L () in
+  let* () = Lwt_unix.sleep 0.11 in
+  expect "bundle query accepted another epoch" (Lwt.is_sleeping pending);
+  let* () = receive () in
+  let+ result = pending in
+  expect "wrong epoch removed active bundle query" (result = Some expected))
+
+let bundle_readers () = with_bundle (fun query receive expected ->
+  let open Lwt.Syntax in
+  let pending = List.init 64 (fun _ -> query ~seconds:10. (fun _ -> true)) in
+  let extra = query (fun _ -> true) in
+  expect "bundle reader capacity was exceeded"
+    (match Lwt.state extra with Lwt.Return None -> true | _ -> false);
+  let* () = receive () in
+  let+ results = Lwt.all pending in
+  expect "bundle reader limit erased pending results"
+    (List.for_all (fun result -> result = Some expected) results))
+
+let bundle_slots () = with_bundle (fun query receive expected ->
+  let open Lwt.Syntax in
+  let pending = List.init 64 (fun index ->
+    query ~id:(String.make 32 (Char.chr index)) ~seconds:10. (fun _ -> true)) in
+  let extra = query ~id:(String.make 32 '\064') (fun _ -> true) in
+  expect "bundle slot capacity was exceeded"
+    (match Lwt.state extra with Lwt.Return None -> true | _ -> false);
+  let* () = Lwt_list.iter_s cancelled pending in
+  let next = query (fun _ -> true) in
+  let* () = receive () in
+  let+ result = next in
+  expect "bundle slot capacity was not released" (result = Some expected))
+
+let bundle_exception () = with_bundle (fun query receive expected ->
+  let open Lwt.Syntax in
+  let first = query (fun _ -> failwith "bundle check refused") in
+  let second = query (fun _ -> true) in
+  let* () = receive () in
+  let* refused = Lwt.catch (fun () -> let+ _ = first in false)
+    (function Failure reason when reason = "bundle check refused" -> Lwt.return_true
+      | exn -> Lwt.fail exn) in
+  expect "bundle check failure was hidden" refused;
+  let+ result = second in
+  expect "bundle check failure removed another reader" (result = Some expected))
 
 let joined () =
   let open Lwt.Syntax in
@@ -798,6 +931,19 @@ let cancel_send () = with_queue (fun driver _ _ ->
       Lwt.return_unit)
     (fun () -> Lwt.cancel pending; Lwt.return_unit))
 
+let send_collection () = with_queue (fun driver conn _ ->
+  let open Lwt.Syntax in
+  let pending = query ~wait_for:D.Collection_window driver 0.05 in
+  Lwt.finalize (fun () ->
+    let* () = Lwt_unix.sleep 0.1 in
+    let* _ = Lwt_mvar.take conn.write_queue in
+    let* () = Lwt.pause () in
+    let* () = Lwt.pause () in
+    expect "default collection window moved before send" (Lwt.is_sleeping pending);
+    let+ replies = pending in
+    expect "empty collection produced replies" (replies = []))
+    (fun () -> Lwt.cancel pending; Lwt.return_unit))
+
 let cancel_send_joined () = with_queue (fun driver conn _ ->
   let open Lwt.Syntax in
   let first = query driver 10. in
@@ -1040,7 +1186,7 @@ let target_timeout () = with_target (fun _ _ _ driver open_target ->
     let started = Unix.gettimeofday () in
     let* result = Octra_node_runtime.Status_read_rpc.sync_target (open_target ()) in
     expect "target exceeded client deadline" (Unix.gettimeofday () -. started < 3.0);
-    expect "blocked target was trusted" (target_value "status" result = `String "unavailable"
+    expect "blocked target was trusted" (target_value "status" result = `String "no_agreement"
       && target_value "targetEpoch" result = `Null);
     expect "blocked target retained query" (not (listening driver 40L));
     Lwt.return_unit)
@@ -1084,13 +1230,9 @@ let target_records () =
            expect "record edit was short" (Unix.write fd (Bytes.make 4 '\255') 0 4 = 4)
          end)
      | _ -> failwith "unknown record edit");
-    let hint = Option.map (fun offset -> head.epoch_id, offset)
-      (Hashtbl.find_opt store.epochlog.offsets head.epoch_id) in
-    let* reason = Octra_node_runtime.Sync_probe.read_child (fun () ->
-      let value = Octra_node_runtime.Status_read_rpc.sync_head_data ~chain_id ~data_dir:directory
-        ~base_dir:(Filename.concat directory "chain") ~hint () in
-      ignore (Sys.opaque_identity store);
-      match value with Error reason -> reason | Ok _ -> "accepted") in
+    let* value = Octra_node_runtime.Status_read_rpc.sync_head_read ~chain_id ~data_dir:directory
+      ~chaindata:store ~epoch_id:(Int64.of_int head.epoch_id) () in
+    let reason = match value with Error reason -> reason | Ok _ -> "accepted" in
     let expected = match change with
       | "missing" -> "sync head location is unavailable"
       | "prefix" -> "epoch location is invalid"
@@ -1118,14 +1260,9 @@ let target_floor () = with_target (fun directory store head _ _ ->
   Index.begin_write store.Octra_core.Store_chaindata.index;
   Index.buffer_meta store.index "history_floor" (String.make (Octra_core.Epochlog.max_record_len + 1) 'x');
   Index.commit_write store.index;
-  let hint = Some (head.Octra_core.Head_manifest.epoch_id,
-    Hashtbl.find store.epochlog.offsets head.epoch_id) in
-  let* value = Octra_node_runtime.Sync_probe.read_child (fun () ->
-    let value = Read.sync_head_data ~chain_id ~data_dir:directory
-      ~base_dir:(Filename.concat directory "chain") ~hint () in
-    ignore (Sys.opaque_identity store);
-    match value with Ok _ -> "accepted" | Error reason -> reason) in
-  expect "unused floor rejected valid certificate" (value = "accepted");
+  let* value = Read.sync_head_read ~chain_id ~data_dir:directory ~chaindata:store
+    ~epoch_id:(Int64.of_int head.Octra_core.Head_manifest.epoch_id) () in
+  expect "unused floor rejected valid certificate" (Result.is_ok value);
   Lwt.return_unit)
 
 let target_history () = with_target ~history:100000 (fun _ store head driver open_target ->
@@ -1155,7 +1292,7 @@ let probe_coalesce () =
   let now = ref 0. and key = ref 1 and calls = ref 0 in
   let gate, release = Lwt.wait () in
   let probe = S.create ~clock:(fun () -> !now) ~valid:(fun value -> value = !key)
-    (fun () -> incr calls; let+ () = gate in !key) in
+    (fun ~background:_ ~deadline:_ -> incr calls; let+ () = gate in !key) in
   let jobs = List.init 100 (fun _ -> S.query probe) in
   let* () = Lwt.pause () in
   expect "probe did not coalesce" (!calls = 1);
@@ -1201,6 +1338,29 @@ let probe_delta () =
   let stopped, _ = S.delta blocked S.Stop in
   let stopped, _ = S.delta stopped (S.Completed (token, 4., true, Some 1)) in
   expect "closed completion revived cache" (stopped.phase = S.Closed && stopped.cached = None);
+  let state, effects = S.delta S.empty (S.Refresh 0.) in
+  let token = match effects with [S.Run token] -> token | _ -> failwith "refresh did not start" in
+  let state, _ = S.delta state (S.Ask (2, 0., false)) in
+  let state, effects = S.delta state (S.Cancel 2) in
+  expect "client cancelled background owner" (effects = []);
+  let state, effects = S.delta state (S.Tick 2.5) in
+  expect "client deadline interrupted background owner" (effects = []);
+  let state, _ = S.delta state (S.Completed (token, 5., true, Some 8)) in
+  expect "background completion renewed sample age" (state.sample = Some (0., 8));
+  let state, effects = S.delta S.empty (S.Refresh 10.) in
+  let token = match effects with [S.Run token] -> token | _ -> failwith "refresh did not start" in
+  let state, effects = S.delta state (S.Tick 20.) in
+  expect "background budget was unlimited" (effects = [S.Interrupt token]);
+  let state, _ = S.delta state (S.Completed (token, 20.1, true, Some 8)) in
+  expect "expired work published a sample" (state.sample = None);
+  let state, effects = S.delta S.empty (S.Refresh 0.) in
+  let token = match effects with [S.Run token] -> token | _ -> failwith "refresh did not start" in
+  let state, _ = S.delta state (S.Ask (2, 0., false)) in
+  let state, _ = S.delta state (S.Ask (3, 1., false)) in
+  let state, effects = S.delta state (S.Completed (token, 3., true, Some 8)) in
+  expect "late completion answered an expired reader"
+    (List.mem (S.Reply (2, None)) effects && List.mem (S.Reply (3, Some 8)) effects);
+  expect "reader expiry discarded background sample" (state.sample = Some (0., 8));
   Lwt.return_unit
 
 let probe_child () =
@@ -1208,7 +1368,7 @@ let probe_child () =
   let module F = Octra_core.Proof_frame in
   let open Lwt.Syntax in
   let prior = F.children (Unix.getpid ()) in
-  let work = S.read_child (fun () -> Unix.sleep 10; "late") in
+  let work = S.read_child ~mode:"--sync-test" ["sleep"] in
   let rec started left =
     if F.children (Unix.getpid ()) <> prior then Lwt.return_unit
     else if left = 0 then Lwt.fail_with "sync read child did not start"
@@ -1221,15 +1381,131 @@ let probe_child () =
   expect "sync child cancellation exceeded deadline"
     (stopped && Unix.gettimeofday () -. start < 1.);
   expect "sync child survived cancellation" (F.children (Unix.getpid ()) = prior);
-  let+ value = S.read_child (fun () -> "ready") in
+  let+ value = S.read_child ~mode:"--sync-test" ["ready"] in
   expect "reaped child retained read slot" (value = "ready")
+
+let probe_process () =
+  let module S = Octra_node_runtime.Sync_probe in
+  let module F = Octra_core.Proof_frame in
+  let open Lwt.Syntax in
+  let prior = F.children (Unix.getpid ()) in
+  let* () = Lwt_list.iter_s (fun (mode, args) ->
+    let* refused = Lwt.catch (fun () -> let+ _ = S.read_child ~mode args in false)
+      (fun _ -> Lwt.return_true) in
+    expect "invalid child response was accepted" refused;
+    expect "failed child was not reaped" (F.children (Unix.getpid ()) = prior);
+    Lwt.return_unit)
+    ["--sync-test", ["fail"]; "--sync-test", ["size"];
+      "--sync-head", []; "--sync-head", ["chain"; "."; "."; "bad"; "0"]] in
+  let heap = Bytes.make (64 * 1024 * 1024) 'h' in
+  let words = (Gc.quick_stat ()).Gc.heap_words in
+  let* raw = S.read_child ~mode:"--sync-test" ["heap"] in
+  expect "reader inherited parent heap" (int_of_string raw < words / 2);
+  expect "parent heap was discarded" (Bytes.get (Sys.opaque_identity heap) 0 = 'h');
+  let files = List.init 32 (fun _ -> Unix.openfile "/dev/null" [Unix.O_RDONLY] 0) in
+  let* () = Lwt.finalize (fun () ->
+    let+ fds = S.read_child ~mode:"--sync-test" ["fds"] in
+    expect "reader inherited descriptors" (fds = "3"))
+    (fun () -> List.iter Unix.close files; Lwt.return_unit) in
+  let+ value = S.read_child ~mode:"--sync-test" ["ready"] in
+  expect "failed reader retained process slot" (value = "ready")
+
+let probe_snapshot () =
+  let module S = Octra_node_runtime.Sync_probe in
+  let open Lwt.Syntax in
+  let* () = Lwt_list.iter_s (fun delay ->
+    let calls = ref 0 in
+    let probe = S.create ~valid:(fun _ -> true) (fun ~background ~deadline ->
+      expect "refresh lost background mode" background;
+      expect "background budget was not passed" (deadline -. S.monotonic () > 9.);
+      incr calls; let+ () = Lwt_unix.sleep delay in 7) in
+    S.start probe;
+    let* () = Lwt.pause () in
+    Lwt.finalize (fun () ->
+      let begun = S.monotonic () in
+      for _ = 1 to 300 do
+        expect "pending snapshot was published" (S.snapshot probe = S.Starting)
+      done;
+      expect "snapshot waited for acquisition" (S.monotonic () -. begun < 0.05);
+      expect "snapshot request started more work" (!calls = 1);
+      let* () = Lwt_unix.sleep (delay +. 0.1) in
+      expect "background work inherited client deadline" (match S.snapshot probe with
+        | S.Snapshot (age, 7) -> age >= delay && age < delay +. 0.5
+        | _ -> false);
+      Lwt.return_unit)
+      (fun () -> let+ closed = S.close probe in expect "snapshot did not close" closed))
+    [0.5; 2.; 5.] in
+  let now = ref 0. in
+  let probe = S.create ~clock:(fun () -> !now) ~valid:(fun _ -> true)
+    (fun ~background ~deadline:_ ->
+      expect "query acquired background mode" (not background);
+      Lwt.return 9) in
+  let* _ = S.query probe in
+  now := 19.9;
+  expect "snapshot age was renewed" (S.snapshot probe = S.Snapshot (19.9, 9));
+  now := 20.1;
+  expect "expired snapshot was accepted" (S.snapshot probe = S.Expired 20.1);
+  let+ closed = S.close probe in
+  expect "closed actor retained snapshot" (closed && S.snapshot probe = S.Read_failed)
+
+let probe_refresh () =
+  let module S = Octra_node_runtime.Sync_probe in
+  let open Lwt.Syntax in
+  let current = ref true and calls = ref 0 in
+  let probe = S.create ~valid:(fun _ -> !current) (fun ~background:_ ~deadline:_ ->
+    incr calls; Lwt.return 7) in
+  let* _ = S.query probe in
+  S.start probe;
+  current := false;
+  let* () = Lwt_unix.sleep 0.15 in
+  expect "known invalid snapshot remained visible" (S.snapshot probe = S.Read_failed && !calls = 1);
+  let* stopped = S.close probe in
+  expect "invalid snapshot owner did not close" stopped;
+  let offset = ref 0. and cancelled = ref false in
+  let clock () = S.monotonic () +. !offset in
+  let probe = S.create ~clock ~valid:(fun _ -> true) (fun ~background:_ ~deadline ->
+    offset := !offset +. 9.;
+    expect "background budget was restarted" (deadline -. clock () <= 1.);
+    let work = Lwt_unix.sleep 10. in
+    Lwt.on_cancel work (fun () -> cancelled := true);
+    Lwt.map (fun () -> 1) work) in
+  S.start probe;
+  let* () = Lwt_unix.sleep 1.2 in
+  expect "setup renewed the job deadline" !cancelled;
+  let+ stopped = S.close probe in expect "expired refresh did not close" stopped
+
+let probe_retry () =
+  let module S = Octra_node_runtime.Sync_probe in
+  let open Lwt.Syntax in
+  let now = ref 0. and calls = ref 0 in
+  let probe = S.create ~clock:(fun () -> !now) ~valid:(fun _ -> true)
+    ~retry:(( = ) 0) (fun ~background:_ ~deadline:_ ->
+      incr calls;
+      Lwt.return (if !calls = 1 then 0 else 7)) in
+  S.start probe;
+  Lwt.finalize (fun () ->
+    let* () = Lwt_unix.sleep 0.15 in
+    expect "negative sample missing" (S.snapshot probe = S.Snapshot (0., 0));
+    now := 2.9;
+    let* () = Lwt_unix.sleep 0.15 in
+    expect "negative sample ignored cooldown" (!calls = 1);
+    now := 3.;
+    let* () = Lwt_unix.sleep 0.15 in
+    expect "negative sample prevented retry" (!calls = 2 && S.snapshot probe = S.Snapshot (0., 7));
+    now := 6.;
+    let* () = Lwt_unix.sleep 0.15 in
+    expect "positive sample retried early" (!calls = 2 && S.snapshot probe = S.Snapshot (3., 7));
+    now := 13.;
+    let+ () = Lwt_unix.sleep 0.15 in
+    expect "positive sample did not refresh" (!calls = 3 && S.snapshot probe = S.Snapshot (0., 7)))
+    (fun () -> let+ closed = S.close probe in expect "retry owner did not close" closed)
 
 let probe_failure () =
   let module S = Octra_node_runtime.Sync_probe in
   let open Lwt.Syntax in
   let now = ref 0. and calls = ref 0 in
   let probe = S.create ~clock:(fun () -> !now) ~valid:(fun _ -> true)
-    (fun () -> incr calls; Lwt.fail_with "read failed") in
+    (fun ~background:_ ~deadline:_ -> incr calls; Lwt.fail_with "read failed") in
   let* first = S.query probe in
   let* second = S.query probe in
   expect "failed probe bypassed cooldown" (first = None && second = None && !calls = 1);
@@ -1244,7 +1520,7 @@ let probe_drain () =
   let now = ref 0. and calls = ref 0 in
   let gate, release = Lwt.wait () in
   let probe = S.create ~clock:(fun () -> !now) ~valid:(fun _ -> true)
-    (fun () -> incr calls; gate) in
+    (fun ~background:_ ~deadline:_ -> incr calls; gate) in
   let pending = S.query probe in
   now := 3.;
   let* result = pending in
@@ -1267,6 +1543,26 @@ let root_readers_free driver =
     | Ok (next, _) -> fill (count + 1) next
     | Error _ -> count in
   fill 0 driver.D.epoch_root_queries
+
+let target_send_window () = with_target (fun _ _ _ driver open_target ->
+  let module Read = Octra_node_runtime.Status_read_rpc in
+  let open Lwt.Syntax in
+  let* fd = Lwt_unix.openfile "/dev/null" [Unix.O_RDONLY] 0 in
+  let conn = Octra_net.P2p_conn.create ~peer_class:Octra_net.P2p_frame_budget.Validator fd
+    ~peer_id:"blocked-target" ~addr:"target-test" ~direction:Octra_net.P2p_conn.Inbound in
+  let frame = Octra_net.P2p_frame.{msg_type = msg_query_epoch_root; payload = ""} in
+  let* () = Lwt_mvar.put conn.write_queue frame in
+  Hashtbl.add driver.D.swarm.peers conn.peer_id conn;
+  Lwt.finalize (fun () ->
+    let pending = Read.sync_target (open_target ()) in
+    let* () = await_target driver in
+    expect "blocked peer did not retain queue" (not (Lwt_mvar.is_empty conn.write_queue));
+    let* () = Lwt_list.iter_s (send_target driver) [0, 42L, false; 1, 42L, false; 2, 42L, false] in
+    let+ result = pending in
+    expect "blocked peer discarded valid target" (target_value "status" result = `String "agreed"
+      && target_value "targetEpoch" result = `String "42");
+    expect "blocked target retained reader" (not (listening driver 40L)))
+    (fun () -> Hashtbl.clear driver.swarm.peers; Octra_net.P2p_conn.close conn))
 
 let target_parallel () = with_target (fun _ _ _ driver open_target ->
   let open Lwt.Syntax in
@@ -1663,6 +1959,102 @@ let control_pause_stop () =
     (fun () -> Lwt.cancel server; Lwt.cancel request; Lwt.async_exception_hook := prior;
       Test_workspace.remove directory; Lwt.return_unit)
 
+let target_delayed () = with_target (fun _ _ _ driver open_target ->
+  let module Read = Octra_node_runtime.Status_read_rpc in
+  let open Lwt.Syntax in
+  let target = open_target () in
+  Read.start_sync_target target;
+  let* () = await_target driver in
+  let* () = Lwt_unix.sleep 2.6 in
+  expect "background ended before delayed replies" (listening driver 40L);
+  let* first = Read.sync_snapshot target in
+  expect "unfinished background invented agreement" (target_value "targetEpoch" first = `Null);
+  let* () = Lwt_list.iter_s (send_target driver)
+    [0, 42L, true; 2, 42L, false; 2, 42L, false] in
+  let* () = Lwt_unix.sleep 0.2 in
+  expect "invalid replies finished background collection" (listening driver 40L);
+  let* () = Lwt_list.iter_s (send_target driver)
+    [0, 42L, false; 1, 42L, false; 2, 42L, false] in
+  let* checked = Read.sync_target target in
+  expect "delayed signed target was lost" (target_value "targetEpoch" checked = `String "42");
+  let+ snapshot = Read.sync_snapshot target in
+  expect "delayed target was not published" (target_value "status" snapshot = `String "agreed"))
+
+let target_delayed_change () = with_target (fun _ _ _ driver open_target ->
+  let module Read = Octra_node_runtime.Status_read_rpc in
+  let open Lwt.Syntax in
+  let target = open_target () in
+  Read.start_sync_target target;
+  let* () = await_target driver in
+  let* () = Lwt_unix.sleep 2.6 in
+  driver.engine.generation <- driver.engine.generation + 1;
+  let* () = Lwt_list.iter_s (send_target driver)
+    [0, 42L, false; 1, 42L, false; 2, 42L, false] in
+  let* result = Read.sync_target target in
+  expect "delayed reply ignored generation" (target_value "targetEpoch" result = `Null);
+  let+ snapshot = Read.sync_snapshot target in
+  expect "changed background published agreement" (target_value "targetEpoch" snapshot = `Null))
+
+let target_collection_end () = with_target (fun _ _ _ driver open_target ->
+  let module Read = Octra_node_runtime.Status_read_rpc in
+  let module Probe = Octra_node_runtime.Sync_probe in
+  let open Lwt.Syntax in
+  let target = open_target () in
+  Read.start_sync_target target;
+  let* () = await_target driver in
+  let started = Probe.monotonic () in
+  let* () = Lwt_list.iter_s (send_target driver)
+    [0, 999999L, false; 1, 999999L, false; 2, 999999L, false] in
+  let* () = Lwt_unix.sleep 2.6 in
+  expect "ceiling bypassed background collection" (listening driver 40L);
+  let rec completed () =
+    let* snapshot = Read.sync_snapshot target in
+    if target_value "status" snapshot = `String "no_agreement" then Lwt.return snapshot
+    else if Probe.monotonic () -. started > 7. then Lwt.fail_with "collection did not finish"
+    else let* () = Lwt_unix.sleep 0.05 in completed () in
+  let+ result = completed () in
+  expect "collection lost finite deadline" (Probe.monotonic () -. started < 7.);
+  expect "collection invented target" (target_value "targetEpoch" result = `Null);
+  expect "completed collection retained reader" (not (listening driver 40L)))
+
+let target_snapshot () = with_target (fun _ _ head driver open_target ->
+  let module Read = Octra_node_runtime.Status_read_rpc in
+  let module Http = Octra_node_runtime.Rpc_http in
+  let open Lwt.Syntax in
+  let target = open_target () in
+  Read.start_sync_target target;
+  let begun = Octra_node_runtime.Sync_probe.monotonic () in
+  let* first = Read.sync_snapshot target in
+  expect "snapshot waited for background read"
+    (Octra_node_runtime.Sync_probe.monotonic () -. begun < 0.05);
+  expect "empty snapshot was not explicit" (target_value "status" first = `String "starting");
+  let* () = await_target driver in
+  let* () = Lwt_list.iter_s (send_target driver) [0, 42L, false; 1, 42L, false; 2, 42L, false] in
+  let* checked = Read.sync_target target in
+  expect "background sample was not verified" (target_value "status" checked = `String "agreed");
+  let started = Octra_node_runtime.Sync_probe.monotonic () in
+  let* results = Lwt_list.map_s (fun _ -> Read.sync_snapshot target) (List.init 300 Fun.id) in
+  expect "snapshot started a new read" (Octra_node_runtime.Sync_probe.monotonic () -. started < 0.05);
+  List.iter (fun value ->
+    expect "snapshot changed head" (target_value "headRoot" value = `String head.state_root);
+    expect "snapshot lost agreement" (target_value "status" value = `String "agreed");
+    expect "snapshot age missing" (match target_value "ageMs" value with
+      | `Int age -> age >= 2000 && age < 2500 | _ -> false)) results;
+  let wire params = Yojson.Safe.to_string (`Assoc [
+    "jsonrpc", `String "2.0"; "id", `Int 1; "method", `String "octra_syncTarget";
+    "params", params]) in
+  let* old = Http.control_reply ~query:(fun () -> Read.sync_snapshot target) (wire (`List [])) in
+  let fields = Yojson.Safe.Util.member "result" old |> Yojson.Safe.Util.to_assoc in
+  expect "snapshot broke existing clients" (List.length fields = 6 && not (List.mem_assoc "ageMs" fields));
+  let* current = Http.control_reply ~query:(fun () -> Read.sync_snapshot target)
+    (wire (`List [`String "snapshot"])) in
+  let fields = Yojson.Safe.Util.member "result" current |> Yojson.Safe.Util.to_assoc in
+  expect "snapshot omitted diagnostics" (List.length fields = 8 && List.mem_assoc "ageMs" fields);
+  driver.engine.generation <- driver.engine.generation + 1;
+  let+ changed = Read.sync_snapshot target in
+  expect "snapshot survived generation change" (target_value "status" changed = `String "changed"
+    && target_value "targetEpoch" changed = `Null))
+
 let () =
   let controls = [
     "control_socket", control_socket; "control_paths", control_paths;
@@ -1679,29 +2071,37 @@ let () =
       [Sys.argv.(2), List.assoc Sys.argv.(2) controls]
     else if Array.to_list Sys.argv = [Sys.argv.(0); "--records"] then
       ["target_records", target_records; "target_floor", target_floor] else
-    ["probe_delta", probe_delta; "probe_child", probe_child;
-     "target_records", target_records; "target_floor", target_floor;
-     "probe_coalesce", probe_coalesce; "probe_failure", probe_failure;
-     "probe_drain", probe_drain; "control_routes", control_routes] @ controls @
-    ["target_parallel", target_parallel;
-     "target_route", target_route; "target_replies", target_replies;
-     "target_changes", target_changes; "target_fresh", target_fresh;
-     "target_offline", target_offline; "target_timeout", target_timeout;
-     "joined", joined; "cancel_one", cancel_one; "cancel_all", cancel_all;
-     "fresh_overlap", fresh_overlap; "fresh_same_signer", fresh_same_signer;
-     "fresh_cancel", fresh_cancel; "collection_window", collection_window;
-     "large_roster", large_roster; "historical_weights", historical_weights;
-     "health_query_link", health_query_link;
-     "historical_identity", historical_identity; "capacity_growth", capacity_growth;
-     "weight_snapshot", weight_snapshot; "source_reachability", source_reachability;
-     "reader_capacity", reader_capacity;
-     "reply_capacity", reply_capacity; "source_mismatch", source_mismatch;
-     "root_ingestion", root_ingestion; "root_height_rules", root_height_rules;
-     "root_query_height", root_query_height;
-     "read_error", read_error; "epochs", epochs; "wait_modes", wait_modes;
-     "request_disabled", request_mode false; "request_enabled", request_mode true;
-     "send_timeout", send_timeout; "cancel_send", cancel_send;
-     "cancel_send_joined", cancel_send_joined; "cancel_fresh_send", cancel_fresh_send] in
+    ["bundle_join", bundle_join; "bundle_cancel", bundle_cancel; "bundle_expire", bundle_expire;
+      "bundle_epoch", bundle_epoch; "bundle_readers", bundle_readers;
+      "bundle_slots", bundle_slots; "bundle_exception", bundle_exception;
+      "probe_delta", probe_delta; "probe_child", probe_child; "probe_process", probe_process;
+      "probe_snapshot", probe_snapshot; "probe_refresh", probe_refresh;
+      "probe_retry", probe_retry;
+      "target_snapshot", target_snapshot; "target_delayed", target_delayed;
+      "target_delayed_change", target_delayed_change;
+      "target_collection_end", target_collection_end;
+      "target_records", target_records; "target_floor", target_floor;
+      "probe_coalesce", probe_coalesce; "probe_failure", probe_failure;
+      "probe_drain", probe_drain; "control_routes", control_routes] @ controls @
+    ["target_send_window", target_send_window; "target_parallel", target_parallel;
+      "target_route", target_route; "target_replies", target_replies;
+      "target_changes", target_changes; "target_fresh", target_fresh;
+      "target_offline", target_offline; "target_timeout", target_timeout;
+      "joined", joined; "cancel_one", cancel_one; "cancel_all", cancel_all;
+      "fresh_overlap", fresh_overlap; "fresh_same_signer", fresh_same_signer;
+      "fresh_cancel", fresh_cancel; "collection_window", collection_window;
+      "large_roster", large_roster; "historical_weights", historical_weights;
+      "health_query_link", health_query_link;
+      "historical_identity", historical_identity; "capacity_growth", capacity_growth;
+      "weight_snapshot", weight_snapshot; "source_reachability", source_reachability;
+      "reader_capacity", reader_capacity;
+      "reply_capacity", reply_capacity; "source_mismatch", source_mismatch;
+      "root_ingestion", root_ingestion; "root_height_rules", root_height_rules;
+      "root_query_height", root_query_height;
+      "read_error", read_error; "epochs", epochs; "wait_modes", wait_modes;
+      "request_disabled", request_mode false; "request_enabled", request_mode true;
+      "send_timeout", send_timeout; "send_collection", send_collection; "cancel_send", cancel_send;
+      "cancel_send_joined", cancel_send_joined; "cancel_fresh_send", cancel_fresh_send] in
   Lwt_main.run (Lwt_list.iter_s (fun (name, run) ->
     let open Lwt.Syntax in
     let* () = run () in

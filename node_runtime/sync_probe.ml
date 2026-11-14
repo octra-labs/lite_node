@@ -4,7 +4,7 @@
 module Ids = Map.Make (Int)
 
 type token = { id : int; generation : int }
-type job = { token : token; deadline : float; stopping : bool }
+type job = { token : token; started : float; deadline : float; background : bool; stopping : bool }
 type phase = Open | Closing | Closed
 type 'a state = {
   phase : phase;
@@ -12,11 +12,15 @@ type 'a state = {
   issued : int;
   active : job option;
   cached : (float * 'a) option;
+  sample : (float * 'a) option;
+  attempted : bool;
   next_at : float;
   readers : (int * float) list;
 }
 type 'a message =
   | Ask of int * float * bool
+  | Refresh of float
+  | Invalidate
   | Cancel of int
   | Tick of float
   | Completed of token * float * bool * 'a option
@@ -24,7 +28,7 @@ type 'a message =
 type 'a effect = Reply of int * 'a option | Run of token | Interrupt of token
 
 let empty = {phase = Open; generation = 0; issued = 0; active = None;
-  cached = None; next_at = neg_infinity; readers = []}
+  cached = None; sample = None; attempted = false; next_at = neg_infinity; readers = []}
 
 let replies readers value = List.map (fun (id, _) -> Reply (id, value)) readers
 
@@ -34,6 +38,15 @@ let interrupt state = match state.active with
   | None | Some _ -> state, []
 
 let delta state = function
+  | Invalidate -> {state with cached = None; sample = None; attempted = true}, []
+  | Refresh now ->
+    if state.phase <> Open || state.active <> None || now < state.next_at
+        || state.issued = max_int then state, []
+    else
+      let token = {id = state.issued + 1; generation = state.generation} in
+      {state with issued = token.id; next_at = now +. 3.;
+        active = Some {token; started = now; deadline = now +. 10.;
+          background = true; stopping = false}}, [Run token]
   | Ask (id, now, fresh) ->
     let state = {state with issued = max id state.issued} in
     if state.phase <> Open || List.length state.readers >= 16 then state, [Reply (id, None)]
@@ -49,11 +62,15 @@ let delta state = function
       | None ->
         let token = {id; generation = state.generation} in
         {state with readers; next_at = now +. 3.;
-          active = Some {token; deadline = now +. 2.5; stopping = false}}, [Run token]
+          active = Some {token; started = now; deadline = now +. 2.5;
+            background = false; stopping = false}}, [Run token]
     end
   | Cancel id ->
     let state = {state with readers = List.filter (fun (found, _) -> found <> id) state.readers} in
-    if state.readers = [] then interrupt state else state, []
+    if state.readers <> [] then state, [] else
+    (match state.active with
+      | Some {background = true; _} -> state, []
+      | None | Some _ -> interrupt state)
   | Tick now ->
     let expired, readers = List.partition (fun (_, until) -> now >= until) state.readers in
     let state = {state with readers} in
@@ -66,22 +83,30 @@ let delta state = function
     | Some job when job.token = token ->
       let value = if state.phase <> Open || job.stopping || now > job.deadline then None else value in
       let cached = match value with Some value when fresh -> Some (now +. 3., value) | _ -> None in
-      {state with active = None; readers = []; cached;
-        phase = if state.phase = Closing then Closed else state.phase}, replies state.readers value
+      let sample = match value with
+        | Some value when fresh -> Some (job.started, value)
+        | None | Some _ -> None in
+      let expired, readers = List.partition (fun (_, until) -> now >= until) state.readers in
+      {state with active = None; readers = []; cached; sample; attempted = true;
+        phase = if state.phase = Closing then Closed else state.phase},
+      replies expired None @ replies readers value
     | None | Some _ -> state, []
     end
   | Stop ->
     let state, effects = interrupt state in
     {state with phase = (if state.active = None then Closed else Closing);
-      generation = state.generation + 1; readers = []; cached = None}, replies state.readers None @ effects
+      generation = state.generation + 1; readers = []; cached = None; sample = None},
+      replies state.readers None @ effects
 
 type 'a t = {
   clock : unit -> float;
-  run : unit -> 'a Lwt.t;
+  run : background:bool -> deadline:float -> 'a Lwt.t;
   valid : 'a -> bool;
+  retry : 'a -> bool;
   mutable state : 'a state;
   mutable replies : 'a option Lwt.u Ids.t;
   mutable work : (token * 'a Lwt.t) option;
+  mutable refresh : unit Lwt.t option;
   changed : unit Lwt_condition.t;
 }
 
@@ -105,8 +130,15 @@ and execute t = function
   | Interrupt token ->
     Option.iter (fun (found, work) -> if found = token then Lwt.cancel work) t.work
   | Run token ->
-    let work = Lwt.catch t.run Lwt.fail in
+    let background, deadline = match t.state.active with
+      | Some job when job.token = token -> job.background, job.deadline
+      | None | Some _ -> false, t.clock () in
+    let work = Lwt.catch (fun () -> t.run ~background ~deadline) Lwt.fail in
     t.work <- Some (token, work);
+    Lwt.async (fun () ->
+      let open Lwt.Syntax in
+      let+ () = Lwt_unix.sleep (max 0. (deadline -. t.clock ())) in
+      dispatch t (Tick (t.clock ())));
     Lwt.async (fun () ->
       let open Lwt.Syntax in
       let* value = Lwt.catch
@@ -117,8 +149,8 @@ and execute t = function
       dispatch t (Completed (token, t.clock (), fresh, value));
       Lwt.return_unit)
 
-let create ?(clock = monotonic) ~valid run = {
-  clock; run; valid; state = empty; replies = Ids.empty; work = None;
+let create ?(clock = monotonic) ?(retry = fun _ -> false) ~valid run = {
+  clock; run; valid; retry; state = empty; replies = Ids.empty; work = None; refresh = None;
   changed = Lwt_condition.create ();
 }
 
@@ -141,8 +173,40 @@ let query t =
     Lwt.return_unit);
   promise
 
+type 'a snapshot = Starting | Read_failed | Expired of float | Snapshot of float * 'a
+
+let snapshot t =
+  if t.state.phase <> Open then Read_failed else
+  match t.state.sample with
+  | None -> if t.state.attempted then Read_failed else Starting
+  | Some (observed, value) ->
+    let age = max 0. (t.clock () -. observed) in
+    if age > 20. then Expired age else Snapshot (age, value)
+
+let start t =
+  if t.refresh = None && t.state.phase = Open then begin
+    let open Lwt.Syntax in
+    let rec loop () =
+      if t.state.phase <> Open then Lwt.return_unit else
+      let now = t.clock () in
+      let refresh = match t.state.sample with
+        | None -> true
+        | Some (observed, value) ->
+          if not (valid t value) then begin dispatch t Invalidate; true end
+          else t.retry value || now -. observed >= 10. in
+      if refresh then dispatch t (Refresh now);
+      let* () = Lwt_unix.sleep 0.1 in
+      loop () in
+    let work = let* () = Lwt.pause () in loop () in
+    t.refresh <- Some work;
+    Lwt.async (fun () -> Lwt.catch (fun () -> work)
+      (function Lwt.Canceled -> Lwt.return_unit | error -> Lwt.fail error))
+  end
+
 let close t =
   dispatch t Stop;
+  Option.iter Lwt.cancel t.refresh;
+  t.refresh <- None;
   let rec finished () =
     if t.state.phase = Closed then Lwt.return_true else
     Lwt.bind (Lwt_condition.wait t.changed) finished in
@@ -150,7 +214,21 @@ let close t =
 
 let read_lock = Lwt_mutex.create ()
 
-let read_child run =
+let child parent run =
+  let module F = Octra_core.Proof_frame in
+  try
+    Irmin_pack_unix.Async.Unix.mask_for_exit ();
+    let output = Octra_core.Store_irmin.pack_child_fd Unix.stdout parent 3 in
+    Logs.set_reporter_mutex ~lock:(fun () -> ()) ~unlock:(fun () -> ());
+    Logs.set_reporter Logs.nop_reporter;
+    Logs.set_level None;
+    let raw = run () in
+    if String.length raw > 8 * 1024 * 1024 then Unix._exit 2;
+    F.write output (F.pack [String.length raw] ^ raw);
+    Unix._exit 0
+  with _ -> Unix._exit 2
+
+let read_child ~mode args =
   let module F = Octra_core.Proof_frame in
   let module Owner = Irmin_pack_unix.Async.Unix in
   if Lwt_mutex.is_locked read_lock then Lwt.fail_with "sync read is already active" else
@@ -159,21 +237,12 @@ let read_child run =
     let input, output = Unix.pipe ~cloexec:true () in
     let reader = try Lwt_unix.of_unix_file_descr ~blocking:false input
       with error -> F.close input; F.close output; raise error in
-    let parent = Unix.getpid () in
-    let pid = try Lwt_unix.fork () with error -> F.close input; F.close output; raise error in
-    if pid = 0 then begin
-      try
-        Owner.mask_for_exit ();
-        let output = Octra_core.Store_irmin.pack_child_fd output parent 3 in
-        Logs.set_reporter_mutex ~lock:(fun () -> ()) ~unlock:(fun () -> ());
-        Logs.set_reporter Logs.nop_reporter;
-        Logs.set_level None;
-        let raw = run () in
-        if String.length raw > 8 * 1024 * 1024 then Unix._exit 2;
-        F.write output (F.pack [String.length raw] ^ raw);
-        Unix._exit 0
-      with _ -> Unix._exit 2
-    end;
+    let program = if Sys.file_exists "/proc/self/exe" then "/proc/self/exe"
+      else Sys.executable_name in
+    let argv = Array.of_list (program :: mode :: string_of_int (Unix.getpid ()) :: args) in
+    let pid = try Unix.create_process_env program argv (Unix.environment ())
+      Unix.stdin output Unix.stderr
+      with error -> F.close input; F.close output; raise error in
     F.close output;
     let status = ref None in
     let poll () = match !status with
