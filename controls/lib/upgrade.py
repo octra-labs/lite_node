@@ -1241,6 +1241,7 @@ def apply(root, sup, values, args, release):
             journal = need if replay else None, guard = need if resumed and not replay else None)
     if (need is None and (tip is None or tip["head"] is None) and state.get("process") == "online"
             and state.get("lag") is None):
+        state = view(values, sup["pid"], release)
         local_only = local_upgrade_allowed(values, sup["config"], state, release)
         if not local_only:
             raise ValidatorError("network head is unavailable; node was not stopped; retry upgrade")

@@ -82,7 +82,7 @@ def effects(states):
             name: stack.enter_context(mock.patch.object(upgrade, name, autospec = True, return_value = value))
             for name, value in replies.items()
         }
-        stack.enter_context(mock.patch.object(upgrade, "view", side_effect=states))
+        mocks["view"] = stack.enter_context(mock.patch.object(upgrade, "view", side_effect = states))
         yield mocks
 
 class UpgradeProfileTest(unittest.TestCase):
@@ -808,7 +808,7 @@ class UpgradeProfileTest(unittest.TestCase):
 
     def test_missing_head(self):
         for tip in [None, {"head": None, "snapshot": None}, {"head": None, "snapshot": 1_580_000}]:
-            with self.subTest(tip = tip), effects([{**STATE, "lag": None}]) as calls:
+            with self.subTest(tip = tip), effects([{**STATE, "lag": None}] * 2) as calls:
                 calls["sync_head"].return_value = tip
                 with self.assertRaisesRegex(ValidatorError, "network head is unavailable"):
                     upgrade.apply(ROOT, SUP, VALUES, ARGS, MARKER)
@@ -822,6 +822,105 @@ class UpgradeProfileTest(unittest.TestCase):
         values = {**VALUES, "OCTRA_SOURCE_COMMIT": "d" * 40, "OCTRA_BINARY_HASH": "e" * 64}
         disk = upgrade.DiskState(state["head_epoch"], state["head_root"], 12, "owner", "public", None)
         return state, values, disk
+
+    @contextmanager
+    def native_case(self):
+        state, values, _ = self.old_native()
+        work = ROOT / "runtime_data"
+        work.mkdir(exist_ok = True)
+        read_disk = upgrade.disk_state
+        identity = {"address": "owner", "pub": "public"}
+        with TemporaryDirectory(dir = work, prefix = "local-head-") as directory:
+            data = Path(directory)
+            (data / "irmin_store").mkdir()
+            (data / "chaindata").mkdir()
+            head = data / "HEAD.json"
+            head.write_text(json.dumps({"epoch_id": state["head_epoch"],
+                "state_root": state["head_root"], "txid_hi": 12}))
+            values = values | {
+                "OCTRA_DATA_DIR": str(data),
+                "OCTRA_CHECKPOINT_EPOCH": str(state["head_epoch"]),
+                "OCTRA_CHECKPOINT_STATE_ROOT": state["head_root"],
+                "OCTRA_CHECKPOINT_TXID_HI": "12",
+            }
+            sup = SUP | {"config": data / "node.env"}
+            with effects(lambda *args: dict(state)) as calls, \
+                mock.patch.object(upgrade, "operator_wallet", return_value = (data / "wallet.json", identity)), \
+                mock.patch.object(upgrade, "load_wallet", return_value = identity) as wallet, \
+                mock.patch.object(upgrade, "emit"):
+                calls["disk_state"].side_effect = read_disk
+                calls["release_sync_values"].return_value = values
+                calls["parse_env"].return_value = values
+                calls["wallet"] = wallet
+                yield state, values, sup, head, calls
+
+    def test_local_head_progress(self):
+        for stage in ("git_update", "sync_head"):
+            with self.subTest(stage = stage), self.native_case() as (state, values, sup, head, calls):
+                def advance(*args):
+                    state.update(head_epoch = state["head_epoch"] + 1, head_root = "b" * 64)
+                    head.write_text(json.dumps({"epoch_id": state["head_epoch"],
+                        "state_root": state["head_root"], "txid_hi": 13}))
+                    return calls[stage].return_value
+                calls[stage].side_effect = advance
+                try:
+                    result = upgrade.apply(ROOT, sup, values, ARGS, MARKER)
+                except ValidatorError:
+                    calls["call"].assert_not_called()
+                    calls["stop"].assert_not_called()
+                    raise
+                self.assertEqual(result, 0)
+                self.assertEqual(calls["view"].call_count, 4)
+                self.assertEqual(calls["disk_state"].call_count, 3)
+                self.assertEqual([Path(call.args[0][1]).name
+                    for call in calls["call"].call_args_list][:2], ["check.sh", "build.sh"])
+                calls["stop"].assert_called_once()
+                calls["sync_wait"].assert_not_called()
+                self.assertTrue(calls["wait_node"].call_args.kwargs["require_target"])
+
+    def test_local_head_refused(self):
+        changes = {
+            "root": {"head_root": "b" * 64},
+            "profile": {"profile_current": False},
+            "source": {"live_source": "f" * 40},
+            "binary": {"binary_match": False},
+            "offline": {"process": "offline"},
+            "rpc": {"rpc": "unavailable"},
+            "wallet": {},
+        }
+        for name, change in changes.items():
+            with self.subTest(change = name), self.native_case() as (state, values, sup, _, calls):
+                def changed(*args):
+                    state.update(change)
+                    if name == "wallet":
+                        calls["wallet"].return_value = {"address": "other", "pub": "public"}
+                    return None
+                calls["sync_head"].side_effect = changed
+                reason = "restart state identity differs" if name == "wallet" else (
+                    "network head is unavailable; node was not stopped; retry upgrade")
+                with self.assertRaisesRegex(ValidatorError, "^" + reason + "$"):
+                    upgrade.apply(ROOT, sup, values, ARGS, MARKER)
+                calls["call"].assert_not_called()
+                calls["stop"].assert_not_called()
+                calls["restore_cycle"].assert_not_called()
+                calls["wait_node"].assert_not_called()
+
+    def test_local_head_late(self):
+        for change in ({"head_root": "b" * 64}, {"profile_current": False}, {"live_source": "f" * 40}):
+            with self.subTest(change = change), self.native_case() as (state, values, sup, _, calls):
+                def changed(command, **kwargs):
+                    if Path(command[1]).name == "validator_guard.py":
+                        state.update(change)
+                calls["call"].side_effect = changed
+                with self.assertRaisesRegex(ValidatorError,
+                    "^local upgrade state changed; node was not stopped; retry upgrade$"):
+                    upgrade.apply(ROOT, sup, values, ARGS, MARKER)
+                self.assertEqual(calls["view"].call_count, 4)
+                self.assertEqual([Path(call.args[0][1]).name
+                    for call in calls["call"].call_args_list][:2], ["check.sh", "build.sh"])
+                calls["stop"].assert_not_called()
+                calls["restore_cycle"].assert_not_called()
+                calls["wait_node"].assert_not_called()
 
     def test_old_native_view(self):
         state, values, _ = self.old_native()
@@ -859,7 +958,7 @@ class UpgradeProfileTest(unittest.TestCase):
             "peer_epoch": state["head_epoch"], "lag": 0}
         next_values = values | {"OCTRA_SOURCE_COMMIT": MARKER["source_commit"]}
         run_wait, run_restore = upgrade.wait_node, upgrade.restore_cycle
-        with effects([state, state, state, unknown, agreed]) as calls, \
+        with effects([state, state, state, state, unknown, agreed]) as calls, \
                 mock.patch.object(upgrade, "pm2_entries", return_value = []), \
                 mock.patch.object(upgrade, "current", return_value = SUP | {"pid": 42}), \
                 mock.patch.object(upgrade, "restore_plan", return_value = None), \
@@ -886,7 +985,7 @@ class UpgradeProfileTest(unittest.TestCase):
         changes = [{"binary_match": False}, {"profile_current": False},
             {"live_source": "0" * 40}, {"head_epoch": True}, {"head_root": "b" * 64}]
         for change in changes:
-            with self.subTest(change = change), effects([state | change]) as calls:
+            with self.subTest(change = change), effects([state | change] * 2) as calls:
                 calls["release_sync_values"].return_value = values
                 calls["disk_state"].return_value = disk
                 with self.assertRaises(ValidatorError):
@@ -894,7 +993,7 @@ class UpgradeProfileTest(unittest.TestCase):
                 calls["call"].assert_not_called()
                 calls["stop"].assert_not_called()
         changed = state | {"profile_current": False}
-        with effects([state, state, changed]) as calls:
+        with effects([state, state, state, changed]) as calls:
             calls["release_sync_values"].return_value = values
             calls["parse_env"].return_value = values
             calls["disk_state"].return_value = disk

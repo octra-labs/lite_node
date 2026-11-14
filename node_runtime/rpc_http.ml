@@ -206,50 +206,70 @@ let control_write fd json =
 
 let control_close fd = Lwt.catch (fun () -> Lwt_unix.close fd) (fun _ -> Lwt.return_unit)
 
-let run_sync_control ~unavailable ~data_dir ~query serve =
+let run_sync_control ~take ~sleep ~bind ~unavailable ~data_dir ~query serve =
   let open Lwt.Syntax in
   let data_dir = Unix.realpath data_dir in
   let lock = control_lock data_dir in
   let path = control_path data_dir in
+  let staged = Filename.concat (Filename.dirname path) "next" in
   let socket = try Lwt_unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0
     with error -> control_active := false; Unix.close lock; raise error in
   Lwt_unix.set_close_on_exec socket;
   let identity = ref None in
   let clients = Hashtbl.create 16 in
-  let client fd =
-    Lwt.finalize
-      (fun () -> Lwt.catch (fun () -> Lwt_unix.with_timeout 2.8 (fun () ->
-        let* body = control_read fd in
-        let* response = control_reply ~query body in
-        control_write fd response)) (fun _ -> Lwt.return_unit))
-      (fun () -> Hashtbl.remove clients fd; control_close fd) in
+  let client key fd =
+    Lwt.catch (fun () -> Lwt.finalize
+      (fun () ->
+        let* () = Lwt.pause () in
+        Lwt.catch (fun () -> Lwt_unix.with_timeout 2.8 (fun () ->
+          let* body = control_read fd in
+          let* response = control_reply ~query body in
+          control_write fd response)) (fun _ -> Lwt.return_unit))
+      (fun () -> Hashtbl.remove clients key; control_close fd))
+      (function Lwt.Canceled -> Lwt.return_unit | error -> Lwt.fail error) in
+  let rec take_client attempt =
+    Lwt.catch (fun () -> take socket) (fun error ->
+      match Octra_net.P2p_conn.accept_delay attempt error with
+      | None -> Lwt.fail error
+      | Some delay ->
+        if attempt = 0 then unavailable (Printexc.to_string error);
+        let* () = sleep delay in
+        take_client (min 7 (attempt + 1))) in
   let rec accept () =
-    let* fd, _ = Lwt_unix.accept socket in
+    let* fd, _ = take_client 0 in
     Lwt_unix.set_close_on_exec fd;
     if Hashtbl.length clients >= 16 then
       let* () = control_close fd in accept ()
     else begin
-      let task = let* () = Lwt.pause () in client fd in
-      Hashtbl.add clients fd task;
+      let key = Lwt_unix.unix_file_descr fd in
+      let task = client key fd in
+      Hashtbl.add clients key (fd, task);
       Lwt.async (fun () -> task);
       accept ()
     end in
   Lwt.finalize
     (fun () ->
-      (try ignore (control_owned Unix.S_SOCK 0o077 path); Unix.unlink path
+      ignore (control_address path);
+      (try ignore (control_owned Unix.S_SOCK 0 staged); Unix.unlink staged
        with Unix.Unix_error (Unix.ENOENT, _, _) -> ());
-      let* () = Lwt_unix.bind socket (control_address path) in
-      Unix.chmod path 0o600;
-      identity := Some (control_owned Unix.S_SOCK 0o077 path);
+      let* () = bind socket (control_address staged) in
+      let stat = control_owned Unix.S_SOCK 0 staged in
+      identity := Some (staged, stat);
+      Unix.chmod staged 0o600;
+      ignore (control_owned Unix.S_SOCK 0o077 staged);
       Lwt_unix.listen socket 16;
+      (try ignore (control_owned Unix.S_SOCK 0 path)
+       with Unix.Unix_error (Unix.ENOENT, _, _) -> ());
+      Unix.rename staged path;
+      identity := Some (path, stat);
       let public = serve () in
       let control = Lwt.catch accept (function
         | Lwt.Canceled -> Lwt.fail Lwt.Canceled
         | error -> unavailable (Printexc.to_string error); Lwt.protected public) in
       Lwt.pick [public; control])
     (fun () ->
-      let sockets = Hashtbl.fold (fun fd _ sockets -> fd :: sockets) clients [] in
-      let tasks = Hashtbl.fold (fun _ task tasks -> task :: tasks) clients [] in
+      let sockets = Hashtbl.fold (fun _ (fd, _) sockets -> fd :: sockets) clients [] in
+      let tasks = Hashtbl.fold (fun _ (_, task) tasks -> task :: tasks) clients [] in
       List.iter Lwt.cancel tasks;
       let* () = control_close socket in
       let* () = Lwt_list.iter_s control_close sockets in
@@ -258,20 +278,22 @@ let run_sync_control ~unavailable ~data_dir ~query serve =
       Fun.protect ~finally:(fun () -> control_active := false; Unix.close lock) (fun () ->
         match !identity with
         | None -> ()
-        | Some prior ->
-          (try let current = Unix.lstat path in
+        | Some (owned, prior) ->
+          (try let current = Unix.lstat owned in
             if current.st_kind = Unix.S_SOCK && current.st_dev = prior.st_dev
-               && current.st_ino = prior.st_ino then Unix.unlink path
+               && current.st_ino = prior.st_ino then Unix.unlink owned
            with Unix.Unix_error (Unix.ENOENT, _, _) -> ()));
       Lwt.return_unit)
 
 let with_sync_control
+    ?(take = fun socket -> Lwt_unix.accept ~cloexec:true socket)
+    ?(sleep = Lwt_unix.sleep) ?(bind = Lwt_unix.bind)
     ?(unavailable = fun reason -> Log.warn "rpc"
         "event = sync_control status = unavailable reason = %s" reason)
     ~data_dir ~query serve =
   let started = ref false in
   let run () = started := true; serve () in
-  Lwt.catch (fun () -> run_sync_control ~unavailable ~data_dir ~query run)
+  Lwt.catch (fun () -> run_sync_control ~take ~sleep ~bind ~unavailable ~data_dir ~query run)
     (function
       | Lwt.Canceled -> Lwt.fail Lwt.Canceled
       | error when not !started -> unavailable (Printexc.to_string error); serve ()

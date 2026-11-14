@@ -57,6 +57,9 @@ val control_reply :
   Yojson.Safe.t Lwt.t
 
 val with_sync_control :
+  ?take:(Lwt_unix.file_descr -> (Lwt_unix.file_descr * Unix.sockaddr) Lwt.t) ->
+  ?sleep:(float -> unit Lwt.t) ->
+  ?bind:(Lwt_unix.file_descr -> Unix.sockaddr -> unit Lwt.t) ->
   ?unavailable:(string -> unit) ->
   data_dir:string ->
   query:(unit -> (Yojson.Safe.t, Octra_core.Rpc.rpc_error) result Lwt.t) ->

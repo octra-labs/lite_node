@@ -1359,6 +1359,7 @@ let control_exchange directory body =
     else receive data in
   Lwt.finalize (fun () -> Lwt_unix.with_timeout 3. (fun () ->
     let* () = Lwt_unix.connect socket (Http.control_address (Http.control_path directory)) in
+    let* () = Lwt_unix.sleep 0.01 in
     let* () = send 0 in receive "")) (fun () -> Lwt_unix.close socket)
 
 let control_socket () =
@@ -1382,10 +1383,16 @@ let control_socket () =
       "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"octra_syncTarget\",\"params\":[]}" in
     expect "Unix control did not reach probe"
       (!calls = 1 && Yojson.Safe.Util.member "result" response = `Int 42);
-    let+ response = control_exchange directory
+    let* response = control_exchange directory
       "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"node_status\",\"params\":[]}" in
     expect "Unix control exposed public routes"
-      (!calls = 1 && Yojson.Safe.Util.member "error" response <> `Null) in
+      (!calls = 1 && Yojson.Safe.Util.member "error" response <> `Null);
+    Lwt_list.iter_s (fun count ->
+      let+ response = control_exchange directory
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"octra_syncTarget\",\"params\":[]}" in
+      expect "Unix control lost completed client capacity"
+        (!calls = count && Yojson.Safe.Util.member "result" response = `Int 42))
+      (List.init 40 (fun index -> index + 2)) in
   Lwt.finalize (fun () ->
     let+ () = Http.with_sync_control ~data_dir:alias ~query run in
     expect "control socket survived shutdown" (not (Sys.file_exists (Http.control_path directory))))
@@ -1403,10 +1410,22 @@ let control_paths () =
        | "missing" -> Unix.rmdir directory
        | "link" -> Unix.symlink directory folder
        | "wide" -> Unix.mkdir folder 0o755; Unix.chmod folder 0o755
+       | "stage_link" ->
+         Unix.mkdir folder 0o700;
+         Unix.symlink directory (Filename.concat folder "next")
+       | "socket_link" ->
+         Unix.mkdir folder 0o700;
+         Unix.symlink directory (Http.control_path directory)
        | _ ->
          Unix.mkdir folder 0o700;
-         let fd = Unix.openfile (Http.control_path directory)
+         let path = if mode = "stage_file" then Filename.concat folder "next"
+           else Http.control_path directory in
+         let fd = Unix.openfile path
            [Unix.O_WRONLY; Unix.O_CREAT; Unix.O_EXCL] 0o600 in Unix.close fd);
+      let preserved = List.filter_map (fun path ->
+        try Some (path, Unix.lstat path)
+        with Unix.Unix_error (Unix.ENOENT, _, _) -> None)
+        [Http.control_path directory; Filename.concat folder "next"] in
       let note = ref None and served = ref false in
       let* () = Http.with_sync_control ~data_dir:directory
         ~query:(fun () -> incr calls; Lwt.return_ok `Null)
@@ -1414,20 +1433,257 @@ let control_paths () =
         (fun () -> served := true; Lwt.return_unit) in
       expect "unsafe control path was accepted" (Option.is_some !note && !calls = 0);
       expect "unavailable control stopped public service" !served;
+      List.iter (fun (path, (prior : Unix.stats)) ->
+        let after = Unix.lstat path in
+        expect "unsafe control path was changed"
+          (prior.st_dev = after.st_dev && prior.st_ino = after.st_ino
+            && prior.st_kind = after.st_kind && prior.st_perm = after.st_perm)) preserved;
       Lwt.return_unit)
-      (fun () -> Test_workspace.remove directory; Lwt.return_unit)) ["missing"; "link"; "wide"; "file"]
+      (fun () -> Test_workspace.remove directory; Lwt.return_unit))
+    ["missing"; "link"; "wide"; "file"; "stage_link"; "stage_file"; "socket_link"]
+
+let control_pressure () =
+  let module Http = Octra_node_runtime.Rpc_http in
+  let open Lwt.Syntax in
+  let directory = Test_workspace.unique_dir "control-pressure" in
+  let body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"octra_syncTarget\",\"params\":[]}" in
+  let full, signal = Lwt.wait () in
+  let released, release = Lwt.wait () in
+  let calls = ref 0 in
+  let query () =
+    incr calls;
+    if !calls = 16 then Lwt.wakeup_later signal ();
+    let+ () = Lwt.protected released in Ok (`Int 42) in
+  let run () =
+    let requests = List.init 16 (fun _ -> control_exchange directory body) in
+    Lwt.finalize (fun () ->
+      let* () = Lwt_unix.with_timeout 2. (fun () -> Lwt.protected full) in
+      let* refused = Lwt.catch
+        (fun () -> let+ _ = control_exchange directory body in false)
+        (function
+          | End_of_file | Unix.Unix_error ((Unix.EPIPE | Unix.ECONNRESET), _, _) -> Lwt.return_true
+          | error -> Lwt.fail error) in
+      expect "control accepted excess clients" (refused && !calls = 16);
+      Lwt.wakeup_later release ();
+      let* responses = Lwt.all requests in
+      expect "control lost admitted requests"
+        (List.for_all (fun response -> Yojson.Safe.Util.member "result" response = `Int 42) responses);
+      let+ response = control_exchange directory body in
+      expect "control did not recover client capacity"
+        (!calls = 17 && Yojson.Safe.Util.member "result" response = `Int 42))
+      (fun () -> List.iter Lwt.cancel requests; Lwt.return_unit) in
+  Lwt.finalize (fun () -> Http.with_sync_control ~data_dir:directory ~query run)
+    (fun () -> Test_workspace.remove directory; Lwt.return_unit)
+
+let control_failures () =
+  let module Http = Octra_node_runtime.Rpc_http in
+  let open Lwt.Syntax in
+  let directory = Test_workspace.unique_dir "control-failures" in
+  let body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"octra_syncTarget\",\"params\":[]}" in
+  let failed = ref true in
+  let calls = ref 0 in
+  let query () =
+    incr calls;
+    if !failed then Lwt.fail_with "control query failed" else Lwt.return_ok (`Int 42) in
+  let run () =
+    let* () = Lwt_list.iter_s (fun count ->
+      let* refused = Lwt.catch
+        (fun () -> let+ _ = control_exchange directory body in false)
+        (function
+          | End_of_file | Unix.Unix_error ((Unix.EPIPE | Unix.ECONNRESET), _, _) -> Lwt.return_true
+          | error -> Lwt.fail error) in
+      expect "control lost failed client capacity" (refused && !calls = count);
+      Lwt.return_unit) (List.init 40 (fun index -> index + 1)) in
+    failed := false;
+    let+ response = control_exchange directory body in
+    expect "control did not recover after query errors"
+      (!calls = 41 && Yojson.Safe.Util.member "result" response = `Int 42) in
+  Lwt.finalize (fun () -> Http.with_sync_control ~data_dir:directory ~query run)
+    (fun () -> Test_workspace.remove directory; Lwt.return_unit)
+
+let control_stop () =
+  let module Http = Octra_node_runtime.Rpc_http in
+  let open Lwt.Syntax in
+  let directory = Test_workspace.unique_dir "control-stop" in
+  let body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"octra_syncTarget\",\"params\":[]}" in
+  let entered, signal = Lwt.wait () in
+  let pending, _ = Lwt.task () in
+  let stopped = ref false in
+  let query () =
+    Lwt.wakeup_later signal ();
+    Lwt.finalize (fun () -> pending) (fun () -> stopped := true; Lwt.return_unit) in
+  let idle, _ = Lwt.task () in
+  let listening, ready = Lwt.wait () in
+  let server = Http.with_sync_control ~data_dir:directory ~query
+    (fun () -> Lwt.wakeup_later ready (); idle) in
+  let request = let* () = listening in control_exchange directory body in
+  Lwt.finalize (fun () ->
+    let* () = Lwt.catch
+      (fun () -> Lwt_unix.with_timeout 2. (fun () -> Lwt.protected entered))
+      (function Lwt_unix.Timeout -> Lwt.fail_with "control query did not start" | error -> Lwt.fail error) in
+    Lwt.cancel server;
+    let* () = Lwt.catch (fun () -> server)
+      (function Lwt.Canceled -> Lwt.return_unit | error -> Lwt.fail error) in
+    let* refused = Lwt.catch (fun () -> let+ _ = request in false)
+      (function
+        | End_of_file | Unix.Unix_error ((Unix.EPIPE | Unix.ECONNRESET), _, _) -> Lwt.return_true
+        | Lwt_unix.Timeout -> Lwt.fail_with "control shutdown left request waiting"
+        | error -> Lwt.fail error) in
+    expect "control shutdown retained active client"
+      (refused && !stopped && not (Sys.file_exists (Http.control_path directory)));
+    Http.with_sync_control ~data_dir:directory ~query:(fun () -> Lwt.return_ok (`Int 42))
+      (fun () -> let+ response = control_exchange directory body in
+        expect "control restart did not accept client"
+          (Yojson.Safe.Util.member "result" response = `Int 42)))
+    (fun () -> Lwt.cancel server; Lwt.cancel request; Test_workspace.remove directory; Lwt.return_unit)
+
+let control_accept () =
+  let module Http = Octra_node_runtime.Rpc_http in
+  let open Lwt.Syntax in
+  let directory = Test_workspace.unique_dir "control-accept" in
+  let body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"octra_syncTarget\",\"params\":[]}" in
+  let errors = [Unix.EMFILE; Unix.ENFILE; Unix.ENOBUFS; Unix.ENOMEM;
+    Unix.EINTR; Unix.EAGAIN; Unix.ECONNABORTED; Unix.EWOULDBLOCK;
+    Unix.EMFILE; Unix.ENFILE] in
+  let attempts = ref 0 and delays = ref [] in
+  let take socket =
+    let index = !attempts in
+    incr attempts;
+    if index < List.length errors then
+      Lwt.fail (Unix.Unix_error (List.nth errors index, "accept", ""))
+    else Lwt_unix.accept ~cloexec:true socket in
+  let sleep delay = delays := delay :: !delays; Lwt.pause () in
+  let run () =
+    let+ response = control_exchange directory body in
+    expect "control did not recover accept"
+      (Yojson.Safe.Util.member "result" response = `Int 42);
+    let expected = List.init (List.length errors) (fun index ->
+      min 1.0 (0.01 *. Float.of_int (1 lsl min 7 index))) in
+    expect "control accept retry delay differs" (List.rev !delays = expected) in
+  Lwt.finalize (fun () ->
+    Http.with_sync_control ~take ~sleep ~data_dir:directory
+      ~query:(fun () -> Lwt.return_ok (`Int 42)) run)
+    (fun () -> Test_workspace.remove directory; Lwt.return_unit)
+
+let control_accept_stop () =
+  let module Http = Octra_node_runtime.Rpc_http in
+  let open Lwt.Syntax in
+  let directory = Test_workspace.unique_dir "control-accept-stop" in
+  let attempts = ref 0 and notes = ref 0 in
+  let idle, _ = Lwt.task () in
+  let waiting, signal = Lwt.wait () in
+  let pause, _ = Lwt.task () in
+  let take _ = incr attempts; Lwt.fail (Unix.Unix_error (Unix.EMFILE, "accept", "")) in
+  let sleep _ = Lwt.wakeup_later signal (); pause in
+  let server = Http.with_sync_control ~take ~sleep ~data_dir:directory
+    ~unavailable:(fun _ -> incr notes) ~query:(fun () -> failwith "accept invoked query")
+    (fun () -> idle) in
+  Lwt.finalize (fun () ->
+    let* () = Lwt_unix.with_timeout 1. (fun () -> Lwt.protected waiting) in
+    Lwt.cancel server;
+    let* () = Lwt.catch (fun () -> server)
+      (function Lwt.Canceled -> Lwt.return_unit | error -> Lwt.fail error) in
+    expect "control accept cancellation was lost"
+      (!attempts = 1 && !notes = 1 && Lwt.state pause = Lwt.Fail Lwt.Canceled);
+    let take _ = incr attempts; Lwt.fail (Unix.Unix_error (Unix.EBADF, "accept", "")) in
+    let* () = Http.with_sync_control ~take
+      ~sleep:(fun _ -> failwith "permanent accept error retried")
+      ~unavailable:(fun _ -> incr notes) ~data_dir:directory
+      ~query:(fun () -> failwith "closed listener invoked query")
+      (fun () -> Lwt.pause ()) in
+    expect "permanent accept error was not isolated" (!attempts = 2 && !notes = 2);
+    Lwt.return_unit)
+    (fun () -> Lwt.cancel server; Test_workspace.remove directory; Lwt.return_unit)
+
+let control_publish () =
+  let module Http = Octra_node_runtime.Rpc_http in
+  let open Lwt.Syntax in
+  let directory = Test_workspace.unique_dir "control-publish" in
+  let path = Http.control_path directory in
+  let staged = Filename.concat (Filename.dirname path) "next" in
+  let interrupted = ref false and notes = ref [] in
+  let bind socket address =
+    let* () = Lwt_unix.bind socket address in
+    expect "unsecured control socket was published" (not (Sys.file_exists path));
+    Unix.chmod staged 0o777;
+    interrupted := true;
+    Lwt.fail_with "control bind interrupted" in
+  let query () = Lwt.return_ok (`Int 42) in
+  let run () =
+    expect "published control mode differs" ((Unix.stat path).st_perm = 0o600);
+    expect "staged socket survived publication" (not (Sys.file_exists staged));
+    let+ response = control_exchange directory
+      "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"octra_syncTarget\",\"params\":[]}" in
+    expect "control did not recover interrupted bind"
+      (Yojson.Safe.Util.member "result" response = `Int 42) in
+  Lwt.finalize (fun () ->
+    let* () = Http.with_sync_control ~bind ~data_dir:directory ~query
+      ~unavailable:(fun reason -> notes := reason :: !notes) (fun () -> Lwt.return_unit) in
+    expect "control bind interruption was not preserved"
+      (!interrupted && List.length !notes = 1 && not (Sys.file_exists path));
+    let* () = Http.with_sync_control ~data_dir:directory ~query run in
+    expect "control path survived shutdown"
+      (not (Sys.file_exists path) && not (Sys.file_exists staged));
+    let socket = Unix.socket Unix.PF_UNIX Unix.SOCK_STREAM 0 in
+    Fun.protect ~finally:(fun () -> Unix.close socket) (fun () ->
+      Unix.bind socket (Http.control_address path); Unix.chmod path 0o777);
+    Http.with_sync_control ~data_dir:directory ~query run)
+    (fun () -> Test_workspace.remove directory; Lwt.return_unit)
+
+let control_pause_stop () =
+  let module Http = Octra_node_runtime.Rpc_http in
+  let open Lwt.Syntax in
+  let directory = Test_workspace.unique_dir "control-pause-stop" in
+  let done_, finish = Lwt.task () in
+  let waiting, ready = Lwt.wait () in
+  let attempts = ref 0 and called = ref false and errors = ref [] in
+  let prior = !Lwt.async_exception_hook in
+  Lwt.async_exception_hook := (fun error -> errors := error :: !errors);
+  let take socket =
+    incr attempts;
+    if !attempts = 2 then begin
+      Lwt.wakeup_later finish ();
+      fst (Lwt.task ())
+    end else Lwt_unix.accept ~cloexec:true socket in
+  let server = Http.with_sync_control ~take ~data_dir:directory
+    ~query:(fun () -> called := true; Lwt.return_ok `Null)
+    (fun () -> Lwt.wakeup_later ready (); done_) in
+  let request = let* () = waiting in control_exchange directory
+    "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"octra_syncTarget\",\"params\":[]}" in
+  Lwt.finalize (fun () ->
+    let* () = Lwt_unix.with_timeout 2. (fun () -> server) in
+    let* refused = Lwt.catch (fun () -> let+ _ = request in false)
+      (function
+        | End_of_file | Unix.Unix_error ((Unix.EPIPE | Unix.ECONNRESET), _, _) -> Lwt.return_true
+        | error -> Lwt.fail error) in
+    let* () = Lwt.pause () in
+    expect "paused control client escaped cancellation"
+      (refused && not !called && !errors = [] && !attempts = 2);
+    Lwt.return_unit)
+    (fun () -> Lwt.cancel server; Lwt.cancel request; Lwt.async_exception_hook := prior;
+      Test_workspace.remove directory; Lwt.return_unit)
 
 let () =
+  let controls = [
+    "control_socket", control_socket; "control_paths", control_paths;
+    "control_pressure", control_pressure; "control_failures", control_failures;
+    "control_stop", control_stop; "control_accept", control_accept;
+    "control_accept_stop", control_accept_stop; "control_publish", control_publish;
+    "control_pause_stop", control_pause_stop
+  ] in
   let cases = if Array.to_list Sys.argv = [Sys.argv.(0); "--history"] then
     ["target_history", target_history]
+    else if Array.to_list Sys.argv = [Sys.argv.(0); "--control"] then
+      controls
+    else if Array.length Sys.argv = 3 && Sys.argv.(1) = "--control" then
+      [Sys.argv.(2), List.assoc Sys.argv.(2) controls]
     else if Array.to_list Sys.argv = [Sys.argv.(0); "--records"] then
       ["target_records", target_records; "target_floor", target_floor] else
     ["probe_delta", probe_delta; "probe_child", probe_child;
      "target_records", target_records; "target_floor", target_floor;
      "probe_coalesce", probe_coalesce; "probe_failure", probe_failure;
-     "probe_drain", probe_drain; "control_routes", control_routes;
-     "control_socket", control_socket; "control_paths", control_paths;
-     "target_parallel", target_parallel;
+     "probe_drain", probe_drain; "control_routes", control_routes] @ controls @
+    ["target_parallel", target_parallel;
      "target_route", target_route; "target_replies", target_replies;
      "target_changes", target_changes; "target_fresh", target_fresh;
      "target_offline", target_offline; "target_timeout", target_timeout;
